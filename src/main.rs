@@ -607,8 +607,14 @@ fn handle_key(
             let outgoing_mode = app.agent_mode.clone();
             app.set_mode_model_preference(&outgoing_mode, &provider, &model);
         }
+        // Save outgoing reasoning effort before the mode change.
+        app.save_reasoning_effort_preference();
         app.agent_mode = next;
         apply_mode_model_if_preferred(app, cmd_tx)?;
+        // Restore the incoming mode's reasoning effort (falls back to auto).
+        if let Some(msg) = app.apply_reasoning_effort_preference() {
+            cmd_tx.send(msg)?;
+        }
         return Ok(());
     }
 
@@ -693,6 +699,11 @@ fn handle_chord(
         }
 
         KeyCode::Char('t') => {
+            let msg = app.cycle_reasoning_effort();
+            cmd_tx.send(msg)?;
+            app.status = format!("thinking: {}", app.reasoning_effort_label());
+        }
+        KeyCode::Char('a') => {
             app.popup = Popup::ThemeSelect;
             app.theme_cursor = 0;
             app.theme_filter.clear();
@@ -790,7 +801,37 @@ fn handle_session_popup_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
-    match key.code {
+    match apply_popup_session_key(app, key.code) {
+        SessionKeyAction::LoadSession { session_id } => {
+            cmd_tx.send(ClientMsg::LoadSession {
+                session_id: session_id.clone(),
+            })?;
+            cmd_tx.send(ClientMsg::SubscribeSession {
+                session_id,
+                agent_id: app.agent_id.clone(),
+            })?;
+        }
+        SessionKeyAction::DeleteSession { session_id } => {
+            cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+        }
+        SessionKeyAction::NewSession | SessionKeyAction::None => {}
+    }
+    Ok(())
+}
+
+/// Pure key-handler for the session popup. Returns a [`SessionKeyAction`] that
+/// the caller should forward to the server.
+///
+/// Uses [`App::visible_popup_items`] (grouped, no caps) and
+/// [`App::popup_collapsed_groups`] so its collapse state is fully independent
+/// of the start-page.
+pub(crate) fn apply_popup_session_key(
+    app: &mut App,
+    key: crossterm::event::KeyCode,
+) -> SessionKeyAction {
+    use crate::app::PopupItem;
+
+    match key {
         KeyCode::Esc => {
             app.popup = Popup::None;
         }
@@ -798,43 +839,54 @@ fn handle_session_popup_key(
             app.session_cursor = app.session_cursor.saturating_sub(1);
         }
         KeyCode::Down => {
-            let max = app.filtered_sessions().len().saturating_sub(1);
+            let max = app.visible_popup_items().len().saturating_sub(1);
             app.session_cursor = (app.session_cursor + 1).min(max);
         }
         KeyCode::Enter => {
-            let selected: Option<protocol::SessionSummary> = app
-                .filtered_sessions()
-                .get(app.session_cursor)
-                .cloned()
-                .cloned();
-            if let Some(session) = selected {
-                let sid = session.session_id.clone();
-                cmd_tx.send(ClientMsg::LoadSession {
-                    session_id: sid.clone(),
-                })?;
-                cmd_tx.send(ClientMsg::SubscribeSession {
-                    session_id: sid,
-                    agent_id: app.agent_id.clone(),
-                })?;
-                app.popup = Popup::None;
+            let items = app.visible_popup_items();
+            if let Some(item) = items.get(app.session_cursor).cloned() {
+                match item {
+                    PopupItem::GroupHeader { cwd, .. } => {
+                        app.toggle_popup_group_collapse(cwd.as_deref());
+                        // Clamp cursor: collapsing may hide rows the cursor pointed at.
+                        let new_len = app.visible_popup_items().len();
+                        if new_len > 0 && app.session_cursor >= new_len {
+                            app.session_cursor = new_len - 1;
+                        }
+                    }
+                    PopupItem::Session {
+                        group_idx,
+                        session_idx,
+                    } => {
+                        let sid = app.session_groups[group_idx].sessions[session_idx]
+                            .session_id
+                            .clone();
+                        app.popup = Popup::None;
+                        return SessionKeyAction::LoadSession { session_id: sid };
+                    }
+                }
             }
         }
         KeyCode::Delete => {
-            let selected: Option<String> = app
-                .filtered_sessions()
-                .get(app.session_cursor)
-                .map(|s| s.session_id.clone());
-            if let Some(sid) = selected {
-                cmd_tx.send(ClientMsg::DeleteSession {
-                    session_id: sid.clone(),
-                })?;
-                for group in &mut app.session_groups {
-                    group.sessions.retain(|s| s.session_id != sid);
-                }
+            let items = app.visible_popup_items();
+            if let Some(PopupItem::Session {
+                group_idx,
+                session_idx,
+            }) = items.get(app.session_cursor).cloned()
+            {
+                let sid = app.session_groups[group_idx].sessions[session_idx]
+                    .session_id
+                    .clone();
+                // Optimistic remove
+                app.session_groups[group_idx].sessions.remove(session_idx);
                 app.session_groups.retain(|g| !g.sessions.is_empty());
-                let max = app.visible_start_items().len().saturating_sub(1);
-                app.session_cursor = app.session_cursor.min(max);
+                let new_len = app.visible_popup_items().len();
+                if new_len > 0 && app.session_cursor >= new_len {
+                    app.session_cursor = new_len - 1;
+                }
+                return SessionKeyAction::DeleteSession { session_id: sid };
             }
+            // Delete on a GroupHeader: no-op
         }
         KeyCode::Backspace => {
             app.session_filter.pop();
@@ -846,7 +898,7 @@ fn handle_session_popup_key(
         }
         _ => {}
     }
-    Ok(())
+    SessionKeyAction::None
 }
 
 fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
@@ -1033,6 +1085,8 @@ fn handle_model_popup_key(
                         node_id: model.node_id.clone(),
                     })?;
                 }
+                // Save current effort for the outgoing model before switching.
+                app.save_reasoning_effort_preference();
                 app.current_model = Some(model.model.clone());
                 app.current_provider = Some(model.provider.clone());
                 // Record this model as the preference for the current agent mode so
@@ -1043,6 +1097,10 @@ fn handle_model_popup_key(
                     &model.provider,
                     &model.model,
                 );
+                // Restore the incoming model's reasoning effort (falls back to auto).
+                if let Some(msg) = app.apply_reasoning_effort_preference() {
+                    cmd_tx.send(msg)?;
+                }
                 app.popup = Popup::None;
                 app.status = format!("model: {}", model.label);
             }
@@ -1450,4 +1508,587 @@ mod sessions_key_tests {
     // ── q quits ───────────────────────────────────────────────────────────────
     // (q is handled in handle_sessions_key, not apply_sessions_key — tested
     //  via the existing integration path)
+}
+
+#[cfg(test)]
+mod session_popup_key_tests {
+    use super::*;
+    use crate::protocol::{SessionGroup, SessionSummary};
+
+    fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
+        SessionGroup {
+            cwd: cwd.map(String::from),
+            latest_activity: None,
+            sessions: ids
+                .iter()
+                .map(|id| SessionSummary {
+                    session_id: id.to_string(),
+                    title: Some(format!("Session {id}")),
+                    cwd: cwd.map(String::from),
+                    created_at: None,
+                    updated_at: None,
+                    parent_session_id: None,
+                    has_children: false,
+                })
+                .collect(),
+        }
+    }
+
+    // ── Down / Up navigation ──────────────────────────────────────────────────
+
+    #[test]
+    fn popup_down_moves_cursor_forward() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        // visible: [GroupHeader, Session(s1), Session(s2)]
+        assert_eq!(app.session_cursor, 0);
+        apply_popup_session_key(&mut app, KeyCode::Down);
+        assert_eq!(app.session_cursor, 1);
+        apply_popup_session_key(&mut app, KeyCode::Down);
+        assert_eq!(app.session_cursor, 2);
+    }
+
+    #[test]
+    fn popup_down_clamps_at_last_item() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        // visible: [GroupHeader(0), Session(1)] — max idx = 1
+        app.session_cursor = 1;
+        apply_popup_session_key(&mut app, KeyCode::Down);
+        assert_eq!(app.session_cursor, 1); // clamped, no button slot
+    }
+
+    #[test]
+    fn popup_up_moves_cursor_back() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.session_cursor = 2;
+        apply_popup_session_key(&mut app, KeyCode::Up);
+        assert_eq!(app.session_cursor, 1);
+    }
+
+    #[test]
+    fn popup_up_does_not_go_below_zero() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.session_cursor = 0;
+        apply_popup_session_key(&mut app, KeyCode::Up);
+        assert_eq!(app.session_cursor, 0);
+    }
+
+    // ── Enter on GroupHeader toggles popup collapse ───────────────────────────
+
+    #[test]
+    fn popup_enter_on_header_collapses_group() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.session_cursor = 0; // GroupHeader
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+        assert_eq!(action, SessionKeyAction::None);
+        assert!(app.popup_collapsed_groups.contains("/a"));
+        // start-page state untouched
+        assert!(!app.collapsed_groups.contains("/a"));
+    }
+
+    #[test]
+    fn popup_enter_on_collapsed_header_expands_group() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.popup_collapsed_groups.insert("/a".to_string());
+        app.session_cursor = 0;
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+        assert_eq!(action, SessionKeyAction::None);
+        assert!(!app.popup_collapsed_groups.contains("/a"));
+    }
+
+    #[test]
+    fn popup_collapse_clamps_cursor() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        // [GroupHeader(0), Session(s1, 1), Session(s2, 2)]
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.session_cursor = 0; // header
+        // Collapse /a → only header remains
+        apply_popup_session_key(&mut app, KeyCode::Enter);
+        // Cursor must be 0 (clamped to header)
+        assert_eq!(app.session_cursor, 0);
+        assert!(app.popup_collapsed_groups.contains("/a"));
+    }
+
+    // ── Enter on Session loads it ─────────────────────────────────────────────
+
+    #[test]
+    fn popup_enter_on_session_returns_load_and_closes_popup() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["abc12345"])];
+        app.session_cursor = 1; // Session row
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "abc12345".to_string()
+            }
+        );
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    // ── Enter with all groups shows all sessions (no cap) ─────────────────────
+
+    #[test]
+    fn popup_enter_can_reach_session_beyond_start_page_cap() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        // 5 sessions — start page would cap at 3; popup shows all
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4", "s5"])];
+        // visible: [Header(0), s1(1), s2(2), s3(3), s4(4), s5(5)]
+        app.session_cursor = 5;
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "s5".to_string()
+            }
+        );
+    }
+
+    // ── Delete on Session removes it ─────────────────────────────────────────
+
+    #[test]
+    fn popup_delete_on_session_returns_delete_and_removes() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.session_cursor = 1; // Session s1
+        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
+        assert_eq!(
+            action,
+            SessionKeyAction::DeleteSession {
+                session_id: "s1".to_string()
+            }
+        );
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+        assert_eq!(app.session_groups[0].sessions[0].session_id, "s2");
+    }
+
+    #[test]
+    fn popup_delete_removes_empty_group() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["only"])];
+        app.session_cursor = 1;
+        apply_popup_session_key(&mut app, KeyCode::Delete);
+        assert!(app.session_groups.is_empty());
+    }
+
+    #[test]
+    fn popup_delete_on_header_is_noop() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.session_cursor = 0; // GroupHeader
+        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
+        assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+    }
+
+    // ── Esc closes popup ──────────────────────────────────────────────────────
+
+    #[test]
+    fn popup_esc_closes_popup() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        apply_popup_session_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    // ── Filter: Char appends, Backspace removes, both reset cursor ────────────
+
+    #[test]
+    fn popup_char_appends_to_filter_and_resets_cursor() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.session_cursor = 1;
+        apply_popup_session_key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.session_filter, "x");
+        assert_eq!(app.session_cursor, 0);
+    }
+
+    #[test]
+    fn popup_backspace_removes_last_filter_char_and_resets_cursor() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_filter = "ab".to_string();
+        app.session_cursor = 2;
+        apply_popup_session_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.session_filter, "a");
+        assert_eq!(app.session_cursor, 0);
+    }
+
+    // ── multiple groups: navigation crosses group boundaries ─────────────────
+
+    #[test]
+    fn popup_down_crosses_group_boundary() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![
+            make_group(Some("/a"), &["s1"]),
+            make_group(Some("/b"), &["s2"]),
+        ];
+        // visible: [Header /a (0), Session s1 (1), Header /b (2), Session s2 (3)]
+        app.session_cursor = 1; // s1
+        apply_popup_session_key(&mut app, KeyCode::Down);
+        assert_eq!(app.session_cursor, 2); // Header /b
+        apply_popup_session_key(&mut app, KeyCode::Down);
+        assert_eq!(app.session_cursor, 3); // s2
+    }
+
+    // ── collapse in popup does not affect start-page navigation ──────────────
+
+    #[test]
+    fn popup_collapse_independent_of_start_page() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        // collapse in popup
+        app.session_cursor = 0;
+        apply_popup_session_key(&mut app, KeyCode::Enter);
+        assert!(app.popup_collapsed_groups.contains("/a"));
+        // start page state untouched
+        assert!(!app.collapsed_groups.contains("/a"));
+    }
+}
+
+#[cfg(test)]
+mod chord_reasoning_effort_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    fn chord_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // ── Ctrl+x p cycles reasoning effort and sends message ───────────────────
+
+    #[test]
+    fn chord_p_cycles_effort_and_sends_msg() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        assert_eq!(app.reasoning_effort, None);
+
+        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        let msg = rx.try_recv().expect("expected SetReasoningEffort message");
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "low");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chord_p_full_cycle_sends_auto_on_wrap() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.reasoning_effort = Some("max".into());
+
+        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+
+        assert_eq!(app.reasoning_effort, None);
+        let msg = rx.try_recv().expect("expected SetReasoningEffort message");
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chord_p_status_updated() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+        // status should reflect the new level
+        assert!(
+            app.status.contains("low"),
+            "expected status to mention 'low', got: {}",
+            app.status
+        );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_integration_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    fn make_model(provider: &str, model: &str) -> crate::protocol::ModelEntry {
+        crate::protocol::ModelEntry {
+            id: format!("{provider}/{model}"),
+            label: model.into(),
+            provider: provider.into(),
+            model: model.into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }
+    }
+
+    fn chord_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn tab_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+    }
+
+    // ── Ctrl+x p saves preference for current context ─────────────────────────
+
+    #[test]
+    fn chord_p_saves_preference_for_current_context() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+
+        handle_chord(&mut app, chord_key('t'), &tx).unwrap();
+
+        // auto → low; preference stored for (build, anthropic, claude-sonnet)
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences.get(&key),
+            Some(&Some("low".into()))
+        );
+    }
+
+    #[test]
+    fn chord_p_different_contexts_stored_separately() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+
+        // set effort in build/sonnet context
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        handle_chord(&mut app, chord_key('t'), &tx).unwrap(); // auto→low
+
+        // switch context, set a different effort
+        app.agent_mode = "plan".into();
+        handle_chord(&mut app, chord_key('t'), &tx).unwrap(); // low→medium (carried from cycle)
+
+        let k_build = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        let k_plan = ("plan".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences[&k_build],
+            Some("low".into())
+        );
+        assert_eq!(
+            app.reasoning_effort_preferences[&k_plan],
+            Some("medium".into())
+        );
+    }
+
+    // ── Tab mode switch: saves outgoing, restores incoming ────────────────────
+
+    #[test]
+    fn tab_saves_outgoing_effort_and_restores_incoming() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+
+        // Pre-store a preference for the plan context
+        app.reasoning_effort_preferences.insert(
+            ("plan".into(), "anthropic".into(), "claude-sonnet".into()),
+            Some("low".into()),
+        );
+
+        // Tab → switch to plan
+        handle_key(&mut app, tab_key(), &tx).unwrap();
+
+        // outgoing (build) preference saved
+        let k_build = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences[&k_build],
+            Some("high".into())
+        );
+
+        // incoming (plan) effort restored to "low"
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+
+        // SetReasoningEffort with "low" was sent (among other messages)
+        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetReasoningEffort { reasoning_effort }
+                if reasoning_effort == "low"
+            )),
+            "expected SetReasoningEffort(low) in messages: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn tab_falls_back_to_auto_for_unknown_incoming_combo() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+        // No preference stored for plan/sonnet
+
+        handle_key(&mut app, tab_key(), &tx).unwrap();
+
+        // Unknown → auto
+        assert_eq!(app.reasoning_effort, None);
+        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetReasoningEffort { reasoning_effort }
+                if reasoning_effort == "auto"
+            )),
+            "expected SetReasoningEffort(auto) in messages: {msgs:?}"
+        );
+    }
+
+    // ── Model picker: saves outgoing, restores incoming ───────────────────────
+
+    #[test]
+    fn model_select_saves_outgoing_effort_and_restores_incoming() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.popup = app::Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+
+        // populate model list; opus is at index 0
+        app.models = vec![make_model("anthropic", "claude-opus")];
+        app.model_cursor = 0;
+
+        // Pre-store opus preference
+        app.reasoning_effort_preferences.insert(
+            ("build".into(), "anthropic".into(), "claude-opus".into()),
+            Some("max".into()),
+        );
+
+        // Enter → select opus
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
+
+        // outgoing sonnet effort saved
+        let k_sonnet = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences[&k_sonnet],
+            Some("high".into())
+        );
+
+        // incoming opus effort restored
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+
+        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetReasoningEffort { reasoning_effort }
+                if reasoning_effort == "max"
+            )),
+            "expected SetReasoningEffort(max) in messages: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn model_select_falls_back_to_auto_for_unknown_incoming() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.popup = app::Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+        app.models = vec![make_model("anthropic", "claude-opus")];
+        app.model_cursor = 0;
+        // No opus preference stored
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
+
+        // fallback to auto
+        assert_eq!(app.reasoning_effort, None);
+        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetReasoningEffort { reasoning_effort }
+                if reasoning_effort == "auto"
+            )),
+            "expected SetReasoningEffort(auto) in messages: {msgs:?}"
+        );
+    }
+
+    // ── reasoning_effort push saves preference ─────────────────────────────────
+
+    #[test]
+    fn server_push_saves_preference_for_current_context() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+
+        app.handle_server_msg(crate::protocol::RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
+        });
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences.get(&key),
+            Some(&Some("medium".into()))
+        );
+    }
+
+    #[test]
+    fn server_push_auto_saves_none_for_current_context() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+
+        app.handle_server_msg(crate::protocol::RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
+        });
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(app.reasoning_effort_preferences.get(&key), Some(&None));
+    }
 }

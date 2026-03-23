@@ -259,6 +259,15 @@ impl Theme {
     pub fn thinking() -> Style {
         Style::default().fg(Self::magenta()).bg(Self::bg())
     }
+    /// Style for the `:` separator between the model name and thinking level.
+    pub fn reasoning_effort_sep() -> Style {
+        Style::default().fg(Self::dim()).bg(Self::bg_dim())
+    }
+    /// Style for the thinking-level label (e.g. `auto`, `high`) in the header.
+    /// Cyan — distinct from the magenta model name and the dim separator.
+    pub fn reasoning_effort_level() -> Style {
+        Style::default().fg(Self::info()).bg(Self::bg_dim())
+    }
     pub fn error_text() -> Style {
         Style::default().fg(Self::err()).bg(Self::bg())
     }

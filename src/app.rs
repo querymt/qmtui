@@ -580,6 +580,30 @@ pub const MAX_RECENT_SESSIONS: usize = 3;
 /// Maximum number of workspace groups shown on the start page before a ShowMore row.
 pub const MAX_VISIBLE_GROUPS: usize = 3;
 
+/// A single visible row in the sessions popup.
+///
+/// Built by [`App::visible_popup_items`]. Unlike [`StartPageItem`] there is no
+/// `ShowMore` variant — the popup always shows all sessions and all groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PopupItem {
+    /// A group header row (cwd label + count + collapsed state).
+    GroupHeader {
+        /// The cwd key used to look up collapse state (mirrors `SessionGroup::cwd`).
+        cwd: Option<String>,
+        /// Total sessions in this group (unfiltered).
+        session_count: usize,
+        /// Whether the group is currently collapsed in the popup.
+        collapsed: bool,
+    },
+    /// A session row inside an expanded group.
+    Session {
+        /// Index into `App::session_groups`.
+        group_idx: usize,
+        /// Index into `App::session_groups[group_idx].sessions`.
+        session_idx: usize,
+    },
+}
+
 pub struct App {
     pub screen: Screen,
     pub popup: Popup,
@@ -592,6 +616,9 @@ pub struct App {
     pub session_filter: String,
     /// Groups whose header has been collapsed by the user on the start page.
     pub collapsed_groups: HashSet<String>,
+    /// Groups whose header has been collapsed by the user in the session popup.
+    /// Separate from `collapsed_groups` so start-page and popup states are independent.
+    pub popup_collapsed_groups: HashSet<String>,
     /// Scroll offset for the start-page session list (in visible rows).
     pub start_page_scroll: usize,
 
@@ -619,6 +646,14 @@ pub struct App {
     pub last_compaction_token_estimate: Option<u32>,
     /// Active elicitation request waiting for user response.
     pub elicitation: Option<ElicitationState>,
+
+    // reasoning effort
+    /// Current reasoning-effort level. `None` = "auto" (server default).
+    /// Matches `reasoningEffort: string | null` in the web UI.
+    pub reasoning_effort: Option<String>,
+    /// Per-context reasoning effort memory: (mode, provider, model) → effort.
+    /// `None` value means "auto". Unknown combos fall back to auto.
+    pub reasoning_effort_preferences: HashMap<(String, String, String), Option<String>>,
 
     // model info
     pub current_model: Option<String>,
@@ -676,6 +711,7 @@ impl App {
             session_cursor: 0,
             session_filter: String::new(),
             collapsed_groups: HashSet::new(),
+            popup_collapsed_groups: HashSet::new(),
             start_page_scroll: 0,
             session_id: None,
             agent_id: None,
@@ -697,6 +733,8 @@ impl App {
             live_compaction: None,
             last_compaction_token_estimate: None,
             elicitation: None,
+            reasoning_effort: None,
+            reasoning_effort_preferences: HashMap::new(),
             current_model: None,
             current_provider: None,
             models: Vec::new(),
@@ -844,7 +882,145 @@ impl App {
         }
     }
 
+    /// Toggle the collapsed state of a group *in the session popup*.
+    ///
+    /// Uses `popup_collapsed_groups` — fully independent of the start-page
+    /// `collapsed_groups` so the two views never interfere.
+    pub fn toggle_popup_group_collapse(&mut self, cwd: Option<&str>) {
+        let key = cwd.unwrap_or("").to_string();
+        if !self.popup_collapsed_groups.remove(&key) {
+            self.popup_collapsed_groups.insert(key);
+        }
+    }
 
+    /// Build the flat list of visible rows for the session popup.
+    ///
+    /// Mirrors [`visible_start_items`] but with two key differences:
+    /// - Uses `popup_collapsed_groups` instead of `collapsed_groups`.
+    /// - No `MAX_RECENT_SESSIONS` or `MAX_VISIBLE_GROUPS` caps — the popup
+    ///   always shows every group and every session (its purpose is to browse
+    ///   the full list).
+    pub fn visible_popup_items(&self) -> Vec<PopupItem> {
+        let q = self.session_filter.to_lowercase();
+        let mut items = Vec::new();
+
+        for (group_idx, group) in self.session_groups.iter().enumerate() {
+            let collapse_key = group.cwd.clone().unwrap_or_default();
+            let collapsed = self.popup_collapsed_groups.contains(&collapse_key);
+
+            // Determine which session indices survive the filter.
+            let matching: Vec<usize> = group
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    q.is_empty()
+                        || s.title.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                        || s.session_id.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            // When a filter is active, skip groups with no matches entirely.
+            if !q.is_empty() && matching.is_empty() {
+                continue;
+            }
+
+            items.push(PopupItem::GroupHeader {
+                cwd: group.cwd.clone(),
+                session_count: group.sessions.len(),
+                collapsed,
+            });
+
+            if !collapsed {
+                for session_idx in matching {
+                    items.push(PopupItem::Session {
+                        group_idx,
+                        session_idx,
+                    });
+                }
+            }
+        }
+
+        items
+    }
+
+
+
+    /// Short display label for the current reasoning effort level.
+    /// Matches the five values used in the web UI: auto / low / medium / high / max.
+    pub fn reasoning_effort_label(&self) -> &str {
+        self.reasoning_effort.as_deref().unwrap_or("auto")
+    }
+
+    /// Cycle through `[auto, low, medium, high, max]` (wraps around).
+    /// Updates `self.reasoning_effort` optimistically, saves the new value as
+    /// the preference for the current `(mode, provider, model)` context, and
+    /// returns the [`ClientMsg`] to forward to the server.
+    pub fn cycle_reasoning_effort(&mut self) -> ClientMsg {
+        const LEVELS: &[Option<&str>] =
+            &[None, Some("low"), Some("medium"), Some("high"), Some("max")];
+        let current = self.reasoning_effort.as_deref();
+        let idx = LEVELS
+            .iter()
+            .position(|l| l.as_deref() == current)
+            .unwrap_or(0);
+        let next = LEVELS[(idx + 1) % LEVELS.len()];
+        self.reasoning_effort = next.map(ToOwned::to_owned);
+        // Persist the new value for the current context.
+        self.save_reasoning_effort_preference();
+        // Server expects the string "auto" when clearing the override.
+        let effort_str = next.unwrap_or("auto").to_string();
+        ClientMsg::SetReasoningEffort {
+            reasoning_effort: effort_str,
+        }
+    }
+
+    /// Save the current `reasoning_effort` as the preference for the current
+    /// `(agent_mode, current_provider, current_model)` context.
+    /// Does nothing if provider or model are not yet known.
+    pub fn save_reasoning_effort_preference(&mut self) {
+        let (Some(provider), Some(model)) =
+            (self.current_provider.clone(), self.current_model.clone())
+        else {
+            return;
+        };
+        let key = (self.agent_mode.clone(), provider, model);
+        self.reasoning_effort_preferences
+            .insert(key, self.reasoning_effort.clone());
+    }
+
+    /// Look up the stored reasoning effort for the current
+    /// `(agent_mode, current_provider, current_model)` and apply it.
+    ///
+    /// - Known combo → restore stored value (may be `None` = auto).
+    /// - Unknown combo → fall back to auto (`None`).
+    ///
+    /// Returns `Some(ClientMsg::SetReasoningEffort)` when the effort changed
+    /// and must be forwarded to the server; `None` when nothing changed or
+    /// there is no provider/model context.
+    pub fn apply_reasoning_effort_preference(&mut self) -> Option<ClientMsg> {
+        let (Some(provider), Some(model)) =
+            (self.current_provider.clone(), self.current_model.clone())
+        else {
+            return None;
+        };
+        let key = (self.agent_mode.clone(), provider, model);
+        // Unknown combos fall back to auto (None).
+        let desired = self
+            .reasoning_effort_preferences
+            .get(&key)
+            .cloned()
+            .unwrap_or(None);
+        if desired == self.reasoning_effort {
+            return None; // already correct, no server round-trip needed
+        }
+        self.reasoning_effort = desired.clone();
+        let effort_str = desired.as_deref().unwrap_or("auto").to_string();
+        Some(ClientMsg::SetReasoningEffort {
+            reasoning_effort: effort_str,
+        })
+    }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
         if self.model_filter.is_empty() {
@@ -997,8 +1173,29 @@ impl App {
                         if let Some(mode) = state.agent_mode {
                             self.agent_mode = mode;
                         }
+                        // Only update reasoning_effort when the key was present in
+                        // the JSON; absent means the server didn't report it.
+                        match state.reasoning_effort {
+                            ReasoningEffortField::Absent => {}
+                            ReasoningEffortField::Auto => self.reasoning_effort = None,
+                            ReasoningEffortField::Set(s) => self.reasoning_effort = Some(s),
+                        }
                         self.conn = ConnState::Connected;
                         self.status = "connected".into();
+                    }
+                }
+                None
+            }
+            "reasoning_effort" => {
+                if let Some(data) = raw.data {
+                    if let Ok(re) = serde_json::from_value::<ReasoningEffortData>(data) {
+                        self.reasoning_effort = match re.reasoning_effort.as_deref() {
+                            None | Some("auto") => None,
+                            Some(s) => Some(s.to_string()),
+                        };
+                        // Server is authoritative — persist so the context
+                        // remembers this level if the user switches away and back.
+                        self.save_reasoning_effort_preference();
                     }
                 }
                 None
@@ -1905,6 +2102,477 @@ impl App {
         self.scroll_offset = 0;
         self.mention_state = None;
         std::mem::take(&mut self.input)
+    }
+}
+
+// ── reasoning_effort_tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    // ── reasoning_effort_label ────────────────────────────────────────────────
+
+    #[test]
+    fn label_none_is_auto() {
+        let app = App::new();
+        assert_eq!(app.reasoning_effort_label(), "auto");
+    }
+
+    #[test]
+    fn label_low() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("low".into());
+        assert_eq!(app.reasoning_effort_label(), "low");
+    }
+
+    #[test]
+    fn label_medium() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        assert_eq!(app.reasoning_effort_label(), "medium");
+    }
+
+    #[test]
+    fn label_high() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("high".into());
+        assert_eq!(app.reasoning_effort_label(), "high");
+    }
+
+    #[test]
+    fn label_max() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("max".into());
+        assert_eq!(app.reasoning_effort_label(), "max");
+    }
+
+    #[test]
+    fn label_unknown_passes_through() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("ultra".into());
+        assert_eq!(app.reasoning_effort_label(), "ultra");
+    }
+
+    // ── cycle_reasoning_effort ────────────────────────────────────────────────
+
+    #[test]
+    fn cycle_from_auto_to_low() {
+        let mut app = App::new();
+        assert_eq!(app.reasoning_effort, None);
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+    }
+
+    #[test]
+    fn cycle_from_low_to_medium() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("low".into());
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
+    }
+
+    #[test]
+    fn cycle_from_medium_to_high() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+    }
+
+    #[test]
+    fn cycle_from_high_to_max() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("high".into());
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+    }
+
+    #[test]
+    fn cycle_from_max_wraps_to_auto() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("max".into());
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn cycle_full_round_trip() {
+        let mut app = App::new();
+        // auto → low → medium → high → max → auto
+        for _ in 0..5 {
+            app.cycle_reasoning_effort();
+        }
+        assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn cycle_returns_correct_client_msg() {
+        let mut app = App::new(); // starts at auto
+        let msg = app.cycle_reasoning_effort();
+        // auto → low: should send "low"
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "low");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_to_auto_sends_auto_string() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("max".into());
+        let msg = app.cycle_reasoning_effort();
+        // max → auto: server expects "auto" string (not null)
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    // ── state message populates reasoning_effort ──────────────────────────────
+
+    #[test]
+    fn state_msg_sets_reasoning_effort() {
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "state".into(),
+            data: Some(serde_json::json!({
+                "active_session_id": null,
+                "agents": [],
+                "agent_mode": "build",
+                "reasoning_effort": "high"
+            })),
+        });
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+    }
+
+    #[test]
+    fn state_msg_with_null_reasoning_effort_sets_none() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "state".into(),
+            data: Some(serde_json::json!({
+                "active_session_id": null,
+                "agents": [],
+                "agent_mode": "build",
+                "reasoning_effort": null
+            })),
+        });
+        assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn state_msg_missing_reasoning_effort_leaves_existing() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "state".into(),
+            data: Some(serde_json::json!({
+                "active_session_id": null,
+                "agents": [],
+                "agent_mode": "build"
+                // reasoning_effort key absent → existing value preserved
+            })),
+        });
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
+    }
+
+    // ── reasoning_effort push notification ────────────────────────────────────
+
+    #[test]
+    fn reasoning_effort_push_updates_field() {
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": "max" })),
+        });
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+    }
+
+    #[test]
+    fn reasoning_effort_push_null_clears_field() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("low".into());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": null })),
+        });
+        assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_effort_push_auto_string_clears_field() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("high".into());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
+        });
+        assert_eq!(app.reasoning_effort, None);
+    }
+}
+
+// ── reasoning_effort_prefs_tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod reasoning_effort_prefs_tests {
+    use super::*;
+
+    fn set_ctx(app: &mut App, mode: &str, provider: &str, model: &str) {
+        app.agent_mode = mode.into();
+        app.current_provider = Some(provider.into());
+        app.current_model = Some(model.into());
+    }
+
+    // ── save_reasoning_effort_preference ─────────────────────────────────────
+
+    #[test]
+    fn save_stores_current_effort_under_mode_provider_model() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("high".into());
+
+        app.save_reasoning_effort_preference();
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences.get(&key),
+            Some(&Some("high".into()))
+        );
+    }
+
+    #[test]
+    fn save_stores_none_for_auto() {
+        let mut app = App::new();
+        set_ctx(&mut app, "plan", "openai", "gpt-4o");
+        app.reasoning_effort = None;
+
+        app.save_reasoning_effort_preference();
+
+        let key = ("plan".into(), "openai".into(), "gpt-4o".into());
+        assert_eq!(app.reasoning_effort_preferences.get(&key), Some(&None));
+    }
+
+    #[test]
+    fn save_noop_when_no_provider_or_model() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        // current_provider / current_model are None
+        app.reasoning_effort = Some("max".into());
+
+        app.save_reasoning_effort_preference();
+
+        assert!(app.reasoning_effort_preferences.is_empty());
+    }
+
+    #[test]
+    fn save_overwrites_existing_entry() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("low".into());
+        app.save_reasoning_effort_preference();
+
+        app.reasoning_effort = Some("max".into());
+        app.save_reasoning_effort_preference();
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences.get(&key),
+            Some(&Some("max".into()))
+        );
+    }
+
+    // ── apply_reasoning_effort_preference ────────────────────────────────────
+
+    #[test]
+    fn apply_restores_stored_effort_and_returns_msg() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = None; // currently auto
+
+        // Pre-store a preference
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        app.reasoning_effort_preferences.insert(key, Some("high".into()));
+
+        let msg = app.apply_reasoning_effort_preference();
+
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        match msg {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+                assert_eq!(reasoning_effort, "high");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_restores_auto_for_stored_none() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("high".into());
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        app.reasoning_effort_preferences.insert(key, None);
+
+        let msg = app.apply_reasoning_effort_preference();
+
+        assert_eq!(app.reasoning_effort, None);
+        match msg {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_falls_back_to_auto_for_unknown_combo() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("max".into()); // currently max, no stored pref
+
+        let msg = app.apply_reasoning_effort_preference();
+
+        // unknown → auto
+        assert_eq!(app.reasoning_effort, None);
+        match msg {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_returns_none_when_effort_already_matches() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("high".into());
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        app.reasoning_effort_preferences.insert(key, Some("high".into()));
+
+        // already at "high" — no message needed
+        let msg = app.apply_reasoning_effort_preference();
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn apply_returns_none_when_both_are_auto() {
+        let mut app = App::new();
+        set_ctx(&mut app, "plan", "openai", "gpt-4o");
+        app.reasoning_effort = None;
+
+        let key = ("plan".into(), "openai".into(), "gpt-4o".into());
+        app.reasoning_effort_preferences.insert(key, None);
+
+        let msg = app.apply_reasoning_effort_preference();
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn apply_noop_when_no_provider_or_model() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        app.reasoning_effort = Some("max".into());
+        // current_provider / current_model are None → can't form a key
+
+        let msg = app.apply_reasoning_effort_preference();
+        // reasoning_effort should not change
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+        assert!(msg.is_none());
+    }
+
+    // ── multiple combos tracked independently ─────────────────────────────────
+
+    #[test]
+    fn different_mode_model_combos_tracked_independently() {
+        let mut app = App::new();
+
+        // build + sonnet → high
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("high".into());
+        app.save_reasoning_effort_preference();
+
+        // plan + sonnet → low
+        set_ctx(&mut app, "plan", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("low".into());
+        app.save_reasoning_effort_preference();
+
+        // build + opus → max
+        set_ctx(&mut app, "build", "anthropic", "claude-opus");
+        app.reasoning_effort = Some("max".into());
+        app.save_reasoning_effort_preference();
+
+        // verify each key
+        let k1 = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        let k2 = ("plan".into(), "anthropic".into(), "claude-sonnet".into());
+        let k3 = ("build".into(), "anthropic".into(), "claude-opus".into());
+        assert_eq!(app.reasoning_effort_preferences[&k1], Some("high".into()));
+        assert_eq!(app.reasoning_effort_preferences[&k2], Some("low".into()));
+        assert_eq!(app.reasoning_effort_preferences[&k3], Some("max".into()));
+    }
+
+    #[test]
+    fn apply_picks_correct_combo_from_multiple() {
+        let mut app = App::new();
+
+        // store two combos
+        app.reasoning_effort_preferences.insert(
+            ("build".into(), "anthropic".into(), "claude-sonnet".into()),
+            Some("high".into()),
+        );
+        app.reasoning_effort_preferences.insert(
+            ("plan".into(), "anthropic".into(), "claude-sonnet".into()),
+            Some("low".into()),
+        );
+
+        // switch to plan context
+        set_ctx(&mut app, "plan", "anthropic", "claude-sonnet");
+        app.reasoning_effort = None;
+        app.apply_reasoning_effort_preference();
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+
+        // switch to build context
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = None;
+        app.apply_reasoning_effort_preference();
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+    }
+
+    // ── cycle_reasoning_effort auto-saves ─────────────────────────────────────
+
+    #[test]
+    fn cycle_saves_preference_for_current_context() {
+        let mut app = App::new();
+        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        assert_eq!(app.reasoning_effort, None); // starts at auto
+
+        app.cycle_reasoning_effort();
+        // should now be "low" and saved
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+
+        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
+        assert_eq!(
+            app.reasoning_effort_preferences.get(&key),
+            Some(&Some("low".into()))
+        );
+    }
+
+    #[test]
+    fn cycle_saves_even_when_no_provider_model() {
+        // Without context we still cycle, just don't save to prefs
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        // no provider/model set
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(app.reasoning_effort_preferences.is_empty()); // nothing saved
     }
 }
 
@@ -3320,6 +3988,247 @@ mod start_page_tests {
         assert!(!items.iter().any(|i| matches!(i, StartPageItem::ShowMore { .. })));
     }
 
+}
+
+// ── popup_item_tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod popup_item_tests {
+    use super::*;
+
+    fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
+        SessionGroup {
+            cwd: cwd.map(String::from),
+            latest_activity: None,
+            sessions: ids
+                .iter()
+                .map(|id| SessionSummary {
+                    session_id: id.to_string(),
+                    title: Some(format!("Session {id}")),
+                    cwd: cwd.map(String::from),
+                    created_at: None,
+                    updated_at: None,
+                    parent_session_id: None,
+                    has_children: false,
+                })
+                .collect(),
+        }
+    }
+
+    // ── empty state ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn popup_items_empty_when_no_sessions() {
+        let app = App::new();
+        assert!(app.visible_popup_items().is_empty());
+    }
+
+    // ── basic structure: header then sessions ─────────────────────────────────
+
+    #[test]
+    fn popup_items_header_then_sessions() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        let items = app.visible_popup_items();
+        // 1 header + 2 sessions
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], PopupItem::GroupHeader { .. }));
+        assert!(matches!(&items[1], PopupItem::Session { .. }));
+        assert!(matches!(&items[2], PopupItem::Session { .. }));
+    }
+
+    // ── no MAX_RECENT_SESSIONS cap ────────────────────────────────────────────
+
+    #[test]
+    fn popup_items_shows_all_sessions_beyond_cap() {
+        let mut app = App::new();
+        // 10 sessions - all should appear, no cap like start page
+        let ids: Vec<&str> = vec!["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"];
+        app.session_groups = vec![make_group(Some("/a"), &ids)];
+        let items = app.visible_popup_items();
+        // 1 header + 10 sessions = 11
+        assert_eq!(items.len(), 11);
+        // No ShowMore items
+        assert!(!items.iter().any(|i| matches!(i, PopupItem::GroupHeader { .. } if false)));
+    }
+
+    // ── no MAX_VISIBLE_GROUPS cap ─────────────────────────────────────────────
+
+    #[test]
+    fn popup_items_shows_all_groups_beyond_cap() {
+        let mut app = App::new();
+        app.session_groups = vec![
+            make_group(Some("/a"), &["s1"]),
+            make_group(Some("/b"), &["s2"]),
+            make_group(Some("/c"), &["s3"]),
+            make_group(Some("/d"), &["s4"]),
+            make_group(Some("/e"), &["s5"]),
+        ];
+        let items = app.visible_popup_items();
+        let headers = items.iter().filter(|i| matches!(i, PopupItem::GroupHeader { .. })).count();
+        // All 5 groups shown (start page would cap at MAX_VISIBLE_GROUPS=3)
+        assert_eq!(headers, 5);
+    }
+
+    // ── collapse is separate from start page ──────────────────────────────────
+
+    #[test]
+    fn popup_collapsed_is_independent_of_start_page_collapsed() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        // Collapse on the start page should NOT affect the popup
+        app.collapsed_groups.insert("/a".to_string());
+        let items = app.visible_popup_items();
+        // Popup uses popup_collapsed_groups, not collapsed_groups
+        // /a is expanded in popup → header + 2 sessions = 3
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn popup_collapsed_hides_sessions() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.popup_collapsed_groups.insert("/a".to_string());
+        let items = app.visible_popup_items();
+        // Only the header visible
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], PopupItem::GroupHeader { collapsed: true, .. }));
+    }
+
+    #[test]
+    fn popup_expanded_shows_sessions() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        // Not in popup_collapsed_groups → expanded
+        let items = app.visible_popup_items();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], PopupItem::GroupHeader { collapsed: false, .. }));
+    }
+
+    // ── multiple groups, mixed collapse ───────────────────────────────────────
+
+    #[test]
+    fn popup_items_multiple_groups() {
+        let mut app = App::new();
+        app.session_groups = vec![
+            make_group(Some("/a"), &["s1"]),
+            make_group(Some("/b"), &["s2", "s3"]),
+        ];
+        let items = app.visible_popup_items();
+        // /a: 1 header + 1 session; /b: 1 header + 2 sessions = 5
+        assert_eq!(items.len(), 5);
+    }
+
+    #[test]
+    fn popup_one_group_collapsed_other_expanded() {
+        let mut app = App::new();
+        app.session_groups = vec![
+            make_group(Some("/a"), &["s1"]),
+            make_group(Some("/b"), &["s2", "s3"]),
+        ];
+        app.popup_collapsed_groups.insert("/a".to_string());
+        let items = app.visible_popup_items();
+        // /a collapsed: 1 header; /b expanded: 1 header + 2 sessions = 4
+        assert_eq!(items.len(), 4);
+        assert!(matches!(&items[0], PopupItem::GroupHeader { collapsed: true, .. }));
+        assert!(matches!(&items[1], PopupItem::GroupHeader { collapsed: false, .. }));
+    }
+
+    // ── filter hides non-matching sessions ────────────────────────────────────
+
+    #[test]
+    fn popup_filter_hides_non_matching_sessions() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(
+            Some("/a"),
+            &["aaa", "bbb", "aab"],
+        )];
+        app.session_filter = "aa".to_string();
+        let items = app.visible_popup_items();
+        // header + "aaa" + "aab" (bbb filtered out by session_id)
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn popup_filter_hides_groups_with_no_matches() {
+        let mut app = App::new();
+        app.session_groups = vec![
+            make_group(Some("/a"), &["aaa"]),
+            make_group(Some("/b"), &["bbb"]),
+        ];
+        app.session_filter = "bbb".to_string();
+        let items = app.visible_popup_items();
+        // /a has no matches → hidden; /b: header + "bbb" = 2
+        assert_eq!(items.len(), 2);
+        if let PopupItem::GroupHeader { cwd, .. } = &items[0] {
+            assert_eq!(cwd.as_deref(), Some("/b"));
+        } else {
+            panic!("expected GroupHeader");
+        }
+    }
+
+    // ── session indices are correct ───────────────────────────────────────────
+
+    #[test]
+    fn popup_items_session_indices_correct() {
+        let mut app = App::new();
+        app.session_groups = vec![
+            make_group(Some("/a"), &["s0", "s1"]),
+            make_group(Some("/b"), &["s2"]),
+        ];
+        let items = app.visible_popup_items();
+        // items[0]: GroupHeader /a
+        // items[1]: Session group_idx=0, session_idx=0
+        // items[2]: Session group_idx=0, session_idx=1
+        // items[3]: GroupHeader /b
+        // items[4]: Session group_idx=1, session_idx=0
+        assert!(matches!(&items[1], PopupItem::Session { group_idx: 0, session_idx: 0 }));
+        assert!(matches!(&items[2], PopupItem::Session { group_idx: 0, session_idx: 1 }));
+        assert!(matches!(&items[4], PopupItem::Session { group_idx: 1, session_idx: 0 }));
+    }
+
+    // ── group header carries correct session_count ────────────────────────────
+
+    #[test]
+    fn popup_group_header_session_count_reflects_total() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
+        let items = app.visible_popup_items();
+        assert!(matches!(
+            &items[0],
+            PopupItem::GroupHeader { session_count: 3, .. }
+        ));
+    }
+
+    // ── toggle_popup_group_collapse ───────────────────────────────────────────
+
+    #[test]
+    fn toggle_popup_collapse_collapses_then_expands() {
+        let mut app = App::new();
+        assert!(!app.popup_collapsed_groups.contains("/a"));
+        app.toggle_popup_group_collapse(Some("/a"));
+        assert!(app.popup_collapsed_groups.contains("/a"));
+        app.toggle_popup_group_collapse(Some("/a"));
+        assert!(!app.popup_collapsed_groups.contains("/a"));
+    }
+
+    #[test]
+    fn toggle_popup_collapse_none_cwd_uses_empty_string_key() {
+        let mut app = App::new();
+        app.toggle_popup_group_collapse(None);
+        assert!(app.popup_collapsed_groups.contains(""));
+        app.toggle_popup_group_collapse(None);
+        assert!(!app.popup_collapsed_groups.contains(""));
+    }
+
+    #[test]
+    fn toggle_popup_collapse_does_not_affect_start_page_state() {
+        let mut app = App::new();
+        app.toggle_popup_group_collapse(Some("/a"));
+        assert!(app.popup_collapsed_groups.contains("/a"));
+        // start page collapsed_groups should be untouched
+        assert!(!app.collapsed_groups.contains("/a"));
+    }
 }
 
 /// Backfill `ChatEntry::Elicitation` cards that were pushed with a generic

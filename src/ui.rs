@@ -2,7 +2,9 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -325,7 +327,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 // ── Start-page session list ────────────────────────────────────────────────────
 
-const COLLAPSE_OPEN: &str = "\u{25BE}";  // ▾ expanded group
+const COLLAPSE_OPEN: &str = "\u{25BE}"; // ▾ expanded group
 const COLLAPSE_CLOSED: &str = "\u{25B8}"; // ▸ collapsed group
 
 /// A single rendered row for the start-page session list.
@@ -356,7 +358,11 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
         } else {
             (Theme::status_accent(), Theme::status())
         };
-        let session_style = if selected { Theme::selected() } else { Theme::popup_bg() };
+        let session_style = if selected {
+            Theme::selected()
+        } else {
+            Theme::popup_bg()
+        };
 
         let line: Line<'static> = match &item {
             crate::app::StartPageItem::GroupHeader {
@@ -364,17 +370,18 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 session_count,
                 collapsed,
             } => {
-                let indicator = if *collapsed { COLLAPSE_CLOSED } else { COLLAPSE_OPEN };
+                let indicator = if *collapsed {
+                    COLLAPSE_CLOSED
+                } else {
+                    COLLAPSE_OPEN
+                };
                 let cwd_display = cwd.as_deref().unwrap_or("(no workspace)");
                 // Shorten very long paths: keep last 3 components
                 let cwd_short = short_cwd(cwd_display, area_width.saturating_sub(16));
                 Line::from(vec![
                     Span::styled(format!(" {indicator} "), header_style),
                     Span::styled(cwd_short, header_style),
-                    Span::styled(
-                        format!("  ({session_count}) "),
-                        dim_style,
-                    ),
+                    Span::styled(format!("  ({session_count}) "), dim_style),
                 ])
             }
 
@@ -524,7 +531,9 @@ fn draw_start(f: &mut Frame, app: &mut App) {
     // Total content = art section + filter row + session rows + button.
     // Cap rows_h to what fits so centring stays correct on short terminals.
     let middle = outer[1];
-    let max_rows_h = middle.height.saturating_sub(art_section_height + 1 + BUTTON_H);
+    let max_rows_h = middle
+        .height
+        .saturating_sub(art_section_height + 1 + BUTTON_H);
     let capped_rows_h = rows_h.min(max_rows_h);
     let content_h = (art_section_height + 1 + capped_rows_h + BUTTON_H).min(middle.height);
 
@@ -533,9 +542,9 @@ fn draw_start(f: &mut Frame, app: &mut App) {
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(top_pad),      // top spacer
-            Constraint::Length(content_h),    // content block
-            Constraint::Min(0),               // bottom spacer
+            Constraint::Length(top_pad),   // top spacer
+            Constraint::Length(content_h), // content block
+            Constraint::Min(0),            // bottom spacer
         ])
         .split(middle);
 
@@ -596,8 +605,7 @@ fn draw_start(f: &mut Frame, app: &mut App) {
                     let char_glitch =
                         glitch_frame && prng(tick.wrapping_mul(col + 1) + row * 31) % 12 == 0;
                     let display_ch = if char_glitch {
-                        let idx =
-                            prng(tick + col * 13 + row * 7) % GLITCH_CHARS.chars().count();
+                        let idx = prng(tick + col * 13 + row * 7) % GLITCH_CHARS.chars().count();
                         GLITCH_CHARS.chars().nth(idx).unwrap_or(ch)
                     } else {
                         ch
@@ -664,7 +672,12 @@ fn draw_start(f: &mut Frame, app: &mut App) {
         let msg_y = list_area.y + list_area.height / 2;
         f.render_widget(
             Paragraph::new(Span::styled(msg, Theme::status())),
-            Rect { x: msg_x, y: msg_y, width: msg_w.min(col_w), height: 1 },
+            Rect {
+                x: msg_x,
+                y: msg_y,
+                width: msg_w.min(col_w),
+                height: 1,
+            },
         );
     } else {
         // Scroll: keep the selected row visible.
@@ -678,7 +691,8 @@ fn draw_start(f: &mut Frame, app: &mut App) {
         if app.session_cursor < app.start_page_scroll {
             app.start_page_scroll = app.session_cursor;
         }
-        app.start_page_scroll = app.start_page_scroll
+        app.start_page_scroll = app
+            .start_page_scroll
             .min(total_rows.saturating_sub(visible_rows));
 
         for (display_row, row) in rows
@@ -691,7 +705,12 @@ fn draw_start(f: &mut Frame, app: &mut App) {
             if y >= list_area.y + list_area.height {
                 break;
             }
-            let row_area = Rect { x: col_x, y, width: col_w, height: 1 };
+            let row_area = Rect {
+                x: col_x,
+                y,
+                width: col_w,
+                height: 1,
+            };
 
             // Fill background for selected row
             if row.selected {
@@ -730,8 +749,7 @@ fn draw_start(f: &mut Frame, app: &mut App) {
                 if ch == ' ' {
                     return Span::raw(" ");
                 }
-                let char_glitch =
-                    glitch_frame && prng(tick.wrapping_mul(col + 1) + 999) % 8 == 0;
+                let char_glitch = glitch_frame && prng(tick.wrapping_mul(col + 1) + 999) % 8 == 0;
                 let display_ch = if char_glitch {
                     let idx = prng(tick + col * 17 + 333) % GLITCH_CHARS.chars().count();
                     GLITCH_CHARS.chars().nth(idx).unwrap_or(ch)
@@ -868,9 +886,16 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         }
     }
 
+    // model + thinking level: " provider/model:level "
+    let effort_label = app.reasoning_effort_label().to_string();
     right_spans.push(Span::styled(
-        format!(" {model_str} "),
+        format!(" {model_str}"),
         Theme::status_accent(),
+    ));
+    right_spans.push(Span::styled(":", Theme::reasoning_effort_sep()));
+    right_spans.push(Span::styled(
+        format!("{effort_label} "),
+        Theme::reasoning_effort_level(),
     ));
 
     draw_header(
@@ -1959,6 +1984,8 @@ fn draw_header(
 }
 
 fn draw_session_popup(f: &mut Frame, app: &App) {
+    use crate::app::PopupItem;
+
     let area = f.area();
     let popup_area = centered_rect(70, 60, area);
 
@@ -2003,49 +2030,78 @@ fn draw_session_popup(f: &mut Frame, app: &App) {
         chunks[1].y,
     ));
 
-    // session list
-    let filtered = app.filtered_sessions();
+    // grouped session list
+    let popup_items = app.visible_popup_items();
     let list_w = chunks[3].width as usize;
 
-    let items: Vec<ListItem> = filtered
+    let items: Vec<ListItem> = popup_items
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            let id_short = if s.session_id.len() > 8 {
-                &s.session_id[..8]
-            } else {
-                &s.session_id
-            };
-            let time_str = s
-                .updated_at
-                .as_deref()
-                .map(relative_time)
-                .unwrap_or_default();
-            let title = s.title.as_deref().unwrap_or("(untitled)");
+        .map(|(i, item)| {
+            let selected = i == app.session_cursor;
+            match item {
+                PopupItem::GroupHeader {
+                    cwd,
+                    session_count,
+                    collapsed,
+                } => {
+                    let indicator = if *collapsed {
+                        COLLAPSE_CLOSED
+                    } else {
+                        COLLAPSE_OPEN
+                    };
+                    let cwd_display = cwd.as_deref().unwrap_or("(no workspace)");
+                    let cwd_short = short_cwd(cwd_display, list_w.saturating_sub(16));
+                    let (header_style, dim_style) = if selected {
+                        (Theme::selected(), Theme::selected())
+                    } else {
+                        (Theme::status_accent(), Theme::status())
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!(" {indicator} "), header_style),
+                        Span::styled(cwd_short, header_style),
+                        Span::styled(format!("  ({session_count}) "), dim_style),
+                    ]))
+                }
+                PopupItem::Session {
+                    group_idx,
+                    session_idx,
+                } => {
+                    let s = &app.session_groups[*group_idx].sessions[*session_idx];
+                    let id_short: String = s.session_id.chars().take(8).collect();
+                    let time_str = s
+                        .updated_at
+                        .as_deref()
+                        .map(relative_time)
+                        .unwrap_or_default();
+                    let title = s.title.as_deref().unwrap_or("(untitled)");
 
-            let id_part = format!(" {id_short} ");
-            let time_part = format!(" {time_str} ");
-            let avail = list_w.saturating_sub(id_part.chars().count() + time_part.chars().count());
-            let title_display = if title.chars().count() > avail {
-                let t: String = title.chars().take(avail.saturating_sub(1)).collect();
-                format!("{t}{ELLIPSIS}")
-            } else {
-                title.to_string()
-            };
-            let title_gap = avail.saturating_sub(title_display.chars().count());
+                    let id_part = format!("   {id_short} ");
+                    let time_part = format!(" {time_str} ");
+                    let avail =
+                        list_w.saturating_sub(id_part.chars().count() + time_part.chars().count());
+                    let title_display = if title.chars().count() > avail {
+                        let t: String = title.chars().take(avail.saturating_sub(1)).collect();
+                        format!("{t}{ELLIPSIS}")
+                    } else {
+                        title.to_string()
+                    };
+                    let title_gap = avail.saturating_sub(title_display.chars().count());
 
-            let (main_style, dim_style, time_style) = if i == app.session_cursor {
-                (Theme::selected(), Theme::selected(), Theme::selected())
-            } else {
-                (Theme::popup_bg(), Theme::status(), Theme::session_time())
-            };
+                    let (main_style, dim_style, time_style) = if selected {
+                        (Theme::selected(), Theme::selected(), Theme::selected())
+                    } else {
+                        (Theme::popup_bg(), Theme::status(), Theme::session_time())
+                    };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(id_part, dim_style),
-                Span::styled(title_display, main_style),
-                Span::styled(" ".repeat(title_gap), dim_style),
-                Span::styled(time_part, time_style),
-            ]))
+                    ListItem::new(Line::from(vec![
+                        Span::styled(id_part, dim_style),
+                        Span::styled(title_display, main_style),
+                        Span::styled(" ".repeat(title_gap), dim_style),
+                        Span::styled(time_part, time_style),
+                    ]))
+                }
+            }
         })
         .collect();
 
@@ -2056,7 +2112,7 @@ fn draw_session_popup(f: &mut Frame, app: &App) {
     // hint
     f.render_widget(
         Paragraph::new(Span::styled(
-            " esc cancel  enter load  del delete  C-x n new",
+            " esc cancel  enter load/collapse  del delete  C-x n new",
             Theme::status(),
         ))
         .style(Theme::popup_bg()),
@@ -2233,10 +2289,14 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("?", "this help"),
                 ("m", "model selector"),
                 ("n", "new session"),
+                ("a", "appearance / theme picker"),
                 ("q", "quit"),
                 ("r", "redo"),
                 ("s", "session switcher"),
-                ("t", "theme picker"),
+                (
+                    "t",
+                    "thinking level (auto\u{2192}low\u{2192}medium\u{2192}high\u{2192}max)",
+                ),
                 ("u", "undo"),
             ],
         },
@@ -2943,6 +3003,19 @@ mod tests {
         }
     }
 
+    /// The chord section must contain the 't' thinking-level cycling entry.
+    #[test]
+    fn shortcut_sections_chord_contains_thinking_cycle() {
+        let chord = shortcut_sections()
+            .iter()
+            .find(|s| s.title.contains("chord"))
+            .expect("chord section missing");
+        assert!(
+            chord.rows.iter().any(|&(k, _)| k == "t"),
+            "chord section must have a 't' row for cycling thinking level"
+        );
+    }
+
     /// The chord section must contain the '?' help entry.
     #[test]
     fn shortcut_sections_chord_contains_help_entry() {
@@ -3057,7 +3130,13 @@ mod tests {
         app.collapsed_groups.insert("/a".to_string());
         let rows = build_start_page_rows(&app, 80);
         assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0].item, StartPageItem::GroupHeader { collapsed: true, .. }));
+        assert!(matches!(
+            rows[0].item,
+            StartPageItem::GroupHeader {
+                collapsed: true,
+                ..
+            }
+        ));
     }
 
     /// The selected row is flagged correctly.
@@ -3068,7 +3147,7 @@ mod tests {
         app.session_cursor = 1; // points at first session row (index 1)
         let rows = build_start_page_rows(&app, 80);
         assert!(!rows[0].selected); // header not selected
-        assert!(rows[1].selected);  // first session selected
+        assert!(rows[1].selected); // first session selected
         assert!(!rows[2].selected);
     }
 
@@ -3079,9 +3158,16 @@ mod tests {
         app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1"])];
         let rows = build_start_page_rows(&app, 80);
         // The header line should contain the cwd somewhere in its text
-        let header_text = rows[0].line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(header_text.contains("/home/user/proj") || header_text.contains("proj"),
-            "header text '{header_text}' should contain cwd");
+        let header_text = rows[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            header_text.contains("/home/user/proj") || header_text.contains("proj"),
+            "header text '{header_text}' should contain cwd"
+        );
     }
 
     /// Session row text contains the session id prefix.
@@ -3090,9 +3176,16 @@ mod tests {
         let mut app = App::new();
         app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
         let rows = build_start_page_rows(&app, 80);
-        let session_text = rows[1].line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(session_text.contains("abcdef12") || session_text.contains("abcdef"),
-            "session row '{session_text}' should contain id prefix");
+        let session_text = rows[1]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            session_text.contains("abcdef12") || session_text.contains("abcdef"),
+            "session row '{session_text}' should contain id prefix"
+        );
     }
 
     /// Collapse indicator `▸` appears in the header when collapsed.
@@ -3102,8 +3195,16 @@ mod tests {
         app.session_groups = vec![make_group(Some("/a"), &["s1"])];
         app.collapsed_groups.insert("/a".to_string());
         let rows = build_start_page_rows(&app, 80);
-        let text = rows[0].line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(text.contains('\u{25B8}'), "collapsed header must contain ▸, got: {text}");
+        let text = rows[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            text.contains('\u{25B8}'),
+            "collapsed header must contain ▸, got: {text}"
+        );
     }
 
     /// Expand indicator `▾` appears in the header when expanded.
@@ -3113,8 +3214,16 @@ mod tests {
         app.session_groups = vec![make_group(Some("/a"), &["s1"])];
         // not collapsed
         let rows = build_start_page_rows(&app, 80);
-        let text = rows[0].line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(text.contains('\u{25BE}'), "expanded header must contain ▾, got: {text}");
+        let text = rows[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            text.contains('\u{25BE}'),
+            "expanded header must contain ▾, got: {text}"
+        );
     }
 
     /// No sessions → empty-state row is produced.
@@ -3122,6 +3231,9 @@ mod tests {
     fn start_page_rows_no_sessions_yields_empty_state_row() {
         let app = App::new();
         let rows = build_start_page_rows(&app, 80);
-        assert!(rows.is_empty(), "no groups means no rows (empty state handled in draw_start)");
+        assert!(
+            rows.is_empty(),
+            "no groups means no rows (empty state handled in draw_start)"
+        );
     }
 }

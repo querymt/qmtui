@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub enum ClientMsg {
     Init,
     ListSessions,
+    SetReasoningEffort {
+        reasoning_effort: String,
+    },
     NewSession {
         cwd: Option<String>,
         request_id: Option<String>,
@@ -73,6 +76,45 @@ pub struct StateData {
     pub active_session_id: Option<String>,
     pub agents: Vec<AgentInfo>,
     pub agent_mode: Option<String>,
+    /// Current reasoning effort level. `None` means "auto". Absent key means
+    /// the server did not report it — callers should leave existing state intact.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
+    pub reasoning_effort: ReasoningEffortField,
+}
+
+/// Three-state field for `reasoning_effort` in the `state` message:
+/// - `Absent` — key was not present in JSON (leave existing TUI state alone)
+/// - `Auto`   — key was `null` or `"auto"` (set to None / auto)
+/// - `Set(s)` — key was a non-auto string like `"low"`, `"high"`, etc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningEffortField {
+    Absent,
+    Auto,
+    Set(String),
+}
+
+impl Default for ReasoningEffortField {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+fn deserialize_reasoning_effort<'de, D>(d: D) -> Result<ReasoningEffortField, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let v = Option::<String>::deserialize(d)?;
+    Ok(match v.as_deref() {
+        None | Some("auto") => ReasoningEffortField::Auto,
+        Some(s) => ReasoningEffortField::Set(s.to_string()),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReasoningEffortData {
+    /// `None` or `"auto"` both map to the "auto" (no effort override) state.
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
