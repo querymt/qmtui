@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod app;
+mod config;
 mod highlight;
 mod markdown;
 mod protocol;
@@ -215,23 +216,37 @@ mod tests {
 #[derive(Parser)]
 #[command(name = "qmt-tui", about = "querymt terminal interface")]
 struct Cli {
-    /// Server address (e.g. 127.0.0.1:3030)
-    #[arg(short, long, default_value = "127.0.0.1:3030")]
-    addr: String,
+    /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
+    #[arg(short, long)]
+    addr: Option<String>,
 
-    /// Use TLS (wss://)
-    #[arg(long, default_value_t = false)]
-    tls: bool,
+    /// Use TLS (wss://). Overrides the value in ~/.qmt/tui.toml.
+    #[arg(long)]
+    tls: Option<bool>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    theme::Theme::init("base16-querymate");
+    // Load persistent config; CLI args override config defaults.
+    let cfg = config::TuiConfig::load();
 
-    let scheme = if cli.tls { "wss" } else { "ws" };
-    let url = format!("{scheme}://{}/ui/ws", cli.addr);
+    let addr = cli
+        .addr
+        .or_else(|| cfg.server.addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:3030".to_string());
+    let tls = cli
+        .tls
+        .or(cfg.server.tls)
+        .unwrap_or(false);
+
+    // Apply saved theme (falls back to built-in default if absent or unknown).
+    let theme_id = cfg.theme.as_deref().unwrap_or("base16-querymate");
+    theme::Theme::init(theme_id);
+
+    let scheme = if tls { "wss" } else { "ws" };
+    let url = format!("{scheme}://{addr}/ui/ws");
 
     // channels for the event loop
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<RawServerMsg>();
@@ -248,6 +263,8 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    // Hydrate session effort cache from disk.
+    config::TuiCache::load().hydrate_app(&mut app);
     let result = run_loop(&mut terminal, &mut app, &mut srv_rx, &mut conn_rx, &cmd_tx).await;
 
     // restore terminal
@@ -372,7 +389,9 @@ async fn run_loop(
             }
             // server messages
             Some(msg) = srv_rx.recv() => {
-                if let Some(reply) = app.handle_server_msg(msg) {
+                // Save config when the server authoritatively updates effort.
+                let is_effort_push = msg.msg_type == "reasoning_effort";
+                for reply in app.handle_server_msg(msg) {
                     // if reloading session, also re-subscribe
                     if let ClientMsg::LoadSession { ref session_id } = reply {
                         let sid = session_id.clone();
@@ -384,6 +403,9 @@ async fn run_loop(
                     } else {
                         cmd_tx.send(reply)?;
                     }
+                }
+                if is_effort_push {
+                    save_cache(app);
                 }
             }
             // terminal input
@@ -599,6 +621,9 @@ fn handle_key(
         if !can_send_server_commands(app) {
             return Ok(());
         }
+        // Save outgoing mode state (model + effort) to session cache.
+        app.cache_session_mode_state();
+
         let next = app.next_mode().to_string();
         cmd_tx.send(ClientMsg::SetAgentMode { mode: next.clone() })?;
         if let (Some(provider), Some(model)) =
@@ -607,14 +632,31 @@ fn handle_key(
             let outgoing_mode = app.agent_mode.clone();
             app.set_mode_model_preference(&outgoing_mode, &provider, &model);
         }
-        // Save outgoing reasoning effort before the mode change.
-        app.save_reasoning_effort_preference();
         app.agent_mode = next;
-        apply_mode_model_if_preferred(app, cmd_tx)?;
-        // Restore the incoming mode's reasoning effort (falls back to auto).
-        if let Some(msg) = app.apply_reasoning_effort_preference() {
+
+        // Restore incoming mode state (model + effort) from session cache.
+        for msg in app.apply_cached_mode_state() {
             cmd_tx.send(msg)?;
         }
+        // If no cache entry existed, fall back to mode_model_preferences.
+        if !app.session_cache
+            .get(app.session_id.as_deref().unwrap_or(""))
+            .is_some_and(|modes| modes.contains_key(&app.agent_mode))
+        {
+            apply_mode_model_if_preferred(app, cmd_tx)?;
+        }
+
+        save_config(app);
+        save_cache(app);
+        return Ok(());
+    }
+
+    // direct: ctrl+t cycles thinking level
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        let msg = app.cycle_reasoning_effort();
+        cmd_tx.send(msg)?;
+        app.status = format!("thinking: {}", app.reasoning_effort_label());
+        save_cache(app);
         return Ok(());
     }
 
@@ -664,6 +706,17 @@ fn handle_key(
     Ok(())
 }
 
+/// Persist current app state to `~/.qmt/tui.toml`.  Called at every
+/// user-initiated change that should survive a restart.
+fn save_config(app: &App) {
+    config::TuiConfig::from_app(app).save();
+}
+
+/// Persist session effort cache to `~/.cache/qmt/tui-cache.toml`.
+fn save_cache(app: &App) {
+    config::TuiCache::from_app(app).save();
+}
+
 /// Handle second key of a ctrl+x chord. Works in any screen.
 fn handle_chord(
     app: &mut App,
@@ -699,11 +752,6 @@ fn handle_chord(
         }
 
         KeyCode::Char('t') => {
-            let msg = app.cycle_reasoning_effort();
-            cmd_tx.send(msg)?;
-            app.status = format!("thinking: {}", app.reasoning_effort_label());
-        }
-        KeyCode::Char('a') => {
             app.popup = Popup::ThemeSelect;
             app.theme_cursor = 0;
             app.theme_filter.clear();
@@ -943,6 +991,7 @@ fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
             if let Some(idx) = filtered_index(app.theme_cursor) {
                 theme::Theme::set_by_index(idx);
                 app.popup = Popup::None;
+                save_config(app);
             }
         }
         KeyCode::Backspace => {
@@ -1085,8 +1134,6 @@ fn handle_model_popup_key(
                         node_id: model.node_id.clone(),
                     })?;
                 }
-                // Save current effort for the outgoing model before switching.
-                app.save_reasoning_effort_preference();
                 app.current_model = Some(model.model.clone());
                 app.current_provider = Some(model.provider.clone());
                 // Record this model as the preference for the current agent mode so
@@ -1097,12 +1144,19 @@ fn handle_model_popup_key(
                     &model.provider,
                     &model.model,
                 );
-                // Restore the incoming model's reasoning effort (falls back to auto).
-                if let Some(msg) = app.apply_reasoning_effort_preference() {
-                    cmd_tx.send(msg)?;
+                // Drop reasoning effort to auto when switching model.
+                if app.reasoning_effort.is_some() {
+                    app.reasoning_effort = None;
+                    cmd_tx.send(ClientMsg::SetReasoningEffort {
+                        reasoning_effort: "auto".into(),
+                    })?;
                 }
+                // Cache the new model + auto effort for this session + mode.
+                app.cache_session_mode_state();
                 app.popup = Popup::None;
                 app.status = format!("model: {}", model.label);
+                save_config(app);
+                save_cache(app);
             }
         }
         KeyCode::Backspace => {
@@ -1230,6 +1284,43 @@ pub(crate) fn apply_sessions_key(
         _ => {}
     }
     SessionKeyAction::None
+}
+
+#[cfg(test)]
+fn install_temp_persistence_paths(label: &str) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("qmt-main-tests-{label}-{pid}-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    config::test_set_config_path_override(Some(dir.join("tui.toml")));
+    config::test_set_cache_path_override(Some(dir.join("tui-cache.toml")));
+}
+
+#[cfg(test)]
+fn clear_temp_persistence_paths() {
+    config::test_set_config_path_override(None);
+    config::test_set_cache_path_override(None);
+}
+
+#[cfg(test)]
+struct PersistenceGuard;
+
+#[cfg(test)]
+impl PersistenceGuard {
+    fn new(label: &str) -> Self {
+        install_temp_persistence_paths(label);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PersistenceGuard {
+    fn drop(&mut self) {
+        clear_temp_persistence_paths();
+    }
 }
 
 #[cfg(test)]
@@ -1772,19 +1863,21 @@ mod chord_reasoning_effort_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
-    fn chord_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    fn ctrl_t() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
     }
 
-    // ── Ctrl+x p cycles reasoning effort and sends message ───────────────────
+    // ── Ctrl+t cycles reasoning effort and sends message ─────────────────────
 
     #[test]
-    fn chord_p_cycles_effort_and_sends_msg() {
+    fn ctrl_t_cycles_effort_and_sends_msg() {
+        install_temp_persistence_paths("ctrl-t-1");
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         assert_eq!(app.reasoning_effort, None);
 
-        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+        handle_key(&mut app, ctrl_t(), &tx).unwrap();
 
         assert_eq!(app.reasoning_effort, Some("low".into()));
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
@@ -1797,12 +1890,13 @@ mod chord_reasoning_effort_tests {
     }
 
     #[test]
-    fn chord_p_full_cycle_sends_auto_on_wrap() {
+    fn ctrl_t_full_cycle_sends_auto_on_wrap() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         app.reasoning_effort = Some("max".into());
 
-        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+        handle_key(&mut app, ctrl_t(), &tx).unwrap();
 
         assert_eq!(app.reasoning_effort, None);
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
@@ -1815,10 +1909,11 @@ mod chord_reasoning_effort_tests {
     }
 
     #[test]
-    fn chord_p_status_updated() {
+    fn ctrl_t_status_updated() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
-        handle_chord(&mut app, chord_key(KeyCode::Char('t')), &tx).unwrap();
+        handle_key(&mut app, ctrl_t(), &tx).unwrap();
         // status should reflect the new level
         assert!(
             app.status.contains("low"),
@@ -1854,61 +1949,36 @@ mod reasoning_effort_integration_tests {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
 
-    // ── Ctrl+x p saves preference for current context ─────────────────────────
+    // ── Ctrl+x t caches mode state per session ──────────────────────────────
 
     #[test]
-    fn chord_p_saves_preference_for_current_context() {
+    fn ctrl_t_caches_mode_state_for_session() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
+        app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
 
-        handle_chord(&mut app, chord_key('t'), &tx).unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .unwrap();
 
-        // auto → low; preference stored for (build, anthropic, claude-sonnet)
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences.get(&key),
-            Some(&Some("low".into()))
-        );
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-sonnet");
+        assert_eq!(cms.effort, Some("low".into()));
     }
 
-    #[test]
-    fn chord_p_different_contexts_stored_separately() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
-        let mut app = App::new();
-        app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
-
-        // set effort in build/sonnet context
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        handle_chord(&mut app, chord_key('t'), &tx).unwrap(); // auto→low
-
-        // switch context, set a different effort
-        app.agent_mode = "plan".into();
-        handle_chord(&mut app, chord_key('t'), &tx).unwrap(); // low→medium (carried from cycle)
-
-        let k_build = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        let k_plan = ("plan".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences[&k_build],
-            Some("low".into())
-        );
-        assert_eq!(
-            app.reasoning_effort_preferences[&k_plan],
-            Some("medium".into())
-        );
-    }
-
-    // ── Tab mode switch: saves outgoing, restores incoming ────────────────────
+    // ── Tab: saves outgoing, restores incoming ────────────────────────────────
 
     #[test]
-    fn tab_saves_outgoing_effort_and_restores_incoming() {
+    fn tab_saves_outgoing_and_restores_incoming_mode_state() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -1917,40 +1987,52 @@ mod reasoning_effort_integration_tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
+        app.models = vec![
+            make_model("anthropic", "claude-sonnet"),
+            make_model("openai", "gpt-4o"),
+        ];
 
-        // Pre-store a preference for the plan context
-        app.reasoning_effort_preferences.insert(
-            ("plan".into(), "anthropic".into(), "claude-sonnet".into()),
-            Some("low".into()),
+        // Pre-cache plan mode state for this session
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            app::CachedModeState {
+                model: "openai/gpt-4o".into(),
+                effort: Some("low".into()),
+            },
         );
 
-        // Tab → switch to plan
+        // Tab → switch build → plan
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
-        // outgoing (build) preference saved
-        let k_build = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences[&k_build],
-            Some("high".into())
-        );
+        // Outgoing build state saved
+        let build = &app.session_cache["s1"]["build"];
+        assert_eq!(build.model, "anthropic/claude-sonnet");
+        assert_eq!(build.effort, Some("high".into()));
 
-        // incoming (plan) effort restored to "low"
+        // Incoming plan state restored
+        assert_eq!(app.agent_mode, "plan");
+        assert_eq!(app.current_provider.as_deref(), Some("openai"));
+        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
         assert_eq!(app.reasoning_effort, Some("low".into()));
 
-        // SetReasoningEffort with "low" was sent (among other messages)
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected SetSessionModel: {msgs:?}"
+        );
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
                 ClientMsg::SetReasoningEffort { reasoning_effort }
                 if reasoning_effort == "low"
             )),
-            "expected SetReasoningEffort(low) in messages: {msgs:?}"
+            "expected SetReasoningEffort(low): {msgs:?}"
         );
     }
 
     #[test]
-    fn tab_falls_back_to_auto_for_unknown_incoming_combo() {
+    fn tab_no_cache_entry_leaves_model_and_effort_unchanged() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -1959,73 +2041,26 @@ mod reasoning_effort_integration_tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
-        // No preference stored for plan/sonnet
+        // No plan cache entry
 
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
-        // Unknown → auto
-        assert_eq!(app.reasoning_effort, None);
+        // Mode switched but model/effort unchanged (no cache to restore from)
+        assert_eq!(app.agent_mode, "plan");
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
-                if reasoning_effort == "auto"
-            )),
-            "expected SetReasoningEffort(auto) in messages: {msgs:?}"
+            !msgs.iter().any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "no SetReasoningEffort expected: {msgs:?}"
         );
     }
 
-    // ── Model picker: saves outgoing, restores incoming ───────────────────────
+    // ── Model select: drops effort to auto ────────────────────────────────────
 
     #[test]
-    fn model_select_saves_outgoing_effort_and_restores_incoming() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
-        let mut app = App::new();
-        app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
-        app.popup = app::Popup::ModelSelect;
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-
-        // populate model list; opus is at index 0
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 0;
-
-        // Pre-store opus preference
-        app.reasoning_effort_preferences.insert(
-            ("build".into(), "anthropic".into(), "claude-opus".into()),
-            Some("max".into()),
-        );
-
-        // Enter → select opus
-        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
-
-        // outgoing sonnet effort saved
-        let k_sonnet = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences[&k_sonnet],
-            Some("high".into())
-        );
-
-        // incoming opus effort restored
-        assert_eq!(app.reasoning_effort, Some("max".into()));
-
-        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
-                if reasoning_effort == "max"
-            )),
-            "expected SetReasoningEffort(max) in messages: {msgs:?}"
-        );
-    }
-
-    #[test]
-    fn model_select_falls_back_to_auto_for_unknown_incoming() {
+    fn model_select_drops_effort_to_auto() {
+        let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -2037,12 +2072,12 @@ mod reasoning_effort_integration_tests {
         app.reasoning_effort = Some("high".into());
         app.models = vec![make_model("anthropic", "claude-opus")];
         app.model_cursor = 0;
-        // No opus preference stored
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
 
-        // fallback to auto
+        // Effort dropped to auto
         assert_eq!(app.reasoning_effort, None);
+
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             msgs.iter().any(|m| matches!(
@@ -2050,15 +2085,62 @@ mod reasoning_effort_integration_tests {
                 ClientMsg::SetReasoningEffort { reasoning_effort }
                 if reasoning_effort == "auto"
             )),
-            "expected SetReasoningEffort(auto) in messages: {msgs:?}"
+            "expected SetReasoningEffort(auto): {msgs:?}"
         );
     }
 
-    // ── reasoning_effort push saves preference ─────────────────────────────────
+    #[test]
+    fn model_select_caches_new_model_with_auto_effort() {
+        let _guard = PersistenceGuard::new("main-test");
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.popup = app::Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("high".into());
+        app.models = vec![make_model("anthropic", "claude-opus")];
+        app.model_cursor = 0;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
+
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-opus");
+        assert_eq!(cms.effort, None); // auto
+    }
 
     #[test]
-    fn server_push_saves_preference_for_current_context() {
+    fn model_select_no_effort_msg_when_already_auto() {
+        let _guard = PersistenceGuard::new("main-test");
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.popup = app::Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = None; // already auto
+        app.models = vec![make_model("anthropic", "claude-opus")];
+        app.model_cursor = 0;
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).unwrap();
+
+        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !msgs.iter().any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "no SetReasoningEffort when already auto: {msgs:?}"
+        );
+    }
+
+    // ── reasoning_effort server push caches per session+mode ──────────────────
+
+    #[test]
+    fn server_push_caches_effort_for_session_and_mode() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
@@ -2068,16 +2150,15 @@ mod reasoning_effort_integration_tests {
             data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
         });
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences.get(&key),
-            Some(&Some("medium".into()))
-        );
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-sonnet");
+        assert_eq!(cms.effort, Some("medium".into()));
     }
 
     #[test]
-    fn server_push_auto_saves_none_for_current_context() {
+    fn server_push_auto_caches_none_effort() {
         let mut app = App::new();
+        app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
@@ -2088,7 +2169,7 @@ mod reasoning_effort_integration_tests {
             data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
         });
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(app.reasoning_effort_preferences.get(&key), Some(&None));
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.effort, None);
     }
 }

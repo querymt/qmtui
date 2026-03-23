@@ -321,6 +321,12 @@ pub enum EventKind {
         requested_schema: serde_json::Value,
         source: String,
     },
+    /// Emitted when a session's mode changes (per-session mode in actor model).
+    /// Durable — appears in the audit journal and replayed on session load.
+    /// The last occurrence in a session's audit gives the session's last-used mode.
+    SessionModeChanged {
+        mode: String,
+    },
     Error {
         message: String,
     },

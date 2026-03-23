@@ -580,6 +580,15 @@ pub const MAX_RECENT_SESSIONS: usize = 3;
 /// Maximum number of workspace groups shown on the start page before a ShowMore row.
 pub const MAX_VISIBLE_GROUPS: usize = 3;
 
+/// In-memory per-mode cached state within a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedModeState {
+    /// `"provider/model"` e.g. `"anthropic/claude-sonnet-4-20250514"`
+    pub model: String,
+    /// Reasoning effort level. `None` = auto.
+    pub effort: Option<String>,
+}
+
 /// A single visible row in the sessions popup.
 ///
 /// Built by [`App::visible_popup_items`]. Unlike [`StartPageItem`] there is no
@@ -651,9 +660,10 @@ pub struct App {
     /// Current reasoning-effort level. `None` = "auto" (server default).
     /// Matches `reasoningEffort: string | null` in the web UI.
     pub reasoning_effort: Option<String>,
-    /// Per-context reasoning effort memory: (mode, provider, model) → effort.
-    /// `None` value means "auto". Unknown combos fall back to auto.
-    pub reasoning_effort_preferences: HashMap<(String, String, String), Option<String>>,
+    /// Per-session, per-mode cache: session_id → mode → CachedModeState.
+    /// Stores which model and reasoning effort were used in each mode within each
+    /// session.  Loaded from `~/.cache/qmt/tui-cache.toml` on startup.
+    pub session_cache: HashMap<String, HashMap<String, CachedModeState>>,
 
     // model info
     pub current_model: Option<String>,
@@ -734,7 +744,7 @@ impl App {
             last_compaction_token_estimate: None,
             elicitation: None,
             reasoning_effort: None,
-            reasoning_effort_preferences: HashMap::new(),
+            session_cache: HashMap::new(),
             current_model: None,
             current_provider: None,
             models: Vec::new(),
@@ -967,8 +977,8 @@ impl App {
             .unwrap_or(0);
         let next = LEVELS[(idx + 1) % LEVELS.len()];
         self.reasoning_effort = next.map(ToOwned::to_owned);
-        // Persist the new value for the current context.
-        self.save_reasoning_effort_preference();
+        // Cache the new value for the current session + mode.
+        self.cache_session_mode_state();
         // Server expects the string "auto" when clearing the override.
         let effort_str = next.unwrap_or("auto").to_string();
         ClientMsg::SetReasoningEffort {
@@ -976,50 +986,88 @@ impl App {
         }
     }
 
-    /// Save the current `reasoning_effort` as the preference for the current
-    /// `(agent_mode, current_provider, current_model)` context.
-    /// Does nothing if provider or model are not yet known.
-    pub fn save_reasoning_effort_preference(&mut self) {
-        let (Some(provider), Some(model)) =
-            (self.current_provider.clone(), self.current_model.clone())
-        else {
+    /// Save the current model + reasoning effort into the session cache for
+    /// the current `session_id` + `agent_mode`.
+    /// No-op if session_id, provider, or model are unknown.
+    pub fn cache_session_mode_state(&mut self) {
+        let (Some(sid), Some(provider), Some(model)) = (
+            self.session_id.clone(),
+            self.current_provider.clone(),
+            self.current_model.clone(),
+        ) else {
             return;
         };
-        let key = (self.agent_mode.clone(), provider, model);
-        self.reasoning_effort_preferences
-            .insert(key, self.reasoning_effort.clone());
+        let model_key = format!("{provider}/{model}");
+        self.session_cache
+            .entry(sid)
+            .or_default()
+            .insert(
+                self.agent_mode.clone(),
+                CachedModeState {
+                    model: model_key,
+                    effort: self.reasoning_effort.clone(),
+                },
+            );
     }
 
-    /// Look up the stored reasoning effort for the current
-    /// `(agent_mode, current_provider, current_model)` and apply it.
+    /// Look up the cached mode state for the current `session_id` +
+    /// `agent_mode` and restore the model and effort from it.
     ///
-    /// - Known combo → restore stored value (may be `None` = auto).
-    /// - Unknown combo → fall back to auto (`None`).
+    /// Returns a list of commands to send to the server:
+    /// - `SetSessionModel` if the cached model differs from the current one
+    /// - `SetReasoningEffort` if the cached effort differs from the current one
     ///
-    /// Returns `Some(ClientMsg::SetReasoningEffort)` when the effort changed
-    /// and must be forwarded to the server; `None` when nothing changed or
-    /// there is no provider/model context.
-    pub fn apply_reasoning_effort_preference(&mut self) -> Option<ClientMsg> {
-        let (Some(provider), Some(model)) =
-            (self.current_provider.clone(), self.current_model.clone())
-        else {
-            return None;
+    /// Returns empty vec when there is no cache entry or nothing changed.
+    pub fn apply_cached_mode_state(&mut self) -> Vec<ClientMsg> {
+        let Some(sid) = self.session_id.clone() else {
+            return vec![];
         };
-        let key = (self.agent_mode.clone(), provider, model);
-        // Unknown combos fall back to auto (None).
-        let desired = self
-            .reasoning_effort_preferences
-            .get(&key)
-            .cloned()
-            .unwrap_or(None);
-        if desired == self.reasoning_effort {
-            return None; // already correct, no server round-trip needed
+        let cached = self
+            .session_cache
+            .get(&sid)
+            .and_then(|modes| modes.get(&self.agent_mode))
+            .cloned();
+        let Some(cached) = cached else {
+            return vec![];
+        };
+
+        let mut cmds = Vec::new();
+
+        // Restore model if it differs from what the session currently has.
+        let current_model_key = match (self.current_provider.as_deref(), self.current_model.as_deref()) {
+            (Some(p), Some(m)) => format!("{p}/{m}"),
+            _ => String::new(),
+        };
+        if cached.model != current_model_key {
+            // Parse "provider/model" back into parts.
+            if let Some((provider, model)) = cached.model.split_once('/') {
+                // Find the model entry to get its full id + node_id.
+                let model_entry = self
+                    .models
+                    .iter()
+                    .find(|e| e.provider == provider && e.model == model);
+                if let Some(entry) = model_entry {
+                    cmds.push(ClientMsg::SetSessionModel {
+                        session_id: sid.clone(),
+                        model_id: entry.id.clone(),
+                        node_id: entry.node_id.clone(),
+                    });
+                    self.current_provider = Some(provider.to_string());
+                    self.current_model = Some(model.to_string());
+                }
+            }
         }
-        self.reasoning_effort = desired.clone();
-        let effort_str = desired.as_deref().unwrap_or("auto").to_string();
-        Some(ClientMsg::SetReasoningEffort {
-            reasoning_effort: effort_str,
-        })
+
+        // Restore effort if it differs.
+        if cached.effort != self.reasoning_effort {
+            self.reasoning_effort = cached.effort.clone();
+            let effort_str = cached.effort.as_deref().unwrap_or("auto").to_string();
+            cmds.push(ClientMsg::SetReasoningEffort {
+                reasoning_effort: effort_str,
+            });
+        }
+
+        cmds
     }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
@@ -1164,7 +1212,7 @@ impl App {
         }
     }
 
-    pub fn handle_server_msg(&mut self, raw: RawServerMsg) -> Option<ClientMsg> {
+    pub fn handle_server_msg(&mut self, raw: RawServerMsg) -> Vec<ClientMsg> {
         match raw.msg_type.as_str() {
             "state" => {
                 if let Some(data) = raw.data {
@@ -1184,7 +1232,7 @@ impl App {
                         self.status = "connected".into();
                     }
                 }
-                None
+                vec![]
             }
             "reasoning_effort" => {
                 if let Some(data) = raw.data {
@@ -1193,12 +1241,12 @@ impl App {
                             None | Some("auto") => None,
                             Some(s) => Some(s.to_string()),
                         };
-                        // Server is authoritative — persist so the context
-                        // remembers this level if the user switches away and back.
-                        self.save_reasoning_effort_preference();
+                        // Server is authoritative — cache so this session + mode
+                        // remembers the level across restarts.
+                        self.cache_session_mode_state();
                     }
                 }
-                None
+                vec![]
             }
             "agent_mode" => {
                 if let Some(data) = raw.data {
@@ -1206,7 +1254,7 @@ impl App {
                         self.agent_mode = am.mode;
                     }
                 }
-                None
+                vec![]
             }
             "file_index" => {
                 if let Some(data) = raw.data {
@@ -1225,7 +1273,7 @@ impl App {
                         self.refresh_mention_state();
                     }
                 }
-                None
+                vec![]
             }
             "undo_result" => {
                 self.pending_session_op = None;
@@ -1252,16 +1300,16 @@ impl App {
                             self.streaming_cache.invalidate();
                             self.status = "undone - reloading session".into();
                             if let Some(ref sid) = self.session_id {
-                                return Some(ClientMsg::LoadSession {
+                                return vec![ClientMsg::LoadSession {
                                     session_id: sid.clone(),
-                                });
+                                }];
                             }
                         } else {
                             self.status = ur.message.unwrap_or_else(|| "undo failed".into());
                         }
                     }
                 }
-                None
+                vec![]
             }
             "redo_result" => {
                 self.pending_session_op = None;
@@ -1273,16 +1321,16 @@ impl App {
                         if rr.success {
                             self.status = "redone - reloading session".into();
                             if let Some(ref sid) = self.session_id {
-                                return Some(ClientMsg::LoadSession {
+                                return vec![ClientMsg::LoadSession {
                                     session_id: sid.clone(),
-                                });
+                                }];
                             }
                         } else {
                             self.status = rr.message.unwrap_or_else(|| "redo failed".into());
                         }
                     }
                 }
-                None
+                vec![]
             }
             "session_list" => {
                 if let Some(data) = raw.data {
@@ -1310,7 +1358,7 @@ impl App {
                         self.status = format!("{} session(s)", total);
                     }
                 }
-                None
+                vec![]
             }
             "session_created" => {
                 if let Some(data) = raw.data {
@@ -1336,13 +1384,13 @@ impl App {
                         self.session_stats = SessionStatsLite::default();
                         self.screen = Screen::Chat;
                         self.status = "session created".into();
-                        return Some(ClientMsg::SubscribeSession {
+                        return vec![ClientMsg::SubscribeSession {
                             session_id: sc.session_id,
                             agent_id: self.agent_id.clone(),
-                        });
+                        }];
                     }
                 }
-                None
+                vec![]
             }
             "session_loaded" => {
                 if let Some(data) = raw.data {
@@ -1377,12 +1425,21 @@ impl App {
                             self.undo_state =
                                 self.build_undo_state_from_server_stack(&sl.undo_stack, None, None);
                             self.status = "ready".into();
-                            // replay audit events from the loaded data
+                            // Replay audit: sets current_provider/model (ProviderChanged)
+                            // and agent_mode (SessionModeChanged).
                             self.replay_audit(&sl.audit);
+
+                            // Restore the session's mode on the server.
+                            let mut cmds = vec![ClientMsg::SetAgentMode {
+                                mode: self.agent_mode.clone(),
+                            }];
+                            // Restore cached model + effort for this session + mode.
+                            cmds.extend(self.apply_cached_mode_state());
+                            return cmds;
                         }
                     }
                 }
-                None
+                vec![]
             }
             "session_events" => {
                 if let Some(data) = raw.data {
@@ -1392,7 +1449,7 @@ impl App {
                         }
                     }
                 }
-                None
+                vec![]
             }
             "event" => {
                 if let Some(data) = raw.data {
@@ -1400,7 +1457,7 @@ impl App {
                         self.handle_event(&ed.event);
                     }
                 }
-                None
+                vec![]
             }
             "all_models_list" => {
                 if let Some(data) = raw.data {
@@ -1408,7 +1465,7 @@ impl App {
                         self.models = ml.models;
                     }
                 }
-                None
+                vec![]
             }
             "error" => {
                 if let Some(data) = raw.data {
@@ -1417,9 +1474,9 @@ impl App {
                         self.status = format!("error: {}", e.message);
                     }
                 }
-                None
+                vec![]
             }
-            _ => None,
+            _ => vec![],
         }
     }
 
@@ -1590,6 +1647,10 @@ impl App {
                 if let Some(limit) = context_limit {
                     self.context_limit = *limit;
                 }
+                // Keep the session cache in sync with live model changes.
+                if !is_replay {
+                    self.cache_session_mode_state();
+                }
             }
             EventKind::LlmRequestEnd {
                 cumulative_cost_usd,
@@ -1645,6 +1706,9 @@ impl App {
                 });
                 self.scroll_offset = 0;
                 self.status = "question — answer in the panel above input".into();
+            }
+            EventKind::SessionModeChanged { mode } => {
+                self.agent_mode = mode.clone();
             }
             EventKind::Cancelled => {
                 self.pending_session_op = None;
@@ -2317,262 +2381,503 @@ mod reasoning_effort_tests {
     }
 }
 
-// ── reasoning_effort_prefs_tests ──────────────────────────────────────────────
+// ── session_cache_tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod reasoning_effort_prefs_tests {
+mod session_cache_tests {
     use super::*;
 
-    fn set_ctx(app: &mut App, mode: &str, provider: &str, model: &str) {
+    fn set_ctx(app: &mut App, sid: &str, mode: &str, provider: &str, model: &str) {
+        app.session_id = Some(sid.into());
         app.agent_mode = mode.into();
         app.current_provider = Some(provider.into());
         app.current_model = Some(model.into());
     }
 
-    // ── save_reasoning_effort_preference ─────────────────────────────────────
+    fn make_model_entry(provider: &str, model: &str) -> ModelEntry {
+        ModelEntry {
+            id: format!("{provider}/{model}"),
+            label: model.into(),
+            provider: provider.into(),
+            model: model.into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }
+    }
+
+    // ── cache_session_mode_state ──────────────────────────────────────────────
 
     #[test]
-    fn save_stores_current_effort_under_mode_provider_model() {
+    fn cache_stores_model_and_effort_under_session_and_mode() {
         let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = Some("high".into());
 
-        app.save_reasoning_effort_preference();
+        app.cache_session_mode_state();
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences.get(&key),
-            Some(&Some("high".into()))
-        );
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-sonnet");
+        assert_eq!(cms.effort, Some("high".into()));
     }
 
     #[test]
-    fn save_stores_none_for_auto() {
+    fn cache_stores_auto_effort_as_none() {
         let mut app = App::new();
-        set_ctx(&mut app, "plan", "openai", "gpt-4o");
+        set_ctx(&mut app, "s1", "plan", "openai", "gpt-4o");
         app.reasoning_effort = None;
 
-        app.save_reasoning_effort_preference();
+        app.cache_session_mode_state();
 
-        let key = ("plan".into(), "openai".into(), "gpt-4o".into());
-        assert_eq!(app.reasoning_effort_preferences.get(&key), Some(&None));
+        let cms = &app.session_cache["s1"]["plan"];
+        assert_eq!(cms.model, "openai/gpt-4o");
+        assert_eq!(cms.effort, None);
     }
 
     #[test]
-    fn save_noop_when_no_provider_or_model() {
+    fn cache_noop_when_no_session_id() {
         let mut app = App::new();
         app.agent_mode = "build".into();
-        // current_provider / current_model are None
-        app.reasoning_effort = Some("max".into());
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
 
-        app.save_reasoning_effort_preference();
+        app.cache_session_mode_state();
 
-        assert!(app.reasoning_effort_preferences.is_empty());
+        assert!(app.session_cache.is_empty());
     }
 
     #[test]
-    fn save_overwrites_existing_entry() {
+    fn cache_noop_when_no_provider_or_model() {
         let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+
+        app.cache_session_mode_state();
+
+        assert!(app.session_cache.is_empty());
+    }
+
+    #[test]
+    fn cache_overwrites_existing_mode_entry() {
+        let mut app = App::new();
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = Some("low".into());
-        app.save_reasoning_effort_preference();
+        app.cache_session_mode_state();
 
+        // Switch model + effort, same session + mode
+        app.current_model = Some("claude-opus".into());
+        app.current_provider = Some("anthropic".into());
         app.reasoning_effort = Some("max".into());
-        app.save_reasoning_effort_preference();
+        app.cache_session_mode_state();
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences.get(&key),
-            Some(&Some("max".into()))
-        );
-    }
-
-    // ── apply_reasoning_effort_preference ────────────────────────────────────
-
-    #[test]
-    fn apply_restores_stored_effort_and_returns_msg() {
-        let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None; // currently auto
-
-        // Pre-store a preference
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        app.reasoning_effort_preferences.insert(key, Some("high".into()));
-
-        let msg = app.apply_reasoning_effort_preference();
-
-        assert_eq!(app.reasoning_effort, Some("high".into()));
-        match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
-                assert_eq!(reasoning_effort, "high");
-            }
-            other => panic!("expected SetReasoningEffort, got {other:?}"),
-        }
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-opus");
+        assert_eq!(cms.effort, Some("max".into()));
     }
 
     #[test]
-    fn apply_restores_auto_for_stored_none() {
+    fn cache_different_modes_independent_within_session() {
         let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = Some("high".into());
+        app.cache_session_mode_state();
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        app.reasoning_effort_preferences.insert(key, None);
+        set_ctx(&mut app, "s1", "plan", "openai", "gpt-4o");
+        app.reasoning_effort = Some("low".into());
+        app.cache_session_mode_state();
 
-        let msg = app.apply_reasoning_effort_preference();
-
-        assert_eq!(app.reasoning_effort, None);
-        match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
-                assert_eq!(reasoning_effort, "auto");
-            }
-            other => panic!("expected SetReasoningEffort, got {other:?}"),
-        }
+        assert_eq!(app.session_cache["s1"]["build"].model, "anthropic/claude-sonnet");
+        assert_eq!(app.session_cache["s1"]["build"].effort, Some("high".into()));
+        assert_eq!(app.session_cache["s1"]["plan"].model, "openai/gpt-4o");
+        assert_eq!(app.session_cache["s1"]["plan"].effort, Some("low".into()));
     }
 
     #[test]
-    fn apply_falls_back_to_auto_for_unknown_combo() {
+    fn cache_different_sessions_independent() {
         let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("max".into()); // currently max, no stored pref
 
-        let msg = app.apply_reasoning_effort_preference();
-
-        // unknown → auto
-        assert_eq!(app.reasoning_effort, None);
-        match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
-                assert_eq!(reasoning_effort, "auto");
-            }
-            other => panic!("expected SetReasoningEffort, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn apply_returns_none_when_effort_already_matches() {
-        let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = Some("high".into());
+        app.cache_session_mode_state();
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        app.reasoning_effort_preferences.insert(key, Some("high".into()));
+        set_ctx(&mut app, "s2", "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("low".into());
+        app.cache_session_mode_state();
 
-        // already at "high" — no message needed
-        let msg = app.apply_reasoning_effort_preference();
-        assert!(msg.is_none());
+        assert_eq!(app.session_cache["s1"]["build"].effort, Some("high".into()));
+        assert_eq!(app.session_cache["s2"]["build"].effort, Some("low".into()));
     }
 
+    // ── apply_cached_mode_state ───────────────────────────────────────────────
+
     #[test]
-    fn apply_returns_none_when_both_are_auto() {
+    fn apply_restores_effort_when_model_matches() {
         let mut app = App::new();
-        set_ctx(&mut app, "plan", "openai", "gpt-4o");
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = None;
 
-        let key = ("plan".into(), "openai".into(), "gpt-4o".into());
-        app.reasoning_effort_preferences.insert(key, None);
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            CachedModeState { model: "anthropic/claude-sonnet".into(), effort: Some("high".into()) },
+        );
 
-        let msg = app.apply_reasoning_effort_preference();
-        assert!(msg.is_none());
+        let cmds = app.apply_cached_mode_state();
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(&cmds[0], ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"));
     }
 
     #[test]
-    fn apply_noop_when_no_provider_or_model() {
+    fn apply_restores_model_and_effort_when_model_differs() {
         let mut app = App::new();
-        app.agent_mode = "build".into();
-        app.reasoning_effort = Some("max".into());
-        // current_provider / current_model are None → can't form a key
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = None;
+        // The cached state says build mode used opus with max effort
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            CachedModeState { model: "anthropic/claude-opus".into(), effort: Some("max".into()) },
+        );
+        // Need the model in the models list for the lookup
+        app.models = vec![make_model_entry("anthropic", "claude-opus")];
 
-        let msg = app.apply_reasoning_effort_preference();
-        // reasoning_effort should not change
+        let cmds = app.apply_cached_mode_state();
+
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
         assert_eq!(app.reasoning_effort, Some("max".into()));
-        assert!(msg.is_none());
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(&cmds[0], ClientMsg::SetSessionModel { .. }));
+        assert!(matches!(&cmds[1], ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "max"));
     }
 
-    // ── multiple combos tracked independently ─────────────────────────────────
-
     #[test]
-    fn different_mode_model_combos_tracked_independently() {
+    fn apply_returns_empty_when_no_cache_entry() {
         let mut app = App::new();
-
-        // build + sonnet → high
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
         app.reasoning_effort = Some("high".into());
-        app.save_reasoning_effort_preference();
 
-        // plan + sonnet → low
-        set_ctx(&mut app, "plan", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("low".into());
-        app.save_reasoning_effort_preference();
-
-        // build + opus → max
-        set_ctx(&mut app, "build", "anthropic", "claude-opus");
-        app.reasoning_effort = Some("max".into());
-        app.save_reasoning_effort_preference();
-
-        // verify each key
-        let k1 = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        let k2 = ("plan".into(), "anthropic".into(), "claude-sonnet".into());
-        let k3 = ("build".into(), "anthropic".into(), "claude-opus".into());
-        assert_eq!(app.reasoning_effort_preferences[&k1], Some("high".into()));
-        assert_eq!(app.reasoning_effort_preferences[&k2], Some("low".into()));
-        assert_eq!(app.reasoning_effort_preferences[&k3], Some("max".into()));
-    }
-
-    #[test]
-    fn apply_picks_correct_combo_from_multiple() {
-        let mut app = App::new();
-
-        // store two combos
-        app.reasoning_effort_preferences.insert(
-            ("build".into(), "anthropic".into(), "claude-sonnet".into()),
-            Some("high".into()),
-        );
-        app.reasoning_effort_preferences.insert(
-            ("plan".into(), "anthropic".into(), "claude-sonnet".into()),
-            Some("low".into()),
-        );
-
-        // switch to plan context
-        set_ctx(&mut app, "plan", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None;
-        app.apply_reasoning_effort_preference();
-        assert_eq!(app.reasoning_effort, Some("low".into()));
-
-        // switch to build context
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None;
-        app.apply_reasoning_effort_preference();
+        let cmds = app.apply_cached_mode_state();
+        assert!(cmds.is_empty());
+        // Nothing changed
         assert_eq!(app.reasoning_effort, Some("high".into()));
     }
 
-    // ── cycle_reasoning_effort auto-saves ─────────────────────────────────────
+    #[test]
+    fn apply_returns_empty_when_everything_matches() {
+        let mut app = App::new();
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = Some("high".into());
+
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            CachedModeState { model: "anthropic/claude-sonnet".into(), effort: Some("high".into()) },
+        );
+
+        let cmds = app.apply_cached_mode_state();
+        assert!(cmds.is_empty());
+    }
 
     #[test]
-    fn cycle_saves_preference_for_current_context() {
+    fn apply_returns_empty_when_no_session_id() {
         let mut app = App::new();
-        set_ctx(&mut app, "build", "anthropic", "claude-sonnet");
-        assert_eq!(app.reasoning_effort, None); // starts at auto
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.reasoning_effort = Some("max".into());
+
+        let cmds = app.apply_cached_mode_state();
+        assert!(cmds.is_empty());
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+    }
+
+    #[test]
+    fn apply_skips_model_switch_when_model_not_in_models_list() {
+        let mut app = App::new();
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
+        app.reasoning_effort = None;
+
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            CachedModeState { model: "anthropic/claude-opus".into(), effort: Some("max".into()) },
+        );
+        // models list is empty — can't resolve opus
+        app.models = vec![];
+
+        let cmds = app.apply_cached_mode_state();
+        // Can't switch model, but effort still restored
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet")); // unchanged
+        assert_eq!(app.reasoning_effort, Some("max".into()));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(&cmds[0], ClientMsg::SetReasoningEffort { .. }));
+    }
+
+    // ── cycle auto-caches ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cycle_caches_mode_state() {
+        let mut app = App::new();
+        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
 
         app.cycle_reasoning_effort();
-        // should now be "low" and saved
-        assert_eq!(app.reasoning_effort, Some("low".into()));
 
-        let key = ("build".into(), "anthropic".into(), "claude-sonnet".into());
-        assert_eq!(
-            app.reasoning_effort_preferences.get(&key),
-            Some(&Some("low".into()))
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-sonnet");
+        assert_eq!(cms.effort, Some("low".into()));
+    }
+
+    #[test]
+    fn cycle_does_not_cache_when_no_context() {
+        let mut app = App::new();
+        app.cycle_reasoning_effort();
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(app.session_cache.is_empty());
+    }
+}
+
+// ── session_mode_tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod session_mode_tests {
+    use super::*;
+
+    fn provider_changed_event(provider: &str, model: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "provider_changed",
+                "data": { "provider": provider, "model": model }
+            }
+        })
+    }
+
+    fn mode_changed_event(mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "session_mode_changed",
+                "data": { "mode": mode }
+            }
+        })
+    }
+
+    fn make_audit(events: &[serde_json::Value]) -> serde_json::Value {
+        serde_json::json!({ "events": events })
+    }
+
+    fn make_session_loaded(audit: serde_json::Value) -> RawServerMsg {
+        RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "audit": audit,
+                "undo_stack": []
+            })),
+        }
+    }
+
+    // ── SessionModeChanged in live events ─────────────────────────────────────
+
+    #[test]
+    fn live_session_mode_changed_updates_agent_mode() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        app.handle_event_kind(&EventKind::SessionModeChanged { mode: "plan".into() }, false);
+        assert_eq!(app.agent_mode, "plan");
+    }
+
+    #[test]
+    fn live_session_mode_changed_to_build_updates_agent_mode() {
+        let mut app = App::new();
+        app.agent_mode = "plan".into();
+        app.handle_event_kind(&EventKind::SessionModeChanged { mode: "build".into() }, false);
+        assert_eq!(app.agent_mode, "build");
+    }
+
+    // ── SessionModeChanged in audit replay ────────────────────────────────────
+
+    #[test]
+    fn replay_session_mode_changed_restores_mode() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        let audit = make_audit(&[mode_changed_event("plan")]);
+        app.replay_audit(&audit);
+        assert_eq!(app.agent_mode, "plan");
+    }
+
+    #[test]
+    fn replay_last_session_mode_changed_wins() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        let audit = make_audit(&[
+            mode_changed_event("plan"),
+            mode_changed_event("build"),
+            mode_changed_event("plan"),
+        ]);
+        app.replay_audit(&audit);
+        assert_eq!(app.agent_mode, "plan");
+    }
+
+    #[test]
+    fn replay_no_mode_change_leaves_agent_mode_unchanged() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        let audit = make_audit(&[provider_changed_event("anthropic", "claude-sonnet")]);
+        app.replay_audit(&audit);
+        assert_eq!(app.agent_mode, "build");
+    }
+
+    // ── session_loaded returns SetAgentMode ───────────────────────────────────
+
+    #[test]
+    fn session_loaded_returns_set_agent_mode_from_audit() {
+        let mut app = App::new();
+        app.agent_mode = "build".into();
+        let audit = make_audit(&[mode_changed_event("plan")]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetAgentMode { mode } if mode == "plan"
+            )),
+            "expected SetAgentMode(plan) in {cmds:?}"
         );
     }
 
     #[test]
-    fn cycle_saves_even_when_no_provider_model() {
-        // Without context we still cycle, just don't save to prefs
+    fn session_loaded_always_returns_set_agent_mode_even_without_mode_event() {
         let mut app = App::new();
         app.agent_mode = "build".into();
-        // no provider/model set
-        app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("low".into()));
-        assert!(app.reasoning_effort_preferences.is_empty()); // nothing saved
+        let audit = make_audit(&[]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+        // No SessionModeChanged → agent_mode stays "build"; command still sent
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetAgentMode { mode } if mode == "build"
+            )),
+            "expected SetAgentMode(build) in {cmds:?}"
+        );
+    }
+
+    // ── session_loaded restores mode state from session cache ──────────────────
+
+    #[test]
+    fn session_loaded_restores_effort_from_session_cache() {
+        let mut app = App::new();
+        // Pre-cache: session s1, mode plan, model anthropic/claude-sonnet, effort high
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            CachedModeState {
+                model: "anthropic/claude-sonnet".into(),
+                effort: Some("high".into()),
+            },
+        );
+
+        let audit = make_audit(&[
+            provider_changed_event("anthropic", "claude-sonnet"),
+            mode_changed_event("plan"),
+        ]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
+            )),
+            "expected SetReasoningEffort(high) in {cmds:?}"
+        );
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+    }
+
+    #[test]
+    fn session_loaded_restores_model_from_session_cache() {
+        let mut app = App::new();
+        // Cache says plan mode used opus
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            CachedModeState {
+                model: "anthropic/claude-opus".into(),
+                effort: Some("max".into()),
+            },
+        );
+        // Need opus in the models list
+        app.models = vec![ModelEntry {
+            id: "anthropic/claude-opus".into(),
+            label: "claude-opus".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+
+        // Audit says session was in plan mode using sonnet (different from cache)
+        let audit = make_audit(&[
+            provider_changed_event("anthropic", "claude-sonnet"),
+            mode_changed_event("plan"),
+        ]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+
+        // Cache wins: model switched to opus
+        assert!(
+            cmds.iter().any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected SetSessionModel in {cmds:?}"
+        );
+        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
+    }
+
+    #[test]
+    fn session_loaded_no_cache_entry_returns_no_effort_or_model_cmds() {
+        let mut app = App::new();
+        app.reasoning_effort = None;
+        let audit = make_audit(&[
+            provider_changed_event("anthropic", "claude-sonnet"),
+            mode_changed_event("plan"),
+        ]);
+
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+        // Only SetAgentMode, no SetReasoningEffort or SetSessionModel
+        assert!(
+            !cmds.iter().any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "expected no SetReasoningEffort: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected no SetSessionModel: {cmds:?}"
+        );
+    }
+
+    // ── handle_server_msg returns Vec now (backward compat for other msgs) ────
+
+    #[test]
+    fn state_msg_returns_empty_vec() {
+        let mut app = App::new();
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "state".into(),
+            data: Some(serde_json::json!({
+                "active_session_id": null,
+                "agents": [],
+                "agent_mode": "build"
+            })),
+        });
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn session_created_returns_subscribe_in_vec() {
+        let mut app = App::new();
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s99",
+                "agent_id": "a1",
+                "request_id": null
+            })),
+        });
+        assert!(
+            cmds.iter().any(|m| matches!(m, ClientMsg::SubscribeSession { session_id, .. } if session_id == "s99")),
+            "expected SubscribeSession in {cmds:?}"
+        );
     }
 }
 

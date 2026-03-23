@@ -2289,14 +2289,10 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("?", "this help"),
                 ("m", "model selector"),
                 ("n", "new session"),
-                ("a", "appearance / theme picker"),
                 ("q", "quit"),
                 ("r", "redo"),
                 ("s", "session switcher"),
-                (
-                    "t",
-                    "thinking level (auto\u{2192}low\u{2192}medium\u{2192}high\u{2192}max)",
-                ),
+                ("t", "theme picker"),
                 ("u", "undo"),
             ],
         },
@@ -2313,6 +2309,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("Backspace", "delete left"),
                 ("Del", "delete right"),
                 ("@", "mention a file"),
+                ("Ctrl+t", "cycle thinking level (auto\u{2192}low\u{2192}medium\u{2192}high\u{2192}max)"),
             ],
         },
         ShortcutSection {
@@ -3003,16 +3000,16 @@ mod tests {
         }
     }
 
-    /// The chord section must contain the 't' thinking-level cycling entry.
+    /// The chat section must contain the 'Ctrl+t' thinking-level cycling entry.
     #[test]
-    fn shortcut_sections_chord_contains_thinking_cycle() {
-        let chord = shortcut_sections()
+    fn shortcut_sections_chat_contains_ctrl_t_thinking_cycle() {
+        let chat = shortcut_sections()
             .iter()
-            .find(|s| s.title.contains("chord"))
-            .expect("chord section missing");
+            .find(|s| s.title == "chat")
+            .expect("chat section missing");
         assert!(
-            chord.rows.iter().any(|&(k, _)| k == "t"),
-            "chord section must have a 't' row for cycling thinking level"
+            chat.rows.iter().any(|&(k, _)| k == "Ctrl+t"),
+            "chat section must have a 'Ctrl+t' row for cycling thinking level"
         );
     }
 
