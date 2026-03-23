@@ -30,6 +30,7 @@ const CONN_OFFLINE: &str = "\u{25CB}"; // ○ empty circle  – connecting
 // ── Status bar icons ──────────────────────────────────────────────────────────
 const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token usage
 const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
+const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
 
 // ── Markdown symbols ──────────────────────────────────────────────────────────
 pub(crate) const MD_HRULE_CHAR: &str = "\u{2500}"; // ─ box drawings light horizontal – HR
@@ -884,6 +885,15 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
                 Theme::status_accent(),
             ));
         }
+    }
+
+    // show a badge when other sessions have produced recent websocket activity.
+    let other_active_session_count = app.other_active_session_count();
+    if other_active_session_count > 0 {
+        right_spans.push(Span::styled(
+            format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
+            Theme::status(),
+        ));
     }
 
     // model + thinking level: " provider/model:level "
@@ -2076,10 +2086,15 @@ fn draw_session_popup(f: &mut Frame, app: &App) {
                         .unwrap_or_default();
                     let title = s.title.as_deref().unwrap_or("(untitled)");
 
+                    let is_active = app.session_id.as_deref() == Some(s.session_id.as_str());
                     let id_part = format!("   {id_short} ");
+                    let active_part = if is_active { " active " } else { "" };
                     let time_part = format!(" {time_str} ");
-                    let avail =
-                        list_w.saturating_sub(id_part.chars().count() + time_part.chars().count());
+                    let avail = list_w.saturating_sub(
+                        id_part.chars().count()
+                            + active_part.chars().count()
+                            + time_part.chars().count(),
+                    );
                     let title_display = if title.chars().count() > avail {
                         let t: String = title.chars().take(avail.saturating_sub(1)).collect();
                         format!("{t}{ELLIPSIS}")
@@ -2093,13 +2108,23 @@ fn draw_session_popup(f: &mut Frame, app: &App) {
                     } else {
                         (Theme::popup_bg(), Theme::status(), Theme::session_time())
                     };
+                    let active_style = if selected {
+                        Theme::selected()
+                    } else {
+                        Theme::status_accent()
+                    };
 
-                    ListItem::new(Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(id_part, dim_style),
                         Span::styled(title_display, main_style),
                         Span::styled(" ".repeat(title_gap), dim_style),
-                        Span::styled(time_part, time_style),
-                    ]))
+                    ];
+                    if is_active {
+                        spans.push(Span::styled(active_part, active_style));
+                    }
+                    spans.push(Span::styled(time_part, time_style));
+
+                    ListItem::new(Line::from(spans))
                 }
             }
         })
@@ -2438,6 +2463,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, ToolDetail};
+    use std::time::{Duration, Instant};
 
     fn tool_call(name: &str) -> ChatEntry {
         ChatEntry::ToolCall {
@@ -2446,6 +2472,100 @@ mod tests {
             is_error: false,
             detail: ToolDetail::None,
         }
+    }
+
+    #[test]
+    fn draw_chat_shows_multi_session_badge_for_other_recent_sessions() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.session_id = Some("session-a".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.session_activity.insert(
+            "session-a".into(),
+            crate::app::SessionActivity {
+                last_event_at: Instant::now(),
+            },
+        );
+
+        let backend = ratatui::backend::TestBackend::new(80, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains(ICON_MULTI_SESSION));
+
+        app.session_activity.insert(
+            "session-b".into(),
+            crate::app::SessionActivity {
+                last_event_at: Instant::now(),
+            },
+        );
+        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 1")));
+        assert!(!rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
+
+        app.session_activity.insert(
+            "session-c".into(),
+            crate::app::SessionActivity {
+                last_event_at: Instant::now(),
+            },
+        );
+        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
+
+        app.session_activity.insert(
+            "session-c".into(),
+            crate::app::SessionActivity {
+                last_event_at: Instant::now() - Duration::from_secs(6),
+            },
+        );
+        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 1")));
+        assert!(!rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
+    }
+
+    #[test]
+    fn draw_session_popup_shows_active_badge_for_current_session() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_id = Some("s2".into());
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("active"));
     }
 
     #[test]

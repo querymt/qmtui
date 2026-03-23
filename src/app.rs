@@ -497,6 +497,11 @@ pub struct SessionStatsLite {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionActivity {
+    pub last_event_at: Instant,
+}
+
+#[derive(Debug, Clone)]
 pub enum ToolDetail {
     None,
     /// Compact one-liner info for display after tool name
@@ -635,6 +640,7 @@ pub struct App {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     pub agent_mode: String,
+    pub session_activity: HashMap<String, SessionActivity>,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -726,6 +732,7 @@ impl App {
             session_id: None,
             agent_id: None,
             agent_mode: "build".into(),
+            session_activity: HashMap::new(),
             messages: Vec::new(),
             input: String::new(),
             input_cursor: 0,
@@ -1184,6 +1191,36 @@ impl App {
         }
     }
 
+    pub fn note_session_activity(&mut self, session_id: &str) {
+        self.session_activity.insert(
+            session_id.to_string(),
+            SessionActivity {
+                last_event_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        const ACTIVE_SESSION_WINDOW: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        self.session_activity
+            .values()
+            .filter(|activity| now.duration_since(activity.last_event_at) <= ACTIVE_SESSION_WINDOW)
+            .count()
+    }
+
+    pub fn other_active_session_count(&self) -> usize {
+        const ACTIVE_SESSION_WINDOW: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        self.session_activity
+            .iter()
+            .filter(|(session_id, activity)| {
+                now.duration_since(activity.last_event_at) <= ACTIVE_SESSION_WINDOW
+                    && self.session_id.as_deref() != Some(session_id.as_str())
+            })
+            .count()
+    }
+
     pub fn handle_connection_event(&mut self, event: ConnectionEvent) {
         self.clear_cancel_confirm();
         match event {
@@ -1444,8 +1481,11 @@ impl App {
             "session_events" => {
                 if let Some(data) = raw.data {
                     if let Ok(se) = serde_json::from_value::<SessionEventsData>(data) {
-                        for envelope in se.events {
-                            self.handle_event(&envelope);
+                        self.note_session_activity(&se.session_id);
+                        if self.session_id.as_deref() == Some(se.session_id.as_str()) {
+                            for envelope in se.events {
+                                self.handle_event(&envelope);
+                            }
                         }
                     }
                 }
@@ -1454,7 +1494,10 @@ impl App {
             "event" => {
                 if let Some(data) = raw.data {
                     if let Ok(ed) = serde_json::from_value::<EventData>(data) {
-                        self.handle_event(&ed.event);
+                        self.note_session_activity(&ed.session_id);
+                        if self.session_id.as_deref() == Some(ed.session_id.as_str()) {
+                            self.handle_event(&ed.event);
+                        }
                     }
                 }
                 vec![]
@@ -2378,6 +2421,172 @@ mod reasoning_effort_tests {
             data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
         });
         assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn event_message_ignores_non_active_session() {
+        let mut app = App::new();
+        app.session_id = Some("session-b".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "agent_id": "agent-1",
+                "session_id": "session-a",
+                "event": {
+                    "type": "ephemeral",
+                    "data": {
+                        "kind": {
+                            "type": "assistant_content_delta",
+                            "data": {
+                                "content": "leaked text",
+                                "message_id": null
+                            }
+                        },
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert!(app.streaming_content.is_empty());
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn session_events_message_ignores_non_active_session() {
+        let mut app = App::new();
+        app.session_id = Some("session-b".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "session-a",
+                "agent_id": "agent-1",
+                "events": [
+                    {
+                        "type": "ephemeral",
+                        "data": {
+                            "kind": {
+                                "type": "assistant_content_delta",
+                                "data": {
+                                    "content": "leaked batch text",
+                                    "message_id": null
+                                }
+                            },
+                            "timestamp": null
+                        }
+                    }
+                ]
+            })),
+        });
+
+        assert!(app.streaming_content.is_empty());
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn event_message_applies_active_session() {
+        let mut app = App::new();
+        app.session_id = Some("session-a".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "agent_id": "agent-1",
+                "session_id": "session-a",
+                "event": {
+                    "type": "ephemeral",
+                    "data": {
+                        "kind": {
+                            "type": "assistant_content_delta",
+                            "data": {
+                                "content": "visible text",
+                                "message_id": null
+                            }
+                        },
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert_eq!(app.streaming_content, "visible text");
+    }
+
+    #[test]
+    fn non_active_session_event_still_counts_as_recent_activity() {
+        let mut app = App::new();
+        app.session_id = Some("session-b".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "agent_id": "agent-1",
+                "session_id": "session-a",
+                "event": {
+                    "type": "ephemeral",
+                    "data": {
+                        "kind": {
+                            "type": "assistant_content_delta",
+                            "data": {
+                                "content": "hidden text",
+                                "message_id": null
+                            }
+                        },
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert_eq!(app.active_session_count(), 1);
+        assert!(app.streaming_content.is_empty());
+    }
+
+    #[test]
+    fn active_session_count_requires_multiple_recent_sessions() {
+        let mut app = App::new();
+        app.note_session_activity("session-a");
+        assert_eq!(app.active_session_count(), 1);
+
+        app.note_session_activity("session-b");
+        assert_eq!(app.active_session_count(), 2);
+    }
+
+    #[test]
+    fn other_active_session_count_excludes_current_session() {
+        let mut app = App::new();
+        app.session_id = Some("session-a".into());
+        app.note_session_activity("session-a");
+        app.note_session_activity("session-b");
+        app.note_session_activity("session-c");
+
+        assert_eq!(app.other_active_session_count(), 2);
+    }
+
+    #[test]
+    fn other_active_session_count_shows_other_session_when_current_is_idle() {
+        let mut app = App::new();
+        app.session_id = Some("session-a".into());
+        app.note_session_activity("session-b");
+
+        assert_eq!(app.other_active_session_count(), 1);
+    }
+
+    #[test]
+    fn active_session_count_excludes_stale_sessions() {
+        let mut app = App::new();
+        app.note_session_activity("session-a");
+        app.session_activity.insert(
+            "session-b".into(),
+            SessionActivity {
+                last_event_at: Instant::now() - Duration::from_secs(6),
+            },
+        );
+
+        assert_eq!(app.active_session_count(), 1);
+        assert_eq!(app.other_active_session_count(), 1);
     }
 }
 
