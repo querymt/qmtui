@@ -44,6 +44,15 @@ pub fn test_set_cache_path_override(path: Option<PathBuf>) {
 pub struct ServerConfig {
     pub addr: Option<String>,
     pub tls: Option<bool>,
+    /// Path to the `qmtcode` binary. Falls back to `$PATH` lookup when absent.
+    pub binary_path: Option<String>,
+    /// Extra CLI arguments passed to the spawned server.
+    /// Default (when absent): `["--dashboard={addr}"]`.
+    pub binary_args: Option<Vec<String>>,
+    /// Automatically start a local server when none is found. Default: `true`.
+    pub auto_start: Option<bool>,
+    /// Kill the spawned server when the TUI exits. Default: `true`.
+    pub shutdown_on_exit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -260,6 +269,7 @@ mod tests {
             server: ServerConfig {
                 addr: Some("127.0.0.1:3030".into()),
                 tls: Some(false),
+                ..Default::default()
             },
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
@@ -413,6 +423,7 @@ mod tests {
             server: ServerConfig {
                 addr: Some("127.0.0.1:3030".into()),
                 tls: Some(false),
+                ..Default::default()
             },
         };
         cfg.save_to_path(&path);

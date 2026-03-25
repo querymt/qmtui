@@ -2,9 +2,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{
-        Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
-    },
+    widgets::{Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -300,16 +298,12 @@ fn build_message_cards(app: &mut App) -> &[Card] {
                 let mut lines = Vec::new();
                 if app.show_thinking {
                     if let Some(thinking_text) = thinking {
-                        let mut rendered = markdown::render(
-                            thinking_text,
-                            Theme::thinking_text(),
-                            &app.hl,
-                        );
+                        let mut rendered =
+                            markdown::render(thinking_text, Theme::thinking_text(), &app.hl);
                         if let Some(first) = rendered.first_mut() {
-                            first.spans.insert(
-                                0,
-                                Span::styled("\u{25CF} ", Theme::thinking()),
-                            );
+                            first
+                                .spans
+                                .insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
                         }
                         lines.extend(rendered);
                         lines.push(Line::default());
@@ -509,6 +503,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::NewSession => draw_new_session_popup(f, app),
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
+        Popup::Log => draw_log_popup(f, app),
         Popup::None => {}
     }
 }
@@ -663,7 +658,13 @@ fn draw_start(f: &mut Frame, app: &mut App) {
         .split(area);
 
     // ── header ────────────────────────────────────────────────────────────────
-    draw_header(f, app, outer[0], vec![], vec![]);
+    draw_header(
+        f,
+        app,
+        outer[0],
+        vec![Span::styled(format!(" {}", app.status), Theme::status())],
+        vec![],
+    );
 
     // ── hints ─────────────────────────────────────────────────────────────────
     // Rendered now (fixed bottom) so we can focus the rest on centring.
@@ -1097,6 +1098,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
                 format!(" {} ", app.agent_mode),
                 Theme::mode_badge(&app.agent_mode),
             ),
+            Span::styled(format!(" {}", app.status), Theme::status()),
         ],
         right_spans,
     );
@@ -1639,7 +1641,9 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
                     rendered
                 };
             if let Some(first) = thinking_lines.first_mut() {
-                first.spans.insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
+                first
+                    .spans
+                    .insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
             }
             lines.extend(thinking_lines);
             if has_content {
@@ -2546,6 +2550,103 @@ fn draw_theme_popup(f: &mut Frame, app: &App) {
     );
 }
 
+fn draw_log_popup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup_area = centered_rect(80, 70, area);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // level
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled("logs", Theme::popup_title())).style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(app.log_filter.clone(), Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    f.set_cursor_position((chunks[1].x + 2 + app.log_filter.chars().count() as u16, chunks[1].y));
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("level: {}+", app.log_level_filter.label()),
+            Theme::status(),
+        ))
+        .style(Theme::popup_bg()),
+        chunks[2],
+    );
+
+    let filtered = app.filtered_logs();
+    let list_w = chunks[3].width as usize;
+    let items: Vec<ListItem> = if filtered.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            " no log entries match current filter",
+            Theme::status(),
+        )))]
+    } else {
+        filtered
+            .iter()
+            .map(|entry| {
+                let prefix = format!(
+                    " {:>6}.{:01} {:<5} {:<10} ",
+                    entry.elapsed.as_secs(),
+                    entry.elapsed.subsec_millis() / 100,
+                    entry.level.label(),
+                    entry.target
+                );
+                let avail = list_w.saturating_sub(prefix.chars().count());
+                let message = if entry.message.chars().count() > avail {
+                    let truncated: String = entry.message.chars().take(avail.saturating_sub(1)).collect();
+                    format!("{truncated}{ELLIPSIS}")
+                } else {
+                    entry.message.clone()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(prefix, Theme::status()),
+                    Span::styled(message, Theme::popup_bg()),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
+    let selected = Some(app.log_cursor.min(filtered.len().saturating_sub(1))).filter(|_| !filtered.is_empty());
+    let mut state = ListState::default().with_selected(selected);
+    f.render_stateful_widget(list, chunks[3], &mut state);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " esc close  tab level  type filter",
+            Theme::status(),
+        ))
+        .style(Theme::popup_bg()),
+        chunks[4],
+    );
+}
+
 // ── Help popup ────────────────────────────────────────────────────────────────
 
 /// One section in the keyboard-shortcut reference.
@@ -2573,6 +2674,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("e", "external editor"),
                 ("m", "model selector"),
                 ("n", "new session"),
+                ("l", "logs popup"),
                 ("q", "quit"),
                 ("r", "redo"),
                 ("s", "session switcher"),
@@ -2935,6 +3037,33 @@ mod tests {
         assert!(rendered.contains("/launch/project"));
         assert!(!rendered.contains("[D]"));
         assert!(rendered.contains("tab complete  enter start  esc cancel"));
+    }
+
+    #[test]
+    fn draw_log_popup_shows_filter_level_and_entries() {
+        let mut app = App::new();
+        app.popup = Popup::Log;
+        app.log_filter = "server".into();
+        app.log_level_filter = crate::app::LogLevel::Info;
+        app.push_log(crate::app::LogLevel::Info, "server", "starting local server");
+        app.push_log(crate::app::LogLevel::Error, "server", "start failed");
+        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_log_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("logs"));
+        assert!(rendered.contains("level: INFO+"));
+        assert!(rendered.contains("starting local server"));
+        assert!(rendered.contains("start failed"));
+        assert!(rendered.contains("server"));
     }
 
     #[test]
@@ -3563,10 +3692,24 @@ mod tests {
             chord
                 .rows
                 .iter()
-                .any(|&(k, d)| k == "e" && d == "external editor"),
-            "chord section must advertise the external editor shortcut"
+                .any(|&(key, desc)| key == "e" && desc == "external editor")
         );
     }
+
+    #[test]
+    fn shortcut_sections_chord_contains_logs_entry() {
+        let chord = shortcut_sections()
+            .iter()
+            .find(|s| s.title.contains("chord"))
+            .expect("chord section missing");
+        assert!(
+            chord
+                .rows
+                .iter()
+                .any(|&(key, desc)| key == "l" && desc == "logs popup")
+        );
+    }
+
 
     /// Every section title must be unique.
     #[test]
@@ -3789,7 +3932,11 @@ mod tests {
         assert_eq!(cards.len(), 1);
         // First line should be the ● bullet
         let first_line = &cards[0].lines[0];
-        let text: String = first_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text: String = first_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(text.contains('\u{25CF}'), "expected ● bullet, got: {text}");
     }
 
@@ -3803,7 +3950,11 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         let first_line = &cards[0].lines[0];
-        let text: String = first_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text: String = first_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(
             !text.contains('\u{25CF}'),
             "should not contain ● when no thinking"

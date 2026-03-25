@@ -5,6 +5,7 @@ mod config;
 mod highlight;
 mod markdown;
 mod protocol;
+mod server_manager;
 mod theme;
 mod themes_gen;
 mod ui;
@@ -222,6 +223,7 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
+    use crate::config::{ServerConfig, TuiConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn ctrl_x() -> KeyEvent {
@@ -353,6 +355,7 @@ mod external_editor_tests {
 
         assert_eq!(action, AppAction::None);
         assert!(app.status.contains("only available in chat"));
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
     }
 
     #[test]
@@ -365,6 +368,37 @@ mod external_editor_tests {
         assert_eq!(app.input, "revised prompt");
         assert_eq!(app.input_cursor, "revised prompt".len());
         assert_eq!(app.status, "loaded prompt from external editor");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
+    }
+
+    #[test]
+    fn log_server_binary_discovery_records_path_lookup_when_binary_path_unset() {
+        let mut app = App::new();
+        let cfg = TuiConfig {
+            server: ServerConfig {
+                binary_path: None,
+                ..ServerConfig::default()
+            },
+            ..TuiConfig::default()
+        };
+
+        log_server_binary_discovery(
+            &mut app,
+            &cfg,
+            &server_manager::BinaryDiscovery {
+                binary: None,
+                configured_path: None,
+                configured_exists: false,
+                used_path_lookup: true,
+            },
+        );
+
+        assert!(app.logs.iter().any(|entry| entry.target == "server"
+            && entry.level == app::LogLevel::Info
+            && entry.message == "server.binary_path not set; checking qmtcode on PATH"));
+        assert!(app.logs.iter().any(|entry| entry.target == "server"
+            && entry.level == app::LogLevel::Info
+            && entry.message == "qmtcode not found on PATH"));
     }
 
     #[test]
@@ -638,14 +672,48 @@ fn apply_external_editor_outcome(app: &mut App, result: anyhow::Result<Option<St
     match result {
         Ok(Some(updated_input)) => {
             apply_external_editor_result(app, updated_input);
-            app.status = "loaded prompt from external editor".into();
+            app.set_status(
+                app::LogLevel::Info,
+                "editor",
+                "loaded prompt from external editor",
+            );
         }
         Ok(None) => {
-            app.status = "external editor cancelled".into();
+            app.set_status(app::LogLevel::Info, "editor", "external editor cancelled");
         }
         Err(err) => {
-            app.status = format!("external editor failed: {err}");
+            app.set_status(
+                app::LogLevel::Error,
+                "editor",
+                format!("external editor failed: {err}"),
+            );
         }
+    }
+}
+
+fn log_server_binary_discovery(
+    app: &mut App,
+    cfg: &config::TuiConfig,
+    discovery: &server_manager::BinaryDiscovery,
+) {
+    if !discovery.used_path_lookup {
+        return;
+    }
+    if let Some(path) = discovery.configured_path.as_deref() {
+        app.push_log(
+            app::LogLevel::Info,
+            "server",
+            format!("configured qmtcode path not found: {path}; checking PATH"),
+        );
+    } else if cfg.server.binary_path.is_none() {
+        app.push_log(
+            app::LogLevel::Info,
+            "server",
+            "server.binary_path not set; checking qmtcode on PATH",
+        );
+    }
+    if discovery.binary.is_none() {
+        app.push_log(app::LogLevel::Info, "server", "qmtcode not found on PATH");
     }
 }
 
@@ -696,6 +764,49 @@ async fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnectionManagerEvent>();
 
+    let mut app = App::new();
+    app.launch_cwd = detect_launch_cwd();
+    app.show_thinking = cfg.show_thinking.unwrap_or(true);
+    if let Some(session_id) = cli.session.clone() {
+        app.session_id = Some(session_id);
+        app.screen = Screen::Chat;
+    }
+    // Hydrate session effort cache from disk.
+    config::TuiCache::load().hydrate_app(&mut app);
+
+    // ── Server auto-start ─────────────────────────────────────────────────────
+    let auto_start = cfg.server.auto_start.unwrap_or(true);
+    let shutdown_on_exit = cfg.server.shutdown_on_exit.unwrap_or(true);
+    let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
+    let (sup_shutdown_tx, sup_shutdown_rx) = mpsc::channel::<()>(1);
+
+    let initial_server_state = if auto_start {
+        let discovery = server_manager::find_binary_info(cfg.server.binary_path.as_deref());
+        log_server_binary_discovery(&mut app, &cfg, &discovery);
+
+        if let Some(binary) = discovery.binary {
+            let sup_config = server_manager::ServerManagerConfig {
+                addr: addr.clone(),
+                binary_args: cfg.server.binary_args.clone().unwrap_or_default(),
+                shutdown_on_exit,
+                lock_path: None,
+                ready_timeout: None,
+            };
+            tokio::spawn(server_manager::supervisor(
+                sup_config,
+                binary,
+                sup_event_tx,
+                sup_shutdown_rx,
+            ));
+            server_manager::ServerState::Starting
+        } else {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
+            server_manager::ServerState::BinaryNotFound
+        }
+    } else {
+        server_manager::ServerState::Disabled
+    };
+
     tokio::spawn(connection_manager(url, srv_tx, cmd_rx, conn_tx));
 
     // setup terminal
@@ -705,16 +816,19 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
-    app.launch_cwd = detect_launch_cwd();
-    app.show_thinking = cfg.show_thinking.unwrap_or(true);
-    if let Some(session_id) = cli.session {
-        app.session_id = Some(session_id);
-        app.screen = Screen::Chat;
-    }
-    // Hydrate session effort cache from disk.
-    config::TuiCache::load().hydrate_app(&mut app);
-    let result = run_loop(&mut terminal, &mut app, &mut srv_rx, &mut conn_rx, &cmd_tx).await;
+    app.server_state = initial_server_state;
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &mut srv_rx,
+        &mut conn_rx,
+        &mut sup_event_rx,
+        &cmd_tx,
+    )
+    .await;
+
+    // Signal supervisor to stop (and kill the child if configured).
+    let _ = sup_shutdown_tx.send(()).await;
 
     // restore terminal
     disable_raw_mode()?;
@@ -812,6 +926,7 @@ async fn run_loop(
     app: &mut App,
     srv_rx: &mut mpsc::UnboundedReceiver<RawServerMsg>,
     conn_rx: &mut mpsc::UnboundedReceiver<ConnectionManagerEvent>,
+    sup_rx: &mut mpsc::UnboundedReceiver<server_manager::ServerEvent>,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
     loop {
@@ -841,7 +956,11 @@ async fn run_loop(
                                 })?;
                             }
                         } else if was_connected && app.conn == app::ConnState::Disconnected {
-                            app.status = "connection lost - reconnecting...".into();
+                            app.set_status(
+                                app::LogLevel::Warn,
+                                "connection",
+                                "connection lost - reconnecting...",
+                            );
                         }
                     }
                 }
@@ -865,6 +984,54 @@ async fn run_loop(
                 }
                 if is_effort_push {
                     save_cache(app);
+                }
+            }
+            // server supervisor events
+            Some(sup_event) = sup_rx.recv() => {
+                use server_manager::{ServerEvent, ServerState};
+                match sup_event {
+                    ServerEvent::Starting => {
+                        app.server_state = ServerState::Starting;
+                        if app.conn != app::ConnState::Connected {
+                            app.set_status(app::LogLevel::Info, "server", "starting local server...");
+                        }
+                    }
+                    ServerEvent::Started => {
+                        app.server_state = ServerState::Running;
+                        if app.conn != app::ConnState::Connected {
+                            app.set_status(
+                                app::LogLevel::Info,
+                                "server",
+                                "local server started — connecting...",
+                            );
+                        }
+                    }
+                    ServerEvent::BinaryNotFound => {
+                        app.server_state = ServerState::BinaryNotFound;
+                        if app.conn != app::ConnState::Connected {
+                            app.set_status(
+                                app::LogLevel::Warn,
+                                "server",
+                                "qmtcode not found — install it or set server.binary_path in ~/.qmt/tui.toml",
+                            );
+                        }
+                    }
+                    ServerEvent::StartFailed { error } => {
+                        app.server_state = ServerState::StartFailed { error: error.clone() };
+                        app.set_status(
+                            app::LogLevel::Error,
+                            "server",
+                            format!("server start failed: {error}"),
+                        );
+                    }
+                    ServerEvent::Stopped { reason } => {
+                        app.server_state = ServerState::Restarting { reason: reason.clone() };
+                        app.set_status(
+                            app::LogLevel::Warn,
+                            "server",
+                            format!("server stopped ({reason}) — restarting..."),
+                        );
+                    }
                 }
             }
             // terminal input
@@ -892,7 +1059,11 @@ fn can_send_server_commands(app: &mut App) -> bool {
     if app.conn == app::ConnState::Connected {
         true
     } else {
-        app.status = "not connected - waiting to reconnect".into();
+        app.set_status(
+            app::LogLevel::Warn,
+            "connection",
+            "not connected - waiting to reconnect",
+        );
         false
     }
 }
@@ -1033,7 +1204,11 @@ fn apply_mode_model_if_preferred(
     {
         app.current_provider = Some(entry.provider.clone());
         app.current_model = Some(entry.model.clone());
-        app.status = format!("mode: {} → model: {}", app.agent_mode, entry.label);
+        app.set_status(
+            app::LogLevel::Info,
+            "model",
+            format!("mode: {} → model: {}", app.agent_mode, entry.label),
+        );
         cmd_tx.send(ClientMsg::SetSessionModel {
             session_id: sid,
             model_id: entry.id,
@@ -1068,10 +1243,14 @@ fn handle_key(
     // chord second key: ctrl+x was pressed, now handle the follow-up
     if app.chord {
         app.chord = false;
-        app.status = "ready".into();
+        app.set_status(app::LogLevel::Debug, "input", "ready");
         if key.code == KeyCode::Char('e') {
             if app.screen != Screen::Chat {
-                app.status = "external editor is only available in chat".into();
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "editor",
+                    "external editor is only available in chat",
+                );
                 return Ok(AppAction::None);
             }
             return Ok(AppAction::OpenExternalEditor);
@@ -1090,7 +1269,11 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
         let msg = app.cycle_reasoning_effort();
         cmd_tx.send(msg)?;
-        app.status = format!("thinking: {}", app.reasoning_effort_label());
+        app.set_status(
+            app::LogLevel::Info,
+            "model",
+            format!("thinking: {}", app.reasoning_effort_label()),
+        );
         save_cache(app);
         return Ok(AppAction::None);
     }
@@ -1098,7 +1281,7 @@ fn handle_key(
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.chord = true;
-        app.status = "C-x ...".into();
+        app.set_status(app::LogLevel::Debug, "input", "C-x ...");
         return Ok(AppAction::None);
     }
 
@@ -1133,6 +1316,10 @@ fn handle_key(
                 }
                 _ => {}
             }
+            return Ok(AppAction::None);
+        }
+        Popup::Log => {
+            handle_log_popup_key(app, key)?;
             return Ok(AppAction::None);
         }
         Popup::None => {}
@@ -1211,7 +1398,7 @@ fn handle_chord(
             app.should_quit = true;
         }
         KeyCode::Char('e') => {
-            app.status = "external editor unavailable here".into();
+            app.set_status(app::LogLevel::Warn, "editor", "external editor unavailable here");
         }
         KeyCode::Char('s') => {
             if !can_send_server_commands(app) {
@@ -1228,6 +1415,11 @@ fn handle_chord(
             app.theme_cursor = 0;
             app.theme_filter.clear();
         }
+        KeyCode::Char('l') => {
+            app.popup = Popup::Log;
+            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.log_filter.clear();
+        }
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
             app.help_scroll = 0;
@@ -1237,9 +1429,9 @@ fn handle_chord(
                 return Ok(());
             }
             if app.is_turn_active() {
-                app.status = "cannot undo while agent is active".into();
+                app.set_status(app::LogLevel::Warn, "session", "cannot undo while agent is active");
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.status = "undo already pending".into();
+                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.current_undo_target().cloned() {
                 if app.input.trim().is_empty() && !turn.text.is_empty() {
                     app.input = turn.text.clone();
@@ -1248,12 +1440,12 @@ fn handle_chord(
                 }
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(app::SessionOp::Undo);
-                app.status = "undoing...".into();
+                app.set_status(app::LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(ClientMsg::Undo {
                     message_id: turn.message_id,
                 })?;
             } else {
-                app.status = "nothing to undo".into();
+                app.set_status(app::LogLevel::Warn, "session", "nothing to undo");
             }
         }
         KeyCode::Char('r') => {
@@ -1261,19 +1453,19 @@ fn handle_chord(
                 return Ok(());
             }
             if app.is_turn_active() {
-                app.status = "cannot redo while agent is active".into();
+                app.set_status(app::LogLevel::Warn, "session", "cannot redo while agent is active");
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.status = "undo already pending".into();
+                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
             } else if app.can_redo() {
                 app.activity = ActivityState::SessionOp(app::SessionOp::Redo);
-                app.status = "redoing...".into();
+                app.set_status(app::LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(ClientMsg::Redo)?;
             } else {
-                app.status = "nothing to redo".into();
+                app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
             }
         }
         _ => {
-            app.status = "unknown chord".into();
+            app.set_status(app::LogLevel::Debug, "input", "unknown chord");
         }
     }
     Ok(())
@@ -1426,6 +1618,48 @@ pub(crate) fn apply_popup_session_key(
     SessionKeyAction::None
 }
 
+fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.popup = Popup::None;
+        }
+        KeyCode::Up => {
+            app.log_cursor = app.log_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = app.filtered_logs().len().saturating_sub(1);
+            app.log_cursor = (app.log_cursor + 1).min(max);
+        }
+        KeyCode::PageUp => {
+            app.log_cursor = app.log_cursor.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            let max = app.filtered_logs().len().saturating_sub(1);
+            app.log_cursor = (app.log_cursor + 10).min(max);
+        }
+        KeyCode::Home => {
+            app.log_cursor = 0;
+        }
+        KeyCode::End => {
+            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        }
+        KeyCode::Backspace => {
+            app.log_filter.pop();
+            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        }
+        KeyCode::Tab => {
+            app.cycle_log_level_filter();
+            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        }
+        KeyCode::Char(c) => {
+            app.log_filter.push(c);
+            app.log_cursor = 0;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_new_session_popup_key(
     app: &mut App,
     key: KeyEvent,
@@ -1564,7 +1798,7 @@ fn handle_chat_key(
             } else if app.has_cancellable_activity() {
                 if app.cancel_confirm_active() {
                     app.clear_cancel_confirm();
-                    app.status = "stopping...".into();
+                    app.set_status(app::LogLevel::Warn, "activity", "stopping...");
                     cmd_tx.send(ClientMsg::CancelSession)?;
                 } else {
                     app.arm_cancel_confirm();
@@ -1728,7 +1962,7 @@ fn handle_model_popup_key(
                 // Cache the new model + auto effort for this session + mode.
                 app.cache_session_mode_state();
                 app.popup = Popup::None;
-                app.status = format!("model: {}", model.label);
+                app.set_status(app::LogLevel::Info, "model", format!("model: {}", model.label));
                 save_config(app);
                 save_cache(app);
             }
@@ -2451,6 +2685,71 @@ mod session_popup_key_tests {
         assert_eq!(app.popup, Popup::NewSession);
         assert_eq!(app.new_session_path, "/launch");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn global_ctrl_x_l_opens_log_popup() {
+        let mut app = App::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, Popup::Log);
+        assert_eq!(app.log_cursor, 0);
+        assert!(app.log_filter.is_empty());
+    }
+
+    #[test]
+    fn log_popup_filters_cycles_level_and_closes() {
+        let mut app = App::new();
+        app.popup = Popup::Log;
+        app.log_cursor = 2;
+        app.log_level_filter = crate::app::LogLevel::Info;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.log_filter, "x");
+        assert_eq!(app.log_cursor, 0);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        assert!(app.log_filter.is_empty());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.log_level_filter, crate::app::LogLevel::Warn);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.popup, Popup::None);
     }
 
     #[test]

@@ -67,6 +67,46 @@ pub enum Popup {
     NewSession,
     ThemeSelect,
     Help,
+    Log,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Trace => Self::Debug,
+            Self::Debug => Self::Info,
+            Self::Info => Self::Warn,
+            Self::Warn => Self::Error,
+            Self::Error => Self::Trace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLogEntry {
+    pub elapsed: Duration,
+    pub level: LogLevel,
+    pub target: &'static str,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -717,6 +757,13 @@ pub struct App {
     // help popup
     pub help_scroll: usize,
 
+    // in-memory logs popup
+    pub started_at: Instant,
+    pub logs: Vec<AppLogEntry>,
+    pub log_cursor: usize,
+    pub log_filter: String,
+    pub log_level_filter: LogLevel,
+
     // Undo/redo state mirrors the web UI semantics: a server-authoritative stack
     // of reverted turns plus a frontier that marks the current branch point.
     pub undo_state: Option<UndoState>,
@@ -735,6 +782,9 @@ pub struct App {
     pub conn: ConnState,
     pub reconnect_attempt: u32,
     pub reconnect_delay_ms: Option<u64>,
+
+    // server lifecycle (managed by server_manager::supervisor)
+    pub server_state: crate::server_manager::ServerState,
 
     // syntax highlighting
     pub hl: Highlighter,
@@ -797,6 +847,11 @@ impl App {
             theme_cursor: 0,
             theme_filter: String::new(),
             help_scroll: 0,
+            started_at: Instant::now(),
+            logs: Vec::new(),
+            log_cursor: 0,
+            log_filter: String::new(),
+            log_level_filter: LogLevel::Info,
             undo_state: None,
             undoable_turns: Vec::new(),
             cumulative_cost: None,
@@ -806,6 +861,7 @@ impl App {
             conn: ConnState::Connecting,
             reconnect_attempt: 0,
             reconnect_delay_ms: None,
+            server_state: crate::server_manager::ServerState::default(),
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
             status: "connecting...".into(),
@@ -1110,6 +1166,52 @@ impl App {
         }
     }
 
+    pub fn push_log(&mut self, level: LogLevel, target: &'static str, message: impl Into<String>) {
+        let message = message.into();
+        if self
+            .logs
+            .last()
+            .is_some_and(|entry| entry.level == level && entry.target == target && entry.message == message)
+        {
+            return;
+        }
+        self.logs.push(AppLogEntry {
+            elapsed: self.started_at.elapsed(),
+            level,
+            target,
+            message,
+        });
+    }
+
+    pub fn set_status(
+        &mut self,
+        level: LogLevel,
+        target: &'static str,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        self.status = message.clone();
+        self.push_log(level, target, message);
+    }
+
+    pub fn filtered_logs(&self) -> Vec<&AppLogEntry> {
+        let query = self.log_filter.to_lowercase();
+        self.logs
+            .iter()
+            .filter(|entry| entry.level >= self.log_level_filter)
+            .filter(|entry| {
+                query.is_empty()
+                    || entry.message.to_lowercase().contains(&query)
+                    || entry.target.to_lowercase().contains(&query)
+                    || entry.level.label().to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn cycle_log_level_filter(&mut self) {
+        self.log_level_filter = self.log_level_filter.next();
+    }
+
     pub fn cancel_confirm_active(&self) -> bool {
         self.pending_cancel_confirm_until
             .map(|deadline| Instant::now() <= deadline)
@@ -1118,7 +1220,7 @@ impl App {
 
     pub fn arm_cancel_confirm(&mut self) {
         self.pending_cancel_confirm_until = Some(Instant::now() + CANCEL_CONFIRM_TIMEOUT);
-        self.status = "press Esc again to stop".into();
+        self.set_status(LogLevel::Warn, "input", "press Esc again to stop");
     }
 
     pub fn clear_cancel_confirm(&mut self) {
@@ -1172,11 +1274,15 @@ impl App {
             return;
         }
         if self.elicitation.is_some() {
-            self.status = "question - answer in the panel above input".into();
+            self.set_status(
+                LogLevel::Debug,
+                "elicitation",
+                "question - answer in the panel above input",
+            );
         } else if let Some(activity_status) = self.activity_status_text() {
-            self.status = activity_status;
+            self.set_status(LogLevel::Debug, "activity", activity_status);
         } else if self.conn == ConnState::Connected {
-            self.status = "ready".into();
+            self.set_status(LogLevel::Debug, "activity", "ready");
         }
     }
 
@@ -1504,22 +1610,34 @@ impl App {
                 self.reconnect_attempt = attempt;
                 self.reconnect_delay_ms = Some(delay_ms);
                 let secs = delay_ms as f64 / 1000.0;
-                self.status = format!("waiting for server - retry {attempt} in {secs:.1}s");
+                self.set_status(
+                    LogLevel::Warn,
+                    "connection",
+                    format!("waiting for server - retry {attempt} in {secs:.1}s"),
+                );
             }
             ConnectionEvent::Connected => {
                 self.conn = ConnState::Connected;
                 self.reconnect_attempt = 0;
                 self.reconnect_delay_ms = None;
-                self.status = if self.session_id.is_some() {
-                    "reconnected".into()
-                } else {
-                    "connected".into()
-                };
+                self.set_status(
+                    LogLevel::Info,
+                    "connection",
+                    if self.session_id.is_some() {
+                        "reconnected".to_string()
+                    } else {
+                        "connected".to_string()
+                    },
+                );
             }
             ConnectionEvent::Disconnected { reason } => {
                 self.conn = ConnState::Disconnected;
                 self.reconnect_delay_ms = None;
-                self.status = format!("connection lost - {reason}");
+                self.set_status(
+                    LogLevel::Warn,
+                    "connection",
+                    format!("connection lost - {reason}"),
+                );
             }
         }
     }
@@ -1542,7 +1660,7 @@ impl App {
                         ReasoningEffortField::Set(s) => self.reasoning_effort = Some(s),
                     }
                     self.conn = ConnState::Connected;
-                    self.status = "connected".into();
+                    self.set_status(LogLevel::Info, "connection", "connected");
                 }
                 vec![]
             }
@@ -1610,14 +1728,18 @@ impl App {
                     if ur.success {
                         self.streaming_content.clear();
                         self.streaming_cache.invalidate();
-                        self.status = "undone - reloading session".into();
+                        self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
                             }];
                         }
                     } else {
-                        self.status = ur.message.unwrap_or_else(|| "undo failed".into());
+                        self.set_status(
+                            LogLevel::Warn,
+                            "session",
+                            ur.message.unwrap_or_else(|| "undo failed".into()),
+                        );
                     }
                 }
                 vec![]
@@ -1630,14 +1752,18 @@ impl App {
                     self.undo_state =
                         self.build_undo_state_from_server_stack(&rr.undo_stack, None, None);
                     if rr.success {
-                        self.status = "redone - reloading session".into();
+                        self.set_status(LogLevel::Info, "session", "redone - reloading session");
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
                             }];
                         }
                     } else {
-                        self.status = rr.message.unwrap_or_else(|| "redo failed".into());
+                        self.set_status(
+                            LogLevel::Warn,
+                            "session",
+                            rr.message.unwrap_or_else(|| "redo failed".into()),
+                        );
                     }
                 }
                 vec![]
@@ -1668,7 +1794,7 @@ impl App {
                     if self.session_cursor >= visible_len && visible_len > 0 {
                         self.session_cursor = visible_len - 1;
                     }
-                    self.status = format!("{} session(s)", total);
+                    self.set_status(LogLevel::Info, "session", format!("{} session(s)", total));
                 }
                 vec![]
             }
@@ -1695,7 +1821,7 @@ impl App {
                     self.cumulative_cost = None;
                     self.session_stats = SessionStatsLite::default();
                     self.screen = Screen::Chat;
-                    self.status = "session created".into();
+                    self.set_status(LogLevel::Info, "session", "session created");
                     return vec![ClientMsg::SubscribeSession {
                         session_id: sc.session_id,
                         agent_id: self.agent_id.clone(),
@@ -1708,7 +1834,7 @@ impl App {
                     match serde_json::from_value::<SessionLoadedData>(data.clone()) {
                         Err(e) => {
                             self.activity = ActivityState::Idle;
-                            self.status = format!("load error: {e}");
+                            self.set_status(LogLevel::Error, "session", format!("load error: {e}"));
                         }
                         Ok(sl) => {
                             self.activity = ActivityState::Idle;
@@ -1732,7 +1858,7 @@ impl App {
                             self.clear_cancel_confirm();
                             self.undo_state =
                                 self.build_undo_state_from_server_stack(&sl.undo_stack, None, None);
-                            self.status = "ready".into();
+                            self.set_status(LogLevel::Debug, "activity", "ready");
                             // Replay audit: sets current_provider/model (ProviderChanged)
                             // and agent_mode (SessionModeChanged).
                             self.replay_audit(&sl.audit);
@@ -1786,7 +1912,7 @@ impl App {
                     && let Ok(e) = serde_json::from_value::<ErrorData>(data)
                 {
                     self.messages.push(ChatEntry::Error(e.message.clone()));
-                    self.status = format!("error: {}", e.message);
+                    self.set_status(LogLevel::Error, "server", format!("error: {}", e.message));
                 }
                 vec![]
             }
@@ -1870,7 +1996,7 @@ impl App {
                 self.streaming_cache.invalidate();
                 self.streaming_thinking.clear();
                 self.streaming_thinking_cache.invalidate();
-                self.status = "thinking...".into();
+                self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
             EventKind::AssistantThinkingDelta { content, .. } => {
                 self.streaming_thinking.push_str(content);
@@ -1890,7 +2016,11 @@ impl App {
                 self.messages.push(ChatEntry::CompactionStart {
                     token_estimate: *token_estimate,
                 });
-                self.status = format!("compacting context (~{token_estimate} tokens)");
+                self.set_status(
+                    LogLevel::Debug,
+                    "activity",
+                    format!("compacting context (~{token_estimate} tokens)"),
+                );
             }
             EventKind::CompactionEnd {
                 summary,
@@ -1908,7 +2038,7 @@ impl App {
                     summary: summary.clone(),
                     summary_len: *summary_len,
                 });
-                self.status = "context compacted".into();
+                self.set_status(LogLevel::Info, "activity", "context compacted");
             }
             EventKind::AssistantMessageStored {
                 content, thinking, ..
@@ -1942,7 +2072,7 @@ impl App {
                 self.activity = ActivityState::RunningTool {
                     name: tool_name.clone(),
                 };
-                self.status = format!("tool: {tool_name}");
+                self.set_status(LogLevel::Debug, "tool", format!("tool: {tool_name}"));
                 // The question tool renders as an ElicitationCard — skip the
                 // redundant "> question …" tool call entry in the chat.
                 if tool_name != "question" {
@@ -2002,13 +2132,13 @@ impl App {
                 self.clear_cancel_confirm();
                 self.activity = ActivityState::Idle;
                 self.cumulative_cost = *cumulative_cost_usd;
-                self.status = "ready".into();
+                self.set_status(LogLevel::Debug, "activity", "ready");
             }
             EventKind::Error { message } => {
                 self.activity = ActivityState::Idle;
                 self.clear_cancel_confirm();
                 self.messages.push(ChatEntry::Error(message.clone()));
-                self.status = format!("error: {message}");
+                self.set_status(LogLevel::Error, "server", format!("error: {message}"));
             }
             EventKind::ElicitationRequested {
                 elicitation_id,
@@ -2047,7 +2177,11 @@ impl App {
                     outcome: None,
                 });
                 self.scroll_offset = 0;
-                self.status = "question — answer in the panel above input".into();
+                self.set_status(
+                    LogLevel::Info,
+                    "elicitation",
+                    "question — answer in the panel above input",
+                );
             }
             EventKind::SessionModeChanged { mode } => {
                 self.agent_mode = mode.clone();
@@ -2069,7 +2203,7 @@ impl App {
                         thinking,
                     });
                 }
-                self.status = "cancelled".into();
+                self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
             _ => {}
         }
@@ -3765,6 +3899,52 @@ mod tests {
     }
 
     #[test]
+    fn push_log_deduplicates_consecutive_entries() {
+        let mut app = App::new();
+
+        app.push_log(LogLevel::Info, "server", "starting local server");
+        app.push_log(LogLevel::Info, "server", "starting local server");
+        app.push_log(LogLevel::Warn, "server", "waiting for lock");
+
+        assert_eq!(app.logs.len(), 2);
+        assert_eq!(app.logs[0].level, LogLevel::Info);
+        assert_eq!(app.logs[0].target, "server");
+        assert_eq!(app.logs[0].message, "starting local server");
+        assert_eq!(app.logs[1].level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn set_status_updates_visible_status_and_appends_log() {
+        let mut app = App::new();
+
+        app.set_status(LogLevel::Info, "connection", "connected");
+
+        assert_eq!(app.status, "connected");
+        let last = app.logs.last().expect("missing log entry");
+        assert_eq!(last.level, LogLevel::Info);
+        assert_eq!(last.target, "connection");
+        assert_eq!(last.message, "connected");
+    }
+
+    #[test]
+    fn filtered_logs_apply_level_threshold_and_text_filter() {
+        let mut app = App::new();
+        app.push_log(LogLevel::Debug, "activity", "ready");
+        app.push_log(LogLevel::Warn, "server", "waiting for lock");
+        app.push_log(LogLevel::Error, "server", "start failed");
+
+        app.log_level_filter = LogLevel::Warn;
+        let filtered = app.filtered_logs();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|entry| entry.level >= LogLevel::Warn));
+
+        app.log_filter = "failed".into();
+        let filtered = app.filtered_logs();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message, "start failed");
+    }
+
+    #[test]
     fn cancel_confirm_arms_expires_and_restores_status() {
         let mut app = App::new();
         app.activity = ActivityState::Thinking;
@@ -3772,18 +3952,20 @@ mod tests {
         app.arm_cancel_confirm();
         assert!(app.cancel_confirm_active());
         assert_eq!(app.status, "press Esc again to stop");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.message == "press Esc again to stop"));
 
         app.pending_cancel_confirm_until = Some(Instant::now() - Duration::from_millis(1));
         app.clear_expired_cancel_confirm();
         assert!(!app.cancel_confirm_active());
         assert_eq!(app.status, "thinking...");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.message == "thinking..."));
     }
 
     #[test]
     fn refresh_transient_status_preserves_connection_and_operation_precedence() {
         let mut app = App::new();
         app.conn = ConnState::Disconnected;
-        app.status = "connection lost - retrying".into();
+        app.set_status(LogLevel::Warn, "connection", "connection lost - retrying");
         app.refresh_transient_status();
         assert_eq!(app.status, "connection lost - retrying");
 
@@ -4038,6 +4220,7 @@ mod tests {
         assert_eq!(app.reconnect_attempt, 3);
         assert_eq!(app.reconnect_delay_ms, Some(2000));
         assert_eq!(app.status, "waiting for server - retry 3 in 2.0s");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "connection" && entry.level == LogLevel::Warn));
 
         app.handle_connection_event(ConnectionEvent::Disconnected {
             reason: "socket closed".into(),
@@ -4045,6 +4228,7 @@ mod tests {
         assert_eq!(app.conn, ConnState::Disconnected);
         assert_eq!(app.reconnect_delay_ms, None);
         assert_eq!(app.status, "connection lost - socket closed");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.message == "connection lost - socket closed"));
 
         app.session_id = Some("session-1".into());
         app.handle_connection_event(ConnectionEvent::Connected);
@@ -4052,6 +4236,7 @@ mod tests {
         assert_eq!(app.reconnect_attempt, 0);
         assert_eq!(app.reconnect_delay_ms, None);
         assert_eq!(app.status, "reconnected");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected"));
     }
 
     #[test]
@@ -4188,7 +4373,9 @@ mod tests {
         assert!(
             matches!(&app.messages[0], ChatEntry::User { text, message_id: Some(message_id) } if text == "first" && message_id == "msg-1")
         );
-        assert!(matches!(&app.messages[1], ChatEntry::Assistant { content, .. } if content == "reply one"));
+        assert!(
+            matches!(&app.messages[1], ChatEntry::Assistant { content, .. } if content == "reply one")
+        );
         assert_eq!(app.undoable_turns.len(), 1);
         assert_eq!(app.undoable_turns[0].message_id, "msg-1");
         assert!(app.can_redo());
