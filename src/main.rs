@@ -535,11 +535,15 @@ mod external_editor_tests {
 }
 
 #[derive(Parser)]
-#[command(name = "qmt-tui", about = "querymt terminal interface")]
+#[command(about = "querymt terminal interface")]
 struct Cli {
     /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
     #[arg(long)]
     server: Option<String>,
+
+    /// Restore a session by id.
+    #[arg(short = 's', long)]
+    session: Option<String>,
 }
 
 fn detect_launch_cwd() -> Option<String> {
@@ -704,6 +708,10 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
+    if let Some(session_id) = cli.session {
+        app.session_id = Some(session_id);
+        app.screen = Screen::Chat;
+    }
     // Hydrate session effort cache from disk.
     config::TuiCache::load().hydrate_app(&mut app);
     let result = run_loop(&mut terminal, &mut app, &mut srv_rx, &mut conn_rx, &cmd_tx).await;
@@ -713,7 +721,17 @@ async fn main() -> anyhow::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
+    if let Some(session_id) = &app.session_id {
+        eprintln!("{}", restore_hint(session_id));
+    }
+
     result
+}
+
+fn restore_hint(session_id: &str) -> String {
+    use clap::CommandFactory;
+    let bin = Cli::command().get_name().to_string();
+    format!("{bin} -s {session_id}")
 }
 
 async fn connection_manager(
@@ -2932,5 +2950,42 @@ mod reasoning_effort_integration_tests {
 
         let cms = &app.session_cache["s1"]["build"];
         assert_eq!(cms.effort, None);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    fn bin() -> String {
+        Cli::command().get_name().to_string()
+    }
+
+    #[test]
+    fn cli_session_short_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-s", "abc123"]).unwrap();
+        assert_eq!(cli.session, Some("abc123".into()));
+    }
+
+    #[test]
+    fn cli_session_long_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--session", "abc123"]).unwrap();
+        assert_eq!(cli.session, Some("abc123".into()));
+    }
+
+    #[test]
+    fn cli_no_session_defaults_to_none() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        assert_eq!(cli.session, None);
+    }
+
+    #[test]
+    fn restore_hint_formats_correctly() {
+        let hint = restore_hint("abc-123-def");
+        assert_eq!(hint, format!("{} -s abc-123-def", bin()));
     }
 }
