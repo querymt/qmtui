@@ -749,7 +749,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = cli
         .server
         .or_else(|| cfg.server.addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:3030".to_string());
+        .unwrap_or_else(|| "127.0.0.1:42069".to_string());
     let tls = cfg.server.tls.unwrap_or(false);
 
     // Apply saved theme (falls back to built-in default if absent or unknown).
