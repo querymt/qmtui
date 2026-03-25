@@ -569,6 +569,8 @@ mod external_editor_tests {
 }
 
 #[derive(Parser)]
+#[command(name = "qmtui")]
+#[command(version = env!("QMTUI_BUILD_VERSION"))]
 #[command(about = "querymt terminal interface")]
 struct Cli {
     /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
