@@ -295,9 +295,27 @@ fn build_message_cards(app: &mut App) -> &[Card] {
                 let lines = markdown::render(text, Theme::user_text(), &app.hl);
                 app.card_cache.cards.push(Card::new(CardKind::User, lines));
             }
-            ChatEntry::Assistant(text) => {
+            ChatEntry::Assistant { content, thinking } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                let lines = markdown::render(text, Theme::assistant_text(), &app.hl);
+                let mut lines = Vec::new();
+                if app.show_thinking {
+                    if let Some(thinking_text) = thinking {
+                        let mut rendered = markdown::render(
+                            thinking_text,
+                            Theme::thinking_text(),
+                            &app.hl,
+                        );
+                        if let Some(first) = rendered.first_mut() {
+                            first.spans.insert(
+                                0,
+                                Span::styled("\u{25CF} ", Theme::thinking()),
+                            );
+                        }
+                        lines.extend(rendered);
+                        lines.push(Line::default());
+                    }
+                }
+                lines.extend(markdown::render(content, Theme::assistant_text(), &app.hl));
                 app.card_cache
                     .cards
                     .push(Card::new(CardKind::Assistant, lines));
@@ -1602,16 +1620,46 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
         _ => format!("{} thinking", spinner(SpinnerKind::Braille, app.tick)),
     };
 
-    if !app.streaming_content.is_empty() {
-        let content_len = app.streaming_content.len();
-        let mut lines = if let Some(cached) = app.streaming_cache.get(content_len) {
-            cached.to_vec()
-        } else {
-            let rendered =
-                markdown::render(&app.streaming_content, Theme::assistant_text(), &app.hl);
-            app.streaming_cache.store(content_len, rendered.clone());
-            rendered
-        };
+    let has_thinking = app.show_thinking && !app.streaming_thinking.is_empty();
+    let has_content = !app.streaming_content.is_empty();
+
+    if has_thinking || has_content {
+        let mut lines = Vec::new();
+
+        if has_thinking {
+            let thinking_len = app.streaming_thinking.len();
+            let mut thinking_lines =
+                if let Some(cached) = app.streaming_thinking_cache.get(thinking_len) {
+                    cached.to_vec()
+                } else {
+                    let rendered =
+                        markdown::render(&app.streaming_thinking, Theme::thinking_text(), &app.hl);
+                    app.streaming_thinking_cache
+                        .store(thinking_len, rendered.clone());
+                    rendered
+                };
+            if let Some(first) = thinking_lines.first_mut() {
+                first.spans.insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
+            }
+            lines.extend(thinking_lines);
+            if has_content {
+                lines.push(Line::default());
+            }
+        }
+
+        if has_content {
+            let content_len = app.streaming_content.len();
+            let content_lines = if let Some(cached) = app.streaming_cache.get(content_len) {
+                cached.to_vec()
+            } else {
+                let rendered =
+                    markdown::render(&app.streaming_content, Theme::assistant_text(), &app.hl);
+                app.streaming_cache.store(content_len, rendered.clone());
+                rendered
+            };
+            lines.extend(content_lines);
+        }
+
         lines.push(Line::from(Span::styled(activity_text, Theme::thinking())));
         Some(Card::new(CardKind::Streaming, lines))
     } else if app.is_turn_active() {
@@ -2949,7 +2997,10 @@ mod tests {
             assert_eq!(cards.len(), 1);
         }
 
-        app.messages.push(ChatEntry::Assistant("world".into()));
+        app.messages.push(ChatEntry::Assistant {
+            content: "world".into(),
+            thinking: None,
+        });
         {
             let cards = build_message_cards(&mut app);
             assert_eq!(cards.len(), 2);
@@ -3046,7 +3097,10 @@ mod tests {
             text: "hello".into(),
             message_id: None,
         });
-        app.messages.push(ChatEntry::Assistant("world".into()));
+        app.messages.push(ChatEntry::Assistant {
+            content: "world".into(),
+            thinking: None,
+        });
         build_message_cards(&mut app);
         assert_eq!(app.card_cache.processed_messages, 2);
 
@@ -3068,7 +3122,10 @@ mod tests {
         });
         build_message_cards(&mut app);
 
-        app.messages.push(ChatEntry::Assistant("a1".into()));
+        app.messages.push(ChatEntry::Assistant {
+            content: "a1".into(),
+            thinking: None,
+        });
         build_message_cards(&mut app);
 
         app.messages.push(tool_call("edit"));
@@ -3096,8 +3153,10 @@ mod tests {
     #[test]
     fn message_cards_compact_tool_after_assistant() {
         let mut app = App::new();
-        app.messages
-            .push(ChatEntry::Assistant("thinking...".into()));
+        app.messages.push(ChatEntry::Assistant {
+            content: "thinking...".into(),
+            thinking: None,
+        });
         app.messages.push(tool_call("read"));
 
         let cards = build_message_cards(&mut app);
@@ -3715,5 +3774,59 @@ mod tests {
             rows.is_empty(),
             "no groups means no rows (empty state handled in draw_start)"
         );
+    }
+
+    // ── Thinking content rendering ────────────────────────────────────────────
+
+    #[test]
+    fn message_card_with_thinking_includes_bullet_header() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::Assistant {
+            content: "answer".into(),
+            thinking: Some("reasoning".into()),
+        });
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        // First line should be the ● bullet
+        let first_line = &cards[0].lines[0];
+        let text: String = first_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('\u{25CF}'), "expected ● bullet, got: {text}");
+    }
+
+    #[test]
+    fn message_card_without_thinking_has_no_bullet() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::Assistant {
+            content: "answer".into(),
+            thinking: None,
+        });
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        let first_line = &cards[0].lines[0];
+        let text: String = first_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains('\u{25CF}'),
+            "should not contain ● when no thinking"
+        );
+    }
+
+    #[test]
+    fn message_card_thinking_hidden_when_show_thinking_false() {
+        let mut app = App::new();
+        app.show_thinking = false;
+        app.messages.push(ChatEntry::Assistant {
+            content: "answer".into(),
+            thinking: Some("reasoning".into()),
+        });
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        // No line should contain the ● bullet
+        for line in &cards[0].lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !text.contains('\u{25CF}'),
+                "thinking should be hidden, got: {text}"
+            );
+        }
     }
 }

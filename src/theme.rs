@@ -259,6 +259,9 @@ impl Theme {
     pub fn thinking() -> Style {
         Style::default().fg(Self::magenta()).bg(Self::bg())
     }
+    pub fn thinking_text() -> Style {
+        Style::default().fg(Self::dim()).bg(Self::bg())
+    }
     /// Style for the `:` separator between the model name and thinking level.
     pub fn reasoning_effort_sep() -> Style {
         Style::default().fg(Self::dim()).bg(Self::bg_dim())

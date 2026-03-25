@@ -75,7 +75,10 @@ pub enum ChatEntry {
         text: String,
         message_id: Option<String>,
     },
-    Assistant(String),
+    Assistant {
+        content: String,
+        thinking: Option<String>,
+    },
     ToolCall {
         tool_call_id: Option<String>,
         name: String,
@@ -674,6 +677,8 @@ pub struct App {
     pub activity: ActivityState,
     pub streaming_content: String,
     pub streaming_cache: StreamingCache,
+    pub streaming_thinking: String,
+    pub streaming_thinking_cache: StreamingCache,
     pub file_index: Vec<FileIndexEntryLite>,
     pub file_index_generated_at: Option<u64>,
     pub file_index_loading: bool,
@@ -682,6 +687,9 @@ pub struct App {
     pub last_compaction_token_estimate: Option<u32>,
     /// Active elicitation request waiting for user response.
     pub elicitation: Option<ElicitationState>,
+
+    // thinking display
+    pub show_thinking: bool,
 
     // reasoning effort
     /// Current reasoning-effort level. `None` = "auto" (server default).
@@ -768,6 +776,8 @@ impl App {
             activity: ActivityState::Idle,
             streaming_content: String::new(),
             streaming_cache: StreamingCache::new(),
+            streaming_thinking: String::new(),
+            streaming_thinking_cache: StreamingCache::new(),
             file_index: Vec::new(),
             file_index_generated_at: None,
             file_index_loading: false,
@@ -775,6 +785,7 @@ impl App {
             mention_state: None,
             last_compaction_token_estimate: None,
             elicitation: None,
+            show_thinking: true,
             reasoning_effort: None,
             session_cache: HashMap::new(),
             current_model: None,
@@ -1857,7 +1868,12 @@ impl App {
                 self.activity = ActivityState::Thinking;
                 self.streaming_content.clear();
                 self.streaming_cache.invalidate();
+                self.streaming_thinking.clear();
+                self.streaming_thinking_cache.invalidate();
                 self.status = "thinking...".into();
+            }
+            EventKind::AssistantThinkingDelta { content, .. } => {
+                self.streaming_thinking.push_str(content);
             }
             EventKind::AssistantContentDelta { content, .. } => {
                 if self.is_turn_active() {
@@ -1894,14 +1910,28 @@ impl App {
                 });
                 self.status = "context compacted".into();
             }
-            EventKind::AssistantMessageStored { content, .. } => {
+            EventKind::AssistantMessageStored {
+                content, thinking, ..
+            } => {
+                let thinking_text = thinking.clone().or_else(|| {
+                    if self.streaming_thinking.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut self.streaming_thinking))
+                    }
+                });
                 self.streaming_content.clear();
                 self.streaming_cache.invalidate();
+                self.streaming_thinking.clear();
+                self.streaming_thinking_cache.invalidate();
                 if self.is_turn_active() {
                     self.activity = ActivityState::Thinking;
                 }
                 if !content.is_empty() {
-                    self.messages.push(ChatEntry::Assistant(content.clone()));
+                    self.messages.push(ChatEntry::Assistant {
+                        content: content.clone(),
+                        thinking: thinking_text,
+                    });
                 }
             }
             EventKind::ToolCallStart {
@@ -2028,8 +2058,16 @@ impl App {
                 if !self.streaming_content.is_empty() {
                     let partial = std::mem::take(&mut self.streaming_content);
                     self.streaming_cache.invalidate();
-                    self.messages
-                        .push(ChatEntry::Assistant(format!("{partial} [cancelled]")));
+                    let thinking = if self.streaming_thinking.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut self.streaming_thinking))
+                    };
+                    self.streaming_thinking_cache.invalidate();
+                    self.messages.push(ChatEntry::Assistant {
+                        content: format!("{partial} [cancelled]"),
+                        thinking,
+                    });
                 }
                 self.status = "cancelled".into();
             }
@@ -4150,7 +4188,7 @@ mod tests {
         assert!(
             matches!(&app.messages[0], ChatEntry::User { text, message_id: Some(message_id) } if text == "first" && message_id == "msg-1")
         );
-        assert!(matches!(&app.messages[1], ChatEntry::Assistant(text) if text == "reply one"));
+        assert!(matches!(&app.messages[1], ChatEntry::Assistant { content, .. } if content == "reply one"));
         assert_eq!(app.undoable_turns.len(), 1);
         assert_eq!(app.undoable_turns[0].message_id, "msg-1");
         assert!(app.can_redo());
@@ -4715,6 +4753,179 @@ mod tests {
         assert_eq!(state.frontier_message_id.as_deref(), Some("msg-3"));
         assert_eq!(state.stack.len(), 1);
         assert_eq!(state.stack[0].reverted_files, vec!["src/lib.rs"]);
+    }
+}
+
+// ── Thinking content tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod thinking_content_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_delta_accumulates_in_streaming_thinking() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Let me ".into(),
+                message_id: None,
+            },
+            false,
+        );
+        assert_eq!(app.streaming_thinking, "Let me ");
+
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "think about this.".into(),
+                message_id: None,
+            },
+            false,
+        );
+        assert_eq!(app.streaming_thinking, "Let me think about this.");
+    }
+
+    #[test]
+    fn turn_started_clears_streaming_thinking() {
+        let mut app = App::new();
+        app.streaming_thinking = "old thinking".into();
+
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        assert!(app.streaming_thinking.is_empty());
+    }
+
+    #[test]
+    fn assistant_message_stored_captures_thinking_field() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "The answer is 42.".into(),
+                thinking: Some("I need to compute the answer.".into()),
+                message_id: None,
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatEntry::Assistant { content, thinking } => {
+                assert_eq!(content, "The answer is 42.");
+                assert_eq!(thinking.as_deref(), Some("I need to compute the answer."));
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assistant_message_stored_without_thinking_sets_none() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "Hello!".into(),
+                thinking: None,
+                message_id: None,
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatEntry::Assistant { content, thinking } => {
+                assert_eq!(content, "Hello!");
+                assert!(thinking.is_none());
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn streaming_thinking_falls_back_when_stored_thinking_is_none() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        // Simulate thinking deltas arriving before the stored message
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Streamed thinking.".into(),
+                message_id: None,
+            },
+            false,
+        );
+
+        // AssistantMessageStored arrives without thinking field
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "Final answer.".into(),
+                thinking: None,
+                message_id: None,
+            },
+            false,
+        );
+
+        match &app.messages[0] {
+            ChatEntry::Assistant { content, thinking } => {
+                assert_eq!(content, "Final answer.");
+                assert_eq!(thinking.as_deref(), Some("Streamed thinking."));
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+        // streaming_thinking should be cleared after capture
+        assert!(app.streaming_thinking.is_empty());
+    }
+
+    #[test]
+    fn cancelled_with_thinking_preserves_thinking_in_entry() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Deep thought.".into(),
+                message_id: None,
+            },
+            false,
+        );
+        app.handle_event_kind(
+            &EventKind::AssistantContentDelta {
+                content: "Partial answer".into(),
+                message_id: None,
+            },
+            false,
+        );
+        app.handle_event_kind(&EventKind::Cancelled, false);
+
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatEntry::Assistant { content, thinking } => {
+                assert!(content.contains("Partial answer"));
+                assert!(content.contains("[cancelled]"));
+                assert_eq!(thinking.as_deref(), Some("Deep thought."));
+            }
+            other => panic!("expected Assistant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thinking_delta_keeps_activity_as_thinking() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+        assert_eq!(app.activity, ActivityState::Thinking);
+
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "hmm".into(),
+                message_id: None,
+            },
+            false,
+        );
+        // Should still be Thinking (not Streaming) during thinking phase
+        assert_eq!(app.activity, ActivityState::Thinking);
     }
 }
 

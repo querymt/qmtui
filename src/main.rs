@@ -703,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
+    app.show_thinking = cfg.show_thinking.unwrap_or(true);
     // Hydrate session effort cache from disk.
     config::TuiCache::load().hydrate_app(&mut app);
     let result = run_loop(&mut terminal, &mut app, &mut srv_rx, &mut conn_rx, &cmd_tx).await;

@@ -50,6 +50,7 @@ pub struct ServerConfig {
 #[serde(default)]
 pub struct TuiConfig {
     pub theme: Option<String>,
+    pub show_thinking: Option<bool>,
     pub server: ServerConfig,
 }
 
@@ -93,9 +94,10 @@ impl TuiConfig {
         }
     }
 
-    pub fn from_app(_app: &crate::app::App) -> Self {
+    pub fn from_app(app: &crate::app::App) -> Self {
         TuiConfig {
             theme: Some(crate::theme::Theme::current_id().to_string()),
+            show_thinking: Some(app.show_thinking),
             server: ServerConfig::default(),
         }
     }
@@ -254,6 +256,7 @@ mod tests {
     fn config_round_trip() {
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
+            show_thinking: Some(false),
             server: ServerConfig {
                 addr: Some("127.0.0.1:3030".into()),
                 tls: Some(false),
@@ -265,10 +268,27 @@ mod tests {
 
     #[test]
     fn config_empty_deserializes_to_default() {
-        assert_eq!(
-            toml::from_str::<TuiConfig>("").unwrap(),
-            TuiConfig::default()
-        );
+        let cfg = toml::from_str::<TuiConfig>("").unwrap();
+        assert_eq!(cfg, TuiConfig::default());
+        // show_thinking defaults to None (treated as true at startup)
+        assert_eq!(cfg.show_thinking, None);
+    }
+
+    #[test]
+    fn config_show_thinking_round_trips() {
+        let cfg = TuiConfig {
+            show_thinking: Some(false),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let loaded: TuiConfig = toml::from_str(&text).unwrap();
+        assert_eq!(loaded.show_thinking, Some(false));
+    }
+
+    #[test]
+    fn config_show_thinking_absent_means_none() {
+        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(cfg.show_thinking, None);
     }
 
     // ── TuiCache TOML ─────────────────────────────────────────────────────────
@@ -389,6 +409,7 @@ mod tests {
         let path = dir.join("nested").join("tui.toml");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
+            show_thinking: None,
             server: ServerConfig {
                 addr: Some("127.0.0.1:3030".into()),
                 tls: Some(false),
@@ -405,6 +426,7 @@ mod tests {
         let _guard = TestPathGuard::new("cfg-override");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
+            show_thinking: None,
             server: ServerConfig::default(),
         };
         cfg.save();
