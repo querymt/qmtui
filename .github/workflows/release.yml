@@ -28,7 +28,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          pattern: 'querymt-tui-*'
+          pattern: 'qmtui-*'
           merge-multiple: true
 
       - name: Create Release and Upload Assets

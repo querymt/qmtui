@@ -73,7 +73,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          pattern: 'querymt-tui-*'
+          pattern: 'qmtui-*'
           merge-multiple: true
 
       # Delete the existing nightly tag and release to ensure fresh artifacts

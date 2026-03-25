@@ -1,1 +1,1 @@
-# querymt-tui
+# qmtui

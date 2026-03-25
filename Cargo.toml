@@ -1,17 +1,17 @@
 [package]
-name = "querymt-tui"
+name = "qmtui"
 description = "A Rust TUI frontend for QueryMT agent."
 authors = [
     "Ivan Zatevakhin <ivan@query.mt>"
 ]
-repository = "https://github.com/querymt/querymt-tui"
+repository = "https://github.com/querymt/qmtui"
 homepage = "https://query.mt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [[bin]]
-name = "querymt-tui"
+name = "qmtui"
 path = "src/main.rs"
 
 [dependencies]

@@ -18,7 +18,7 @@ env:
 
 jobs:
   build:
-    name: Build querymt-tui for ${{ matrix.target }}
+    name: Build qmtui for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -28,21 +28,21 @@ jobs:
           # ─── Linux (Static MUSL) ──────────────────────────────────────────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            bin_name: querymt-tui
+            bin_name: qmtui
             archive_ext: tar.gz
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            bin_name: querymt-tui
+            bin_name: qmtui
             archive_ext: tar.gz
 
           # ─── macOS ────────────────────────────────────────────────────────
           - os: macos-14
             target: x86_64-apple-darwin
-            bin_name: querymt-tui
+            bin_name: qmtui
             archive_ext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            bin_name: querymt-tui
+            bin_name: qmtui
             archive_ext: tar.gz
 
           # TODO: add Windows targets (x86_64-pc-windows-msvc, aarch64-pc-windows-msvc)
@@ -71,14 +71,14 @@ jobs:
 
       - name: Build
         env:
-          QUERYMT_TUI_VERSION: ${{ inputs.version_name }}
-        run: cargo build --release --bin querymt-tui --target ${{ matrix.target }}
+          QMTUI_VERSION: ${{ inputs.version_name }}
+        run: cargo build --release --bin qmtui --target ${{ matrix.target }}
 
       - name: Prepare artifact
         shell: bash
         run: |
           ARTIFACT_DIR="dist"
-          PKG="querymt-tui-${{ inputs.version_name }}-${{ matrix.target }}"
+          PKG="qmtui-${{ inputs.version_name }}-${{ matrix.target }}"
           STAGING="$ARTIFACT_DIR/$PKG"
           mkdir -p "$STAGING"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"
@@ -89,5 +89,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: querymt-tui-${{ matrix.target }}
+          name: qmtui-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
