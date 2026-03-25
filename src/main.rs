@@ -777,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Server auto-start ─────────────────────────────────────────────────────
     let auto_start = cfg.server.auto_start.unwrap_or(true);
     let shutdown_on_exit = cfg.server.shutdown_on_exit.unwrap_or(true);
+    let launch_mode = cfg.server.launch_mode.unwrap_or_default();
     let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
     let (sup_shutdown_tx, sup_shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -787,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(binary) = discovery.binary {
             let sup_config = server_manager::ServerManagerConfig {
                 addr: addr.clone(),
+                launch_mode,
                 binary_args: cfg.server.binary_args.clone().unwrap_or_default(),
                 shutdown_on_exit,
                 lock_path: None,

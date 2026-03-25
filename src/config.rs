@@ -39,6 +39,14 @@ pub fn test_set_cache_path_override(path: Option<PathBuf>) {
 
 // ── TuiConfig — ~/.qmt/tui.toml ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerLaunchMode {
+    #[default]
+    Api,
+    Dashboard,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -46,8 +54,11 @@ pub struct ServerConfig {
     pub tls: Option<bool>,
     /// Path to the `qmtcode` binary. Falls back to `$PATH` lookup when absent.
     pub binary_path: Option<String>,
+    /// Which built-in qmtcode server mode to launch when `binary_args` is absent.
+    /// Default: `api`.
+    pub launch_mode: Option<ServerLaunchMode>,
     /// Extra CLI arguments passed to the spawned server.
-    /// Default (when absent): `["--dashboard={addr}"]`.
+    /// Default (when absent): `["--api={addr}"]` or `["--dashboard={addr}"]`.
     pub binary_args: Option<Vec<String>>,
     /// Automatically start a local server when none is found. Default: `true`.
     pub auto_start: Option<bool>,
@@ -299,6 +310,25 @@ mod tests {
     fn config_show_thinking_absent_means_none() {
         let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
         assert_eq!(cfg.show_thinking, None);
+    }
+
+    #[test]
+    fn config_launch_mode_defaults_to_api_when_absent() {
+        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(
+            cfg.server.launch_mode.unwrap_or_default(),
+            ServerLaunchMode::Api
+        );
+    }
+
+    #[test]
+    fn config_launch_mode_round_trips_dashboard() {
+        let cfg: TuiConfig = toml::from_str("[server]\nlaunch_mode = \"dashboard\"\n").unwrap();
+        assert_eq!(cfg.server.launch_mode, Some(ServerLaunchMode::Dashboard));
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let loaded: TuiConfig = toml::from_str(&text).unwrap();
+        assert_eq!(loaded.server.launch_mode, Some(ServerLaunchMode::Dashboard));
     }
 
     // ── TuiCache TOML ─────────────────────────────────────────────────────────

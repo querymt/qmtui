@@ -17,6 +17,8 @@ use std::time::Duration;
 use fs2::FileExt;
 use tokio::sync::mpsc;
 
+use crate::config::ServerLaunchMode;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Events sent from the supervisor task to the TUI run_loop.
@@ -56,6 +58,7 @@ pub enum ServerState {
 #[derive(Debug, Clone)]
 pub struct ServerManagerConfig {
     pub addr: String,
+    pub launch_mode: ServerLaunchMode,
     pub binary_args: Vec<String>,
     pub shutdown_on_exit: bool,
     /// Override the lock-file path (default: `~/.cache/qmt/server.lock` or
@@ -175,10 +178,17 @@ async fn wait_until_ready(addr: &str, timeout: Duration) -> bool {
 
 /// Return the effective CLI arguments for the spawned server.
 ///
-/// When `extra_args` is empty the default is `["--dashboard={addr}"]`.
-fn build_spawn_args(addr: &str, extra_args: &[String]) -> Vec<String> {
+/// When `extra_args` is empty the default is mode-dependent.
+fn build_spawn_args(
+    addr: &str,
+    launch_mode: ServerLaunchMode,
+    extra_args: &[String],
+) -> Vec<String> {
     if extra_args.is_empty() {
-        vec![format!("--dashboard={addr}")]
+        match launch_mode {
+            ServerLaunchMode::Api => vec![format!("--api={addr}")],
+            ServerLaunchMode::Dashboard => vec![format!("--dashboard={addr}")],
+        }
     } else {
         extra_args.to_vec()
     }
@@ -238,7 +248,7 @@ pub async fn supervisor(
         // ── Phase 3: we are the owner, spawn the server ───────────────────
         let _ = event_tx.send(ServerEvent::Starting);
 
-        let args = build_spawn_args(&config.addr, &config.binary_args);
+        let args = build_spawn_args(&config.addr, config.launch_mode, &config.binary_args);
 
         let mut child = match tokio::process::Command::new(&binary)
             .args(&args)
@@ -313,15 +323,21 @@ mod tests {
     // ── build_spawn_args ──────────────────────────────────────────────────────
 
     #[test]
-    fn spawn_args_default_uses_dashboard_flag() {
-        let args = build_spawn_args("127.0.0.1:3030", &[]);
+    fn spawn_args_default_uses_api_flag() {
+        let args = build_spawn_args("127.0.0.1:3030", ServerLaunchMode::Api, &[]);
+        assert_eq!(args, vec!["--api=127.0.0.1:3030"]);
+    }
+
+    #[test]
+    fn spawn_args_dashboard_mode_uses_dashboard_flag() {
+        let args = build_spawn_args("127.0.0.1:3030", ServerLaunchMode::Dashboard, &[]);
         assert_eq!(args, vec!["--dashboard=127.0.0.1:3030"]);
     }
 
     #[test]
     fn spawn_args_custom_overrides_default() {
         let custom = vec!["--dashboard=0.0.0.0:9999".to_string(), "--mesh".to_string()];
-        let args = build_spawn_args("127.0.0.1:3030", &custom);
+        let args = build_spawn_args("127.0.0.1:3030", ServerLaunchMode::Api, &custom);
         assert_eq!(args, custom);
     }
 
@@ -476,6 +492,7 @@ mod tests {
     fn test_config(addr: &str, label: &str) -> ServerManagerConfig {
         ServerManagerConfig {
             addr: addr.to_string(),
+            launch_mode: ServerLaunchMode::Api,
             binary_args: vec![],
             shutdown_on_exit: true,
             lock_path: Some(temp_lock_path(label)),
