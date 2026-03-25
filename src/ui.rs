@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+        Block, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
     },
 };
 use unicode_width::UnicodeWidthChar;
@@ -526,12 +526,12 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
         let (header_style, dim_style) = if selected {
             (Theme::selected(), Theme::selected())
         } else {
-            (Theme::status_accent(), Theme::status())
+            (Theme::start_header(), Theme::start_dim())
         };
         let session_style = if selected {
             Theme::selected()
         } else {
-            Theme::popup_bg()
+            Theme::start_session()
         };
 
         let line: Line<'static> = match &item {
@@ -695,8 +695,8 @@ fn draw_start(f: &mut Frame, app: &mut App) {
     let rows = build_start_page_rows(app, col_w as usize);
     let rows_h = rows.len() as u16;
 
-    // Button: 1 gap row + 3 rows (top border + text + bottom border).
-    const BUTTON_H: u16 = 4; // 1 gap + 3 button
+    // Button: 1 gap row + 1 text row (no border).
+    const BUTTON_H: u16 = 2; // 1 gap + 1 button
 
     // Total content = art section + filter row + session rows + button.
     // Cap rows_h to what fits so centring stays correct on short terminals.
@@ -728,7 +728,7 @@ fn draw_start(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),                  // filter
             Constraint::Min(0),                     // session rows
             Constraint::Length(1),                  // gap before button
-            Constraint::Length(3),                  // button
+            Constraint::Length(1),                  // button
         ])
         .split(content_area);
 
@@ -814,7 +814,7 @@ fn draw_start(f: &mut Frame, app: &mut App) {
         height: 1,
     };
     let filter_line = Line::from(vec![
-        Span::styled(" > ", Theme::status_accent()),
+        Span::styled(" > ", Theme::start_header()),
         Span::styled(app.session_filter.clone(), Theme::fg()),
     ]);
     f.render_widget(
@@ -882,35 +882,31 @@ fn draw_start(f: &mut Frame, app: &mut App) {
                 height: 1,
             };
 
-            // Fill background for selected row
-            if row.selected {
-                f.render_widget(Block::default().style(Theme::selected()), row_area);
-            }
+            // Fill background for the entire row first
+            let row_bg = if row.selected {
+                Theme::selected()
+            } else {
+                Theme::base()
+            };
+            f.render_widget(Block::default().style(row_bg), row_area);
             f.render_widget(Paragraph::new(row.line.clone()), row_area);
         }
     }
 
     // ── New Session button ────────────────────────────────────────────────────
     const BUTTON_TEXT: &str = "+ New Session";
-    // button_w = 2 border + 2 space padding + text = 2+2+13 = 17
-    let button_w = (BUTTON_TEXT.len() as u16 + 4).min(col_w);
+    let button_w = (BUTTON_TEXT.len() as u16).min(col_w);
     let button_x = col_x + col_w.saturating_sub(button_w) / 2;
     let button_rect = Rect {
         x: button_x,
         y: sections[4].y,
         width: button_w,
-        height: 3,
+        height: 1,
     };
 
     let button_focused = app.session_cursor == rows.len();
 
-    let border_style = if button_focused {
-        Theme::selected()
-    } else {
-        Theme::status_accent()
-    };
-
-    // Build text spans: glitch only when focused
+    // Build text spans: glitch only when focused, always bold
     let text_spans: Vec<Span<'static>> = if button_focused {
         BUTTON_TEXT
             .chars()
@@ -941,18 +937,15 @@ fn draw_start(f: &mut Frame, app: &mut App) {
             })
             .collect()
     } else {
-        vec![Span::styled(BUTTON_TEXT, Theme::status_accent())]
+        vec![Span::styled(
+            BUTTON_TEXT,
+            Theme::start_header().add_modifier(ratatui::style::Modifier::BOLD),
+        )]
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style);
-    let inner_rect = block.inner(button_rect);
-    f.render_widget(block, button_rect);
     f.render_widget(
         Paragraph::new(Line::from(text_spans)).alignment(Alignment::Center),
-        inner_rect,
+        button_rect,
     );
 }
 

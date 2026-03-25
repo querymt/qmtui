@@ -275,6 +275,17 @@ impl Theme {
         Style::default().fg(Self::info()).bg(Self::bg())
     }
 
+    // -- start page (uses bg() instead of bg_dim() so rows blend with the base background) --
+    pub fn start_header() -> Style {
+        Style::default().fg(Self::magenta()).bg(Self::bg())
+    }
+    pub fn start_dim() -> Style {
+        Style::default().fg(Self::dim()).bg(Self::bg())
+    }
+    pub fn start_session() -> Style {
+        Style::default().fg(Self::fg()).bg(Self::bg())
+    }
+
     // -- selection --
     pub fn selected() -> Style {
         Style::default().fg(Self::bright()).bg(Self::bg_hl())
