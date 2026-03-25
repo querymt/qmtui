@@ -9,7 +9,13 @@ mod theme;
 mod themes_gen;
 mod ui;
 
-use std::time::Duration;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use app::{App, Popup, Screen};
 use clap::Parser;
@@ -213,6 +219,142 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod external_editor_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ctrl_x() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+    }
+
+    fn plain_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    #[test]
+    fn chat_up_down_navigate_wrapped_input_without_scrolling_history() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "abcdef".into();
+        app.input_cursor = 4;
+        app.input_line_width = 4;
+        app.scroll_offset = 7;
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), &tx).unwrap();
+        assert_eq!(app.input_cursor, 2);
+        assert_eq!(app.scroll_offset, 7);
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &tx).unwrap();
+        assert_eq!(app.input_cursor, 4);
+        assert_eq!(app.scroll_offset, 7);
+    }
+
+    #[test]
+    fn chat_pageup_pagedown_still_scroll_history() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.scroll_offset = 3;
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()), &tx)
+            .unwrap();
+        assert_eq!(app.scroll_offset, 13);
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()), &tx)
+            .unwrap();
+        assert_eq!(app.scroll_offset, 3);
+    }
+
+    #[test]
+    fn editor_command_prefers_visual_over_editor() {
+        let env = [("VISUAL", Some("nvim -f")), ("EDITOR", Some("vim"))];
+        let cmd = editor_command_from_env(&env).expect("expected editor command");
+        assert_eq!(cmd.program, "nvim");
+        assert_eq!(cmd.args, vec![OsString::from("-f")]);
+    }
+
+    #[test]
+    fn editor_command_uses_editor_when_visual_missing() {
+        let env = [("VISUAL", None), ("EDITOR", Some("nano"))];
+        let cmd = editor_command_from_env(&env).expect("expected editor command");
+        assert_eq!(cmd.program, "nano");
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn editor_command_rejects_blank_values() {
+        let env = [("VISUAL", Some("   ")), ("EDITOR", Some(""))];
+        assert!(editor_command_from_env(&env).is_none());
+    }
+
+    #[test]
+    fn apply_external_editor_result_updates_input_and_cursor() {
+        let mut app = App::new();
+        app.input = "old".into();
+        app.input_cursor = 1;
+        app.input_scroll = 3;
+
+        apply_external_editor_result(&mut app, "new text".into());
+
+        assert_eq!(app.input, "new text");
+        assert_eq!(app.input_cursor, "new text".len());
+        assert_eq!(app.input_scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_x_e_returns_open_editor_action_in_chat() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "draft".into();
+        assert_eq!(handle_key(&mut app, ctrl_x(), &tx).unwrap(), AppAction::None);
+
+        let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
+
+        assert_eq!(action, AppAction::OpenExternalEditor);
+        assert!(!app.chord);
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn ctrl_x_e_outside_chat_stays_in_tui() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Sessions;
+        assert_eq!(handle_key(&mut app, ctrl_x(), &tx).unwrap(), AppAction::None);
+
+        let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
+
+        assert_eq!(action, AppAction::None);
+        assert!(app.status.contains("only available in chat"));
+    }
+
+    #[test]
+    fn apply_external_editor_outcome_updates_input_on_success() {
+        let mut app = App::new();
+        app.input = "draft".into();
+
+        apply_external_editor_outcome(&mut app, Ok(Some("revised prompt".into())));
+
+        assert_eq!(app.input, "revised prompt");
+        assert_eq!(app.input_cursor, "revised prompt".len());
+        assert_eq!(app.status, "loaded prompt from external editor");
+    }
+
+    #[test]
+    fn apply_external_editor_outcome_keeps_input_on_cancel() {
+        let mut app = App::new();
+        app.input = "draft".into();
+
+        apply_external_editor_outcome(&mut app, Ok(None));
+
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.status, "external editor cancelled");
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "qmt-tui", about = "querymt terminal interface")]
 struct Cli {
@@ -225,6 +367,123 @@ fn detect_launch_cwd() -> Option<String> {
     std::env::current_dir()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorCommand {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+fn parse_editor_command(value: &str) -> Option<EditorCommand> {
+    let parts: Vec<_> = value.split_whitespace().collect();
+    let (program, args) = parts.split_first()?;
+    Some(EditorCommand {
+        program: OsString::from(program),
+        args: args.iter().map(OsString::from).collect(),
+    })
+}
+
+fn editor_command_from_env(env: &[(impl AsRef<str>, Option<impl AsRef<str>>)]) -> Option<EditorCommand> {
+    env.iter().find_map(|(_, value)| {
+        value
+            .as_ref()
+            .and_then(|value| parse_editor_command(value.as_ref().trim()))
+    })
+}
+
+fn system_editor_command() -> Option<EditorCommand> {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppAction {
+    None,
+    OpenExternalEditor,
+}
+
+fn temp_editor_file_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("qmt-tui-editor-{}-{nanos}.md", std::process::id()))
+}
+
+fn run_external_editor(command: &EditorCommand, path: &Path) -> anyhow::Result<Option<String>> {
+    let status = Command::new(&command.program)
+        .args(&command.args)
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read_to_string(path)?))
+}
+
+fn cleanup_temp_editor_file(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn open_external_editor(initial_text: &str) -> anyhow::Result<Option<String>> {
+    let command = system_editor_command()
+        .ok_or_else(|| anyhow::anyhow!("set $VISUAL or $EDITOR to use an external editor"))?;
+    let path = temp_editor_file_path();
+    fs::write(&path, initial_text)?;
+    let result = run_external_editor(&command, &path);
+    let cleanup_result = cleanup_temp_editor_file(&path);
+    cleanup_result?;
+    result
+}
+
+fn apply_external_editor_result(app: &mut App, updated_input: String) {
+    app.input = updated_input;
+    app.input_cursor = app.input.len();
+    app.input_scroll = 0;
+    app.refresh_mention_state();
+}
+
+fn apply_external_editor_outcome(app: &mut App, result: anyhow::Result<Option<String>>) {
+    match result {
+        Ok(Some(updated_input)) => {
+            apply_external_editor_result(app, updated_input);
+            app.status = "loaded prompt from external editor".into();
+        }
+        Ok(None) => {
+            app.status = "external editor cancelled".into();
+        }
+        Err(err) => {
+            app.status = format!("external editor failed: {err}");
+        }
+    }
+}
+
+fn open_external_editor_with_terminal(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    terminal.show_cursor()?;
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let result = open_external_editor(&app.input);
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    terminal.autoresize()?;
+    app.card_cache.invalidate();
+    app.streaming_cache.invalidate();
+    apply_external_editor_outcome(app, result);
+    terminal.draw(|f| ui::draw(f, app))?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -415,7 +674,10 @@ async fn run_loop(
                 if event::poll(Duration::from_millis(0))?
                     && let Event::Key(key) = event::read()?
                 {
-                    handle_key(app, key, cmd_tx)?;
+                    let action = handle_key(app, key, cmd_tx)?;
+                    if matches!(action, AppAction::OpenExternalEditor) {
+                        open_external_editor_with_terminal(terminal, app)?;
+                    }
                 }
             }
         }
@@ -585,7 +847,7 @@ fn handle_key(
     app: &mut App,
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AppAction> {
     if key.code != KeyCode::Esc && app.pending_cancel_confirm_until.is_some() {
         app.clear_cancel_confirm();
         app.refresh_transient_status();
@@ -600,20 +862,28 @@ fn handle_key(
         } else {
             app.should_quit = true;
         }
-        return Ok(());
+        return Ok(AppAction::None);
     }
 
     // chord second key: ctrl+x was pressed, now handle the follow-up
     if app.chord {
         app.chord = false;
         app.status = "ready".into();
-        return handle_chord(app, key, cmd_tx);
+        if key.code == KeyCode::Char('e') {
+            if app.screen != Screen::Chat {
+                app.status = "external editor is only available in chat".into();
+                return Ok(AppAction::None);
+            }
+            return Ok(AppAction::OpenExternalEditor);
+        }
+        handle_chord(app, key, cmd_tx)?;
+        return Ok(AppAction::None);
     }
 
     // elicitation popup takes full control of input when active
     if app.elicitation.is_some() {
         handle_elicitation_key(app, key, cmd_tx)?;
-        return Ok(());
+        return Ok(AppAction::None);
     }
 
     // direct: ctrl+t cycles thinking level
@@ -622,33 +892,33 @@ fn handle_key(
         cmd_tx.send(msg)?;
         app.status = format!("thinking: {}", app.reasoning_effort_label());
         save_cache(app);
-        return Ok(());
+        return Ok(AppAction::None);
     }
 
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.chord = true;
         app.status = "C-x ...".into();
-        return Ok(());
+        return Ok(AppAction::None);
     }
 
     // popup handling
     match app.popup {
         Popup::ModelSelect => {
             handle_model_popup_key(app, key, cmd_tx)?;
-            return Ok(());
+            return Ok(AppAction::None);
         }
         Popup::SessionSelect => {
             handle_session_popup_key(app, key, cmd_tx)?;
-            return Ok(());
+            return Ok(AppAction::None);
         }
         Popup::NewSession => {
             handle_new_session_popup_key(app, key, cmd_tx)?;
-            return Ok(());
+            return Ok(AppAction::None);
         }
         Popup::ThemeSelect => {
             handle_theme_popup_key(app, key)?;
-            return Ok(());
+            return Ok(AppAction::None);
         }
         Popup::Help => {
             match key.code {
@@ -663,7 +933,7 @@ fn handle_key(
                 }
                 _ => {}
             }
-            return Ok(());
+            return Ok(AppAction::None);
         }
         Popup::None => {}
     }
@@ -671,9 +941,8 @@ fn handle_key(
     // global: tab toggles mode when no popup is active
     if key.code == KeyCode::Tab {
         if !can_send_server_commands(app) {
-            return Ok(());
+            return Ok(AppAction::None);
         }
-        // Save outgoing mode state (model + effort) to session cache.
         app.cache_session_mode_state();
 
         let next = app.next_mode().to_string();
@@ -686,11 +955,9 @@ fn handle_key(
         }
         app.agent_mode = next;
 
-        // Restore incoming mode state (model + effort) from session cache.
         for msg in app.apply_cached_mode_state() {
             cmd_tx.send(msg)?;
         }
-        // If no cache entry existed, fall back to mode_model_preferences.
         if !app
             .session_cache
             .get(app.session_id.as_deref().unwrap_or(""))
@@ -701,14 +968,14 @@ fn handle_key(
 
         save_config(app);
         save_cache(app);
-        return Ok(());
+        return Ok(AppAction::None);
     }
 
     match app.screen {
         Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
         Screen::Chat => handle_chat_key(app, key, cmd_tx)?,
     }
-    Ok(())
+    Ok(AppAction::None)
 }
 
 /// Persist current app state to `~/.qmt/tui.toml`.  Called at every
@@ -742,6 +1009,9 @@ fn handle_chord(
         }
         KeyCode::Char('q') => {
             app.should_quit = true;
+        }
+        KeyCode::Char('e') => {
+            app.status = "external editor unavailable here".into();
         }
         KeyCode::Char('s') => {
             if !can_send_server_commands(app) {
@@ -1082,6 +1352,9 @@ fn handle_chat_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
+    if app.input_line_width == 0 {
+        app.input_line_width = 1;
+    }
     match key.code {
         KeyCode::Esc => {
             if app.mention_state.is_some() {
@@ -1142,14 +1415,14 @@ fn handle_chat_key(
             if app.mention_state.is_some() {
                 app.move_mention_selection(-1);
             } else {
-                app.scroll_offset = app.scroll_offset.saturating_add(3);
+                app.input_up_visual(2);
             }
         }
         KeyCode::Down => {
             if app.mention_state.is_some() {
                 app.move_mention_selection(1);
             } else {
-                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                app.input_down_visual(2);
             }
         }
         KeyCode::PageUp => {

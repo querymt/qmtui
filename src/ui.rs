@@ -6,9 +6,161 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
     },
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, ChatEntry, ConnState, Popup, Screen, SessionOp, ToolDetail};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputVisualRow {
+    pub(crate) text: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) columns: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputVisualLayout {
+    pub(crate) rows: Vec<InputVisualRow>,
+    pub(crate) cursor_row: usize,
+    pub(crate) cursor_col: usize,
+    pub(crate) cursor_text_col: usize,
+}
+
+impl InputVisualLayout {
+    pub(crate) fn total_rows(&self) -> usize {
+        self.rows.len().max(1)
+    }
+
+    pub(crate) fn cursor_offset_for_row_col(&self, row: usize, preferred_col: usize) -> usize {
+        let Some(row) = self.rows.get(row) else {
+            return 0;
+        };
+        let mut best = row.end;
+        for (col, offset) in &row.columns {
+            if *col <= preferred_col {
+                best = *offset;
+            } else {
+                break;
+            }
+        }
+        best
+    }
+}
+
+pub(crate) fn build_input_visual_layout(
+    input: &str,
+    input_cursor: usize,
+    line_width: usize,
+    prefix_width: usize,
+) -> InputVisualLayout {
+    let line_width = line_width.max(1);
+    let mut rows: Vec<InputVisualRow> = Vec::new();
+    let mut row_text = String::new();
+    let mut row_columns = vec![(0usize, 0usize)];
+    let mut row_start = 0usize;
+    let mut row_end = 0usize;
+    let mut col = prefix_width;
+    let mut text_col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = prefix_width;
+    let mut cursor_text_col = 0usize;
+    let mut cursor_found = input_cursor == 0;
+
+    let row_prefix_width = |rows_len: usize| if rows_len == 0 { prefix_width } else { 0 };
+
+    if cursor_found {
+        cursor_row = 0;
+        cursor_col = prefix_width;
+        cursor_text_col = 0;
+    }
+
+    let finish_row = |rows: &mut Vec<InputVisualRow>,
+                      row_text: &mut String,
+                      row_columns: &mut Vec<(usize, usize)>,
+                      row_start: &mut usize,
+                      row_end: &mut usize,
+                      next_start: usize| {
+        rows.push(InputVisualRow {
+            text: std::mem::take(row_text),
+            start: *row_start,
+            end: *row_end,
+            columns: std::mem::take(row_columns),
+        });
+        *row_columns = vec![(0, next_start)];
+        *row_start = next_start;
+        *row_end = next_start;
+    };
+
+    for (byte_idx, ch) in input.char_indices() {
+        if !cursor_found && byte_idx == input_cursor {
+            cursor_row = rows.len();
+            cursor_col = col;
+            cursor_text_col = text_col;
+            cursor_found = true;
+        }
+
+        if ch == '\n' {
+            row_end = byte_idx;
+            finish_row(
+                &mut rows,
+                &mut row_text,
+                &mut row_columns,
+                &mut row_start,
+                &mut row_end,
+                byte_idx + ch.len_utf8(),
+            );
+            col = row_prefix_width(rows.len());
+            text_col = 0;
+            continue;
+        }
+
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width > 0 && col + ch_width > line_width {
+            finish_row(
+                &mut rows,
+                &mut row_text,
+                &mut row_columns,
+                &mut row_start,
+                &mut row_end,
+                byte_idx,
+            );
+            col = row_prefix_width(rows.len());
+            text_col = 0;
+            if !cursor_found && byte_idx == input_cursor {
+                cursor_row = rows.len();
+                cursor_col = col;
+                cursor_text_col = 0;
+                cursor_found = true;
+            }
+        }
+
+        row_text.push(ch);
+        col += ch_width;
+        text_col += ch_width;
+        row_end = byte_idx + ch.len_utf8();
+        row_columns.push((text_col, row_end));
+    }
+
+    if !cursor_found && input_cursor == input.len() {
+        cursor_row = rows.len();
+        cursor_col = col;
+        cursor_text_col = text_col;
+    }
+
+    rows.push(InputVisualRow {
+        text: row_text,
+        start: row_start,
+        end: row_end,
+        columns: row_columns,
+    });
+
+    InputVisualLayout {
+        rows,
+        cursor_row,
+        cursor_col,
+        cursor_text_col,
+    }
+}
 
 const BRAILLE_SPINNER: &[char] = &[
     '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
@@ -800,19 +952,16 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     };
 
     // Compute how many visual rows the input text needs when wrapped.
-    // The inner width is area.width minus 4 (2 horizontal padding on each side).
-    // The prefix "> " takes 2 columns.
     let input_inner_width = area.width.saturating_sub(4) as usize;
     let prefix_width = 2usize; // "> "
-    let text_display_width = UnicodeWidthStr::width(app.input.as_str());
-    let total_display_width = prefix_width + text_display_width;
-    let wrapped_lines = if input_inner_width == 0 {
-        1
-    } else {
-        total_display_width.max(1).div_ceil(input_inner_width) as u16
-    };
+    let input_layout = build_input_visual_layout(
+        &app.input,
+        app.input_cursor,
+        input_inner_width.max(1),
+        prefix_width,
+    );
     let max_input_lines: u16 = 5;
-    let input_height = wrapped_lines.clamp(1, max_input_lines) + 1; // +1 bottom padding
+    let input_height = (input_layout.total_rows() as u16).clamp(1, max_input_lines) + 1; // +1 bottom padding
 
     // Elicitation popup height: header (2) + message (1) + blank (1) + options/field + hint (1)
     let elicitation_height: u16 = if let Some(state) = &app.elicitation {
@@ -953,6 +1102,7 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
         .padding(Padding::new(2, 2, 0, 1))
         .style(Theme::input());
     let inner = input_bg.inner(chunks[5]);
+    app.input_line_width = (inner.width as usize).max(1);
     f.render_widget(input_bg, chunks[5]);
 
     let (label_text, label_style) = match app.pending_session_op {
@@ -981,104 +1131,38 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     };
     let input_style = Theme::input();
 
-    // Build wrapped lines manually (character-level wrapping) so cursor
-    // position is guaranteed to match the rendered output.
-    let line_width = (inner.width as usize).max(1);
+    let layout = build_input_visual_layout(&app.input, app.input_cursor, app.input_line_width, prefix_width);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut cur_spans: Vec<Span<'static>> = Vec::new();
-    let mut col: usize = 0;
-    let mut cursor_row: usize = 0;
-    let mut cursor_col: usize = 0;
-    let mut cursor_found = false;
-
-    // Helper: flush accumulated text into a span and push it
-    // We'll walk through label chars then input chars, tracking style + cursor.
-    let label_byte_len = label_text.len();
-    let combined = format!("{label_text}{}", app.input);
-
-    let mut byte_offset: usize = 0;
-    let mut current_run_start: usize = 0;
-    let mut current_style = label_style;
-
-    for ch in combined.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        let in_label = byte_offset < label_byte_len;
-        let style = if in_label { label_style } else { input_style };
-
-        // Style changed — flush the current run
-        if style != current_style && byte_offset > current_run_start {
-            cur_spans.push(Span::styled(
-                combined[current_run_start..byte_offset].to_string(),
-                current_style,
-            ));
-            current_run_start = byte_offset;
-            current_style = style;
+    for (idx, row) in layout.rows.iter().enumerate() {
+        if idx == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(label_text.clone(), label_style),
+                Span::styled(row.text.clone(), input_style),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(row.text.clone(), input_style)));
         }
-
-        // Check if cursor is at this position (before placing the char)
-        if !cursor_found && !in_label && (byte_offset - label_byte_len) == app.input_cursor {
-            cursor_row = lines.len();
-            cursor_col = col;
-            cursor_found = true;
-        }
-
-        // Wrap: if adding this char would exceed the line width, break here
-        if ch_width > 0 && col + ch_width > line_width {
-            // flush current run up to this char
-            if byte_offset > current_run_start {
-                cur_spans.push(Span::styled(
-                    combined[current_run_start..byte_offset].to_string(),
-                    current_style,
-                ));
-                current_run_start = byte_offset;
-            }
-            lines.push(Line::from(std::mem::take(&mut cur_spans)));
-            col = 0;
-        }
-
-        col += ch_width;
-        byte_offset += ch.len_utf8();
     }
-
-    // Cursor at the very end of input
-    if !cursor_found {
-        cursor_row = lines.len();
-        cursor_col = col;
-    }
-
-    // Flush remaining run
-    if byte_offset > current_run_start {
-        cur_spans.push(Span::styled(
-            combined[current_run_start..byte_offset].to_string(),
-            current_style,
-        ));
-    }
-    if !cur_spans.is_empty() {
-        lines.push(Line::from(cur_spans));
-    }
-    // Ensure at least one empty line so the input area isn't blank
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("", input_style)));
     }
 
-    // Scroll the input so the cursor row is always visible.
     let total_lines = lines.len() as u16;
     let visible = inner.height;
-    if (cursor_row as u16) >= app.input_scroll + visible {
-        app.input_scroll = (cursor_row as u16) - visible + 1;
+    if (layout.cursor_row as u16) >= app.input_scroll + visible {
+        app.input_scroll = (layout.cursor_row as u16) - visible + 1;
     }
-    if (cursor_row as u16) < app.input_scroll {
-        app.input_scroll = cursor_row as u16;
+    if (layout.cursor_row as u16) < app.input_scroll {
+        app.input_scroll = layout.cursor_row as u16;
     }
     app.input_scroll = app.input_scroll.min(total_lines.saturating_sub(visible));
 
     f.render_widget(Paragraph::new(lines).scroll((app.input_scroll, 0)), inner);
 
-    // Set cursor position (adjusted for scroll)
     if !app.is_busy_for_input() {
-        let visual_row = (cursor_row as u16).saturating_sub(app.input_scroll);
+        let visual_row = (layout.cursor_row as u16).saturating_sub(app.input_scroll);
         if visual_row < visible {
-            f.set_cursor_position((inner.x + cursor_col as u16, inner.y + visual_row));
+            f.set_cursor_position((inner.x + layout.cursor_col as u16, inner.y + visual_row));
         }
     }
 }
@@ -2402,6 +2486,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             title: "chord  (C-x \u{2026})",
             rows: &[
                 ("?", "this help"),
+                ("e", "external editor"),
                 ("m", "model selector"),
                 ("n", "new session"),
                 ("q", "quit"),
@@ -2556,6 +2641,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, ToolDetail};
+    use ratatui::backend::Backend;
+    use ratatui::layout::Position;
     use std::time::{Duration, Instant};
 
     fn tool_call(name: &str) -> ChatEntry {
@@ -2565,6 +2652,39 @@ mod tests {
             is_error: false,
             detail: ToolDetail::None,
         }
+    }
+
+    fn render_chat_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_chat(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn input_visual_layout_wraps_long_lines_and_tracks_cursor() {
+        let layout = build_input_visual_layout("abcdef", 4, 4, 2);
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!(layout.rows[0].text, "ab");
+        assert_eq!(layout.rows[1].text, "cdef");
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 2);
+    }
+
+    #[test]
+    fn input_visual_layout_preserves_hard_break_rows() {
+        let layout = build_input_visual_layout("ab\ncd", 3, 6, 2);
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!(layout.rows[0].text, "ab");
+        assert_eq!(layout.rows[1].text, "cd");
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 0);
+    }
+
+    fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
     }
 
     #[test]
@@ -2582,10 +2702,7 @@ mod tests {
             },
         );
 
-        let backend = ratatui::backend::TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_chat_buffer(&mut app, 80, 8);
         let rendered = buffer
             .content()
             .iter()
@@ -2599,8 +2716,7 @@ mod tests {
                 last_event_at: Instant::now(),
             },
         );
-        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_chat_buffer(&mut app, 80, 8);
         let rendered = buffer
             .content()
             .iter()
@@ -2615,8 +2731,7 @@ mod tests {
                 last_event_at: Instant::now(),
             },
         );
-        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_chat_buffer(&mut app, 80, 8);
         let rendered = buffer
             .content()
             .iter()
@@ -2630,8 +2745,7 @@ mod tests {
                 last_event_at: Instant::now() - Duration::from_secs(6),
             },
         );
-        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = render_chat_buffer(&mut app, 80, 8);
         let rendered = buffer
             .content()
             .iter()
@@ -2639,6 +2753,38 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 1")));
         assert!(!rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
+    }
+
+    #[test]
+    fn draw_chat_preserves_hard_line_breaks_in_input() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.input = "alpha\nbeta".into();
+        app.input_cursor = app.input.len();
+
+        let buffer = render_chat_buffer(&mut app, 40, 10);
+        let line1 = buffer_line(&buffer, 7);
+        let line2 = buffer_line(&buffer, 8);
+
+        assert!(line1.contains("> alpha"), "first input line missing: {line1:?}");
+        assert!(line2.contains("beta"), "second input line missing: {line2:?}");
+    }
+
+    #[test]
+    fn draw_chat_places_cursor_on_next_row_after_newline() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.input = "alpha\nbeta".into();
+        app.input_cursor = "alpha\n".len();
+
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+
+        assert_eq!(cursor, Position::new(2, 8));
     }
 
     #[test]
@@ -3296,6 +3442,18 @@ mod tests {
         assert!(
             chord.rows.iter().any(|&(k, _)| k == "?"),
             "chord section must have a '?' row"
+        );
+    }
+
+    #[test]
+    fn shortcut_sections_chord_contains_external_editor_entry() {
+        let chord = shortcut_sections()
+            .iter()
+            .find(|s| s.title.contains("chord"))
+            .expect("chord section missing");
+        assert!(
+            chord.rows.iter().any(|&(k, d)| k == "e" && d == "external editor"),
+            "chord section must advertise the external editor shortcut"
         );
     }
 

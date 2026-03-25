@@ -9,7 +9,10 @@ use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
 use crate::protocol::*;
-use crate::ui::{CardCache, ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
+use crate::ui::{
+    CardCache, ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_input_visual_layout,
+    build_write_lines,
+};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
 /// Invalidated when `streaming_content` grows or is cleared.
@@ -660,6 +663,8 @@ pub struct App {
     pub input: String,
     pub input_cursor: usize,
     pub input_scroll: u16,
+    pub input_line_width: usize,
+    pub input_preferred_col: Option<usize>,
     pub scroll_offset: u16,
     pub is_thinking: bool,
     pub pending_session_op: Option<SessionOp>,
@@ -754,6 +759,8 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             input_scroll: 0,
+            input_line_width: 1,
+            input_preferred_col: None,
             scroll_offset: 0,
             is_thinking: false,
             pending_session_op: None,
@@ -2043,7 +2050,12 @@ impl App {
 
     // -- input helpers --
 
+    fn reset_input_preferred_col(&mut self) {
+        self.input_preferred_col = None;
+    }
+
     pub fn input_insert(&mut self, c: char) {
+        self.reset_input_preferred_col();
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
         self.refresh_mention_state();
@@ -2051,6 +2063,7 @@ impl App {
 
     pub fn input_backspace(&mut self) {
         if self.input_cursor > 0 {
+            self.reset_input_preferred_col();
             let prev = self.input[..self.input_cursor]
                 .char_indices()
                 .last()
@@ -2064,6 +2077,7 @@ impl App {
 
     pub fn input_delete(&mut self) {
         if self.input_cursor < self.input.len() {
+            self.reset_input_preferred_col();
             let next = self.input[self.input_cursor..]
                 .char_indices()
                 .nth(1)
@@ -2076,6 +2090,7 @@ impl App {
 
     pub fn input_left(&mut self) {
         if self.input_cursor > 0 {
+            self.reset_input_preferred_col();
             self.input_cursor = self.input[..self.input_cursor]
                 .char_indices()
                 .last()
@@ -2087,6 +2102,7 @@ impl App {
 
     pub fn input_right(&mut self) {
         if self.input_cursor < self.input.len() {
+            self.reset_input_preferred_col();
             self.input_cursor = self.input[self.input_cursor..]
                 .char_indices()
                 .nth(1)
@@ -2097,12 +2113,48 @@ impl App {
     }
 
     pub fn input_home(&mut self) {
+        self.reset_input_preferred_col();
         self.input_cursor = 0;
         self.refresh_mention_state();
     }
 
     pub fn input_end(&mut self) {
+        self.reset_input_preferred_col();
         self.input_cursor = self.input.len();
+        self.refresh_mention_state();
+    }
+
+    pub fn input_up_visual(&mut self, prefix_width: usize) {
+        let layout = build_input_visual_layout(
+            &self.input,
+            self.input_cursor,
+            self.input_line_width,
+            prefix_width,
+        );
+        if layout.cursor_row == 0 {
+            self.input_preferred_col = Some(layout.cursor_text_col);
+            return;
+        }
+        let preferred_col = self.input_preferred_col.unwrap_or(layout.cursor_text_col);
+        self.input_cursor = layout.cursor_offset_for_row_col(layout.cursor_row - 1, preferred_col);
+        self.input_preferred_col = Some(preferred_col);
+        self.refresh_mention_state();
+    }
+
+    pub fn input_down_visual(&mut self, prefix_width: usize) {
+        let layout = build_input_visual_layout(
+            &self.input,
+            self.input_cursor,
+            self.input_line_width,
+            prefix_width,
+        );
+        if layout.cursor_row + 1 >= layout.total_rows() {
+            self.input_preferred_col = Some(layout.cursor_text_col);
+            return;
+        }
+        let preferred_col = self.input_preferred_col.unwrap_or(layout.cursor_text_col);
+        self.input_cursor = layout.cursor_offset_for_row_col(layout.cursor_row + 1, preferred_col);
+        self.input_preferred_col = Some(preferred_col);
         self.refresh_mention_state();
     }
 
@@ -2442,6 +2494,7 @@ impl App {
     pub fn take_input(&mut self) -> String {
         self.input_cursor = 0;
         self.input_scroll = 0;
+        self.input_preferred_col = None;
         self.scroll_offset = 0;
         self.mention_state = None;
         std::mem::take(&mut self.input)
@@ -3799,6 +3852,57 @@ mod tests {
         assert_eq!(ranked[0], "src/main.rs");
         assert!(ranked.contains(&"src/manifest.toml"));
         assert!(ranked.contains(&"tests/main_spec.rs"));
+    }
+
+    #[test]
+    fn input_up_visual_moves_to_previous_wrapped_row() {
+        let mut app = App::new();
+        app.input = "abcdef".into();
+        app.input_cursor = 4;
+        app.input_line_width = 4;
+
+        app.input_up_visual(2);
+
+        assert_eq!(app.input_cursor, 2);
+        assert_eq!(app.input_preferred_col, Some(2));
+    }
+
+    #[test]
+    fn input_down_visual_moves_to_next_wrapped_row() {
+        let mut app = App::new();
+        app.input = "abcdef".into();
+        app.input_cursor = 2;
+        app.input_line_width = 4;
+
+        app.input_down_visual(2);
+
+        assert_eq!(app.input_cursor, 4);
+        assert_eq!(app.input_preferred_col, Some(2));
+    }
+
+    #[test]
+    fn input_down_visual_crosses_newline_boundary() {
+        let mut app = App::new();
+        app.input = "ab\ncd".into();
+        app.input_cursor = 1;
+        app.input_line_width = 6;
+
+        app.input_down_visual(2);
+
+        assert_eq!(app.input_cursor, 4);
+    }
+
+    #[test]
+    fn input_horizontal_move_resets_preferred_column() {
+        let mut app = App::new();
+        app.input = "abcdef".into();
+        app.input_cursor = 4;
+        app.input_preferred_col = Some(2);
+
+        app.input_left();
+
+        assert_eq!(app.input_cursor, 3);
+        assert_eq!(app.input_preferred_col, None);
     }
 
     #[test]
