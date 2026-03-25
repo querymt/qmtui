@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use app::{App, Popup, Screen};
+use app::{ActivityState, App, Popup, Screen};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -242,11 +242,21 @@ mod external_editor_tests {
         app.input_line_width = 4;
         app.scroll_offset = 7;
 
-        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), &tx).unwrap();
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
         assert_eq!(app.input_cursor, 2);
         assert_eq!(app.scroll_offset, 7);
 
-        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &tx).unwrap();
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
         assert_eq!(app.input_cursor, 4);
         assert_eq!(app.scroll_offset, 7);
     }
@@ -258,12 +268,20 @@ mod external_editor_tests {
         app.screen = Screen::Chat;
         app.scroll_offset = 3;
 
-        handle_chat_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()), &tx)
-            .unwrap();
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
         assert_eq!(app.scroll_offset, 13);
 
-        handle_chat_key(&mut app, KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()), &tx)
-            .unwrap();
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
         assert_eq!(app.scroll_offset, 3);
     }
 
@@ -309,7 +327,10 @@ mod external_editor_tests {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "draft".into();
-        assert_eq!(handle_key(&mut app, ctrl_x(), &tx).unwrap(), AppAction::None);
+        assert_eq!(
+            handle_key(&mut app, ctrl_x(), &tx).unwrap(),
+            AppAction::None
+        );
 
         let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
 
@@ -323,7 +344,10 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
         app.screen = Screen::Sessions;
-        assert_eq!(handle_key(&mut app, ctrl_x(), &tx).unwrap(), AppAction::None);
+        assert_eq!(
+            handle_key(&mut app, ctrl_x(), &tx).unwrap(),
+            AppAction::None
+        );
 
         let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
 
@@ -352,6 +376,161 @@ mod external_editor_tests {
 
         assert_eq!(app.input, "draft");
         assert_eq!(app.status, "external editor cancelled");
+    }
+
+    #[test]
+    fn chat_input_accepts_typing_and_submit_while_turn_active() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.activity = ActivityState::RunningTool {
+            name: "read_tool".into(),
+        };
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("prompt sent"),
+            ClientMsg::Prompt { prompt } if matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
+        ));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn chat_double_esc_cancels_running_tool_phase() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.activity = ActivityState::RunningTool {
+            name: "read_tool".into(),
+        };
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert!(app.cancel_confirm_active());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().expect("cancel sent"),
+            ClientMsg::CancelSession
+        ));
+        assert_eq!(app.status, "stopping...");
+    }
+
+    #[test]
+    fn chat_input_is_blocked_while_undo_is_pending() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.activity = ActivityState::SessionOp(app::SessionOp::Undo);
+        app.input = "draft".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.input, "draft");
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.input, "draft");
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.input_cursor, "draft".len());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.input, "draft");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn chat_input_is_blocked_while_cancel_confirm_is_active() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.activity = ActivityState::RunningTool {
+            name: "read_tool".into(),
+        };
+        app.input = "draft".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert!(app.cancel_confirm_active());
+        assert!(app.input_blocked_by_activity());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.input, "draft");
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.status, "press Esc again to stop");
+        assert!(rx.try_recv().is_err());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.status, "stopping...");
+        assert!(matches!(
+            rx.try_recv().expect("cancel sent"),
+            ClientMsg::CancelSession
+        ));
     }
 }
 
@@ -384,7 +563,9 @@ fn parse_editor_command(value: &str) -> Option<EditorCommand> {
     })
 }
 
-fn editor_command_from_env(env: &[(impl AsRef<str>, Option<impl AsRef<str>>)]) -> Option<EditorCommand> {
+fn editor_command_from_env(
+    env: &[(impl AsRef<str>, Option<impl AsRef<str>>)],
+) -> Option<EditorCommand> {
     env.iter().find_map(|(_, value)| {
         value
             .as_ref()
@@ -1036,9 +1217,9 @@ fn handle_chord(
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if app.is_thinking {
-                app.status = "cannot undo while thinking".into();
-            } else if app.pending_session_op.is_some() || app.has_pending_undo() {
+            if app.is_turn_active() {
+                app.status = "cannot undo while agent is active".into();
+            } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.status = "undo already pending".into();
             } else if let Some(turn) = app.current_undo_target().cloned() {
                 if app.input.trim().is_empty() && !turn.text.is_empty() {
@@ -1047,7 +1228,7 @@ fn handle_chord(
                     app.input_scroll = 0;
                 }
                 app.push_pending_undo(&turn);
-                app.pending_session_op = Some(app::SessionOp::Undo);
+                app.activity = ActivityState::SessionOp(app::SessionOp::Undo);
                 app.status = "undoing...".into();
                 cmd_tx.send(ClientMsg::Undo {
                     message_id: turn.message_id,
@@ -1060,12 +1241,12 @@ fn handle_chord(
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if app.is_thinking {
-                app.status = "cannot redo while thinking".into();
-            } else if app.pending_session_op.is_some() || app.has_pending_undo() {
+            if app.is_turn_active() {
+                app.status = "cannot redo while agent is active".into();
+            } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.status = "undo already pending".into();
             } else if app.can_redo() {
-                app.pending_session_op = Some(app::SessionOp::Redo);
+                app.activity = ActivityState::SessionOp(app::SessionOp::Redo);
                 app.status = "redoing...".into();
                 cmd_tx.send(ClientMsg::Redo)?;
             } else {
@@ -1355,12 +1536,13 @@ fn handle_chat_key(
     if app.input_line_width == 0 {
         app.input_line_width = 1;
     }
+    let input_blocked = app.input_blocked_by_activity();
     match key.code {
         KeyCode::Esc => {
             if app.mention_state.is_some() {
                 app.mention_state = None;
                 app.clear_cancel_confirm();
-            } else if app.is_thinking {
+            } else if app.has_cancellable_activity() {
                 if app.cancel_confirm_active() {
                     app.clear_cancel_confirm();
                     app.status = "stopping...".into();
@@ -1379,8 +1561,8 @@ fn handle_chat_key(
                 }
                 return Ok(());
             }
-            if !app.input.is_empty() && !app.is_busy_for_input() {
-                if !can_send_server_commands(app) {
+            if !app.input.is_empty() {
+                if input_blocked || !can_send_server_commands(app) {
                     return Ok(());
                 }
                 let (text, links) = app.build_prompt_text_and_links(&app.input);
@@ -1396,7 +1578,8 @@ fn handle_chat_key(
             }
         }
         KeyCode::Tab => {
-            if app.mention_state.is_some()
+            if !input_blocked
+                && app.mention_state.is_some()
                 && app.accept_selected_mention()
                 && let Some(msg) = app.request_file_index_if_needed()
             {
@@ -1404,7 +1587,7 @@ fn handle_chat_key(
             }
         }
         KeyCode::Char(c) => {
-            if !app.is_busy_for_input() {
+            if !input_blocked {
                 app.input_insert(c);
                 if let Some(msg) = app.request_file_index_if_needed() {
                     cmd_tx.send(msg)?;
@@ -1412,6 +1595,9 @@ fn handle_chat_key(
             }
         }
         KeyCode::Up => {
+            if input_blocked {
+                return Ok(());
+            }
             if app.mention_state.is_some() {
                 app.move_mention_selection(-1);
             } else {
@@ -1419,6 +1605,9 @@ fn handle_chat_key(
             }
         }
         KeyCode::Down => {
+            if input_blocked {
+                return Ok(());
+            }
             if app.mention_state.is_some() {
                 app.move_mention_selection(1);
             } else {
@@ -1431,13 +1620,35 @@ fn handle_chat_key(
         KeyCode::PageDown => {
             app.scroll_offset = app.scroll_offset.saturating_sub(10);
         }
-        KeyCode::Backspace => app.input_backspace(),
-        KeyCode::Delete => app.input_delete(),
-        KeyCode::Left => app.input_left(),
-        KeyCode::Right => app.input_right(),
-        KeyCode::Home => app.input_home(),
+        KeyCode::Backspace => {
+            if !input_blocked {
+                app.input_backspace();
+            }
+        }
+        KeyCode::Delete => {
+            if !input_blocked {
+                app.input_delete();
+            }
+        }
+        KeyCode::Left => {
+            if !input_blocked {
+                app.input_left();
+            }
+        }
+        KeyCode::Right => {
+            if !input_blocked {
+                app.input_right();
+            }
+        }
+        KeyCode::Home => {
+            if !input_blocked {
+                app.input_home();
+            }
+        }
         KeyCode::End => {
-            if app.input.is_empty() {
+            if input_blocked {
+                app.scroll_offset = 0;
+            } else if app.input.is_empty() {
                 app.scroll_offset = 0; // snap to bottom
             } else {
                 app.input_end();

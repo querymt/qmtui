@@ -8,7 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, ChatEntry, ConnState, Popup, Screen, SessionOp, ToolDetail};
+use crate::app::{ActivityState, App, ChatEntry, ConnState, Popup, Screen, SessionOp, ToolDetail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputVisualRow {
@@ -162,10 +162,7 @@ pub(crate) fn build_input_visual_layout(
     }
 }
 
-const BRAILLE_SPINNER: &[char] = &[
-    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
-    '\u{2807}', '\u{280F}',
-];
+const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 // ── Elicitation symbols ───────────────────────────────────────────────────────
 const RADIO_SELECTED: &str = "\u{25CF} "; // ● filled circle  – single-select active
@@ -193,8 +190,27 @@ pub(crate) const ELLIPSIS: &str = "\u{2026}"; // … horizontal ellipsis – tru
 const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 
-fn spinner(tick: u64) -> char {
-    BRAILLE_SPINNER[(tick as usize / 2) % BRAILLE_SPINNER.len()]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpinnerKind {
+    Braille,
+    Line,
+    Dots,
+}
+
+const LINE_SPINNER: &[&str] = &["-", "\\", "|", "/"];
+const DOTS_SPINNER: &[&str] = &[".  ", ".. ", "..."];
+
+fn spinner_frames(kind: SpinnerKind) -> &'static [&'static str] {
+    match kind {
+        SpinnerKind::Braille => BRAILLE_SPINNER,
+        SpinnerKind::Line => LINE_SPINNER,
+        SpinnerKind::Dots => DOTS_SPINNER,
+    }
+}
+
+fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
+    let frames = spinner_frames(kind);
+    frames[(tick as usize / 2) % frames.len()]
 }
 use crate::markdown;
 use crate::theme::Theme;
@@ -1085,14 +1101,16 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     }
 
     // input border line reflects active session state
-    let border_style = match app.pending_session_op {
-        Some(SessionOp::Undo) => Theme::input_border_undo(),
-        Some(SessionOp::Redo) => Theme::input_border_redo(),
-        None if app.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
-        None if app.live_compaction.is_some() => Theme::input_border_compacting(),
-        None if app.is_thinking => Theme::input_border_thinking(),
-        None if app.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
-        None => Theme::mode_border(&app.agent_mode),
+    let border_style = match &app.activity {
+        ActivityState::SessionOp(SessionOp::Undo) => Theme::input_border_undo(),
+        ActivityState::SessionOp(SessionOp::Redo) => Theme::input_border_redo(),
+        _ if app.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
+        ActivityState::Compacting { .. } => Theme::input_border_compacting(),
+        ActivityState::Thinking | ActivityState::Streaming | ActivityState::RunningTool { .. } => {
+            Theme::input_border_thinking()
+        }
+        _ if app.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
+        _ => Theme::mode_border(&app.agent_mode),
     };
     let border_line = Paragraph::new("▔".repeat(chunks[4].width as usize)).style(border_style);
     f.render_widget(border_line, chunks[4]);
@@ -1105,61 +1123,78 @@ fn draw_chat(f: &mut Frame, app: &mut App) {
     app.input_line_width = (inner.width as usize).max(1);
     f.render_widget(input_bg, chunks[5]);
 
-    let (label_text, label_style) = match app.pending_session_op {
-        Some(SessionOp::Undo) => (
-            format!("{} undoing ", spinner(app.tick)),
+    let (label_text, label_style) = match &app.activity {
+        ActivityState::SessionOp(SessionOp::Undo) => (
+            format!("{} undoing ", spinner(SpinnerKind::Braille, app.tick)),
             Theme::input_undo(),
         ),
-        Some(SessionOp::Redo) => (
-            format!("{} redoing ", spinner(app.tick)),
+        ActivityState::SessionOp(SessionOp::Redo) => (
+            format!("{} redoing ", spinner(SpinnerKind::Braille, app.tick)),
             Theme::input_redo(),
         ),
-        None if app.cancel_confirm_active() => (
-            format!("{} Esc again to stop ", spinner(app.tick)),
+        _ if app.cancel_confirm_active() => (
+            format!(
+                "{} Esc again to stop ",
+                spinner(SpinnerKind::Braille, app.tick)
+            ),
             Theme::input_cancel_confirm(),
         ),
-        None if app.live_compaction.is_some() => (
-            format!("{} compacting ", spinner(app.tick)),
-            Theme::input_compacting(),
+        ActivityState::Compacting { .. }
+        | ActivityState::RunningTool { .. }
+        | ActivityState::Thinking
+        | ActivityState::Streaming => (
+            format!("{} ", spinner(SpinnerKind::Braille, app.tick)),
+            Theme::input_thinking(),
         ),
-        None if app.is_thinking => (format!("{} ", spinner(app.tick)), Theme::input_thinking()),
-        None if app.elicitation.is_some() => (
+        _ if app.elicitation.is_some() => (
             format!("  answer above {ARROW_UP} "),
             Theme::input_thinking(),
         ),
-        None => ("> ".into(), Theme::mode_border(&app.agent_mode)),
+        _ => ("> ".into(), Theme::mode_border(&app.agent_mode)),
     };
     let input_style = Theme::input();
+    let hide_input_contents = app.should_hide_input_contents();
 
-    let layout = build_input_visual_layout(&app.input, app.input_cursor, app.input_line_width, prefix_width);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (idx, row) in layout.rows.iter().enumerate() {
-        if idx == 0 {
-            lines.push(Line::from(vec![
-                Span::styled(label_text.clone(), label_style),
-                Span::styled(row.text.clone(), input_style),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(row.text.clone(), input_style)));
+    if hide_input_contents {
+        app.input_scroll = 0;
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(label_text, label_style))),
+            inner,
+        );
+    } else {
+        let layout = build_input_visual_layout(
+            &app.input,
+            app.input_cursor,
+            app.input_line_width,
+            prefix_width,
+        );
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (idx, row) in layout.rows.iter().enumerate() {
+            if idx == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(label_text.clone(), label_style),
+                    Span::styled(row.text.clone(), input_style),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(row.text.clone(), input_style)));
+            }
         }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled("", input_style)));
-    }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("", input_style)));
+        }
 
-    let total_lines = lines.len() as u16;
-    let visible = inner.height;
-    if (layout.cursor_row as u16) >= app.input_scroll + visible {
-        app.input_scroll = (layout.cursor_row as u16) - visible + 1;
-    }
-    if (layout.cursor_row as u16) < app.input_scroll {
-        app.input_scroll = layout.cursor_row as u16;
-    }
-    app.input_scroll = app.input_scroll.min(total_lines.saturating_sub(visible));
+        let total_lines = lines.len() as u16;
+        let visible = inner.height;
+        if (layout.cursor_row as u16) >= app.input_scroll + visible {
+            app.input_scroll = (layout.cursor_row as u16) - visible + 1;
+        }
+        if (layout.cursor_row as u16) < app.input_scroll {
+            app.input_scroll = layout.cursor_row as u16;
+        }
+        app.input_scroll = app.input_scroll.min(total_lines.saturating_sub(visible));
 
-    f.render_widget(Paragraph::new(lines).scroll((app.input_scroll, 0)), inner);
+        f.render_widget(Paragraph::new(lines).scroll((app.input_scroll, 0)), inner);
 
-    if !app.is_busy_for_input() {
         let visual_row = (layout.cursor_row as u16).saturating_sub(app.input_scroll);
         if visual_row < visible {
             f.set_cursor_position((inner.x + layout.cursor_col as u16, inner.y + visual_row));
@@ -1511,7 +1546,7 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     if app.file_index_loading && app.file_index.is_empty() {
         items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("{} indexing files", spinner(app.tick)),
+            format!("{} indexing files", spinner(SpinnerKind::Braille, app.tick)),
             Theme::thinking(),
         )])));
     } else if let Some(error) = &app.file_index_error {
@@ -1560,6 +1595,19 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
 
 /// Build the transient streaming/thinking card (not cached, rebuilt every frame).
 fn build_streaming_card(app: &mut App) -> Option<Card> {
+    let activity_text = match &app.activity {
+        ActivityState::RunningTool { name } => {
+            format!("{} tool: {name}", spinner(SpinnerKind::Braille, app.tick))
+        }
+        ActivityState::Compacting { .. } => {
+            format!("{} compacting", spinner(SpinnerKind::Braille, app.tick))
+        }
+        ActivityState::Streaming => {
+            format!("{} streaming", spinner(SpinnerKind::Braille, app.tick))
+        }
+        _ => format!("{} thinking", spinner(SpinnerKind::Braille, app.tick)),
+    };
+
     if !app.streaming_content.is_empty() {
         let content_len = app.streaming_content.len();
         let mut lines = if let Some(cached) = app.streaming_cache.get(content_len) {
@@ -1570,18 +1618,12 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
             app.streaming_cache.store(content_len, rendered.clone());
             rendered
         };
-        lines.push(Line::from(Span::styled(
-            spinner(app.tick).to_string(),
-            Theme::thinking(),
-        )));
+        lines.push(Line::from(Span::styled(activity_text, Theme::thinking())));
         Some(Card::new(CardKind::Streaming, lines))
-    } else if app.is_thinking {
+    } else if app.is_turn_active() {
         Some(Card::new(
             CardKind::Thinking,
-            vec![Line::from(Span::styled(
-                format!("{} thinking", spinner(app.tick)),
-                Theme::thinking(),
-            ))],
+            vec![Line::from(Span::styled(activity_text, Theme::thinking()))],
         ))
     } else {
         None
@@ -2662,6 +2704,13 @@ mod tests {
     }
 
     #[test]
+    fn spinner_supports_all_defined_kinds() {
+        assert_eq!(spinner(SpinnerKind::Braille, 0), "⠋");
+        assert_eq!(spinner(SpinnerKind::Line, 0), "-");
+        assert_eq!(spinner(SpinnerKind::Dots, 0), ".  ");
+    }
+
+    #[test]
     fn input_visual_layout_wraps_long_lines_and_tracks_cursor() {
         let layout = build_input_visual_layout("abcdef", 4, 4, 2);
         assert_eq!(layout.rows.len(), 2);
@@ -2767,8 +2816,14 @@ mod tests {
         let line1 = buffer_line(&buffer, 7);
         let line2 = buffer_line(&buffer, 8);
 
-        assert!(line1.contains("> alpha"), "first input line missing: {line1:?}");
-        assert!(line2.contains("beta"), "second input line missing: {line2:?}");
+        assert!(
+            line1.contains("> alpha"),
+            "first input line missing: {line1:?}"
+        );
+        assert!(
+            line2.contains("beta"),
+            "second input line missing: {line2:?}"
+        );
     }
 
     #[test]
@@ -3452,7 +3507,10 @@ mod tests {
             .find(|s| s.title.contains("chord"))
             .expect("chord section missing");
         assert!(
-            chord.rows.iter().any(|&(k, d)| k == "e" && d == "external editor"),
+            chord
+                .rows
+                .iter()
+                .any(|&(k, d)| k == "e" && d == "external editor"),
             "chord section must advertise the external editor shortcut"
         );
     }

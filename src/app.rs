@@ -149,11 +149,6 @@ pub struct PathCompletionState {
     pub results: Vec<FileIndexEntryLite>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveCompactionState {
-    pub token_estimate: u32,
-}
-
 // ── Elicitation types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -553,6 +548,16 @@ pub enum SessionOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityState {
+    Idle,
+    Thinking,
+    Streaming,
+    RunningTool { name: String },
+    Compacting { token_estimate: u32 },
+    SessionOp(SessionOp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connecting { attempt: u32, delay_ms: u64 },
     Connected,
@@ -666,8 +671,7 @@ pub struct App {
     pub input_line_width: usize,
     pub input_preferred_col: Option<usize>,
     pub scroll_offset: u16,
-    pub is_thinking: bool,
-    pub pending_session_op: Option<SessionOp>,
+    pub activity: ActivityState,
     pub streaming_content: String,
     pub streaming_cache: StreamingCache,
     pub file_index: Vec<FileIndexEntryLite>,
@@ -675,7 +679,6 @@ pub struct App {
     pub file_index_loading: bool,
     pub file_index_error: Option<String>,
     pub mention_state: Option<MentionState>,
-    pub live_compaction: Option<LiveCompactionState>,
     pub last_compaction_token_estimate: Option<u32>,
     /// Active elicitation request waiting for user response.
     pub elicitation: Option<ElicitationState>,
@@ -762,8 +765,7 @@ impl App {
             input_line_width: 1,
             input_preferred_col: None,
             scroll_offset: 0,
-            is_thinking: false,
-            pending_session_op: None,
+            activity: ActivityState::Idle,
             streaming_content: String::new(),
             streaming_cache: StreamingCache::new(),
             file_index: Vec::new(),
@@ -771,7 +773,6 @@ impl App {
             file_index_loading: false,
             file_index_error: None,
             mention_state: None,
-            live_compaction: None,
             last_compaction_token_estimate: None,
             elicitation: None,
             reasoning_effort: None,
@@ -1132,19 +1133,56 @@ impl App {
         self.pending_cancel_confirm_until = None;
     }
 
+    pub fn is_turn_active(&self) -> bool {
+        matches!(
+            self.activity,
+            ActivityState::Thinking
+                | ActivityState::Streaming
+                | ActivityState::RunningTool { .. }
+                | ActivityState::Compacting { .. }
+        )
+    }
+
+    pub fn has_cancellable_activity(&self) -> bool {
+        self.is_turn_active()
+    }
+
+    pub fn has_pending_session_op(&self) -> bool {
+        matches!(self.activity, ActivityState::SessionOp(_))
+    }
+
+    pub fn input_blocked_by_activity(&self) -> bool {
+        self.elicitation.is_some()
+            || self.has_pending_session_op()
+            || self.pending_cancel_confirm_until.is_some()
+    }
+
+    pub fn should_hide_input_contents(&self) -> bool {
+        self.input_blocked_by_activity()
+    }
+
+    pub fn activity_status_text(&self) -> Option<String> {
+        match &self.activity {
+            ActivityState::Idle => None,
+            ActivityState::Thinking => Some("thinking...".into()),
+            ActivityState::Streaming => Some("streaming...".into()),
+            ActivityState::RunningTool { name } => Some(format!("tool: {name}")),
+            ActivityState::Compacting { token_estimate } => {
+                Some(format!("compacting context (~{token_estimate} tokens)"))
+            }
+            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing...".into()),
+            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing...".into()),
+        }
+    }
+
     pub fn refresh_transient_status(&mut self) {
         if self.pending_cancel_confirm_until.is_some() {
             return;
         }
-        if let Some(op) = self.pending_session_op {
-            self.status = match op {
-                SessionOp::Undo => "undoing...".into(),
-                SessionOp::Redo => "redoing...".into(),
-            };
-        } else if let Some(compaction) = &self.live_compaction {
-            self.status = format!("compacting context (~{} tokens)", compaction.token_estimate);
-        } else if self.is_thinking {
-            self.status = "thinking...".into();
+        if self.elicitation.is_some() {
+            self.status = "question - answer in the panel above input".into();
+        } else if let Some(activity_status) = self.activity_status_text() {
+            self.status = activity_status;
         } else if self.conn == ConnState::Connected {
             self.status = "ready".into();
         }
@@ -1558,8 +1596,7 @@ impl App {
                 vec![]
             }
             "undo_result" => {
-                self.pending_session_op = None;
-                self.is_thinking = false;
+                self.activity = ActivityState::Idle;
                 if let Some(data) = raw.data
                     && let Ok(ur) = serde_json::from_value::<UndoResultData>(data)
                 {
@@ -1594,8 +1631,7 @@ impl App {
                 vec![]
             }
             "redo_result" => {
-                self.pending_session_op = None;
-                self.is_thinking = false;
+                self.activity = ActivityState::Idle;
                 if let Some(data) = raw.data
                     && let Ok(rr) = serde_json::from_value::<RedoResultData>(data)
                 {
@@ -1661,7 +1697,6 @@ impl App {
                     self.file_index_loading = false;
                     self.file_index_error = None;
                     self.mention_state = None;
-                    self.live_compaction = None;
                     self.last_compaction_token_estimate = None;
                     self.elicitation = None;
                     self.clear_cancel_confirm();
@@ -1680,12 +1715,11 @@ impl App {
                 if let Some(data) = raw.data {
                     match serde_json::from_value::<SessionLoadedData>(data.clone()) {
                         Err(e) => {
-                            self.pending_session_op = None;
-                            self.is_thinking = false;
+                            self.activity = ActivityState::Idle;
                             self.status = format!("load error: {e}");
                         }
                         Ok(sl) => {
-                            self.pending_session_op = None;
+                            self.activity = ActivityState::Idle;
                             self.session_id = Some(sl.session_id);
                             self.agent_id = Some(sl.agent_id);
                             self.messages.clear();
@@ -1694,7 +1728,6 @@ impl App {
                             self.scroll_offset = 0;
                             self.cumulative_cost = None;
                             self.session_stats = SessionStatsLite::default();
-                            self.is_thinking = false;
                             self.screen = Screen::Chat;
                             self.undoable_turns.clear();
                             self.file_index.clear();
@@ -1702,7 +1735,6 @@ impl App {
                             self.file_index_loading = false;
                             self.file_index_error = None;
                             self.mention_state = None;
-                            self.live_compaction = None;
                             self.last_compaction_token_estimate = None;
                             self.elicitation = None;
                             self.clear_cancel_confirm();
@@ -1841,19 +1873,22 @@ impl App {
             }
             EventKind::TurnStarted => {
                 self.clear_cancel_confirm();
-                self.is_thinking = true;
+                self.activity = ActivityState::Thinking;
                 self.streaming_content.clear();
                 self.streaming_cache.invalidate();
                 self.status = "thinking...".into();
             }
             EventKind::AssistantContentDelta { content, .. } => {
+                if self.is_turn_active() {
+                    self.activity = ActivityState::Streaming;
+                }
                 self.streaming_content.push_str(content);
                 self.scroll_offset = 0;
             }
             EventKind::CompactionStart { token_estimate } => {
-                self.live_compaction = Some(LiveCompactionState {
+                self.activity = ActivityState::Compacting {
                     token_estimate: *token_estimate,
-                });
+                };
                 self.last_compaction_token_estimate = Some(*token_estimate);
                 self.messages.push(ChatEntry::CompactionStart {
                     token_estimate: *token_estimate,
@@ -1864,7 +1899,11 @@ impl App {
                 summary,
                 summary_len,
             } => {
-                self.live_compaction = None;
+                self.activity = if self.streaming_content.is_empty() {
+                    ActivityState::Thinking
+                } else {
+                    ActivityState::Streaming
+                };
                 self.messages
                     .retain(|entry| !matches!(entry, ChatEntry::CompactionStart { .. }));
                 self.messages.push(ChatEntry::CompactionEnd {
@@ -1875,9 +1914,11 @@ impl App {
                 self.status = "context compacted".into();
             }
             EventKind::AssistantMessageStored { content, .. } => {
-                self.is_thinking = false;
                 self.streaming_content.clear();
                 self.streaming_cache.invalidate();
+                if self.is_turn_active() {
+                    self.activity = ActivityState::Thinking;
+                }
                 if !content.is_empty() {
                     self.messages.push(ChatEntry::Assistant(content.clone()));
                 }
@@ -1887,6 +1928,9 @@ impl App {
                 tool_name,
                 arguments,
             } => {
+                self.activity = ActivityState::RunningTool {
+                    name: tool_name.clone(),
+                };
                 self.status = format!("tool: {tool_name}");
                 // The question tool renders as an ElicitationCard — skip the
                 // redundant "> question …" tool call entry in the chat.
@@ -1945,14 +1989,13 @@ impl App {
                 ..
             } => {
                 self.clear_cancel_confirm();
-                self.is_thinking = false;
+                self.activity = ActivityState::Idle;
                 self.cumulative_cost = *cumulative_cost_usd;
                 self.status = "ready".into();
             }
             EventKind::Error { message } => {
-                self.pending_session_op = None;
+                self.activity = ActivityState::Idle;
                 self.clear_cancel_confirm();
-                self.is_thinking = false;
                 self.messages.push(ChatEntry::Error(message.clone()));
                 self.status = format!("error: {message}");
             }
@@ -1999,9 +2042,8 @@ impl App {
                 self.agent_mode = mode.clone();
             }
             EventKind::Cancelled => {
-                self.pending_session_op = None;
+                self.activity = ActivityState::Idle;
                 self.clear_cancel_confirm();
-                self.is_thinking = false;
                 if !self.streaming_content.is_empty() {
                     let partial = std::mem::take(&mut self.streaming_content);
                     self.streaming_cache.invalidate();
@@ -2322,15 +2364,11 @@ impl App {
             .unwrap_or(false)
     }
 
-    pub fn is_busy_for_input(&self) -> bool {
-        self.is_thinking || self.pending_session_op.is_some() || self.elicitation.is_some()
-    }
-
     pub fn pending_session_label(&self) -> Option<&'static str> {
-        match self.pending_session_op {
-            Some(SessionOp::Undo) => Some("undoing"),
-            Some(SessionOp::Redo) => Some("redoing"),
-            None => None,
+        match self.activity {
+            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing"),
+            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing"),
+            _ => None,
         }
     }
 
@@ -2469,7 +2507,7 @@ impl App {
         }
         self.elicitation = None;
         self.card_cache.invalidate();
-        self.status = "ready".into();
+        self.refresh_transient_status();
     }
 
     pub fn set_mode_model_preference(&mut self, mode: &str, provider: &str, model: &str) {
@@ -3664,10 +3702,10 @@ mod tests {
             false,
         );
         assert_eq!(
-            app.live_compaction,
-            Some(LiveCompactionState {
+            app.activity,
+            ActivityState::Compacting {
                 token_estimate: 12_000
-            })
+            }
         );
         assert!(matches!(
             app.messages.last(),
@@ -3684,7 +3722,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(app.live_compaction, None);
+        assert_eq!(app.activity, ActivityState::Thinking);
         assert!(
             matches!(app.messages.last(), Some(ChatEntry::CompactionEnd { token_estimate: Some(12_000), summary, summary_len }) if summary == "Trimmed tool output" && *summary_len == 19)
         );
@@ -3698,19 +3736,19 @@ mod tests {
     #[test]
     fn pending_session_label_stays_reserved_for_undo_and_redo() {
         let mut app = App::new();
-        app.live_compaction = Some(LiveCompactionState {
+        app.activity = ActivityState::Compacting {
             token_estimate: 9_000,
-        });
+        };
         assert_eq!(app.pending_session_label(), None);
 
-        app.pending_session_op = Some(SessionOp::Undo);
+        app.activity = ActivityState::SessionOp(SessionOp::Undo);
         assert_eq!(app.pending_session_label(), Some("undoing"));
     }
 
     #[test]
     fn cancel_confirm_arms_expires_and_restores_status() {
         let mut app = App::new();
-        app.is_thinking = true;
+        app.activity = ActivityState::Thinking;
 
         app.arm_cancel_confirm();
         assert!(app.cancel_confirm_active());
@@ -3731,17 +3769,17 @@ mod tests {
         assert_eq!(app.status, "connection lost - retrying");
 
         app.conn = ConnState::Connected;
-        app.is_thinking = true;
+        app.activity = ActivityState::Thinking;
         app.refresh_transient_status();
         assert_eq!(app.status, "thinking...");
 
-        app.live_compaction = Some(LiveCompactionState {
+        app.activity = ActivityState::Compacting {
             token_estimate: 2048,
-        });
+        };
         app.refresh_transient_status();
         assert_eq!(app.status, "compacting context (~2048 tokens)");
 
-        app.pending_session_op = Some(SessionOp::Redo);
+        app.activity = ActivityState::SessionOp(SessionOp::Redo);
         app.refresh_transient_status();
         assert_eq!(app.status, "redoing...");
     }
@@ -3933,23 +3971,41 @@ mod tests {
     }
 
     #[test]
-    fn pending_session_op_blocks_input_and_reports_label() {
+    fn activity_helpers_report_turn_and_session_state() {
         let mut app = App::new();
-        assert!(!app.is_busy_for_input());
+        assert!(!app.is_turn_active());
+        assert!(!app.has_pending_session_op());
+        assert!(!app.input_blocked_by_activity());
+        assert!(!app.should_hide_input_contents());
         assert_eq!(app.pending_session_label(), None);
 
-        app.pending_session_op = Some(SessionOp::Undo);
-        assert!(app.is_busy_for_input());
+        app.activity = ActivityState::SessionOp(SessionOp::Undo);
+        assert!(!app.is_turn_active());
+        assert!(app.has_pending_session_op());
+        assert!(app.input_blocked_by_activity());
+        assert!(app.should_hide_input_contents());
         assert_eq!(app.pending_session_label(), Some("undoing"));
 
-        app.pending_session_op = Some(SessionOp::Redo);
-        assert!(app.is_busy_for_input());
+        app.activity = ActivityState::SessionOp(SessionOp::Redo);
+        assert!(!app.is_turn_active());
+        assert!(app.has_pending_session_op());
+        assert!(app.input_blocked_by_activity());
+        assert!(app.should_hide_input_contents());
         assert_eq!(app.pending_session_label(), Some("redoing"));
 
-        app.pending_session_op = None;
-        app.is_thinking = true;
-        assert!(app.is_busy_for_input());
+        app.activity = ActivityState::RunningTool {
+            name: "read_tool".into(),
+        };
+        assert!(app.is_turn_active());
+        assert!(app.has_cancellable_activity());
+        assert!(!app.has_pending_session_op());
+        assert!(!app.input_blocked_by_activity());
+        assert!(!app.should_hide_input_contents());
         assert_eq!(app.pending_session_label(), None);
+
+        app.arm_cancel_confirm();
+        assert!(app.input_blocked_by_activity());
+        assert!(app.should_hide_input_contents());
     }
 
     #[test]
@@ -3982,7 +4038,7 @@ mod tests {
     #[test]
     fn undo_and_redo_results_clear_pending_session_op() {
         let mut app = App::new();
-        app.pending_session_op = Some(SessionOp::Undo);
+        app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.handle_server_msg(RawServerMsg {
             msg_type: "undo_result".into(),
             data: Some(serde_json::json!({
@@ -3991,9 +4047,9 @@ mod tests {
                 "undo_stack": []
             })),
         });
-        assert_eq!(app.pending_session_op, None);
+        assert_eq!(app.activity, ActivityState::Idle);
 
-        app.pending_session_op = Some(SessionOp::Redo);
+        app.activity = ActivityState::SessionOp(SessionOp::Redo);
         app.handle_server_msg(RawServerMsg {
             msg_type: "redo_result".into(),
             data: Some(serde_json::json!({
@@ -4002,7 +4058,53 @@ mod tests {
                 "undo_stack": []
             })),
         });
-        assert_eq!(app.pending_session_op, None);
+        assert_eq!(app.activity, ActivityState::Idle);
+    }
+
+    #[test]
+    fn turn_activity_transitions_across_tool_and_completion_events() {
+        let mut app = App::new();
+
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+        assert_eq!(app.activity, ActivityState::Thinking);
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "draft".into(),
+                thinking: None,
+                message_id: None,
+            },
+            false,
+        );
+        assert_eq!(app.activity, ActivityState::Thinking);
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("call-1".into()),
+                tool_name: "read_tool".into(),
+                arguments: None,
+            },
+            false,
+        );
+        assert_eq!(
+            app.activity,
+            ActivityState::RunningTool {
+                name: "read_tool".into()
+            }
+        );
+
+        app.handle_event_kind(
+            &EventKind::LlmRequestEnd {
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: None,
+                tool_calls: None,
+                metrics: None,
+            },
+            false,
+        );
+        assert_eq!(app.activity, ActivityState::Idle);
     }
 
     #[test]
