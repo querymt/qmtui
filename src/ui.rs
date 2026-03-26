@@ -2000,18 +2000,20 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     build_message_cards(app);
     let streaming_card = build_streaming_card(app);
 
-    let all_cards: Vec<&Card> = app
-        .card_cache
-        .cards
-        .iter()
-        .chain(streaming_card.iter())
-        .collect();
+    // Compute total_height in a temporary scope so we can mutably access app
+    // for scroll compensation before borrowing card_cache again for rendering.
+    let total_height: u16 = {
+        let cards = app.card_cache.cards.iter().chain(streaming_card.iter());
+        cards.map(|c| c.height(area.width)).sum()
+    };
 
-    if all_cards.is_empty() {
+    if total_height == 0 && app.card_cache.cards.is_empty() && streaming_card.is_none() {
         return;
     }
 
-    let total_height: u16 = all_cards.iter().map(|c| c.height(area.width)).sum::<u16>();
+    // When the user is scrolled up, bump scroll_offset by however much
+    // content grew so the viewport stays at the same absolute position.
+    app.compensate_scroll_for_growth(total_height);
 
     // max scroll = how far we can scroll from the bottom
     let max_scroll = total_height.saturating_sub(area.height);
@@ -2019,6 +2021,13 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     app.scroll_offset = app.scroll_offset.min(max_scroll);
     // scroll_offset 0 = pinned to bottom, higher = scrolled up
     let scroll = max_scroll.saturating_sub(app.scroll_offset);
+
+    let all_cards: Vec<&Card> = app
+        .card_cache
+        .cards
+        .iter()
+        .chain(streaming_card.iter())
+        .collect();
 
     let mut y: i32 = -(scroll as i32);
     for card in &all_cards {

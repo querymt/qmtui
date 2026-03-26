@@ -714,6 +714,10 @@ pub struct App {
     pub input_line_width: usize,
     pub input_preferred_col: Option<usize>,
     pub scroll_offset: u16,
+    /// Total content height (in rows) from the last render frame.
+    /// Used to compensate `scroll_offset` when content grows while the user
+    /// is scrolled up, so the viewport stays at the same absolute position.
+    pub prev_total_height: u16,
     pub activity: ActivityState,
     pub streaming_content: String,
     pub streaming_cache: StreamingCache,
@@ -823,6 +827,7 @@ impl App {
             input_line_width: 1,
             input_preferred_col: None,
             scroll_offset: 0,
+            prev_total_height: 0,
             activity: ActivityState::Idle,
             streaming_content: String::new(),
             streaming_cache: StreamingCache::new(),
@@ -1233,6 +1238,19 @@ impl App {
                 | ActivityState::RunningTool { .. }
                 | ActivityState::Compacting { .. }
         )
+    }
+
+    /// Adjust `scroll_offset` to compensate for content growth so the
+    /// viewport stays at the same absolute position when the user is
+    /// scrolled up.  No-op when `scroll_offset == 0` (auto-following).
+    ///
+    /// Call from the renderer after computing the new `total_height`.
+    pub fn compensate_scroll_for_growth(&mut self, total_height: u16) {
+        let growth = total_height.saturating_sub(self.prev_total_height);
+        if self.scroll_offset > 0 && growth > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(growth);
+        }
+        self.prev_total_height = total_height;
     }
 
     pub fn has_cancellable_activity(&self) -> bool {
@@ -2004,7 +2022,6 @@ impl App {
                     self.activity = ActivityState::Streaming;
                 }
                 self.streaming_content.push_str(content);
-                self.scroll_offset = 0;
             }
             EventKind::CompactionStart { token_estimate } => {
                 self.activity = ActivityState::Compacting {
@@ -6147,6 +6164,97 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
             }
             break;
         }
+    }
+}
+
+// ── scroll_tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use crate::protocol::EventKind;
+
+    #[test]
+    fn content_delta_preserves_scroll_when_scrolled_up() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.scroll_offset = 20;
+
+        app.handle_event_kind(
+            &EventKind::AssistantContentDelta {
+                content: "hello".into(),
+                message_id: None,
+            },
+            false,
+        );
+
+        assert_eq!(
+            app.scroll_offset, 20,
+            "scroll_offset should be preserved when user is scrolled up"
+        );
+    }
+
+    #[test]
+    fn scroll_compensation_bumps_offset_by_growth() {
+        let mut app = App::new();
+        app.scroll_offset = 30;
+        app.prev_total_height = 100;
+
+        // Content grew by 5 rows
+        app.compensate_scroll_for_growth(105);
+
+        assert_eq!(
+            app.scroll_offset, 35,
+            "scroll_offset should increase by growth to keep viewport stable"
+        );
+        assert_eq!(app.prev_total_height, 105);
+    }
+
+    #[test]
+    fn scroll_compensation_noop_when_at_bottom() {
+        let mut app = App::new();
+        app.scroll_offset = 0; // following
+        app.prev_total_height = 100;
+
+        app.compensate_scroll_for_growth(110);
+
+        assert_eq!(
+            app.scroll_offset, 0,
+            "scroll_offset should stay 0 when auto-following"
+        );
+        assert_eq!(app.prev_total_height, 110);
+    }
+
+    #[test]
+    fn scroll_compensation_noop_when_no_growth() {
+        let mut app = App::new();
+        app.scroll_offset = 20;
+        app.prev_total_height = 100;
+
+        app.compensate_scroll_for_growth(100);
+
+        assert_eq!(app.scroll_offset, 20);
+        assert_eq!(app.prev_total_height, 100);
+    }
+
+    #[test]
+    fn content_delta_stays_at_bottom_when_following() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.scroll_offset = 0; // at bottom
+
+        app.handle_event_kind(
+            &EventKind::AssistantContentDelta {
+                content: "hello".into(),
+                message_id: None,
+            },
+            false,
+        );
+
+        assert_eq!(
+            app.scroll_offset, 0,
+            "scroll_offset should remain 0 when user is at the bottom"
+        );
     }
 }
 
