@@ -37,7 +37,7 @@ pub fn render(md: &str, base_style: Style, hl: &Highlighter) -> Vec<Line<'static
 
     for event in parser {
         match event {
-            Event::Start(tag) => ctx.open_tag(&tag),
+            Event::Start(tag) => ctx.open_tag(&tag, &mut lines),
             Event::End(tag) => ctx.close_tag(&tag, &mut lines),
             Event::Text(text) => ctx.push_text(&text),
             Event::Code(code) => ctx.push_inline_code(&code),
@@ -108,7 +108,7 @@ impl RenderCtx<'_> {
         }
     }
 
-    fn open_tag(&mut self, tag: &Tag) {
+    fn open_tag(&mut self, tag: &Tag, lines: &mut Vec<Line<'static>>) {
         match tag {
             Tag::Heading { level, .. } => {
                 self.in_heading = true;
@@ -142,6 +142,9 @@ impl RenderCtx<'_> {
                 };
             }
             Tag::List(start) => {
+                // Flush any pending spans from the parent item so a nested
+                // list starts on its own line rather than being concatenated.
+                self.flush_line(lines);
                 self.list_depth += 1;
                 self.list_indices.push(*start);
             }
@@ -248,6 +251,30 @@ impl RenderCtx<'_> {
         }
     }
 
+    /// Emit list-bullet / blockquote prefix if this is the first span on
+    /// the current line and we are inside a list or blockquote.
+    fn ensure_line_prefix(&mut self) {
+        // List bullet / number
+        if self.current_spans.is_empty() && !self.list_indices.is_empty() {
+            let indent = "  ".repeat(self.list_depth.saturating_sub(1));
+            let bullet = if let Some(Some(n)) = self.list_indices.last_mut() {
+                let b = format!("{indent}{n}. ");
+                *n += 1;
+                b
+            } else {
+                format!("{indent}{MD_BULLET}")
+            };
+            self.current_spans
+                .push(Span::styled(bullet, Theme::md_list_bullet()));
+        }
+
+        // Blockquote prefix
+        if self.in_blockquote && self.current_spans.is_empty() {
+            self.current_spans
+                .push(Span::styled("  ", Theme::md_blockquote()));
+        }
+    }
+
     fn push_text(&mut self, text: &str) {
         if self.in_code_block {
             // collect lines for code block
@@ -274,27 +301,7 @@ impl RenderCtx<'_> {
         }
 
         let style = self.current_style();
-
-        // if this is the first span of a list item, prepend bullet/number
-        if self.current_spans.is_empty() && !self.list_indices.is_empty() {
-            let indent = "  ".repeat(self.list_depth.saturating_sub(1));
-            let bullet = if let Some(Some(n)) = self.list_indices.last_mut() {
-                let b = format!("{indent}{n}. ");
-                *n += 1;
-                b
-            } else {
-                format!("{indent}{MD_BULLET}")
-            };
-            self.current_spans
-                .push(Span::styled(bullet, Theme::md_list_bullet()));
-        }
-
-        // blockquote prefix
-        if self.in_blockquote && self.current_spans.is_empty() {
-            self.current_spans
-                .push(Span::styled("  ", Theme::md_blockquote()));
-        }
-
+        self.ensure_line_prefix();
         self.current_spans
             .push(Span::styled(text.to_string(), style));
     }
@@ -305,6 +312,7 @@ impl RenderCtx<'_> {
                 .push(Span::styled(code.to_string(), Theme::md_code_inline()));
             return;
         }
+        self.ensure_line_prefix();
         self.current_spans
             .push(Span::styled(code.to_string(), Theme::md_code_inline()));
     }
@@ -715,6 +723,131 @@ mod tests {
                 .contains(ratatui::style::Modifier::BOLD),
             "Header cell should be bold, got style: {:?}",
             head_span.style
+        );
+    }
+
+    // ── Column width calculation ───────────────────────────────────────
+
+    // ── List bullet rendering ────────────────────────────────────────────
+
+    #[test]
+    fn list_item_starting_with_inline_code_has_bullet() {
+        let md = "- `foo` bar\n- `baz` qux\n";
+        let lines = render_md(md);
+        let text = lines_to_text(&lines);
+
+        // Every non-empty line should contain the bullet character
+        let bullet = "\u{2022}"; // •
+        let items_with_bullet: Vec<_> = text.iter().filter(|l| l.contains(bullet)).collect();
+        assert_eq!(
+            items_with_bullet.len(),
+            2,
+            "Expected 2 lines with bullet, got {}: {text:#?}",
+            items_with_bullet.len()
+        );
+        // First item should contain bullet followed by inline code content
+        assert!(
+            text.iter().any(|l| l.contains(bullet) && l.contains("foo")),
+            "First list item should have bullet and 'foo': {text:#?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains(bullet) && l.contains("baz")),
+            "Second list item should have bullet and 'baz': {text:#?}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_item_starting_with_inline_code_has_number() {
+        let md = "1. `alpha` first\n2. `beta` second\n";
+        let lines = render_md(md);
+        let text = lines_to_text(&lines);
+
+        assert!(
+            text.iter().any(|l| l.contains("1.") && l.contains("alpha")),
+            "First ordered item should have '1.' and 'alpha': {text:#?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("2.") && l.contains("beta")),
+            "Second ordered item should have '2.' and 'beta': {text:#?}"
+        );
+    }
+
+    #[test]
+    fn nested_list_first_child_not_concatenated_to_parent() {
+        // Reproduces the bug where the first nested item gets glued to the
+        // parent line instead of appearing on its own indented line.
+        let md = "\
+- parent text:
+  - `child1`
+  - `child2`
+";
+        let lines = render_md(md);
+        let text = lines_to_text(&lines);
+        let bullet = "\u{2022}"; // •
+
+        // The parent line should NOT contain child content
+        let parent = text
+            .iter()
+            .find(|l| l.contains("parent text"))
+            .expect("should have a parent line");
+        assert!(
+            !parent.contains("child1"),
+            "Parent line must not contain first child text, got: {parent:?}"
+        );
+
+        // child1 should be on its own line with a bullet
+        assert!(
+            text.iter()
+                .any(|l| l.contains(bullet) && l.contains("child1")),
+            "child1 should be on its own bulleted line: {text:#?}"
+        );
+        // child2 should be on its own line with a bullet
+        assert!(
+            text.iter()
+                .any(|l| l.contains(bullet) && l.contains("child2")),
+            "child2 should be on its own bulleted line: {text:#?}"
+        );
+    }
+
+    #[test]
+    fn nested_list_with_inline_code_real_world() {
+        // Real-world case from the bug report: parent text followed by
+        // nested list where sub-items start with inline code.
+        let md = "\
+- `/rest/settings` remains accessible and leaks config:
+  - `settingsMode: \"public\"`
+  - `authMethod: \"email\"`
+  - `authCookie.secure: false`
+- `authCookie.secure: false` is important.
+";
+        let lines = render_md(md);
+        let text = lines_to_text(&lines);
+        let bullet = "\u{2022}"; // •
+
+        // Parent line must not contain settingsMode
+        let parent = text
+            .iter()
+            .find(|l| l.contains("leaks config"))
+            .expect("should have a parent line");
+        assert!(
+            !parent.contains("settingsMode"),
+            "Parent line must not contain first nested item, got: {parent:?}"
+        );
+
+        // Each nested item should have its own bulleted line
+        for needle in &["settingsMode", "authMethod", "authCookie.secure: false"] {
+            assert!(
+                text.iter()
+                    .any(|l| l.contains(bullet) && l.contains(needle)),
+                "{needle} should appear on its own bulleted line: {text:#?}"
+            );
+        }
+
+        // The standalone item about authCookie should also have a bullet
+        assert!(
+            text.iter()
+                .any(|l| l.contains(bullet) && l.contains("is important")),
+            "Standalone item should have bullet: {text:#?}"
         );
     }
 
