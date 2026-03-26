@@ -218,6 +218,95 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
         assert_eq!(app.elicitation.as_ref().unwrap().text_input, "H");
     }
+
+    #[test]
+    fn invalidate_theme_caches_clears_all_render_caches() {
+        use crate::theme::Theme;
+        use crate::ui::build_diff_lines;
+
+        // Build cached_lines under theme 0
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+
+        let mut app = App::new();
+
+        // Populate card_cache
+        app.messages.push(ChatEntry::User {
+            text: "hello".into(),
+            message_id: None,
+        });
+        app.card_cache.processed_messages = 1;
+
+        // Populate streaming caches
+        app.streaming_cache
+            .store(5, vec![ratatui::text::Line::from("stream")]);
+        app.streaming_thinking_cache
+            .store(3, vec![ratatui::text::Line::from("think")]);
+
+        // Populate a ToolCall with cached_lines baked under theme 0
+        let old_lines = build_diff_lines("aaa", "bbb", None);
+        assert!(!old_lines.is_empty());
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "edit".into(),
+            is_error: false,
+            detail: app::ToolDetail::Edit {
+                file: "f.rs".into(),
+                old: "aaa".into(),
+                new: "bbb".into(),
+                start_line: None,
+                cached_lines: old_lines.clone(),
+            },
+        });
+
+        // Confirm caches are populated
+        assert!(app.streaming_cache.get(5).is_some());
+        assert!(app.streaming_thinking_cache.get(3).is_some());
+        assert_eq!(app.card_cache.processed_messages, 1);
+
+        // Switch to a different theme and update the frame snapshot
+        // before invalidating — just as handle_theme_popup_key does.
+        Theme::set_by_index(2);
+        Theme::begin_frame();
+        invalidate_theme_caches(&mut app);
+
+        // All caches cleared
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "card_cache should be invalidated"
+        );
+        assert!(
+            app.streaming_cache.get(5).is_none(),
+            "streaming_cache should be invalidated"
+        );
+        assert!(
+            app.streaming_thinking_cache.get(3).is_none(),
+            "streaming_thinking_cache should be invalidated"
+        );
+
+        // Tool cached_lines rebuilt with the NEW theme's styles
+        if let ChatEntry::ToolCall {
+            detail: app::ToolDetail::Edit { cached_lines, .. },
+            ..
+        } = &app.messages[1]
+        {
+            assert!(
+                !cached_lines.is_empty(),
+                "tool cached_lines should be rebuilt"
+            );
+            // Lines must differ from the old theme — styles are theme-dependent
+            assert_ne!(
+                *cached_lines, old_lines,
+                "cached_lines should use the new theme's styles, not the old"
+            );
+        } else {
+            panic!("expected ToolCall with Edit detail");
+        }
+
+        // Reset
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+    }
 }
 
 #[cfg(test)]
@@ -1740,6 +1829,44 @@ fn handle_new_session_popup_key(
     Ok(())
 }
 
+/// Invalidate every theme-dependent cache in `app` so that the next render
+/// frame rebuilds styled lines with the current palette.
+///
+/// Covers:
+/// - `card_cache` (finalized message cards)
+/// - `streaming_cache` / `streaming_thinking_cache`
+/// - `ToolDetail::Edit` / `ToolDetail::WriteFile` inline cached_lines
+fn invalidate_theme_caches(app: &mut App) {
+    app.card_cache.invalidate();
+    app.streaming_cache.invalidate();
+    app.streaming_thinking_cache.invalidate();
+
+    // Re-generate diff/write preview lines baked into ToolCall entries.
+    for entry in &mut app.messages {
+        if let app::ChatEntry::ToolCall { detail, .. } = entry {
+            match detail {
+                app::ToolDetail::Edit {
+                    old,
+                    new,
+                    start_line,
+                    cached_lines,
+                    ..
+                } => {
+                    *cached_lines = ui::build_diff_lines(old, new, *start_line);
+                }
+                app::ToolDetail::WriteFile {
+                    content,
+                    cached_lines,
+                    ..
+                } => {
+                    *cached_lines = ui::build_write_lines(content);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
     let filtered_len = || -> usize {
         let q = app.theme_filter.to_lowercase();
@@ -1781,6 +1908,8 @@ fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
         KeyCode::Enter => {
             if let Some(idx) = filtered_index(app.theme_cursor) {
                 theme::Theme::set_by_index(idx);
+                theme::Theme::begin_frame();
+                invalidate_theme_caches(app);
                 app.popup = Popup::None;
                 save_config(app);
             }
