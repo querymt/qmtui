@@ -9,8 +9,8 @@ use crate::app::App;
 use crate::theme::Theme;
 
 use super::{
-    short_cwd, relative_time,
-    COLLAPSE_OPEN, COLLAPSE_CLOSED, ELLIPSIS, ARROW_UP, ARROW_DOWN, COLOR_SWATCH,
+    ARROW_DOWN, ARROW_UP, COLLAPSE_CLOSED, COLLAPSE_OPEN, COLOR_SWATCH, ELLIPSIS, relative_time,
+    short_cwd,
 };
 
 // ── Centered rect helper ──────────────────────────────────────────────────────

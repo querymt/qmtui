@@ -9,10 +9,7 @@ use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
 use crate::protocol::*;
-use crate::ui::{
-    CardCache, ELLIPSIS, OUTCOME_BULLET, build_diff_lines,
-    build_write_lines,
-};
+use crate::ui::{CardCache, ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
 /// Invalidated when `streaming_content` grows or is cleared.
@@ -886,7 +883,6 @@ impl App {
         self.streaming_thinking_cache.invalidate();
     }
 
-
     /// Short display label for the current reasoning effort level.
     /// Matches the five values used in the web UI: auto / low / medium / high / max.
     pub fn reasoning_effort_label(&self) -> &str {
@@ -1211,7 +1207,6 @@ impl App {
             Some(elapsed)
         }
     }
-
 
     pub fn handle_connection_event(&mut self, event: ConnectionEvent) {
         self.clear_cancel_confirm();
@@ -4605,4 +4600,3 @@ mod popup_item_tests {
         assert!(!app.collapsed_groups.contains("/a"));
     }
 }
-

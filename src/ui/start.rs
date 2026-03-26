@@ -8,7 +8,7 @@ use ratatui::{
 use crate::app::App;
 use crate::theme::Theme;
 
-use super::{draw_header, relative_time, ELLIPSIS};
+use super::{ELLIPSIS, draw_header, relative_time};
 
 // ── Start-page session list ────────────────────────────────────────────────────
 

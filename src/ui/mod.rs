@@ -2,14 +2,15 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::{
-    build_diff_lines, build_write_lines, Card, CardCache, CardKind,
-};
+pub(crate) use chat::{Card, CardCache, CardKind, build_diff_lines, build_write_lines};
+use chat::{ICON_MULTI_SESSION, SpinnerKind, build_message_cards, draw_chat, spinner};
 pub(crate) use popups::{ShortcutSection, build_theme_list_item, shortcut_sections};
+use popups::{
+    draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup, draw_session_popup,
+    draw_theme_popup,
+};
+use start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, draw_start, short_cwd};
 pub(crate) use start::{StartPageRow, build_start_page_rows};
-use chat::{build_message_cards, draw_chat, SpinnerKind, spinner, ICON_MULTI_SESSION};
-use popups::{draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup, draw_session_popup, draw_theme_popup};
-use start::{draw_start, short_cwd, COLLAPSE_CLOSED, COLLAPSE_OPEN};
 
 use ratatui::{
     Frame,
@@ -300,7 +301,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-
 fn conn_indicator(app: &App) -> Span<'static> {
     let (sym, color) = match app.conn {
         ConnState::Connected => (CONN_ONLINE, Theme::ok()),
@@ -345,20 +345,6 @@ fn draw_header(
         area,
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {

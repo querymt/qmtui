@@ -9,7 +9,7 @@ use crate::app::{ActivityState, App, ChatEntry, SessionOp, ToolDetail};
 use crate::markdown;
 use crate::theme::Theme;
 
-use super::{build_input_visual_layout, draw_header, OUTCOME_BULLET};
+use super::{OUTCOME_BULLET, build_input_visual_layout, draw_header};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 

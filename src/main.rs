@@ -48,10 +48,10 @@ fn reconnect_delay_ms(attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::*;
     use app::{
         ChatEntry, ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
-    use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
     use ui::OUTCOME_BULLET;
@@ -1149,7 +1149,6 @@ async fn run_loop(
         }
     }
 }
-
 
 #[cfg(test)]
 struct PersistenceGuard(config::TestPersistenceGuard);

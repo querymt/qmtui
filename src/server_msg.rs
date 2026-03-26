@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::app::*;
 use crate::protocol::*;
-use crate::ui::{build_diff_lines, build_write_lines, ELLIPSIS, OUTCOME_BULLET};
+use crate::ui::{ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
 
 impl App {
     pub fn handle_server_msg(&mut self, raw: RawServerMsg) -> Vec<ClientMsg> {
@@ -606,7 +606,6 @@ impl App {
             }
         }
     }
-
 }
 
 pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_str: &str) {
