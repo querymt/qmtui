@@ -884,6 +884,24 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
     }
 }
 
+fn content_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
 // ── scroll_tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -972,23 +990,5 @@ mod scroll_tests {
             app.scroll_offset, 0,
             "scroll_offset should remain 0 when user is at the bottom"
         );
-    }
-}
-
-fn content_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block.get("text").and_then(|t| t.as_str()).map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
     }
 }

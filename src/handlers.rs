@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use crate::app::{self, ActivityState, App, Popup, Screen};
 use crate::config;
 use crate::protocol::{self, ClientMsg, PromptBlock};
-use crate::theme::{self, Theme};
+use crate::theme;
 use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

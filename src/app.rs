@@ -1,15 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 
 use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
 use crate::protocol::*;
-use crate::ui::{CardCache, ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
+use crate::ui::{CardCache, OUTCOME_BULLET};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
 /// Invalidated when `streaming_content` grows or is cleared.

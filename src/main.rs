@@ -22,15 +22,15 @@ use std::{
     time::Duration,
 };
 
-use app::{ActivityState, App, Popup, Screen};
+use app::{App, Screen};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::{SinkExt, StreamExt};
-use protocol::{ClientMsg, PromptBlock, RawServerMsg};
+use protocol::{ClientMsg, RawServerMsg};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -319,7 +319,9 @@ mod external_editor_tests {
     use super::*;
     use crate::config::{ServerConfig, TuiConfig};
     use crate::handlers::*;
+    use app::ActivityState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use protocol::PromptBlock;
 
     fn ctrl_x() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
@@ -714,7 +716,7 @@ fn system_editor_command() -> Option<EditorCommand> {
     editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
 }
 
-use handlers::{AppAction, handle_key, save_cache, save_config};
+use handlers::{AppAction, handle_key, save_cache};
 
 fn temp_editor_file_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -1165,6 +1167,7 @@ mod sessions_key_tests {
     use super::*;
     use crate::handlers::*;
     use crate::protocol::{SessionGroup, SessionSummary};
+    use crossterm::event::KeyCode;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -1444,6 +1447,8 @@ mod session_popup_key_tests {
     use super::*;
     use crate::handlers::*;
     use crate::protocol::{SessionGroup, SessionSummary};
+    use app::Popup;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -1940,7 +1945,6 @@ mod session_popup_key_tests {
 #[cfg(test)]
 mod chord_reasoning_effort_tests {
     use super::*;
-    use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
     use tokio::sync::mpsc;
@@ -2010,7 +2014,6 @@ mod chord_reasoning_effort_tests {
 #[cfg(test)]
 mod reasoning_effort_integration_tests {
     use super::*;
-    use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
     use tokio::sync::mpsc;

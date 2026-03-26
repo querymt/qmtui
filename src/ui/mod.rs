@@ -2,15 +2,23 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::{Card, CardCache, CardKind, build_diff_lines, build_write_lines};
-use chat::{ICON_MULTI_SESSION, SpinnerKind, build_message_cards, draw_chat, spinner};
-pub(crate) use popups::{ShortcutSection, build_theme_list_item, shortcut_sections};
+use chat::draw_chat;
+pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
 use popups::{
     draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup, draw_session_popup,
     draw_theme_popup,
 };
 use start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, draw_start, short_cwd};
-pub(crate) use start::{StartPageRow, build_start_page_rows};
+
+// Re-exports used only by the test module (via `use super::*`).
+#[cfg(test)]
+pub(crate) use chat::{
+    Card, CardKind, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
+};
+#[cfg(test)]
+pub(crate) use popups::{build_theme_list_item, shortcut_sections};
+#[cfg(test)]
+pub(crate) use start::build_start_page_rows;
 
 use ratatui::{
     Frame,

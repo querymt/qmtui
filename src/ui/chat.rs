@@ -16,7 +16,7 @@ use super::{OUTCOME_BULLET, build_input_visual_layout, draw_header};
 const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SpinnerKind {
+pub(crate) enum SpinnerKind {
     Braille,
     Line,
     Dots,
@@ -33,7 +33,7 @@ pub(super) fn spinner_frames(kind: SpinnerKind) -> &'static [&'static str] {
     }
 }
 
-pub(super) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
+pub(crate) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
     let frames = spinner_frames(kind);
     frames[(tick as usize / 2) % frames.len()]
 }
@@ -47,7 +47,7 @@ const CHECK_UNCHECKED: &str = "\u{2610} "; // ☐ ballot box unchecked – multi
 // ── Status bar icons ──────────────────────────────────────────────────────────
 const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token usage
 const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
-pub(super) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
+pub(crate) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
 
 // ── General text symbols ──────────────────────────────────────────────────────
 const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
@@ -211,7 +211,7 @@ impl Card {
 
 /// Build cards for finalized messages incrementally (cached).
 /// Does NOT include the streaming/thinking card — that's built separately.
-pub(super) fn build_message_cards(app: &mut App) -> &[Card] {
+pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
     let cache = &app.card_cache;
 
     // Auto-invalidate if messages shrank (clear/retain)
