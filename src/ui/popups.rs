@@ -114,8 +114,26 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
 pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     use crate::app::PopupItem;
 
+    const SESSION_ID_COL_W: u16 = 12;
+    const SESSION_ACTIVE_COL_W: u16 = 3;
+    const SESSION_TIME_COL_W: u16 = 9;
+    const SESSION_TITLE_MAX_W: u16 = 44;
+    const SESSION_ROW_MAX_W: u16 =
+        SESSION_ID_COL_W + SESSION_TITLE_MAX_W + SESSION_ACTIVE_COL_W + SESSION_TIME_COL_W;
+    const SESSION_POPUP_MAX_W: u16 = SESSION_ROW_MAX_W + 2;
+    const SESSION_POPUP_MIN_W: u16 = 36;
+
     let area = f.area();
-    let popup_area = centered_rect(70, 60, area);
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(SESSION_POPUP_MIN_W, SESSION_POPUP_MAX_W);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
+        width: popup_width,
+        height: area.height * 60 / 100,
+    };
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -206,8 +224,8 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
 
                     let is_active = app.session_id.as_deref() == Some(s.session_id.as_str());
                     let id_part = format!("   {id_short} ");
-                    let active_part = if is_active { " active " } else { "" };
-                    let time_part = format!(" {time_str} ");
+                    let active_part = if is_active { "  ●" } else { "   " };
+                    let time_part = format!(" {time_str:>7} ");
                     let avail = list_w.saturating_sub(
                         id_part.chars().count()
                             + active_part.chars().count()
@@ -231,15 +249,17 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
                     } else {
                         Theme::status_accent()
                     };
+                    let id_style = if is_active { active_style } else { dim_style };
 
                     let mut spans = vec![
-                        Span::styled(id_part, dim_style),
+                        Span::styled(id_part, id_style),
                         Span::styled(title_display, main_style),
                         Span::styled(" ".repeat(title_gap), dim_style),
+                        Span::styled(
+                            active_part,
+                            if is_active { active_style } else { dim_style },
+                        ),
                     ];
-                    if is_active {
-                        spans.push(Span::styled(active_part, active_style));
-                    }
                     spans.push(Span::styled(time_part, time_style));
 
                     ListItem::new(Line::from(spans))
@@ -253,14 +273,17 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            " esc cancel  enter load/collapse  del delete  ctrl-n new",
-            Theme::status(),
-        ))
-        .style(Theme::popup_bg()),
-        chunks[4],
-    );
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("cancel  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("load/collapse  ", Theme::status()),
+        Span::styled("del ", Theme::status_accent()),
+        Span::styled("delete  ", Theme::status()),
+        Span::styled("ctrl-n ", Theme::status_accent()),
+        Span::styled("new", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
 
 // ── Theme list item builder ───────────────────────────────────────────────────

@@ -412,6 +412,17 @@ mod tests {
             .collect::<String>()
     }
 
+    fn find_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buffer.area.height {
+            let line = buffer_line(buffer, y);
+            if let Some(byte_idx) = line.find(needle) {
+                let x = line[..byte_idx].chars().count() as u16;
+                return Some((x, y));
+            }
+        }
+        None
+    }
+
     #[test]
     fn draw_chat_shows_multi_session_badge_for_other_recent_sessions() {
         let mut app = App::new();
@@ -519,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_session_popup_shows_active_badge_for_current_session() {
+    fn draw_session_popup_shows_active_marker_for_current_session() {
         let mut app = App::new();
         app.popup = Popup::SessionSelect;
         app.session_id = Some("s2".into());
@@ -535,7 +546,52 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("active"));
+        assert!(rendered.contains('●'));
+        assert!(!rendered.contains("active"));
+    }
+
+    #[test]
+    fn draw_session_popup_highlights_active_session_id() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_id = Some("s2".into());
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (bullet_x, bullet_y) = find_buffer_text(&buffer, "●").expect("active marker missing");
+        let (id_x, id_y) = find_buffer_text(&buffer, "s2").expect("session id missing");
+
+        assert_eq!(bullet_y, id_y);
+        assert!(id_x < bullet_x);
+        assert_eq!(buffer[(bullet_x, bullet_y)].fg, buffer[(id_x, id_y)].fg);
+    }
+
+    #[test]
+    fn draw_session_popup_truncates_long_titles_with_unicode_ellipsis() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["session-12345678"])];
+        app.session_groups[0].sessions[0].title =
+            Some("This is a very long session title that should truncate in the popup".into());
+        app.session_groups[0].sessions[0].updated_at = Some("2026-03-20T14:30:00Z".into());
+        app.session_cursor = 1;
+
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("..."));
     }
 
     #[test]
