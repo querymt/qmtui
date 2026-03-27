@@ -882,6 +882,8 @@ mod tests {
         assert!(rendered.contains("starting local server"));
         assert!(rendered.contains("start failed"));
         assert!(rendered.contains("server"));
+        assert!(rendered.contains("esc close"));
+        assert!(rendered.contains("tab level"));
     }
 
     #[test]

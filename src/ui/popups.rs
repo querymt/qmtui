@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::App;
+use crate::app::{App, LogLevel};
 use crate::theme::Theme;
 
 use super::{
@@ -33,6 +33,22 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
+    match level {
+        LogLevel::Trace => Theme::status(),
+        LogLevel::Debug => Theme::status_accent(),
+        LogLevel::Info => ratatui::style::Style::default()
+            .fg(Theme::info())
+            .bg(Theme::bg_dim()),
+        LogLevel::Warn => ratatui::style::Style::default()
+            .fg(Theme::warn())
+            .bg(Theme::bg_dim()),
+        LogLevel::Error => ratatui::style::Style::default()
+            .fg(Theme::err())
+            .bg(Theme::bg_dim()),
+    }
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -696,12 +712,15 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
         chunks[1].y,
     ));
 
+    let level_line = Line::from(vec![
+        Span::styled("level: ", Theme::status()),
+        Span::styled(
+            format!("{}+", app.log_level_filter.label()),
+            popup_log_level_style(app.log_level_filter),
+        ),
+    ]);
     f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("level: {}+", app.log_level_filter.label()),
-            Theme::status(),
-        ))
-        .style(Theme::popup_bg()),
+        Paragraph::new(level_line).style(Theme::popup_bg()),
         chunks[2],
     );
 
@@ -716,14 +735,17 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
         filtered
             .iter()
             .map(|entry| {
-                let prefix = format!(
-                    " {:>6}.{:01} {:<5} {:<10} ",
+                let time_part = format!(
+                    " {:>6}.{:01} ",
                     entry.elapsed.as_secs(),
                     entry.elapsed.subsec_millis() / 100,
-                    entry.level.label(),
-                    entry.target
                 );
-                let avail = list_w.saturating_sub(prefix.chars().count());
+                let level_part = format!("{:<5}", entry.level.label());
+                let target_part = format!(" {:<10} ", entry.target);
+                let prefix_w = time_part.chars().count()
+                    + level_part.chars().count()
+                    + target_part.chars().count();
+                let avail = list_w.saturating_sub(prefix_w);
                 let message = if entry.message.chars().count() > avail {
                     let truncated: String = entry
                         .message
@@ -735,7 +757,9 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
                     entry.message.clone()
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(prefix, Theme::status()),
+                    Span::styled(time_part, Theme::status()),
+                    Span::styled(level_part, popup_log_level_style(entry.level)),
+                    Span::styled(target_part, Theme::status()),
                     Span::styled(message, Theme::popup_bg()),
                 ]))
             })
@@ -748,14 +772,13 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, chunks[3], &mut state);
 
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            " esc close  tab level  type filter",
-            Theme::status(),
-        ))
-        .style(Theme::popup_bg()),
-        chunks[4],
-    );
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("close  ", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("level", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
 
 // ── Help popup ────────────────────────────────────────────────────────────────
