@@ -5,8 +5,8 @@ mod start;
 use chat::draw_chat;
 pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
 use popups::{
-    draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup, draw_session_popup,
-    draw_theme_popup,
+    draw_auth_popup, draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup,
+    draw_session_popup, draw_theme_popup,
 };
 use start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, draw_start, short_cwd};
 
@@ -16,7 +16,9 @@ pub(crate) use chat::{
     Card, CardKind, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
 };
 #[cfg(test)]
-pub(crate) use popups::{build_theme_list_item, shortcut_sections};
+pub(crate) use popups::{
+    build_theme_list_item, scroll_input, scroll_input_chars, shortcut_sections,
+};
 #[cfg(test)]
 pub(crate) use start::build_start_page_rows;
 
@@ -306,6 +308,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
         Popup::Log => draw_log_popup(f, app),
+        Popup::ProviderAuth => draw_auth_popup(f, app),
         Popup::None => {}
     }
 }
@@ -1859,5 +1862,89 @@ mod tests {
                 "thinking should be hidden, got: {text}"
             );
         }
+    }
+
+    // ── scroll_input tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_input_short_text_no_scroll() {
+        let (vis, cur) = scroll_input("abc", 3, 10);
+        assert_eq!(vis, "abc");
+        assert_eq!(cur, 3);
+    }
+
+    #[test]
+    fn scroll_input_cursor_at_start_no_scroll() {
+        let (vis, cur) = scroll_input("abcdef", 0, 4);
+        assert_eq!(vis, "abcd");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn scroll_input_cursor_at_end_overflows() {
+        // text = "abcdef" (6 chars), avail = 4, cursor at end (byte 6)
+        // scroll = 6+1-4 = 3 → skip(3).take(4) = "def" (only 3 chars remain)
+        let (vis, cur) = scroll_input("abcdef", 6, 4);
+        assert_eq!(vis, "def");
+        assert_eq!(cur, 3); // cursor at right edge of visible area
+    }
+
+    #[test]
+    fn scroll_input_cursor_mid_overflow() {
+        // text = "abcdefgh", avail = 4, cursor at position 5 ('f')
+        let (vis, cur) = scroll_input("abcdefgh", 5, 4);
+        assert_eq!(vis, "cdef");
+        assert_eq!(cur, 3);
+    }
+
+    #[test]
+    fn scroll_input_cursor_within_avail() {
+        // text = "abcdefgh", avail = 6, cursor at position 2
+        let (vis, cur) = scroll_input("abcdefgh", 2, 6);
+        assert_eq!(vis, "abcdef");
+        assert_eq!(cur, 2);
+    }
+
+    #[test]
+    fn scroll_input_avail_zero_returns_empty() {
+        let (vis, cur) = scroll_input("hello", 3, 0);
+        assert_eq!(vis, "");
+        assert_eq!(cur, 0);
+    }
+
+    #[test]
+    fn scroll_input_exact_fit_scrolls_at_end() {
+        // text = "abcd" (4), cursor at end, avail = 4
+        // cursor_chars=4 >= avail=4 → scroll=1, visible="bcd", cursor at edge
+        let (vis, cur) = scroll_input("abcd", 4, 4);
+        assert_eq!(vis, "bcd");
+        assert_eq!(cur, 3);
+    }
+
+    #[test]
+    fn scroll_input_cursor_always_within_avail() {
+        // Property: cursor_col < avail for any non-zero avail
+        for avail in 1..=10usize {
+            for cursor in 0..=20usize {
+                let text: String = (0..20).map(|i| (b'a' + (i % 26)) as char).collect();
+                let cursor_byte = cursor.min(text.len());
+                let (_, col) = scroll_input(&text, cursor_byte, avail);
+                assert!(col < avail, "col={col} must be < avail={avail}");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_input_chars_masked_bullets() {
+        // Simulates masked API key: each original char → one bullet
+        let original = "secret123";
+        let masked = "\u{2022}".repeat(original.chars().count()); // 9 bullets
+        let cursor_chars = 9; // cursor at end
+        let avail = 6;
+        // scroll = 9+1-6 = 4 → skip(4).take(6) = 5 bullets (only 5 remain)
+        let (vis, cur) = scroll_input_chars(&masked, cursor_chars, avail);
+        let expected: String = "\u{2022}".repeat(5);
+        assert_eq!(vis, expected);
+        assert_eq!(cur, 5);
     }
 }

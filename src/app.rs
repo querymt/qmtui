@@ -61,6 +61,7 @@ pub enum Popup {
     ThemeSelect,
     Help,
     Log,
+    ProviderAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -682,6 +683,18 @@ pub enum ModelPopupItem {
     },
 }
 
+/// Which sub-panel is active in the provider auth popup.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuthPanel {
+    /// Browsing the provider list.
+    #[default]
+    List,
+    /// Editing an API key for the selected provider.
+    ApiKeyInput,
+    /// Active OAuth flow — showing URL and callback/device-poll input.
+    OAuthFlow,
+}
+
 pub struct App {
     pub screen: Screen,
     pub popup: Popup,
@@ -800,6 +813,22 @@ pub struct App {
     // card cache for incremental rendering
     pub card_cache: CardCache,
 
+    // auth popup state
+    pub auth_providers: Vec<crate::protocol::AuthProviderEntry>,
+    pub auth_cursor: usize,
+    pub auth_filter: String,
+    pub auth_selected: Option<usize>,
+    pub auth_panel: AuthPanel,
+    pub auth_api_key_input: String,
+    pub auth_api_key_cursor: usize,
+    pub auth_api_key_masked: bool,
+    pub auth_oauth_flow: Option<crate::protocol::OAuthFlowData>,
+    pub auth_oauth_response: String,
+    pub auth_oauth_response_cursor: usize,
+    pub auth_result_message: Option<(bool, String)>,
+    /// When clipboard copy fails, store the URL here for a fallback display popup.
+    pub auth_clipboard_fallback: Option<String>,
+
     pub tick: u64,
     pub should_quit: bool,
 }
@@ -873,6 +902,19 @@ impl App {
             server_state: crate::server_manager::ServerState::default(),
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
+            auth_providers: Vec::new(),
+            auth_cursor: 0,
+            auth_filter: String::new(),
+            auth_selected: None,
+            auth_panel: AuthPanel::default(),
+            auth_api_key_input: String::new(),
+            auth_api_key_cursor: 0,
+            auth_api_key_masked: true,
+            auth_oauth_flow: None,
+            auth_oauth_response: String::new(),
+            auth_oauth_response_cursor: 0,
+            auth_result_message: None,
+            auth_clipboard_fallback: None,
             status: "connecting...".into(),
             tick: 0,
             should_quit: false,
@@ -1001,6 +1043,53 @@ impl App {
         }
 
         cmds
+    }
+
+    /// Filtered auth providers matching the current `auth_filter`.
+    pub fn filtered_auth_providers(&self) -> Vec<(usize, &crate::protocol::AuthProviderEntry)> {
+        if self.auth_filter.is_empty() {
+            self.auth_providers.iter().enumerate().collect()
+        } else {
+            let q = self.auth_filter.to_lowercase();
+            self.auth_providers
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    p.display_name.to_lowercase().contains(&q)
+                        || p.provider.to_lowercase().contains(&q)
+                })
+                .collect()
+        }
+    }
+
+    /// Reset auth popup state for a fresh open.
+    pub fn open_auth_popup(&mut self) {
+        self.popup = Popup::ProviderAuth;
+        self.auth_cursor = 0;
+        self.auth_filter.clear();
+        self.auth_selected = None;
+        self.auth_panel = AuthPanel::List;
+        self.auth_api_key_input.clear();
+        self.auth_api_key_cursor = 0;
+        self.auth_api_key_masked = true;
+        self.auth_oauth_flow = None;
+        self.auth_oauth_response.clear();
+        self.auth_oauth_response_cursor = 0;
+        self.auth_result_message = None;
+        self.auth_clipboard_fallback = None;
+    }
+
+    /// Reset auth detail panel state (when switching providers or going back).
+    pub fn auth_close_detail(&mut self) {
+        self.auth_selected = None;
+        self.auth_panel = AuthPanel::List;
+        self.auth_api_key_input.clear();
+        self.auth_api_key_cursor = 0;
+        self.auth_oauth_flow = None;
+        self.auth_oauth_response.clear();
+        self.auth_oauth_response_cursor = 0;
+        self.auth_result_message = None;
+        self.auth_clipboard_fallback = None;
     }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {

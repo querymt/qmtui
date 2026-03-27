@@ -50,6 +50,31 @@ pub enum ClientMsg {
         action: String, // "accept", "decline", "cancel"
         content: Option<serde_json::Value>,
     },
+    ListAuthProviders,
+    #[serde(rename = "start_oauth_login")]
+    StartOAuthLogin {
+        provider: String,
+    },
+    #[serde(rename = "complete_oauth_login")]
+    CompleteOAuthLogin {
+        flow_id: String,
+        response: String,
+    },
+    #[serde(rename = "disconnect_oauth")]
+    DisconnectOAuth {
+        provider: String,
+    },
+    SetApiToken {
+        provider: String,
+        api_key: String,
+    },
+    ClearApiToken {
+        provider: String,
+    },
+    SetAuthMethod {
+        provider: String,
+        method: AuthMethod,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -355,4 +380,160 @@ pub struct AgentModeData {
 #[derive(Debug, Deserialize)]
 pub struct ErrorData {
     pub message: String,
+}
+
+// ── Auth / token types ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMethod {
+    #[serde(rename = "oauth")]
+    OAuth,
+    ApiKey,
+    EnvVar,
+}
+
+impl std::fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OAuth => write!(f, "OAuth"),
+            Self::ApiKey => write!(f, "API Key"),
+            Self::EnvVar => write!(f, "Env"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthStatus {
+    Connected,
+    Expired,
+    NotAuthenticated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuthProviderEntry {
+    pub provider: String,
+    pub display_name: String,
+    pub oauth_status: Option<OAuthStatus>,
+    pub has_stored_api_key: bool,
+    pub has_env_api_key: bool,
+    pub env_var_name: Option<String>,
+    pub supports_oauth: bool,
+    pub preferred_method: Option<AuthMethod>,
+}
+
+impl AuthProviderEntry {
+    /// Provider supports only OAuth (no API key env var).
+    pub fn is_oauth_only(&self) -> bool {
+        self.supports_oauth && self.env_var_name.is_none()
+    }
+
+    /// Provider supports only API key (no OAuth).
+    pub fn is_api_key_only(&self) -> bool {
+        !self.supports_oauth && self.env_var_name.is_some()
+    }
+
+    /// Provider supports multiple auth methods (both OAuth and API key).
+    pub fn has_multiple_auth_methods(&self) -> bool {
+        self.supports_oauth && self.env_var_name.is_some()
+    }
+
+    /// Provider requires OAuth but the build doesn't include it.
+    pub fn is_unconfigurable(&self) -> bool {
+        !self.supports_oauth && self.env_var_name.is_none()
+    }
+
+    /// Resolve which auth method is effectively active.
+    pub fn effective_auth(&self) -> Option<AuthMethod> {
+        let pref = self.preferred_method;
+        let order: &[AuthMethod] = if let Some(p) = pref {
+            // Preferred first, then defaults
+            match p {
+                AuthMethod::OAuth => &[AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar],
+                AuthMethod::ApiKey => &[AuthMethod::ApiKey, AuthMethod::OAuth, AuthMethod::EnvVar],
+                AuthMethod::EnvVar => &[AuthMethod::EnvVar, AuthMethod::OAuth, AuthMethod::ApiKey],
+            }
+        } else if self.supports_oauth {
+            &[AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar]
+        } else {
+            &[AuthMethod::ApiKey, AuthMethod::EnvVar]
+        };
+
+        for method in order {
+            match method {
+                AuthMethod::OAuth => {
+                    if self.oauth_status == Some(OAuthStatus::Connected) {
+                        return Some(AuthMethod::OAuth);
+                    }
+                }
+                AuthMethod::ApiKey => {
+                    if self.has_stored_api_key {
+                        return Some(AuthMethod::ApiKey);
+                    }
+                }
+                AuthMethod::EnvVar => {
+                    if self.has_env_api_key {
+                        return Some(AuthMethod::EnvVar);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Badge label for current auth state.
+    pub fn auth_badge_label(&self) -> &'static str {
+        if self.is_unconfigurable() {
+            return "OAuth required";
+        }
+        if self.oauth_status == Some(OAuthStatus::Expired) {
+            return "Expired";
+        }
+        match self.effective_auth() {
+            Some(AuthMethod::OAuth) => "OAuth",
+            Some(AuthMethod::ApiKey) => "API Key",
+            Some(AuthMethod::EnvVar) => "Env",
+            None => "Not configured",
+        }
+    }
+
+    /// Whether the badge indicates a successful/active auth.
+    pub fn is_auth_active(&self) -> bool {
+        self.effective_auth().is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowKind {
+    RedirectCode,
+    DevicePoll,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OAuthFlowData {
+    pub flow_id: String,
+    pub provider: String,
+    pub authorization_url: String,
+    pub flow_kind: OAuthFlowKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OAuthResultData {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApiTokenResultData {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthProvidersData {
+    pub providers: Vec<AuthProviderEntry>,
 }

@@ -6,13 +6,43 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, LogLevel};
+use crate::app::{App, AuthPanel, LogLevel};
+use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
 use super::{
     ARROW_DOWN, ARROW_UP, COLLAPSE_CLOSED, COLLAPSE_OPEN, COLOR_SWATCH, ELLIPSIS, relative_time,
     short_cwd,
 };
+
+// ── Single-line input scroll helper ──────────────────────────────────────────
+
+/// Returns `(visible_text, cursor_col)` for a single-line input field so the
+/// cursor is always within `[0, avail)`.
+///
+/// * `text`        – full input string
+/// * `cursor_byte` – cursor offset in bytes within `text`
+/// * `avail`       – available display columns (= field_width - prefix_width)
+pub(crate) fn scroll_input(text: &str, cursor_byte: usize, avail: usize) -> (String, usize) {
+    let cursor_chars = text[..cursor_byte.min(text.len())].chars().count();
+    scroll_input_chars(text, cursor_chars, avail)
+}
+
+/// Same as [`scroll_input`] but takes a cursor position in chars instead of bytes.
+/// Useful when the display text differs from the source (e.g. masked API key).
+pub(crate) fn scroll_input_chars(text: &str, cursor_chars: usize, avail: usize) -> (String, usize) {
+    if avail == 0 {
+        return (String::new(), 0);
+    }
+    let scroll = if cursor_chars >= avail {
+        cursor_chars + 1 - avail
+    } else {
+        0
+    };
+    let visible: String = text.chars().skip(scroll).take(avail).collect();
+    let cursor_col = cursor_chars - scroll;
+    (visible, cursor_col)
+}
 
 // ── Centered rect helper ──────────────────────────────────────────────────────
 
@@ -129,15 +159,18 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (model_filter_display, model_filter_cur) =
+        scroll_input(&app.model_filter, app.model_filter.len(), avail);
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
-        Span::styled(app.model_filter.clone(), Theme::popup_bg()),
+        Span::styled(model_filter_display, Theme::popup_bg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + app.model_filter.len() as u16, chunks[1].y));
+    f.set_cursor_position((chunks[1].x + 2 + model_filter_cur as u16, chunks[1].y));
 
     let list_w = chunks[3].width as usize;
 
@@ -296,18 +329,18 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     );
 
     // filter
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (session_filter_display, session_filter_cur) =
+        scroll_input(&app.session_filter, app.session_filter.len(), avail);
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
-        Span::styled(app.session_filter.clone(), Theme::popup_bg()),
+        Span::styled(session_filter_display, Theme::popup_bg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((
-        chunks[1].x + 2 + app.session_filter.chars().count() as u16,
-        chunks[1].y,
-    ));
+    f.set_cursor_position((chunks[1].x + 2 + session_filter_cur as u16, chunks[1].y));
 
     // grouped session list
     let popup_items = app.visible_popup_items();
@@ -550,15 +583,18 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
         .style(Theme::popup_bg()),
         chunks[1],
     );
+    let avail = chunks[2].width.saturating_sub(2) as usize;
+    let (path_display, path_cur) =
+        scroll_input(&app.new_session_path, app.new_session_cursor, avail);
     let input_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
-        Span::styled(app.new_session_path.clone(), Theme::popup_bg()),
+        Span::styled(path_display, Theme::popup_bg()),
     ]);
     f.render_widget(
         Paragraph::new(input_line).style(Theme::popup_bg()),
         chunks[2],
     );
-    f.set_cursor_position((chunks[2].x + 2 + app.new_session_cursor as u16, chunks[2].y));
+    f.set_cursor_position((chunks[2].x + 2 + path_cur as u16, chunks[2].y));
 
     if let Some(completion) = &app.new_session_completion
         && !completion.results.is_empty()
@@ -643,18 +679,18 @@ pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
     );
 
     // filter
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (theme_filter_display, theme_filter_cur) =
+        scroll_input(&app.theme_filter, app.theme_filter.len(), avail);
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
-        Span::styled(app.theme_filter.clone(), Theme::popup_bg()),
+        Span::styled(theme_filter_display, Theme::popup_bg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((
-        chunks[1].x + 2 + app.theme_filter.chars().count() as u16,
-        chunks[1].y,
-    ));
+    f.set_cursor_position((chunks[1].x + 2 + theme_filter_cur as u16, chunks[1].y));
 
     // theme list
     let all_themes = Theme::available_themes();
@@ -732,18 +768,18 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (log_filter_display, log_filter_cur) =
+        scroll_input(&app.log_filter, app.log_filter.len(), avail);
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
-        Span::styled(app.log_filter.clone(), Theme::popup_bg()),
+        Span::styled(log_filter_display, Theme::popup_bg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((
-        chunks[1].x + 2 + app.log_filter.chars().count() as u16,
-        chunks[1].y,
-    ));
+    f.set_cursor_position((chunks[1].x + 2 + log_filter_cur as u16, chunks[1].y));
 
     let level_line = Line::from(vec![
         Span::styled("level: ", Theme::status()),
@@ -838,6 +874,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             title: "chord  (C-x \u{2026})",
             rows: &[
                 ("?", "this help"),
+                ("a", "provider auth"),
                 ("e", "external editor"),
                 ("m", "model selector"),
                 ("n", "new session"),
@@ -969,4 +1006,522 @@ pub(super) fn draw_help_popup(f: &mut Frame, app: &App) {
         .style(Theme::popup_bg()),
         chunks[3],
     );
+}
+
+// ── Auth popup ────────────────────────────────────────────────────────────────
+
+const AUTH_POPUP_MAX_W: u16 = 68;
+const AUTH_POPUP_MIN_W: u16 = 44;
+
+pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(AUTH_POPUP_MIN_W, AUTH_POPUP_MAX_W);
+    let popup_height = (area.height * 30 / 100).max(15).min(area.height);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    // If clipboard fallback is active, draw a simple URL display popup over everything.
+    if let Some(ref url) = app.auth_clipboard_fallback {
+        draw_auth_clipboard_fallback(f, inner, url);
+        return;
+    }
+
+    // Determine detail area height based on panel state.
+    let detail_height: u16 = match app.auth_panel {
+        AuthPanel::List => {
+            if app.auth_selected.is_some() {
+                3 // status line + info
+            } else {
+                0
+            }
+        }
+        AuthPanel::ApiKeyInput => 5,
+        AuthPanel::OAuthFlow => 7,
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),             // title
+            Constraint::Length(1),             // filter
+            Constraint::Length(1),             // spacer
+            Constraint::Min(1),                // provider list
+            Constraint::Length(detail_height), // detail panel
+            Constraint::Length(1),             // hint
+        ])
+        .split(inner);
+
+    // title
+    f.render_widget(
+        Paragraph::new(Span::styled("provider auth", Theme::popup_title()))
+            .style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    // filter
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (auth_filter_display, auth_filter_cur) =
+        scroll_input(&app.auth_filter, app.auth_filter.len(), avail);
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(auth_filter_display, Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    if app.auth_panel == AuthPanel::List {
+        f.set_cursor_position((chunks[1].x + 2 + auth_filter_cur as u16, chunks[1].y));
+    }
+
+    // provider list
+    let filtered = app.filtered_auth_providers();
+    let list_w = chunks[3].width as usize;
+
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, (_, provider))| {
+            let selected = i == app.auth_cursor;
+            let badge = provider.auth_badge_label();
+            let badge_active = provider.is_auth_active();
+            let is_expired = provider.oauth_status == Some(OAuthStatus::Expired);
+
+            // Badge styling
+            let badge_style = if selected {
+                Theme::selected()
+            } else if is_expired {
+                ratatui::style::Style::default()
+                    .fg(Theme::warn())
+                    .bg(Theme::bg_dim())
+            } else if badge_active {
+                ratatui::style::Style::default()
+                    .fg(Theme::ok())
+                    .bg(Theme::bg_dim())
+            } else {
+                Theme::status()
+            };
+
+            let name_style = if selected {
+                Theme::selected()
+            } else {
+                Theme::popup_bg()
+            };
+
+            let badge_str = format!("[{badge}]");
+            let badge_len = badge_str.chars().count();
+            let name = &provider.display_name;
+            let avail = list_w.saturating_sub(badge_len + 3);
+            let name_display = if name.chars().count() > avail {
+                let t: String = name.chars().take(avail.saturating_sub(1)).collect();
+                format!("{t}{ELLIPSIS}")
+            } else {
+                name.to_string()
+            };
+            let gap = avail.saturating_sub(name_display.chars().count());
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {name_display}"), name_style),
+                Span::styled(" ".repeat(gap), name_style),
+                Span::styled(format!(" {badge_str} "), badge_style),
+            ]))
+        })
+        .collect();
+
+    if items.is_empty() {
+        let msg = if app.auth_filter.is_empty() {
+            "loading providers..."
+        } else {
+            "no providers match filter"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" {msg}"), Theme::status()))
+                .style(Theme::popup_bg()),
+            chunks[3],
+        );
+    } else {
+        let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
+        let visible_rows = chunks[3].height as usize;
+        let offset = app
+            .auth_cursor
+            .saturating_sub(visible_rows.saturating_sub(1));
+        let mut state = ListState::default()
+            .with_offset(offset)
+            .with_selected(Some(app.auth_cursor));
+        f.render_stateful_widget(list, chunks[3], &mut state);
+    }
+
+    // detail panel
+    if detail_height > 0 {
+        draw_auth_detail_panel(f, app, chunks[4]);
+    }
+
+    // hint
+    let hint = match app.auth_panel {
+        AuthPanel::List => {
+            let mut spans = vec![
+                Span::styled(" esc ", Theme::status_accent()),
+                Span::styled("close  ", Theme::status()),
+                Span::styled("enter ", Theme::status_accent()),
+                Span::styled("select  ", Theme::status()),
+            ];
+            // Show C-d contextually when a provider with clearable credentials is selected
+            if let Some(idx) = app.auth_selected
+                && let Some(provider) = app.auth_providers.get(idx)
+            {
+                if provider.oauth_status == Some(OAuthStatus::Connected) {
+                    spans.push(Span::styled("C-d ", Theme::status_accent()));
+                    spans.push(Span::styled("disconnect  ", Theme::status()));
+                } else if provider.has_stored_api_key {
+                    spans.push(Span::styled("C-d ", Theme::status_accent()));
+                    spans.push(Span::styled("clear key  ", Theme::status()));
+                }
+            }
+            spans.push(Span::styled("C-k ", Theme::status_accent()));
+            spans.push(Span::styled("api key  ", Theme::status()));
+            spans.push(Span::styled("C-o ", Theme::status_accent()));
+            spans.push(Span::styled("oauth", Theme::status()));
+            Line::from(spans)
+        }
+        AuthPanel::ApiKeyInput => Line::from(vec![
+            Span::styled(" esc ", Theme::status_accent()),
+            Span::styled("back  ", Theme::status()),
+            Span::styled("enter ", Theme::status_accent()),
+            Span::styled("save  ", Theme::status()),
+            Span::styled("tab ", Theme::status_accent()),
+            Span::styled("toggle mask  ", Theme::status()),
+            Span::styled("C-d ", Theme::status_accent()),
+            Span::styled("clear key", Theme::status()),
+        ]),
+        AuthPanel::OAuthFlow => Line::from(vec![
+            Span::styled(" esc ", Theme::status_accent()),
+            Span::styled("back  ", Theme::status()),
+            Span::styled("C-y ", Theme::status_accent()),
+            Span::styled("copy url  ", Theme::status()),
+            Span::styled("enter ", Theme::status_accent()),
+            Span::styled("complete", Theme::status()),
+        ]),
+    };
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[5]);
+}
+
+fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
+    let Some(idx) = app.auth_selected else {
+        return;
+    };
+    let Some(provider) = app.auth_providers.get(idx) else {
+        return;
+    };
+
+    match app.auth_panel {
+        AuthPanel::List => {
+            // Show selected provider status summary
+            let mut lines: Vec<Line<'static>> = Vec::new();
+
+            let status_label = provider.auth_badge_label();
+            let is_active = provider.is_auth_active();
+            let status_style = if is_active {
+                ratatui::style::Style::default()
+                    .fg(Theme::ok())
+                    .bg(Theme::bg_dim())
+            } else {
+                Theme::status()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", provider.display_name), Theme::popup_title()),
+                Span::styled(format!("[{status_label}]"), status_style),
+            ]));
+
+            if provider.is_unconfigurable() {
+                lines.push(Line::from(Span::styled(
+                    " OAuth required (not available in this build)",
+                    Theme::status(),
+                )));
+            } else if let Some(ref env_var) = provider.env_var_name {
+                lines.push(Line::from(Span::styled(
+                    format!(" env: {env_var}"),
+                    Theme::status(),
+                )));
+            }
+
+            if let Some((success, ref msg)) = app.auth_result_message {
+                let style = if success {
+                    ratatui::style::Style::default()
+                        .fg(Theme::ok())
+                        .bg(Theme::bg_dim())
+                } else {
+                    ratatui::style::Style::default()
+                        .fg(Theme::err())
+                        .bg(Theme::bg_dim())
+                };
+                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+            }
+
+            for (i, line) in lines.into_iter().enumerate() {
+                if i as u16 >= area.height {
+                    break;
+                }
+                let row = Rect {
+                    x: area.x,
+                    y: area.y + i as u16,
+                    width: area.width,
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line).style(Theme::popup_bg()), row);
+            }
+        }
+
+        AuthPanel::ApiKeyInput => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" API Key for {} ", provider.display_name),
+                    Theme::popup_title(),
+                ),
+                if let Some(ref env_var) = provider.env_var_name {
+                    Span::styled(format!(" {env_var}"), Theme::status())
+                } else {
+                    Span::raw("")
+                },
+            ]));
+
+            if provider.has_stored_api_key {
+                lines.push(Line::from(Span::styled(
+                    " key stored in keychain",
+                    ratatui::style::Style::default()
+                        .fg(Theme::ok())
+                        .bg(Theme::bg_dim()),
+                )));
+            }
+
+            // Input line
+            let cursor_chars = app.auth_api_key_input[..app.auth_api_key_cursor]
+                .chars()
+                .count();
+            let display_input = if app.auth_api_key_masked && !app.auth_api_key_input.is_empty() {
+                "\u{2022}".repeat(app.auth_api_key_input.chars().count())
+            } else {
+                app.auth_api_key_input.clone()
+            };
+            let placeholder = if provider.has_stored_api_key {
+                "new key to update..."
+            } else {
+                "enter API key..."
+            };
+            // " > " prefix = 3 cols
+            let avail = area.width.saturating_sub(3) as usize;
+            let (input_text, api_key_cur) = if app.auth_api_key_input.is_empty() {
+                (placeholder.to_string(), 0usize)
+            } else {
+                let (vis, col) = scroll_input_chars(&display_input, cursor_chars, avail);
+                (vis, col)
+            };
+            let input_style = if app.auth_api_key_input.is_empty() {
+                Theme::status()
+            } else {
+                Theme::popup_bg()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" > ", Theme::popup_title()),
+                Span::styled(input_text, input_style),
+            ]));
+
+            if let Some((success, ref msg)) = app.auth_result_message {
+                let style = if success {
+                    ratatui::style::Style::default()
+                        .fg(Theme::ok())
+                        .bg(Theme::bg_dim())
+                } else {
+                    ratatui::style::Style::default()
+                        .fg(Theme::err())
+                        .bg(Theme::bg_dim())
+                };
+                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+            }
+
+            for (i, line) in lines.into_iter().enumerate() {
+                if i as u16 >= area.height {
+                    break;
+                }
+                let row = Rect {
+                    x: area.x,
+                    y: area.y + i as u16,
+                    width: area.width,
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line).style(Theme::popup_bg()), row);
+            }
+
+            // Position cursor in the input field
+            let input_row_idx = if provider.has_stored_api_key { 2 } else { 1 };
+            if (input_row_idx as u16) < area.height {
+                f.set_cursor_position((
+                    area.x + 3 + api_key_cur as u16,
+                    area.y + input_row_idx as u16,
+                ));
+            }
+        }
+
+        AuthPanel::OAuthFlow => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+
+            if let Some(ref flow) = app.auth_oauth_flow {
+                let is_device_poll = flow.flow_kind == crate::protocol::OAuthFlowKind::DevicePoll;
+
+                lines.push(Line::from(Span::styled(
+                    format!(" OAuth for {}", flow.provider),
+                    Theme::popup_title(),
+                )));
+
+                // Truncate URL for display
+                let url = &flow.authorization_url;
+                let avail = area.width.saturating_sub(3) as usize;
+                let url_display = if url.chars().count() > avail {
+                    let t: String = url.chars().take(avail.saturating_sub(1)).collect();
+                    format!("{t}{ELLIPSIS}")
+                } else {
+                    url.to_string()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(" {url_display}"),
+                    Theme::status(),
+                )));
+
+                if is_device_poll {
+                    lines.push(Line::from(Span::styled(
+                        " Open URL, approve, then press Enter to check",
+                        Theme::status(),
+                    )));
+                } else {
+                    // " > " prefix = 3 cols
+                    let avail = area.width.saturating_sub(3) as usize;
+                    let (response_display, _) = scroll_input(
+                        &app.auth_oauth_response,
+                        app.auth_oauth_response_cursor,
+                        avail,
+                    );
+                    lines.push(Line::from(Span::styled(
+                        " Open URL, approve, paste callback below:",
+                        Theme::status(),
+                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled(" > ", Theme::popup_title()),
+                        Span::styled(response_display, Theme::popup_bg()),
+                    ]));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    " Starting OAuth flow...",
+                    Theme::status(),
+                )));
+            }
+
+            if let Some((success, ref msg)) = app.auth_result_message {
+                let style = if success {
+                    ratatui::style::Style::default()
+                        .fg(Theme::ok())
+                        .bg(Theme::bg_dim())
+                } else {
+                    ratatui::style::Style::default()
+                        .fg(Theme::err())
+                        .bg(Theme::bg_dim())
+                };
+                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+            }
+
+            for (i, line) in lines.into_iter().enumerate() {
+                if i as u16 >= area.height {
+                    break;
+                }
+                let row = Rect {
+                    x: area.x,
+                    y: area.y + i as u16,
+                    width: area.width,
+                    height: 1,
+                };
+                f.render_widget(Paragraph::new(line).style(Theme::popup_bg()), row);
+            }
+
+            // Position cursor on callback input (non-device-poll only, row 3)
+            if app.auth_oauth_flow.is_some()
+                && app
+                    .auth_oauth_flow
+                    .as_ref()
+                    .is_some_and(|f| f.flow_kind != crate::protocol::OAuthFlowKind::DevicePoll)
+            {
+                let avail = area.width.saturating_sub(3) as usize;
+                let (_, oauth_cur) = scroll_input(
+                    &app.auth_oauth_response,
+                    app.auth_oauth_response_cursor,
+                    avail,
+                );
+                if 3 < area.height {
+                    f.set_cursor_position((area.x + 3 + oauth_cur as u16, area.y + 3));
+                }
+            }
+        }
+    }
+}
+
+fn draw_auth_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Clipboard not available",
+        Theme::popup_title(),
+    )));
+    lines.push(Line::from(Span::styled(
+        " Copy this URL manually:",
+        Theme::status(),
+    )));
+    lines.push(Line::from(""));
+
+    // Word-wrap the URL into available width
+    let avail = area.width.saturating_sub(2) as usize;
+    let mut remaining = url;
+    while !remaining.is_empty() {
+        let take = remaining.len().min(avail);
+        lines.push(Line::from(Span::styled(
+            format!(" {}", &remaining[..take]),
+            Theme::popup_bg(),
+        )));
+        remaining = &remaining[take..];
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " press any key to dismiss",
+        Theme::status(),
+    )));
+
+    for (i, line) in lines.into_iter().enumerate() {
+        if i as u16 >= area.height {
+            break;
+        }
+        let row = Rect {
+            x: area.x,
+            y: area.y + i as u16,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(line).style(Theme::popup_bg()), row);
+    }
 }

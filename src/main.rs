@@ -2379,3 +2379,861 @@ mod cli_tests {
         assert_eq!(hint, format!("{} -s abc-123-def", bin()));
     }
 }
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::handlers::*;
+    use crate::protocol::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn make_provider(name: &str) -> AuthProviderEntry {
+        AuthProviderEntry {
+            provider: name.to_lowercase(),
+            display_name: name.to_string(),
+            oauth_status: Some(OAuthStatus::NotAuthenticated),
+            has_stored_api_key: false,
+            has_env_api_key: false,
+            env_var_name: Some(format!("{}_API_KEY", name.to_uppercase())),
+            supports_oauth: true,
+            preferred_method: None,
+        }
+    }
+
+    fn make_oauth_only(name: &str) -> AuthProviderEntry {
+        AuthProviderEntry {
+            provider: name.to_lowercase(),
+            display_name: name.to_string(),
+            oauth_status: Some(OAuthStatus::NotAuthenticated),
+            has_stored_api_key: false,
+            has_env_api_key: false,
+            env_var_name: None,
+            supports_oauth: true,
+            preferred_method: None,
+        }
+    }
+
+    fn make_api_key_only(name: &str) -> AuthProviderEntry {
+        AuthProviderEntry {
+            provider: name.to_lowercase(),
+            display_name: name.to_string(),
+            oauth_status: None,
+            has_stored_api_key: false,
+            has_env_api_key: false,
+            env_var_name: Some(format!("{}_API_KEY", name.to_uppercase())),
+            supports_oauth: false,
+            preferred_method: None,
+        }
+    }
+
+    fn make_app_with_providers(providers: Vec<AuthProviderEntry>) -> App {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.auth_providers = providers;
+        app.popup = app::Popup::ProviderAuth;
+        app
+    }
+
+    // ── Protocol type tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn auth_provider_entry_effective_auth_oauth_connected() {
+        let mut p = make_provider("OpenAI");
+        p.oauth_status = Some(OAuthStatus::Connected);
+        assert_eq!(p.effective_auth(), Some(AuthMethod::OAuth));
+        assert_eq!(p.auth_badge_label(), "OAuth");
+        assert!(p.is_auth_active());
+    }
+
+    #[test]
+    fn auth_provider_entry_effective_auth_api_key_stored() {
+        let mut p = make_api_key_only("Groq");
+        p.has_stored_api_key = true;
+        assert_eq!(p.effective_auth(), Some(AuthMethod::ApiKey));
+        assert_eq!(p.auth_badge_label(), "API Key");
+        assert!(p.is_auth_active());
+    }
+
+    #[test]
+    fn auth_provider_entry_effective_auth_env_var() {
+        let mut p = make_api_key_only("DeepSeek");
+        p.has_env_api_key = true;
+        assert_eq!(p.effective_auth(), Some(AuthMethod::EnvVar));
+        assert_eq!(p.auth_badge_label(), "Env");
+    }
+
+    #[test]
+    fn auth_provider_entry_not_configured() {
+        let p = make_provider("OpenAI");
+        assert_eq!(p.effective_auth(), None);
+        assert_eq!(p.auth_badge_label(), "Not configured");
+        assert!(!p.is_auth_active());
+    }
+
+    #[test]
+    fn auth_provider_entry_expired_badge() {
+        let mut p = make_oauth_only("Codex");
+        p.oauth_status = Some(OAuthStatus::Expired);
+        assert_eq!(p.auth_badge_label(), "Expired");
+    }
+
+    #[test]
+    fn auth_provider_entry_unconfigurable() {
+        let p = AuthProviderEntry {
+            provider: "codex".into(),
+            display_name: "Codex".into(),
+            oauth_status: None,
+            has_stored_api_key: false,
+            has_env_api_key: false,
+            env_var_name: None,
+            supports_oauth: false,
+            preferred_method: None,
+        };
+        assert!(p.is_unconfigurable());
+        assert_eq!(p.auth_badge_label(), "OAuth required");
+    }
+
+    #[test]
+    fn auth_provider_entry_preferred_method_overrides_default_order() {
+        let mut p = make_provider("OpenAI");
+        p.oauth_status = Some(OAuthStatus::Connected);
+        p.has_stored_api_key = true;
+        p.preferred_method = Some(AuthMethod::ApiKey);
+        // With preference ApiKey, should pick that over OAuth even though both are available
+        assert_eq!(p.effective_auth(), Some(AuthMethod::ApiKey));
+    }
+
+    #[test]
+    fn auth_provider_classification_helpers() {
+        let multi = make_provider("OpenAI");
+        assert!(multi.has_multiple_auth_methods());
+        assert!(!multi.is_oauth_only());
+        assert!(!multi.is_api_key_only());
+
+        let oauth_only = make_oauth_only("Codex");
+        assert!(oauth_only.is_oauth_only());
+        assert!(!oauth_only.has_multiple_auth_methods());
+
+        let api_only = make_api_key_only("Groq");
+        assert!(api_only.is_api_key_only());
+        assert!(!api_only.has_multiple_auth_methods());
+    }
+
+    // ── App state tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn open_auth_popup_resets_state() {
+        let mut app = App::new();
+        app.auth_cursor = 5;
+        app.auth_filter = "test".into();
+        app.auth_selected = Some(2);
+        app.auth_api_key_input = "secret".into();
+        app.open_auth_popup();
+        assert_eq!(app.popup, app::Popup::ProviderAuth);
+        assert_eq!(app.auth_cursor, 0);
+        assert!(app.auth_filter.is_empty());
+        assert!(app.auth_selected.is_none());
+        assert!(app.auth_api_key_input.is_empty());
+        assert!(app.auth_api_key_masked);
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+    }
+
+    #[test]
+    fn filtered_auth_providers_with_empty_filter() {
+        let app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
+        let filtered = app.filtered_auth_providers();
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filtered_auth_providers_filters_by_name() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
+        app.auth_filter = "groq".into();
+        let filtered = app.filtered_auth_providers();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1.provider, "groq");
+    }
+
+    #[test]
+    fn auth_close_detail_resets_panel_state() {
+        let mut app = App::new();
+        app.auth_selected = Some(1);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth_api_key_input = "secret".into();
+        app.auth_close_detail();
+        assert!(app.auth_selected.is_none());
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth_api_key_input.is_empty());
+    }
+
+    // ── Key handler tests: List panel ─────────────────────────────────────────
+
+    #[test]
+    fn auth_list_esc_closes_popup_when_no_selection() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert_eq!(app.popup, app::Popup::None);
+    }
+
+    #[test]
+    fn auth_list_esc_clears_selection_when_selected() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        app.auth_selected = Some(0);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert_eq!(app.popup, app::Popup::ProviderAuth);
+        assert!(app.auth_selected.is_none());
+    }
+
+    #[test]
+    fn auth_list_down_up_navigates() {
+        let mut app = make_app_with_providers(vec![
+            make_provider("OpenAI"),
+            make_provider("Groq"),
+            make_provider("DeepSeek"),
+        ]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(app.auth_cursor, 0);
+        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        assert_eq!(app.auth_cursor, 1);
+        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        assert_eq!(app.auth_cursor, 2);
+        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        assert_eq!(app.auth_cursor, 2); // clamped
+        handle_auth_popup_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        assert_eq!(app.auth_cursor, 1);
+    }
+
+    #[test]
+    fn auth_list_enter_on_api_key_only_opens_api_key_panel() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
+        assert_eq!(app.auth_selected, Some(0));
+    }
+
+    #[test]
+    fn auth_list_enter_on_oauth_only_starts_flow() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert_eq!(app.auth_selected, Some(0));
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "codex"));
+    }
+
+    #[test]
+    fn auth_list_enter_on_multi_method_selects_provider() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert_eq!(app.auth_selected, Some(0));
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+    }
+
+    #[test]
+    fn auth_list_char_input_filters() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('g')), &tx).unwrap();
+        assert_eq!(app.auth_filter, "g");
+        assert_eq!(app.auth_cursor, 0);
+    }
+
+    #[test]
+    fn auth_list_backspace_removes_filter() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        app.auth_filter = "op".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        assert_eq!(app.auth_filter, "o");
+    }
+
+    #[test]
+    fn auth_list_ctrl_k_opens_api_key_panel() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, ctrl('k'), &tx).unwrap();
+        assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
+        assert_eq!(app.auth_selected, Some(0));
+    }
+
+    #[test]
+    fn auth_list_ctrl_o_starts_oauth() {
+        let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_auth_popup_key(&mut app, ctrl('o'), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "openai"));
+    }
+
+    // ── Key handler tests: API Key panel ──────────────────────────────────────
+
+    #[test]
+    fn auth_api_key_typing_and_submit() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('s')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('k')), &tx).unwrap();
+        assert_eq!(app.auth_api_key_input, "sk");
+        assert_eq!(app.auth_api_key_cursor, 2);
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(
+            msg,
+            ClientMsg::SetApiToken { provider, api_key }
+            if provider == "groq" && api_key == "sk"
+        ));
+    }
+
+    #[test]
+    fn auth_api_key_backspace() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth_api_key_input = "abc".into();
+        app.auth_api_key_cursor = 3;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        assert_eq!(app.auth_api_key_input, "ab");
+        assert_eq!(app.auth_api_key_cursor, 2);
+    }
+
+    #[test]
+    fn auth_api_key_esc_returns_to_list() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth_api_key_input = "draft".into();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth_api_key_input.is_empty());
+    }
+
+    #[test]
+    fn auth_api_key_tab_toggles_mask() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        assert!(app.auth_api_key_masked);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        assert!(!app.auth_api_key_masked);
+        handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        assert!(app.auth_api_key_masked);
+    }
+
+    #[test]
+    fn auth_api_key_ctrl_d_sends_clear() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg, ClientMsg::ClearApiToken { provider } if provider == "groq"));
+    }
+
+    #[test]
+    fn auth_api_key_empty_submit_does_nothing() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert!(rx.try_recv().is_err()); // nothing sent
+    }
+
+    // ── Key handler tests: OAuth flow panel ───────────────────────────────────
+
+    #[test]
+    fn auth_oauth_esc_returns_to_list() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth_oauth_flow = Some(OAuthFlowData {
+            flow_id: "f1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://example.com".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth_oauth_flow.is_none());
+    }
+
+    #[test]
+    fn auth_oauth_redirect_code_typing_and_submit() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth_oauth_flow = Some(OAuthFlowData {
+            flow_id: "f1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://example.com".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('c')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('o')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('d')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('e')), &tx).unwrap();
+        assert_eq!(app.auth_oauth_response, "code");
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(
+            msg,
+            ClientMsg::CompleteOAuthLogin { flow_id, response }
+            if flow_id == "f1" && response == "code"
+        ));
+    }
+
+    #[test]
+    fn auth_oauth_device_poll_enter_sends_empty_response() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth_oauth_flow = Some(OAuthFlowData {
+            flow_id: "f1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://example.com/device".into(),
+            flow_kind: OAuthFlowKind::DevicePoll,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(
+            msg,
+            ClientMsg::CompleteOAuthLogin { flow_id, response }
+            if flow_id == "f1" && response.is_empty()
+        ));
+    }
+
+    // ── Server message handling tests ─────────────────────────────────────────
+
+    #[test]
+    fn server_msg_auth_providers_populates_list() {
+        let mut app = App::new();
+        let raw = RawServerMsg {
+            msg_type: "auth_providers".into(),
+            data: Some(serde_json::json!({
+                "providers": [
+                    {
+                        "provider": "openai",
+                        "display_name": "OpenAI",
+                        "oauth_status": "not_authenticated",
+                        "has_stored_api_key": false,
+                        "has_env_api_key": true,
+                        "env_var_name": "OPENAI_API_KEY",
+                        "supports_oauth": true,
+                        "preferred_method": null
+                    },
+                    {
+                        "provider": "groq",
+                        "display_name": "Groq",
+                        "oauth_status": null,
+                        "has_stored_api_key": true,
+                        "has_env_api_key": false,
+                        "env_var_name": "GROQ_API_KEY",
+                        "supports_oauth": false,
+                        "preferred_method": null
+                    }
+                ]
+            })),
+        };
+        let cmds = app.handle_server_msg(raw);
+        assert!(cmds.is_empty());
+        assert_eq!(app.auth_providers.len(), 2);
+        assert_eq!(app.auth_providers[0].provider, "openai");
+        assert!(app.auth_providers[0].has_env_api_key);
+        assert_eq!(app.auth_providers[1].provider, "groq");
+        assert!(app.auth_providers[1].has_stored_api_key);
+    }
+
+    #[test]
+    fn server_msg_oauth_flow_started_sets_flow_state() {
+        let mut app = App::new();
+        app.popup = app::Popup::ProviderAuth;
+        let raw = RawServerMsg {
+            msg_type: "oauth_flow_started".into(),
+            data: Some(serde_json::json!({
+                "flow_id": "flow-123",
+                "provider": "openai",
+                "authorization_url": "https://auth.example.com/authorize",
+                "flow_kind": "redirect_code"
+            })),
+        };
+        let cmds = app.handle_server_msg(raw);
+        assert!(cmds.is_empty());
+        assert!(app.auth_oauth_flow.is_some());
+        let flow = app.auth_oauth_flow.unwrap();
+        assert_eq!(flow.flow_id, "flow-123");
+        assert_eq!(flow.provider, "openai");
+        assert_eq!(flow.flow_kind, OAuthFlowKind::RedirectCode);
+        assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
+    }
+
+    #[test]
+    fn server_msg_oauth_result_success_clears_flow() {
+        let mut app = App::new();
+        app.auth_oauth_flow = Some(OAuthFlowData {
+            flow_id: "f1".into(),
+            provider: "openai".into(),
+            authorization_url: "https://example.com".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+        let raw = RawServerMsg {
+            msg_type: "oauth_result".into(),
+            data: Some(serde_json::json!({
+                "provider": "openai",
+                "success": true,
+                "message": "Connected successfully"
+            })),
+        };
+        let cmds = app.handle_server_msg(raw);
+        // Should request refreshed provider list
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
+        );
+        assert!(app.auth_oauth_flow.is_none());
+        assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert_eq!(
+            app.auth_result_message,
+            Some((true, "Connected successfully".into()))
+        );
+    }
+
+    #[test]
+    fn server_msg_api_token_result_success_clears_input() {
+        let mut app = App::new();
+        app.auth_api_key_input = "sk-secret".into();
+        app.auth_api_key_cursor = 9;
+        let raw = RawServerMsg {
+            msg_type: "api_token_result".into(),
+            data: Some(serde_json::json!({
+                "provider": "groq",
+                "success": true,
+                "message": "API key saved"
+            })),
+        };
+        let cmds = app.handle_server_msg(raw);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
+        );
+        assert!(app.auth_api_key_input.is_empty());
+        assert_eq!(app.auth_api_key_cursor, 0);
+        assert_eq!(
+            app.auth_result_message,
+            Some((true, "API key saved".into()))
+        );
+    }
+
+    #[test]
+    fn server_msg_api_token_result_failure_keeps_input() {
+        let mut app = App::new();
+        app.auth_api_key_input = "bad-key".into();
+        app.auth_api_key_cursor = 7;
+        let raw = RawServerMsg {
+            msg_type: "api_token_result".into(),
+            data: Some(serde_json::json!({
+                "provider": "groq",
+                "success": false,
+                "message": "Invalid key"
+            })),
+        };
+        let cmds = app.handle_server_msg(raw);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
+        );
+        assert_eq!(app.auth_api_key_input, "bad-key"); // preserved
+        assert_eq!(app.auth_result_message, Some((false, "Invalid key".into())));
+    }
+
+    // ── Disconnect / clear credential tests (C-d in List panel) ─────────────
+
+    #[test]
+    fn auth_list_ctrl_d_disconnects_oauth_when_connected() {
+        let mut provider = make_provider("OpenAI");
+        provider.oauth_status = Some(OAuthStatus::Connected);
+        let mut app = make_app_with_providers(vec![provider]);
+        app.auth_selected = Some(0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(
+            msg,
+            ClientMsg::DisconnectOAuth { provider } if provider == "openai"
+        ));
+    }
+
+    #[test]
+    fn auth_list_ctrl_d_clears_api_key_when_stored() {
+        let mut provider = make_api_key_only("Groq");
+        provider.has_stored_api_key = true;
+        let mut app = make_app_with_providers(vec![provider]);
+        app.auth_selected = Some(0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(
+            msg,
+            ClientMsg::ClearApiToken { provider } if provider == "groq"
+        ));
+    }
+
+    #[test]
+    fn auth_list_ctrl_d_noop_when_no_credential() {
+        let app_provider = make_provider("OpenAI"); // not connected, no stored key
+        let mut app = make_app_with_providers(vec![app_provider]);
+        app.auth_selected = Some(0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        assert!(rx.try_recv().is_err()); // nothing sent
+    }
+
+    #[test]
+    fn auth_list_ctrl_d_noop_when_no_selection() {
+        let mut provider = make_provider("OpenAI");
+        provider.oauth_status = Some(OAuthStatus::Connected);
+        let mut app = make_app_with_providers(vec![provider]);
+        // auth_selected is None
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        assert!(rx.try_recv().is_err()); // nothing sent
+    }
+
+    #[test]
+    fn auth_list_ctrl_d_prefers_oauth_disconnect_over_api_key_clear() {
+        // Provider has both OAuth connected AND a stored API key
+        let mut provider = make_provider("OpenAI");
+        provider.oauth_status = Some(OAuthStatus::Connected);
+        provider.has_stored_api_key = true;
+        let mut app = make_app_with_providers(vec![provider]);
+        app.auth_selected = Some(0);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
+        let msg = rx.try_recv().expect("message sent");
+        // Should disconnect OAuth first, not clear API key
+        assert!(matches!(msg, ClientMsg::DisconnectOAuth { .. }));
+    }
+
+    // ── Clipboard copy tests ────────────────────────────────────────────────
+
+    #[test]
+    fn auth_oauth_ctrl_y_triggers_clipboard_copy() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_selected = Some(0);
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth_oauth_flow = Some(OAuthFlowData {
+            flow_id: "f1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://auth.example.com/authorize".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, ctrl('y'), &tx).unwrap();
+        // In CI there's no clipboard tool, so it falls back to the URL display
+        assert!(
+            app.auth_clipboard_fallback.is_some()
+                || app.auth_result_message == Some((true, "Copied to clipboard".into())),
+            "C-y should attempt clipboard copy"
+        );
+    }
+
+    #[test]
+    fn auth_clipboard_fallback_dismisses_on_any_key() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_clipboard_fallback = Some("https://example.com".into());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        assert!(app.auth_clipboard_fallback.is_none());
+    }
+
+    // ── Chord binding test ────────────────────────────────────────────────────
+
+    #[test]
+    fn chord_a_opens_auth_popup_and_sends_list() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+
+        // Activate chord mode
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_x, &tx).unwrap();
+        assert!(app.chord);
+
+        // Press 'a'
+        handle_key(&mut app, key(KeyCode::Char('a')), &tx).unwrap();
+        assert_eq!(app.popup, app::Popup::ProviderAuth);
+        assert!(!app.chord);
+
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg, ClientMsg::ListAuthProviders));
+    }
+
+    // ── ClientMsg serialization tests ─────────────────────────────────────────
+
+    #[test]
+    fn client_msg_list_auth_providers_serializes() {
+        let msg = ClientMsg::ListAuthProviders;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("list_auth_providers"));
+    }
+
+    #[test]
+    fn client_msg_set_api_token_serializes() {
+        let msg = ClientMsg::SetApiToken {
+            provider: "openai".into(),
+            api_key: "sk-123".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("set_api_token"));
+        assert!(json.contains("openai"));
+        assert!(json.contains("sk-123"));
+    }
+
+    #[test]
+    fn client_msg_start_oauth_login_serializes() {
+        let msg = ClientMsg::StartOAuthLogin {
+            provider: "codex".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("start_oauth_login"));
+        assert!(json.contains("codex"));
+    }
+
+    #[test]
+    fn client_msg_complete_oauth_login_serializes() {
+        let msg = ClientMsg::CompleteOAuthLogin {
+            flow_id: "f1".into(),
+            response: "code123".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("complete_oauth_login"));
+        assert!(json.contains("f1"));
+    }
+
+    #[test]
+    fn client_msg_set_auth_method_serializes() {
+        let msg = ClientMsg::SetAuthMethod {
+            provider: "openai".into(),
+            method: AuthMethod::ApiKey,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("set_auth_method"));
+        assert!(json.contains("api_key"));
+    }
+
+    // ── Deserialization round-trip tests (server → TUI) ───────────────────────
+
+    #[test]
+    fn auth_method_oauth_serde_matches_server_wire_format() {
+        // Server explicitly renames OAuth to "oauth" (not "o_auth")
+        let json = serde_json::json!("oauth");
+        let method: AuthMethod = serde_json::from_value(json).unwrap();
+        assert_eq!(method, AuthMethod::OAuth);
+
+        // Round-trip: our serialization must also produce "oauth"
+        let serialized = serde_json::to_string(&AuthMethod::OAuth).unwrap();
+        assert_eq!(serialized, "\"oauth\"");
+    }
+
+    #[test]
+    fn auth_provider_entry_deserializes_with_oauth_preferred_method() {
+        // Exact JSON shape the server sends for a provider with OAuth preference
+        let json = serde_json::json!({
+            "provider": "anthropic",
+            "display_name": "Anthropic",
+            "oauth_status": "connected",
+            "has_stored_api_key": true,
+            "has_env_api_key": false,
+            "env_var_name": "ANTHROPIC_API_KEY",
+            "supports_oauth": true,
+            "preferred_method": "oauth"
+        });
+        let entry: AuthProviderEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.oauth_status, Some(OAuthStatus::Connected));
+        assert_eq!(entry.preferred_method, Some(AuthMethod::OAuth));
+    }
+
+    #[test]
+    fn auth_providers_data_deserializes_mixed_providers() {
+        // Full server response shape
+        let json = serde_json::json!({
+            "providers": [
+                {
+                    "provider": "openai",
+                    "display_name": "OpenAI",
+                    "oauth_status": "not_authenticated",
+                    "has_stored_api_key": false,
+                    "has_env_api_key": true,
+                    "env_var_name": "OPENAI_API_KEY",
+                    "supports_oauth": true,
+                    "preferred_method": "oauth"
+                },
+                {
+                    "provider": "groq",
+                    "display_name": "Groq",
+                    "oauth_status": null,
+                    "has_stored_api_key": true,
+                    "has_env_api_key": false,
+                    "env_var_name": "GROQ_API_KEY",
+                    "supports_oauth": false,
+                    "preferred_method": "api_key"
+                },
+                {
+                    "provider": "local",
+                    "display_name": "Local",
+                    "oauth_status": null,
+                    "has_stored_api_key": false,
+                    "has_env_api_key": false,
+                    "env_var_name": null,
+                    "supports_oauth": false,
+                    "preferred_method": null
+                }
+            ]
+        });
+        let data: AuthProvidersData = serde_json::from_value(json).unwrap();
+        assert_eq!(data.providers.len(), 3);
+        assert_eq!(data.providers[0].preferred_method, Some(AuthMethod::OAuth));
+        assert_eq!(data.providers[1].preferred_method, Some(AuthMethod::ApiKey));
+        assert_eq!(data.providers[2].preferred_method, None);
+    }
+}

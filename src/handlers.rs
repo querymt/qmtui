@@ -280,6 +280,10 @@ pub(crate) fn handle_key(
             handle_log_popup_key(app, key)?;
             return Ok(AppAction::None);
         }
+        Popup::ProviderAuth => {
+            handle_auth_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
         Popup::None => {}
     }
 
@@ -390,6 +394,13 @@ pub(crate) fn handle_chord(
             app.popup = Popup::Log;
             app.log_cursor = app.filtered_logs().len().saturating_sub(1);
             app.log_filter.clear();
+        }
+        KeyCode::Char('a') => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_auth_popup();
+            cmd_tx.send(ClientMsg::ListAuthProviders)?;
         }
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
@@ -929,6 +940,287 @@ pub(crate) fn handle_chat_key(
         _ => {}
     }
     Ok(())
+}
+
+// ── Auth popup key handler ─────────────────────────────────────────────────────
+
+pub(crate) fn handle_auth_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    use crate::app::AuthPanel;
+
+    // Clipboard fallback popup: any key dismisses it
+    if app.auth_clipboard_fallback.is_some() {
+        app.auth_clipboard_fallback = None;
+        return Ok(());
+    }
+
+    match app.auth_panel {
+        AuthPanel::List => match key.code {
+            KeyCode::Esc => {
+                if app.auth_selected.is_some() {
+                    app.auth_close_detail();
+                } else {
+                    app.popup = Popup::None;
+                }
+            }
+            KeyCode::Up => {
+                let max = app.filtered_auth_providers().len().saturating_sub(1);
+                app.auth_cursor = app.auth_cursor.saturating_sub(1).min(max);
+            }
+            KeyCode::Down => {
+                let max = app.filtered_auth_providers().len().saturating_sub(1);
+                app.auth_cursor = (app.auth_cursor + 1).min(max);
+            }
+            KeyCode::Enter => {
+                let filtered = app.filtered_auth_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
+                    let provider = &app.auth_providers[real_idx];
+                    app.auth_result_message = None;
+                    if provider.is_unconfigurable() {
+                        app.auth_selected = Some(real_idx);
+                        // Stay in list — the draw fn shows the info message
+                    } else if provider.is_api_key_only() {
+                        app.auth_selected = Some(real_idx);
+                        app.auth_panel = AuthPanel::ApiKeyInput;
+                        app.auth_api_key_input.clear();
+                        app.auth_api_key_cursor = 0;
+                    } else if provider.is_oauth_only()
+                        && provider.oauth_status != Some(crate::protocol::OAuthStatus::Connected)
+                    {
+                        app.auth_selected = Some(real_idx);
+                        let provider_id = provider.provider.clone();
+                        cmd_tx.send(ClientMsg::StartOAuthLogin {
+                            provider: provider_id,
+                        })?;
+                    } else {
+                        // Multi-method or connected OAuth-only: select for detail
+                        app.auth_selected = Some(real_idx);
+                    }
+                }
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+D: disconnect/clear credential for selected provider
+                if let Some(idx) = app.auth_selected {
+                    let provider = &app.auth_providers[idx];
+                    if provider.oauth_status == Some(crate::protocol::OAuthStatus::Connected) {
+                        let provider_id = provider.provider.clone();
+                        cmd_tx.send(ClientMsg::DisconnectOAuth {
+                            provider: provider_id,
+                        })?;
+                    } else if provider.has_stored_api_key {
+                        let provider_id = provider.provider.clone();
+                        cmd_tx.send(ClientMsg::ClearApiToken {
+                            provider: provider_id,
+                        })?;
+                    }
+                }
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+K: open API key panel for selected provider
+                let filtered = app.filtered_auth_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
+                    let provider = &app.auth_providers[real_idx];
+                    if provider.env_var_name.is_some() || provider.has_stored_api_key {
+                        app.auth_selected = Some(real_idx);
+                        app.auth_panel = AuthPanel::ApiKeyInput;
+                        app.auth_api_key_input.clear();
+                        app.auth_api_key_cursor = 0;
+                    }
+                }
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+O: start OAuth for selected provider
+                let filtered = app.filtered_auth_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
+                    let provider = &app.auth_providers[real_idx];
+                    if provider.supports_oauth {
+                        app.auth_selected = Some(real_idx);
+                        let provider_id = provider.provider.clone();
+                        cmd_tx.send(ClientMsg::StartOAuthLogin {
+                            provider: provider_id,
+                        })?;
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                app.auth_filter.pop();
+                app.auth_cursor = 0;
+            }
+            KeyCode::Char(c) => {
+                app.auth_filter.push(c);
+                app.auth_cursor = 0;
+            }
+            _ => {}
+        },
+        AuthPanel::ApiKeyInput => match key.code {
+            KeyCode::Esc => {
+                app.auth_panel = AuthPanel::List;
+                app.auth_api_key_input.clear();
+                app.auth_api_key_cursor = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(idx) = app.auth_selected {
+                    let trimmed = app.auth_api_key_input.trim().to_string();
+                    if !trimmed.is_empty() {
+                        let provider = app.auth_providers[idx].provider.clone();
+                        cmd_tx.send(ClientMsg::SetApiToken {
+                            provider,
+                            api_key: trimmed,
+                        })?;
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                app.auth_api_key_masked = !app.auth_api_key_masked;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Clear stored key
+                if let Some(idx) = app.auth_selected {
+                    let provider = app.auth_providers[idx].provider.clone();
+                    cmd_tx.send(ClientMsg::ClearApiToken { provider })?;
+                }
+            }
+            KeyCode::Char(c) => {
+                app.auth_api_key_input.insert(app.auth_api_key_cursor, c);
+                app.auth_api_key_cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if app.auth_api_key_cursor > 0 {
+                    let cursor = app.auth_api_key_cursor;
+                    let ch = app.auth_api_key_input[..cursor]
+                        .chars()
+                        .next_back()
+                        .unwrap();
+                    app.auth_api_key_input.remove(cursor - ch.len_utf8());
+                    app.auth_api_key_cursor -= ch.len_utf8();
+                }
+            }
+            KeyCode::Left => {
+                if app.auth_api_key_cursor > 0 {
+                    let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
+                        .chars()
+                        .next_back()
+                        .unwrap();
+                    app.auth_api_key_cursor -= ch.len_utf8();
+                }
+            }
+            KeyCode::Right => {
+                if app.auth_api_key_cursor < app.auth_api_key_input.len() {
+                    let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
+                        .chars()
+                        .next()
+                        .unwrap();
+                    app.auth_api_key_cursor += ch.len_utf8();
+                }
+            }
+            _ => {}
+        },
+        AuthPanel::OAuthFlow => match key.code {
+            KeyCode::Esc => {
+                app.auth_oauth_flow = None;
+                app.auth_panel = AuthPanel::List;
+                app.auth_oauth_response.clear();
+                app.auth_oauth_response_cursor = 0;
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Copy authorization URL to clipboard (C-y to avoid global C-c quit)
+                if let Some(ref flow) = app.auth_oauth_flow {
+                    let url = flow.authorization_url.clone();
+                    try_copy_to_clipboard(app, &url);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(ref flow) = app.auth_oauth_flow {
+                    let flow_id = flow.flow_id.clone();
+                    let is_device_poll =
+                        flow.flow_kind == crate::protocol::OAuthFlowKind::DevicePoll;
+                    let response = if is_device_poll {
+                        String::new()
+                    } else {
+                        app.auth_oauth_response.trim().to_string()
+                    };
+                    if is_device_poll || !response.is_empty() {
+                        cmd_tx.send(ClientMsg::CompleteOAuthLogin { flow_id, response })?;
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                app.auth_oauth_response
+                    .insert(app.auth_oauth_response_cursor, c);
+                app.auth_oauth_response_cursor += c.len_utf8();
+            }
+            KeyCode::Backspace => {
+                if app.auth_oauth_response_cursor > 0 {
+                    let cursor = app.auth_oauth_response_cursor;
+                    let ch = app.auth_oauth_response[..cursor]
+                        .chars()
+                        .next_back()
+                        .unwrap();
+                    app.auth_oauth_response.remove(cursor - ch.len_utf8());
+                    app.auth_oauth_response_cursor -= ch.len_utf8();
+                }
+            }
+            KeyCode::Left => {
+                if app.auth_oauth_response_cursor > 0 {
+                    let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
+                        .chars()
+                        .next_back()
+                        .unwrap();
+                    app.auth_oauth_response_cursor -= ch.len_utf8();
+                }
+            }
+            KeyCode::Right => {
+                if app.auth_oauth_response_cursor < app.auth_oauth_response.len() {
+                    let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
+                        .chars()
+                        .next()
+                        .unwrap();
+                    app.auth_oauth_response_cursor += ch.len_utf8();
+                }
+            }
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
+/// Try to copy text to the system clipboard. On failure, store in the fallback
+/// field so the draw function can show a popup with the URL for manual copy.
+fn try_copy_to_clipboard(app: &mut App, text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Try common clipboard commands in order
+    let commands = [
+        ("xclip", &["-selection", "clipboard"] as &[&str]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("wl-copy", &[]),
+        ("pbcopy", &[]),
+    ];
+
+    for (cmd, args) in &commands {
+        if let Ok(mut child) = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                app.auth_result_message = Some((true, "Copied to clipboard".into()));
+                return;
+            }
+        }
+    }
+
+    // Clipboard not available — store for fallback display
+    app.auth_clipboard_fallback = Some(text.to_string());
 }
 
 pub(crate) fn handle_model_popup_key(

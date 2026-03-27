@@ -276,6 +276,76 @@ impl App {
                 }
                 vec![]
             }
+            "auth_providers" => {
+                if let Some(data) = raw.data
+                    && let Ok(ap) = serde_json::from_value::<AuthProvidersData>(data)
+                {
+                    self.auth_providers = ap.providers;
+                    self.push_log(
+                        LogLevel::Debug,
+                        "auth",
+                        format!("{} auth provider(s)", self.auth_providers.len()),
+                    );
+                }
+                vec![]
+            }
+            "oauth_flow_started" => {
+                if let Some(data) = raw.data
+                    && let Ok(flow) = serde_json::from_value::<OAuthFlowData>(data)
+                {
+                    self.push_log(
+                        LogLevel::Info,
+                        "auth",
+                        format!("OAuth flow started for {}", flow.provider),
+                    );
+                    self.auth_oauth_flow = Some(flow);
+                    self.auth_panel = AuthPanel::OAuthFlow;
+                    self.auth_oauth_response.clear();
+                    self.auth_oauth_response_cursor = 0;
+                    self.auth_result_message = None;
+                }
+                vec![]
+            }
+            "oauth_result" => {
+                if let Some(data) = raw.data
+                    && let Ok(result) = serde_json::from_value::<OAuthResultData>(data)
+                {
+                    let level = if result.success {
+                        LogLevel::Info
+                    } else {
+                        LogLevel::Warn
+                    };
+                    self.push_log(level, "auth", &result.message);
+                    self.auth_result_message = Some((result.success, result.message));
+                    if result.success {
+                        self.auth_oauth_flow = None;
+                        self.auth_panel = AuthPanel::List;
+                    }
+                    // Refresh provider list to show updated status
+                    return vec![ClientMsg::ListAuthProviders];
+                }
+                vec![]
+            }
+            "api_token_result" => {
+                if let Some(data) = raw.data
+                    && let Ok(result) = serde_json::from_value::<ApiTokenResultData>(data)
+                {
+                    let level = if result.success {
+                        LogLevel::Info
+                    } else {
+                        LogLevel::Warn
+                    };
+                    self.push_log(level, "auth", &result.message);
+                    self.auth_result_message = Some((result.success, result.message));
+                    if result.success {
+                        self.auth_api_key_input.clear();
+                        self.auth_api_key_cursor = 0;
+                    }
+                    // Refresh provider list to show updated status
+                    return vec![ClientMsg::ListAuthProviders];
+                }
+                vec![]
+            }
             "error" => {
                 if let Some(data) = raw.data
                     && let Ok(e) = serde_json::from_value::<ErrorData>(data)
