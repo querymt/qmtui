@@ -501,8 +501,12 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
         .style(Theme::popup_bg()),
         chunks[1],
     );
+    let input_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(app.new_session_path.clone(), Theme::popup_bg()),
+    ]);
     f.render_widget(
-        Paragraph::new(format!("> {}", app.new_session_path)).style(Theme::popup_bg()),
+        Paragraph::new(input_line).style(Theme::popup_bg()),
         chunks[2],
     );
     f.set_cursor_position((chunks[2].x + 2 + app.new_session_cursor as u16, chunks[2].y));
@@ -529,14 +533,15 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
         f.render_stateful_widget(list, chunks[3], &mut state);
     }
 
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "tab complete  enter start  esc cancel",
-            Theme::status(),
-        ))
-        .style(Theme::popup_bg()),
-        chunks[4],
-    );
+    let hint = Line::from(vec![
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("complete  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("start  ", Theme::status()),
+        Span::styled("esc ", Theme::status_accent()),
+        Span::styled("cancel", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
 
 // ── Theme popup ───────────────────────────────────────────────────────────────

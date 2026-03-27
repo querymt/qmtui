@@ -848,7 +848,9 @@ mod tests {
         assert!(rendered.contains("> /launch"));
         assert!(rendered.contains("/launch/project"));
         assert!(!rendered.contains("[D]"));
-        assert!(rendered.contains("tab complete  enter start  esc cancel"));
+        assert!(rendered.contains("tab complete"));
+        assert!(rendered.contains("enter start"));
+        assert!(rendered.contains("esc cancel"));
     }
 
     #[test]
