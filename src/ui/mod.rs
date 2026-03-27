@@ -595,6 +595,124 @@ mod tests {
     }
 
     #[test]
+    fn draw_theme_popup_highlights_hint_keys() {
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (esc_x, esc_y) = find_buffer_text(&buffer, "esc").expect("esc hint missing");
+        let (cancel_x, cancel_y) =
+            find_buffer_text(&buffer, "cancel").expect("cancel hint missing");
+        let (enter_x, enter_y) = find_buffer_text(&buffer, "enter").expect("enter hint missing");
+        let (apply_x, apply_y) = find_buffer_text(&buffer, "apply").expect("apply hint missing");
+
+        assert_eq!(esc_y, cancel_y);
+        assert_eq!(enter_y, apply_y);
+        assert_eq!(buffer[(esc_x, esc_y)].fg, buffer[(enter_x, enter_y)].fg);
+        assert_ne!(buffer[(esc_x, esc_y)].fg, buffer[(cancel_x, cancel_y)].fg);
+        assert_ne!(buffer[(enter_x, enter_y)].fg, buffer[(apply_x, apply_y)].fg);
+    }
+
+    #[test]
+    fn draw_theme_popup_truncates_long_labels_with_unicode_ellipsis() {
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+        app.theme_filter = "Penumbra Dark Contrast Plus Plus".into();
+
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn draw_theme_popup_uses_bounded_width_on_wide_terminal() {
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+
+        let backend = ratatui::backend::TestBackend::new(120, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (theme_x, _) = find_buffer_text(&buffer, "theme").expect("theme title missing");
+
+        assert!(
+            theme_x >= 28,
+            "theme popup should be centered and use a bounded width"
+        );
+    }
+
+    #[test]
+    fn draw_theme_popup_shows_current_theme_when_opened_on_short_terminal() {
+        crate::theme::Theme::set_by_index(20);
+        crate::theme::Theme::begin_frame();
+
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+        app.theme_cursor = 20;
+
+        let current_label = crate::theme::Theme::available_themes()[20].label;
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            rendered.contains(current_label),
+            "current theme should be visible when popup opens"
+        );
+
+        crate::theme::Theme::set_by_index(0);
+        crate::theme::Theme::begin_frame();
+    }
+
+    #[test]
+    fn draw_theme_popup_highlights_current_theme_marker_with_accent() {
+        crate::theme::Theme::set_by_index(20);
+        crate::theme::Theme::begin_frame();
+
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+        app.theme_cursor = 20;
+
+        let current_label = crate::theme::Theme::available_themes()[20].label;
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (label_x, label_y) =
+            find_buffer_text(&buffer, current_label).expect("current theme label missing");
+        let marker_x = label_x.saturating_sub(2);
+
+        assert_eq!(buffer[(marker_x, label_y)].symbol(), "*");
+        assert_eq!(
+            buffer[(marker_x, label_y)].fg,
+            crate::theme::Theme::status_accent().fg.expect("accent fg")
+        );
+        assert_eq!(buffer[(marker_x, label_y)].bg, crate::theme::Theme::bg_hl());
+
+        crate::theme::Theme::set_by_index(0);
+        crate::theme::Theme::begin_frame();
+    }
+
+    #[test]
     fn draw_new_session_popup_shows_compact_default_cwd_hint() {
         let mut app = App::new();
         app.popup = Popup::NewSession;

@@ -320,6 +320,11 @@ pub(crate) fn build_theme_list_item(
     } else {
         (Theme::popup_bg(), Theme::status(), Theme::bg_dim())
     };
+    let marker_style = if orig_idx == current_idx {
+        Theme::status_accent().bg(row_bg)
+    } else {
+        dim_style
+    };
 
     // Label truncation (same pattern as session title) ───────────────────────
     let avail = list_w.saturating_sub(marker_w + swatches_w);
@@ -334,7 +339,7 @@ pub(crate) fn build_theme_list_item(
 
     // Build spans ─────────────────────────────────────────────────────────────
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(3 + NUM_SWATCHES + 1);
-    spans.push(Span::styled(marker, dim_style));
+    spans.push(Span::styled(marker, marker_style));
     spans.push(Span::styled(label_display, main_style));
     spans.push(Span::styled(" ".repeat(label_gap + GAP), dim_style));
 
@@ -445,8 +450,24 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
 // ── Theme popup ───────────────────────────────────────────────────────────────
 
 pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
+    const THEME_MARKER_COL_W: u16 = 2;
+    const THEME_LABEL_MAX_W: u16 = 44;
+    const THEME_SWATCH_COL_W: u16 = 17;
+    const THEME_ROW_MAX_W: u16 = THEME_MARKER_COL_W + THEME_LABEL_MAX_W + THEME_SWATCH_COL_W;
+    const THEME_POPUP_MAX_W: u16 = THEME_ROW_MAX_W + 2;
+    const THEME_POPUP_MIN_W: u16 = 28;
+
     let area = f.area();
-    let popup_area = centered_rect(70, 60, area);
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(THEME_POPUP_MIN_W, THEME_POPUP_MAX_W);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
+        width: popup_width,
+        height: area.height * 60 / 100,
+    };
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -514,15 +535,23 @@ pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let mut state = ListState::default().with_selected(Some(app.theme_cursor));
+    let visible_rows = chunks[3].height as usize;
+    let offset = app
+        .theme_cursor
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(app.theme_cursor));
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
-    f.render_widget(
-        Paragraph::new(Span::styled(" esc cancel  enter apply", Theme::status()))
-            .style(Theme::popup_bg()),
-        chunks[4],
-    );
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("cancel  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("apply", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
 
 // ── Log popup ─────────────────────────────────────────────────────────────────

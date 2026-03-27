@@ -375,8 +375,8 @@ pub(crate) fn handle_chord(
 
         KeyCode::Char('t') => {
             app.popup = Popup::ThemeSelect;
-            app.theme_cursor = 0;
             app.theme_filter.clear();
+            app.theme_cursor = theme::Theme::current_index();
         }
         KeyCode::Char('l') => {
             app.popup = Popup::Log;
