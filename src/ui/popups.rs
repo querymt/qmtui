@@ -934,6 +934,28 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("Esc", "decline"),
             ],
         },
+        ShortcutSection {
+            title: "slash commands",
+            rows: &[
+                ("/model [q]", "model selector (optional filter)"),
+                ("/mode [m]", "switch mode (build, plan)"),
+                (
+                    "/thinking [lvl]",
+                    "set thinking (auto, low, med, high, max)",
+                ),
+                ("/theme", "open theme picker"),
+                ("/sessions", "open session switcher"),
+                ("/new", "new session"),
+                ("/help", "show help"),
+                ("/logs", "open logs popup"),
+                ("/auth", "provider auth"),
+                ("/undo", "undo last turn"),
+                ("/redo", "redo"),
+                ("/editor", "open external editor"),
+                ("/cancel", "cancel active turn"),
+                ("/quit", "quit"),
+            ],
+        },
     ]
 }
 

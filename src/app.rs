@@ -180,6 +180,14 @@ pub struct MentionState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCompletionState {
+    /// The text typed after the leading `/` (e.g. `"mo"` while typing `/mo`).
+    pub query: String,
+    pub selected_index: usize,
+    pub results: Vec<&'static crate::slash::SlashCommandDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathCompletionState {
     pub query: String,
     pub selected_index: usize,
@@ -745,6 +753,7 @@ pub struct App {
     pub file_index_loading: bool,
     pub file_index_error: Option<String>,
     pub mention_state: Option<MentionState>,
+    pub slash_state: Option<SlashCompletionState>,
     pub last_compaction_token_estimate: Option<u32>,
     /// Active elicitation request waiting for user response.
     pub elicitation: Option<ElicitationState>,
@@ -871,6 +880,7 @@ impl App {
             file_index_loading: false,
             file_index_error: None,
             mention_state: None,
+            slash_state: None,
             last_compaction_token_estimate: None,
             elicitation: None,
             show_thinking: true,
@@ -938,6 +948,9 @@ impl App {
         self.reasoning_effort.as_deref().unwrap_or("auto")
     }
 
+    /// Valid reasoning effort levels (excluding "auto" which maps to `None`).
+    pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
+
     /// Cycle through `[auto, low, medium, high, max]` (wraps around).
     /// Updates `self.reasoning_effort` optimistically, saves the new value as
     /// the preference for the current `(mode, provider, model)` context, and
@@ -951,11 +964,21 @@ impl App {
             .position(|l| l.as_deref() == current)
             .unwrap_or(0);
         let next = LEVELS[(idx + 1) % LEVELS.len()];
-        self.reasoning_effort = next.map(ToOwned::to_owned);
-        // Cache the new value for the current session + mode.
+        self.set_reasoning_effort(next)
+    }
+
+    /// Set the reasoning effort to a specific level.
+    /// `None` or `Some("auto")` both map to the "auto" (no override) state.
+    /// Updates `self.reasoning_effort`, caches the session mode state, and
+    /// returns the [`ClientMsg`] to forward to the server.
+    pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> ClientMsg {
+        let level = match level {
+            Some("auto") | None => None,
+            Some(s) => Some(s),
+        };
+        self.reasoning_effort = level.map(ToOwned::to_owned);
         self.cache_session_mode_state();
-        // Server expects the string "auto" when clearing the override.
-        let effort_str = next.unwrap_or("auto").to_string();
+        let effort_str = level.unwrap_or("auto").to_string();
         ClientMsg::SetReasoningEffort {
             reasoning_effort: effort_str,
         }
@@ -1704,6 +1727,49 @@ mod reasoning_effort_tests {
         app.reasoning_effort = Some("max".into());
         let msg = app.cycle_reasoning_effort();
         // max → auto: server expects "auto" string (not null)
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    // ── set_reasoning_effort ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_reasoning_effort_high_returns_correct_msg() {
+        let mut app = App::new();
+        let msg = app.set_reasoning_effort(Some("high"));
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "high");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_reasoning_effort_auto_clears_to_none() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("max".into());
+        let msg = app.set_reasoning_effort(Some("auto"));
+        assert_eq!(app.reasoning_effort, None);
+        match msg {
+            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+                assert_eq!(reasoning_effort, "auto");
+            }
+            other => panic!("expected SetReasoningEffort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_reasoning_effort_none_clears_to_auto() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("low".into());
+        let msg = app.set_reasoning_effort(None);
+        assert_eq!(app.reasoning_effort, None);
         match msg {
             ClientMsg::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "auto");
@@ -4756,5 +4822,144 @@ mod popup_item_tests {
         assert!(app.popup_collapsed_groups.contains("/a"));
         // start page collapsed_groups should be untouched
         assert!(!app.collapsed_groups.contains("/a"));
+    }
+
+    // ── slash completion state ─────────────────────────────────────────────────
+
+    #[test]
+    fn slash_query_cursor_at_zero_returns_none() {
+        let mut app = App::new();
+        app.input = "/model".into();
+        app.input_cursor = 0;
+        assert_eq!(app.active_slash_query(), None);
+    }
+
+    #[test]
+    fn slash_query_only_slash_typed() {
+        let mut app = App::new();
+        app.input = "/".into();
+        app.input_cursor = 1;
+        assert_eq!(app.active_slash_query(), Some(String::new()));
+    }
+
+    #[test]
+    fn slash_query_partial_command() {
+        let mut app = App::new();
+        app.input = "/mo".into();
+        app.input_cursor = 3;
+        assert_eq!(app.active_slash_query(), Some("mo".into()));
+    }
+
+    #[test]
+    fn slash_query_full_command_no_space() {
+        let mut app = App::new();
+        app.input = "/model".into();
+        app.input_cursor = 6;
+        assert_eq!(app.active_slash_query(), Some("model".into()));
+    }
+
+    #[test]
+    fn slash_query_after_space_returns_none() {
+        let mut app = App::new();
+        app.input = "/model ".into();
+        app.input_cursor = 7;
+        assert_eq!(app.active_slash_query(), None);
+    }
+
+    #[test]
+    fn slash_query_non_slash_input_returns_none() {
+        let mut app = App::new();
+        app.input = "hello".into();
+        app.input_cursor = 5;
+        assert_eq!(app.active_slash_query(), None);
+    }
+
+    #[test]
+    fn refresh_slash_state_filters_by_prefix() {
+        let mut app = App::new();
+        app.input = "/mo".into();
+        app.input_cursor = 3;
+        app.refresh_slash_state();
+        let state = app
+            .slash_state
+            .as_ref()
+            .expect("slash_state should be Some");
+        assert!(!state.results.is_empty());
+        assert!(state.results.iter().all(|c| c.name.starts_with("mo")));
+        assert!(state.results.iter().any(|c| c.name == "model"));
+    }
+
+    #[test]
+    fn refresh_slash_state_clears_on_no_match() {
+        let mut app = App::new();
+        app.input = "/zzz".into();
+        app.input_cursor = 4;
+        app.refresh_slash_state();
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn refresh_slash_state_clears_on_cursor_at_zero() {
+        let mut app = App::new();
+        app.input = "/model".into();
+        app.input_cursor = 0;
+        app.refresh_slash_state(); // must not panic
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn move_slash_selection_wraps_down_to_first() {
+        let mut app = App::new();
+        app.input = "/".into();
+        app.input_cursor = 1;
+        app.refresh_slash_state();
+        let total = app.slash_state.as_ref().unwrap().results.len();
+        app.slash_state.as_mut().unwrap().selected_index = total - 1;
+        app.move_slash_selection(1);
+        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, 0);
+    }
+
+    #[test]
+    fn move_slash_selection_wraps_up_to_last() {
+        let mut app = App::new();
+        app.input = "/".into();
+        app.input_cursor = 1;
+        app.refresh_slash_state();
+        let total = app.slash_state.as_ref().unwrap().results.len();
+        app.slash_state.as_mut().unwrap().selected_index = 0;
+        app.move_slash_selection(-1);
+        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, total - 1);
+    }
+
+    #[test]
+    fn accept_slash_completion_replaces_partial_token() {
+        let mut app = App::new();
+        app.input = "/mo".into();
+        app.input_cursor = 3;
+        app.refresh_slash_state();
+        let idx = app
+            .slash_state
+            .as_ref()
+            .unwrap()
+            .results
+            .iter()
+            .position(|c| c.name == "model")
+            .expect("model should be in results");
+        app.slash_state.as_mut().unwrap().selected_index = idx;
+
+        let accepted = app.accept_selected_slash_completion();
+        assert!(accepted);
+        assert_eq!(app.input, "/model ");
+        assert_eq!(app.input_cursor, "/model ".len());
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn accept_slash_completion_no_state_returns_false() {
+        let mut app = App::new();
+        app.input = "/model".into();
+        app.input_cursor = 6;
+        app.slash_state = None;
+        assert!(!app.accept_selected_slash_completion());
     }
 }

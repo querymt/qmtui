@@ -1,7 +1,7 @@
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::app::{App, FileIndexEntryLite, MentionState};
+use crate::app::{App, FileIndexEntryLite, MentionState, SlashCompletionState};
 use crate::protocol::ClientMsg;
 use crate::ui::build_input_visual_layout;
 
@@ -17,6 +17,7 @@ impl App {
         self.input.insert(self.input_cursor, c);
         self.input_cursor += c.len_utf8();
         self.refresh_mention_state();
+        self.refresh_slash_state();
     }
 
     pub fn input_backspace(&mut self) {
@@ -30,6 +31,7 @@ impl App {
             self.input.drain(prev..self.input_cursor);
             self.input_cursor = prev;
             self.refresh_mention_state();
+            self.refresh_slash_state();
         }
     }
 
@@ -43,6 +45,7 @@ impl App {
                 .unwrap_or(self.input.len());
             self.input.drain(self.input_cursor..next);
             self.refresh_mention_state();
+            self.refresh_slash_state();
         }
     }
 
@@ -55,6 +58,7 @@ impl App {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             self.refresh_mention_state();
+            self.refresh_slash_state();
         }
     }
 
@@ -67,6 +71,7 @@ impl App {
                 .map(|(i, _)| self.input_cursor + i)
                 .unwrap_or(self.input.len());
             self.refresh_mention_state();
+            self.refresh_slash_state();
         }
     }
 
@@ -74,12 +79,14 @@ impl App {
         self.reset_input_preferred_col();
         self.input_cursor = 0;
         self.refresh_mention_state();
+        self.refresh_slash_state();
     }
 
     pub fn input_end(&mut self) {
         self.reset_input_preferred_col();
         self.input_cursor = self.input.len();
         self.refresh_mention_state();
+        self.refresh_slash_state();
     }
 
     pub fn input_up_visual(&mut self, prefix_width: usize) {
@@ -97,6 +104,7 @@ impl App {
         self.input_cursor = layout.cursor_offset_for_row_col(layout.cursor_row - 1, preferred_col);
         self.input_preferred_col = Some(preferred_col);
         self.refresh_mention_state();
+        self.refresh_slash_state();
     }
 
     pub fn input_down_visual(&mut self, prefix_width: usize) {
@@ -114,6 +122,7 @@ impl App {
         self.input_cursor = layout.cursor_offset_for_row_col(layout.cursor_row + 1, preferred_col);
         self.input_preferred_col = Some(preferred_col);
         self.refresh_mention_state();
+        self.refresh_slash_state();
     }
 
     pub fn active_mention_query_from(&self, input: &str, cursor: usize) -> Option<(usize, String)> {
@@ -274,6 +283,96 @@ impl App {
         self.input_preferred_col = None;
         self.scroll_offset = 0;
         self.mention_state = None;
+        self.slash_state = None;
         std::mem::take(&mut self.input)
+    }
+
+    // ── Slash command completion ───────────────────────────────────────────────
+
+    /// Returns the slash query (text after leading `/`) when the cursor sits
+    /// inside the first whitespace-free token starting at column 0, e.g.
+    /// input = `/mo`, cursor = 3 → `Some("mo")`.
+    /// Returns `None` if the input doesn't start with `/` or the cursor has
+    /// moved past a space (command name is already fully typed).
+    pub fn active_slash_query(&self) -> Option<String> {
+        let end = self.input_cursor.min(self.input.len());
+        let before_cursor = &self.input[..end];
+        // strip_prefix returns None when cursor is at 0 or input doesn't start with '/'.
+        let after_slash = before_cursor.strip_prefix('/')?;
+        // No whitespace allowed between '/' and cursor.
+        if after_slash.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(after_slash.to_string())
+    }
+
+    /// Recompute `slash_state` based on the current input and cursor position.
+    /// Sets `slash_state = None` when no slash command is being typed.
+    pub fn refresh_slash_state(&mut self) {
+        let Some(query) = self.active_slash_query() else {
+            self.slash_state = None;
+            return;
+        };
+
+        let q = query.to_lowercase();
+        let results: Vec<&'static crate::slash::SlashCommandDef> = crate::slash::SLASH_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.name.starts_with(q.as_str()))
+            .collect();
+
+        if results.is_empty() {
+            self.slash_state = None;
+            return;
+        }
+
+        // Preserve the selected index if it is still in range.
+        let selected_index = self
+            .slash_state
+            .as_ref()
+            .map(|s| s.selected_index.min(results.len().saturating_sub(1)))
+            .unwrap_or(0);
+
+        self.slash_state = Some(SlashCompletionState {
+            query,
+            selected_index,
+            results,
+        });
+    }
+
+    /// Move the slash completion cursor by `delta` rows (wraps around).
+    pub fn move_slash_selection(&mut self, delta: isize) {
+        if let Some(state) = self.slash_state.as_mut() {
+            let len = state.results.len();
+            if len == 0 {
+                state.selected_index = 0;
+                return;
+            }
+            let next = (state.selected_index as isize + delta).rem_euclid(len as isize) as usize;
+            state.selected_index = next;
+        }
+    }
+
+    /// Replace the slash token in the input with the selected command name
+    /// followed by a space, then clear `slash_state`.
+    /// Returns `true` on success, `false` if no completion was active.
+    pub fn accept_selected_slash_completion(&mut self) -> bool {
+        let Some(state) = self.slash_state.clone() else {
+            return false;
+        };
+        let Some(&cmd) = state.results.get(state.selected_index) else {
+            self.slash_state = None;
+            return false;
+        };
+
+        // Replace everything up to the first space (or end of input).
+        let end = self
+            .input
+            .find(char::is_whitespace)
+            .unwrap_or(self.input.len());
+        let replacement = format!("/{} ", cmd.name);
+        self.input.replace_range(..end, &replacement);
+        self.input_cursor = replacement.len();
+        self.slash_state = None;
+        true
     }
 }

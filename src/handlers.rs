@@ -292,37 +292,13 @@ pub(crate) fn handle_key(
         if !can_send_server_commands(app) {
             return Ok(AppAction::None);
         }
-        app.cache_session_mode_state();
-
-        let next = app.next_mode().to_string();
-        cmd_tx.send(ClientMsg::SetAgentMode { mode: next.clone() })?;
-        if let (Some(provider), Some(model)) =
-            (app.current_provider.clone(), app.current_model.clone())
-        {
-            let outgoing_mode = app.agent_mode.clone();
-            app.set_mode_model_preference(&outgoing_mode, &provider, &model);
-        }
-        app.agent_mode = next;
-
-        for msg in app.apply_cached_mode_state() {
-            cmd_tx.send(msg)?;
-        }
-        if !app
-            .session_cache
-            .get(app.session_id.as_deref().unwrap_or(""))
-            .is_some_and(|modes| modes.contains_key(&app.agent_mode))
-        {
-            apply_mode_model_if_preferred(app, cmd_tx)?;
-        }
-
-        save_config(app);
-        save_cache(app);
+        switch_mode(app, cmd_tx, app.next_mode())?;
         return Ok(AppAction::None);
     }
 
     match app.screen {
         Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
-        Screen::Chat => handle_chat_key(app, key, cmd_tx)?,
+        Screen::Chat => return handle_chat_key(app, key, cmd_tx),
     }
     Ok(AppAction::None)
 }
@@ -829,15 +805,17 @@ pub(crate) fn handle_chat_key(
     app: &mut App,
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AppAction> {
     if app.input_line_width == 0 {
         app.input_line_width = 1;
     }
     let input_blocked = app.input_blocked_by_activity();
     match key.code {
         KeyCode::Esc => {
-            if app.mention_state.is_some() {
+            // Dismiss whichever completion popup is open first.
+            if app.mention_state.is_some() || app.slash_state.is_some() {
                 app.mention_state = None;
+                app.slash_state = None;
                 app.clear_cancel_confirm();
             } else if app.has_cancellable_activity() {
                 if app.cancel_confirm_active() {
@@ -852,15 +830,29 @@ pub(crate) fn handle_chat_key(
             }
         }
         KeyCode::Enter => {
+            // 1. Complete slash completion, then fall through to execute.
+            if app.slash_state.is_some() {
+                app.accept_selected_slash_completion();
+            }
+            // 2. Try slash command execution (input starts with '/').
+            if !app.input.is_empty() && app.input.trim_start().starts_with('/') {
+                match try_execute_slash_command(app, cmd_tx)? {
+                    SlashResult::OpenEditor => return Ok(AppAction::OpenExternalEditor),
+                    SlashResult::Handled => return Ok(AppAction::None),
+                    SlashResult::NotACommand => {}
+                }
+            }
+            // 3. Accept mention completion.
             if app.mention_state.is_some() && app.accept_selected_mention() {
                 if let Some(msg) = app.request_file_index_if_needed() {
                     cmd_tx.send(msg)?;
                 }
-                return Ok(());
+                return Ok(AppAction::None);
             }
+            // 4. Normal prompt send.
             if !app.input.is_empty() {
                 if input_blocked || !can_send_server_commands(app) {
-                    return Ok(());
+                    return Ok(AppAction::None);
                 }
                 let (text, links) = app.build_prompt_text_and_links(&app.input);
                 let _ = app.take_input();
@@ -875,12 +867,15 @@ pub(crate) fn handle_chat_key(
             }
         }
         KeyCode::Tab => {
-            if !input_blocked
-                && app.mention_state.is_some()
-                && app.accept_selected_mention()
-                && let Some(msg) = app.request_file_index_if_needed()
-            {
-                cmd_tx.send(msg)?;
+            if !input_blocked {
+                if app.slash_state.is_some() {
+                    app.accept_selected_slash_completion();
+                } else if app.mention_state.is_some()
+                    && app.accept_selected_mention()
+                    && let Some(msg) = app.request_file_index_if_needed()
+                {
+                    cmd_tx.send(msg)?;
+                }
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -893,9 +888,11 @@ pub(crate) fn handle_chat_key(
         }
         KeyCode::Up => {
             if input_blocked {
-                return Ok(());
+                return Ok(AppAction::None);
             }
-            if app.mention_state.is_some() {
+            if app.slash_state.is_some() {
+                app.move_slash_selection(-1);
+            } else if app.mention_state.is_some() {
                 app.move_mention_selection(-1);
             } else {
                 app.input_up_visual(2);
@@ -903,9 +900,11 @@ pub(crate) fn handle_chat_key(
         }
         KeyCode::Down => {
             if input_blocked {
-                return Ok(());
+                return Ok(AppAction::None);
             }
-            if app.mention_state.is_some() {
+            if app.slash_state.is_some() {
+                app.move_slash_selection(1);
+            } else if app.mention_state.is_some() {
                 app.move_mention_selection(1);
             } else {
                 app.input_down_visual(2);
@@ -953,7 +952,295 @@ pub(crate) fn handle_chat_key(
         }
         _ => {}
     }
+    Ok(AppAction::None)
+}
+
+// ── Mode switching ─────────────────────────────────────────────────────────────
+
+/// Switch the agent mode to `target` (e.g. "build", "plan").
+/// Caches the outgoing mode state, sends `SetAgentMode`, restores cached state
+/// for the target mode, and persists config/cache.
+fn switch_mode(
+    app: &mut App,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    target: &str,
+) -> anyhow::Result<()> {
+    app.cache_session_mode_state();
+
+    cmd_tx.send(ClientMsg::SetAgentMode {
+        mode: target.to_string(),
+    })?;
+    if let (Some(provider), Some(model)) = (app.current_provider.clone(), app.current_model.clone())
+    {
+        let outgoing_mode = app.agent_mode.clone();
+        app.set_mode_model_preference(&outgoing_mode, &provider, &model);
+    }
+    app.agent_mode = target.to_string();
+
+    for msg in app.apply_cached_mode_state() {
+        cmd_tx.send(msg)?;
+    }
+    if !app
+        .session_cache
+        .get(app.session_id.as_deref().unwrap_or(""))
+        .is_some_and(|modes| modes.contains_key(&app.agent_mode))
+    {
+        apply_mode_model_if_preferred(app, cmd_tx)?;
+    }
+
+    save_config(app);
+    save_cache(app);
     Ok(())
+}
+
+// ── Slash command execution ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashResult {
+    /// Command executed; input has been consumed.
+    Handled,
+    /// User invoked `/editor`; caller should open the external editor.
+    OpenEditor,
+    /// Input starts with `/` but the command name is not recognised;
+    /// treat as a normal chat message.
+    NotACommand,
+}
+
+/// Parse and execute a slash command from `app.input`.
+///
+/// Expects `app.input` to begin with `/`.  Always calls `app.take_input()`
+/// before performing any side-effects so the command text is cleared first
+/// (this allows `/undo` to optionally restore the previous turn text).
+fn try_execute_slash_command(
+    app: &mut App,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<SlashResult> {
+    // Extract the command name (first word after '/') and optional argument.
+    let after_slash = app.input.trim_start_matches('/');
+    let cmd = after_slash
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let arg = after_slash
+        .strip_prefix(cmd.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if cmd.is_empty() {
+        return Ok(SlashResult::NotACommand);
+    }
+
+    match cmd.as_str() {
+        "model" => {
+            app.take_input();
+            if app.screen != crate::app::Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "model",
+                    "model select is only available in chat",
+                );
+                return Ok(SlashResult::Handled);
+            }
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.popup = crate::app::Popup::ModelSelect;
+            if arg.is_empty() {
+                app.model_filter.clear();
+                app.model_cursor = app.current_mode_model_cursor();
+            } else {
+                app.model_filter = arg;
+                app.model_cursor = 0;
+            }
+        }
+        "mode" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if arg.is_empty() {
+                // No arg: cycle to next mode (same as Tab).
+                switch_mode(app, cmd_tx, app.next_mode())?;
+            } else {
+                match arg.as_str() {
+                    "build" | "plan" => {
+                        if app.agent_mode == arg {
+                            app.set_status(
+                                app::LogLevel::Info,
+                                "mode",
+                                format!("already in {} mode", arg),
+                            );
+                        } else {
+                            switch_mode(app, cmd_tx, &arg)?;
+                        }
+                    }
+                    _ => {
+                        app.set_status(
+                            app::LogLevel::Warn,
+                            "mode",
+                            format!("unknown mode: {} (try build or plan)", arg),
+                        );
+                    }
+                }
+            }
+        }
+        "thinking" => {
+            app.take_input();
+            if arg.is_empty() {
+                app.set_status(
+                    app::LogLevel::Info,
+                    "model",
+                    format!("thinking: {}", app.reasoning_effort_label()),
+                );
+            } else {
+                let level = arg.to_lowercase();
+                match level.as_str() {
+                    "auto" | "low" | "medium" | "med" | "high" | "max" => {
+                        let target = match level.as_str() {
+                            "auto" => None,
+                            "med" => Some("medium"),
+                            other => Some(other),
+                        };
+                        let msg = app.set_reasoning_effort(target);
+                        cmd_tx.send(msg)?;
+                        app.set_status(
+                            app::LogLevel::Info,
+                            "model",
+                            format!("thinking: {}", app.reasoning_effort_label()),
+                        );
+                        save_cache(app);
+                    }
+                    _ => {
+                        app.set_status(
+                            app::LogLevel::Warn,
+                            "model",
+                            format!(
+                                "unknown level: {} (try auto, low, medium, high, max)",
+                                level
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        "theme" => {
+            app.take_input();
+            app.popup = crate::app::Popup::ThemeSelect;
+            app.theme_filter.clear();
+            app.theme_cursor = crate::theme::Theme::current_index();
+        }
+        "sessions" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.popup = crate::app::Popup::SessionSelect;
+            app.session_cursor = 0;
+            app.session_filter.clear();
+            cmd_tx.send(ClientMsg::ListSessions)?;
+        }
+        "new" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.open_new_session_popup();
+        }
+        "help" => {
+            app.take_input();
+            app.popup = crate::app::Popup::Help;
+            app.help_scroll = 0;
+        }
+        "logs" => {
+            app.take_input();
+            app.popup = crate::app::Popup::Log;
+            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.log_filter.clear();
+        }
+        "auth" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.open_auth_popup();
+            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+        "undo" => {
+            // Clear '/undo' first so the undo logic can optionally restore
+            // the previous turn's text into the now-empty input.
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if app.is_turn_active() {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "session",
+                    "cannot undo while agent is active",
+                );
+            } else if app.has_pending_session_op() || app.has_pending_undo() {
+                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
+            } else if let Some(turn) = app.current_undo_target().cloned() {
+                if app.input.trim().is_empty() && !turn.text.is_empty() {
+                    app.input = turn.text.clone();
+                    app.input_cursor = app.input.len();
+                    app.input_scroll = 0;
+                }
+                app.push_pending_undo(&turn);
+                app.activity = app::ActivityState::SessionOp(app::SessionOp::Undo);
+                app.set_status(app::LogLevel::Info, "session", "undoing...");
+                cmd_tx.send(ClientMsg::Undo {
+                    message_id: turn.message_id,
+                })?;
+            } else {
+                app.set_status(app::LogLevel::Warn, "session", "nothing to undo");
+            }
+        }
+        "redo" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if app.is_turn_active() {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "session",
+                    "cannot redo while agent is active",
+                );
+            } else if app.has_pending_session_op() || app.has_pending_undo() {
+                app.set_status(app::LogLevel::Warn, "session", "redo already pending");
+            } else if app.can_redo() {
+                app.activity = app::ActivityState::SessionOp(app::SessionOp::Redo);
+                app.set_status(app::LogLevel::Info, "session", "redoing...");
+                cmd_tx.send(ClientMsg::Redo)?;
+            } else {
+                app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
+            }
+        }
+        "editor" => {
+            app.take_input();
+            return Ok(SlashResult::OpenEditor);
+        }
+        "cancel" => {
+            app.take_input();
+            if app.has_cancellable_activity() {
+                app.clear_cancel_confirm();
+                app.set_status(app::LogLevel::Warn, "activity", "stopping...");
+                cmd_tx.send(ClientMsg::CancelSession)?;
+            } else {
+                app.set_status(app::LogLevel::Warn, "activity", "nothing to cancel");
+            }
+        }
+        "quit" => {
+            app.take_input();
+            app.should_quit = true;
+        }
+        _ => return Ok(SlashResult::NotACommand),
+    }
+
+    Ok(SlashResult::Handled)
 }
 
 // ── Auth popup key handler ─────────────────────────────────────────────────────

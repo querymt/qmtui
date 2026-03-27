@@ -10,6 +10,7 @@ mod protocol;
 mod server_manager;
 mod server_msg;
 mod session;
+mod slash;
 mod theme;
 mod themes_gen;
 mod ui;
@@ -557,6 +558,392 @@ mod external_editor_tests {
         assert!(app.input.is_empty());
     }
 
+    // ── slash command handler tests ────────────────────────────────────────────
+
+    #[test]
+    fn left_arrow_with_slash_input_does_not_crash() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/model".into();
+        app.input_cursor = "/model".len();
+        app.refresh_slash_state();
+        assert!(app.slash_state.is_some());
+
+        // hold left until cursor reaches 0 — must not panic at any step
+        for _ in 0..=app.input.len() {
+            handle_chat_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+                &tx,
+            )
+            .unwrap();
+        }
+        assert_eq!(app.input_cursor, 0);
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn slash_esc_clears_slash_state() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/mo".into();
+        app.input_cursor = 3;
+        app.refresh_slash_state();
+        assert!(app.slash_state.is_some());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn slash_enter_opens_help_popup() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/help".into();
+        app.input_cursor = "/help".len();
+        app.refresh_slash_state();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, app::Popup::Help);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn slash_enter_with_partial_completion_executes_command() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/hel".into();
+        app.input_cursor = "/hel".len();
+        app.refresh_slash_state();
+        assert!(app.slash_state.is_some());
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, app::Popup::Help);
+        assert!(app.input.is_empty());
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn slash_tab_completes_command_name_without_executing() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/hel".into();
+        app.input_cursor = "/hel".len();
+        app.refresh_slash_state();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        // Completed but not executed — no popup opened
+        assert_eq!(app.input, "/help ");
+        assert_eq!(app.popup, app::Popup::None);
+        assert!(app.slash_state.is_none());
+    }
+
+    #[test]
+    fn slash_down_up_navigates_selection() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/".into();
+        app.input_cursor = 1;
+        app.refresh_slash_state();
+        let initial = app.slash_state.as_ref().unwrap().selected_index;
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            app.slash_state.as_ref().unwrap().selected_index,
+            initial + 1
+        );
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, initial);
+    }
+
+    #[test]
+    fn slash_mode_no_arg_cycles_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.input = "/mode".into();
+        app.input_cursor = "/mode".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.agent_mode, "plan");
+        assert!(app.input.is_empty());
+        // SetAgentMode should have been sent
+        assert!(matches!(
+            rx.try_recv().expect("SetAgentMode sent"),
+            ClientMsg::SetAgentMode { mode } if mode == "plan"
+        ));
+    }
+
+    #[test]
+    fn slash_mode_plan_switches_to_plan() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.input = "/mode plan".into();
+        app.input_cursor = "/mode plan".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.agent_mode, "plan");
+        assert!(matches!(
+            rx.try_recv().expect("SetAgentMode sent"),
+            ClientMsg::SetAgentMode { mode } if mode == "plan"
+        ));
+    }
+
+    #[test]
+    fn slash_mode_same_is_idempotent() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.input = "/mode build".into();
+        app.input_cursor = "/mode build".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.agent_mode, "build");
+        assert!(app.status.contains("already in build"));
+    }
+
+    #[test]
+    fn slash_mode_unknown_shows_error() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.input = "/mode xyz".into();
+        app.input_cursor = "/mode xyz".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(app.status.contains("unknown mode"));
+    }
+
+    #[test]
+    fn slash_thinking_high_sets_level() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.input = "/thinking high".into();
+        app.input_cursor = "/thinking high".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert!(matches!(
+            rx.try_recv().expect("SetReasoningEffort sent"),
+            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
+        ));
+    }
+
+    #[test]
+    fn slash_thinking_auto_clears_level() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.reasoning_effort = Some("max".into());
+        app.input = "/thinking auto".into();
+        app.input_cursor = "/thinking auto".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.reasoning_effort, None);
+        assert!(matches!(
+            rx.try_recv().expect("SetReasoningEffort sent"),
+            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto"
+        ));
+    }
+
+    #[test]
+    fn slash_thinking_med_alias_sets_medium() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.input = "/thinking med".into();
+        app.input_cursor = "/thinking med".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert!(matches!(
+            rx.try_recv().expect("SetReasoningEffort sent"),
+            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "medium"
+        ));
+    }
+
+    #[test]
+    fn slash_thinking_no_arg_shows_current() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.reasoning_effort = Some("high".into());
+        app.input = "/thinking".into();
+        app.input_cursor = "/thinking".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(app.status.contains("thinking: high"));
+    }
+
+    #[test]
+    fn slash_thinking_unknown_shows_error() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.input = "/thinking xyz".into();
+        app.input_cursor = "/thinking xyz".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(app.status.contains("unknown level"));
+    }
+
+    #[test]
+    fn slash_model_with_arg_prefilters_popup() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.input = "/model sonnet".into();
+        app.input_cursor = "/model sonnet".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, app::Popup::ModelSelect);
+        assert_eq!(app.model_filter, "sonnet");
+        assert_eq!(app.model_cursor, 0);
+    }
+
+    #[test]
+    fn slash_model_no_arg_opens_popup_unfiltered() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.session_id = Some("s1".into());
+        app.input = "/model".into();
+        app.input_cursor = "/model".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, app::Popup::ModelSelect);
+        assert!(app.model_filter.is_empty());
+    }
+
     #[test]
     fn chat_double_esc_cancels_running_tool_phase() {
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -779,6 +1166,7 @@ fn apply_external_editor_result(app: &mut App, updated_input: String) {
     app.input_cursor = app.input.len();
     app.input_scroll = 0;
     app.refresh_mention_state();
+    app.refresh_slash_state();
 }
 
 fn apply_external_editor_outcome(app: &mut App, result: anyhow::Result<Option<String>>) {

@@ -463,13 +463,15 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 
 pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let mention_height = if app.mention_state.is_some()
+    // Both slash-completion and @-mention share one panel slot (mutually exclusive).
+    let completion_panel_height = if app.slash_state.is_some()
+        || app.mention_state.is_some()
         || app.file_index_loading
         || app.file_index_error.is_some()
     {
-        6
+        6u16
     } else {
-        0
+        0u16
     };
 
     // Compute how many visual rows the input text needs when wrapped.
@@ -496,12 +498,12 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(3),    // messages
-            Constraint::Length(mention_height),
-            Constraint::Length(elicitation_height), // elicitation popup (0 when inactive)
-            Constraint::Length(1),                  // input border line
-            Constraint::Length(input_height),       // input (dynamic)
+            Constraint::Length(1),                       // header
+            Constraint::Min(3),                          // messages
+            Constraint::Length(completion_panel_height), // slash or mention
+            Constraint::Length(elicitation_height),      // elicitation popup (0 when inactive)
+            Constraint::Length(1),                       // input border line
+            Constraint::Length(input_height),            // input (dynamic)
         ])
         .split(area);
 
@@ -598,8 +600,12 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     // messages
     draw_messages(f, app, chunks[1]);
 
-    if mention_height > 0 {
-        draw_mention_panel(f, app, chunks[2]);
+    if completion_panel_height > 0 {
+        if app.slash_state.is_some() {
+            draw_slash_panel(f, app, chunks[2]);
+        } else {
+            draw_mention_panel(f, app, chunks[2]);
+        }
     }
 
     if elicitation_height > 0 {
@@ -915,6 +921,49 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
             },
         );
     }
+}
+
+// ── Slash command completion panel ────────────────────────────────────────────
+
+fn draw_slash_panel(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Some(state) = &app.slash_state else {
+        return;
+    };
+
+    let max_name_len = state
+        .results
+        .iter()
+        .map(|cmd| cmd.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let items: Vec<ListItem> = state
+        .results
+        .iter()
+        .map(|cmd| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  /{:<width$}  ", cmd.name, width = max_name_len),
+                    Theme::status_accent(),
+                ),
+                Span::styled(cmd.description, Theme::dim()),
+            ]))
+        })
+        .collect();
+
+    let title = Line::from(vec![
+        Span::styled(" /", Theme::status_accent()),
+        Span::styled(" commands ", Theme::dim()),
+    ]);
+    let list = List::new(items)
+        .block(Block::default().title(title).style(Theme::popup_bg()))
+        .highlight_style(Theme::selected())
+        .highlight_symbol("");
+    let mut list_state = ListState::default().with_selected(Some(state.selected_index));
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
 // ── Mention panel ─────────────────────────────────────────────────────────────
