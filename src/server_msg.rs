@@ -95,6 +95,7 @@ impl App {
                     self.undo_state = next;
 
                     if ur.success {
+                        self.recent_prompt_text = None;
                         self.streaming_content.clear();
                         self.streaming_cache.invalidate();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
@@ -179,6 +180,9 @@ impl App {
                     self.scroll_offset = 0;
                     self.undo_state = None;
                     self.undoable_turns.clear();
+                    self.recent_prompt_text = None;
+                    self.suppress_turn_output = false;
+                    self.delegate_entries.clear();
                     self.file_index.clear();
                     self.file_index_generated_at = None;
                     self.file_index_loading = false;
@@ -217,6 +221,9 @@ impl App {
                             self.session_stats = SessionStatsLite::default();
                             self.screen = Screen::Chat;
                             self.undoable_turns.clear();
+                            self.recent_prompt_text = None;
+                            self.suppress_turn_output = false;
+                            self.delegate_entries.clear();
                             self.file_index.clear();
                             self.file_index_generated_at = None;
                             self.file_index_loading = false;
@@ -238,6 +245,9 @@ impl App {
                             }];
                             // Restore cached model + effort for this session + mode.
                             cmds.extend(self.apply_cached_mode_state());
+                            // Drain any subscribe commands queued during audit replay
+                            // (e.g. SubscribeSession for delegation child sessions).
+                            cmds.extend(self.drain_pending());
                             return cmds;
                         }
                     }
@@ -245,28 +255,72 @@ impl App {
                 vec![]
             }
             "session_events" => {
-                if let Some(data) = raw.data
-                    && let Ok(se) = serde_json::from_value::<SessionEventsData>(data)
-                {
-                    self.note_session_activity(&se.session_id);
-                    if self.session_id.as_deref() == Some(se.session_id.as_str()) {
-                        for envelope in se.events {
-                            self.handle_event(&envelope);
+                if let Some(data) = raw.data {
+                    if let Ok(parent) = serde_json::from_value::<SessionEventsData>(data.clone()) {
+                        self.note_session_activity(&parent.session_id);
+                        if self.session_id.as_deref() == Some(parent.session_id.as_str()) {
+                            for envelope in parent.events {
+                                self.handle_event(&envelope);
+                            }
+                        }
+                    } else {
+                        match serde_json::from_value::<SessionEventsDataRaw>(data) {
+                            Err(e) => {
+                                // Structural error (missing session_id etc.) — log it.
+                                self.push_log(
+                                    LogLevel::Warn,
+                                    "session_events",
+                                    format!("session_events parse error: {e}"),
+                                );
+                            }
+                            Ok(se) => {
+                                if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
+                                    e.child_session_id.as_deref() == Some(se.session_id.as_str())
+                                }) {
+                                    for val in se.events {
+                                        // Child sessions keep the raw parse path so
+                                        // unknown kinds do not block known stats updates.
+                                        if let Ok(envelope) =
+                                            serde_json::from_value::<EventEnvelope>(val)
+                                        {
+                                            accumulate_delegate_stats(
+                                                &mut entry.stats,
+                                                envelope.kind(),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    self.note_session_activity(&se.session_id);
+                                }
+                            }
                         }
                     }
                 }
-                vec![]
+                self.drain_pending()
             }
             "event" => {
-                if let Some(data) = raw.data
-                    && let Ok(ed) = serde_json::from_value::<EventData>(data)
-                {
-                    self.note_session_activity(&ed.session_id);
-                    if self.session_id.as_deref() == Some(ed.session_id.as_str()) {
-                        self.handle_event(&ed.event);
+                if let Some(data) = raw.data {
+                    if let Ok(parent) = serde_json::from_value::<EventData>(data.clone()) {
+                        self.note_session_activity(&parent.session_id);
+                        if self.session_id.as_deref() == Some(parent.session_id.as_str()) {
+                            self.handle_event(&parent.event);
+                        }
+                    } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
+                        if let Some(entry) = self
+                            .delegate_entries
+                            .iter_mut()
+                            .find(|e| e.child_session_id.as_deref() == Some(ed.session_id.as_str()))
+                        {
+                            if let Ok(envelope) = serde_json::from_value::<EventEnvelope>(ed.event)
+                            {
+                                accumulate_delegate_stats(&mut entry.stats, envelope.kind());
+                            }
+                        } else {
+                            self.note_session_activity(&ed.session_id);
+                        }
                     }
                 }
-                vec![]
+                self.drain_pending()
             }
             "all_models_list" => {
                 if let Some(data) = raw.data
@@ -372,35 +426,57 @@ impl App {
             } => {
                 let text = content_to_string(content);
                 if !text.is_empty() {
-                    if !is_replay {
-                        if let Some(frontier_message_id) = self
-                            .undo_state
-                            .as_ref()
-                            .and_then(|state| state.frontier_message_id.clone())
+                    let frontier_message_id = self
+                        .undo_state
+                        .as_ref()
+                        .and_then(|state| state.frontier_message_id.clone());
+
+                    if let Some(message_id) = message_id.as_deref()
+                        && self.messages.iter().any(|entry| {
+                            matches!(entry, ChatEntry::User { message_id: Some(mid), .. } if mid == message_id)
+                        })
+                    {
+                        self.recent_prompt_text = Some(text.clone());
+                        self.suppress_turn_output = false;
+                        return;
+                    }
+
+                    if !is_replay && let Some(frontier_message_id) = frontier_message_id {
+                        if let Some(frontier_idx) = self
+                            .messages
+                            .iter()
+                            .position(|entry| matches!(entry, ChatEntry::User { message_id: Some(mid), .. } if mid == &frontier_message_id))
                         {
-                            if let Some(frontier_idx) = self
-                                .messages
-                                .iter()
-                                .position(|entry| matches!(entry, ChatEntry::User { message_id: Some(mid), .. } if mid == &frontier_message_id))
-                            {
-                                self.messages.truncate(frontier_idx);
-                            }
-                            if let Some(turn_idx) = self
-                                .undoable_turns
-                                .iter()
-                                .position(|turn| turn.message_id == frontier_message_id)
-                            {
-                                self.undoable_turns.truncate(turn_idx);
-                            }
+                            self.messages.truncate(frontier_idx);
+                        }
+                        if let Some(turn_idx) = self
+                            .undoable_turns
+                            .iter()
+                            .position(|turn| turn.message_id == frontier_message_id)
+                        {
+                            self.undoable_turns.truncate(turn_idx);
+                        }
+                        // A replayed frontier prompt arrives after the backend has already
+                        // moved the branch point; prune stale UI state but do not re-add it.
+                        if message_id.as_deref() == Some(frontier_message_id.as_str()) {
+                            self.suppress_turn_output = true;
+                            return;
                         }
                         self.undo_state = None;
                     }
 
+                    self.suppress_turn_output = false;
                     self.messages.push(ChatEntry::User {
                         text: text.clone(),
                         message_id: message_id.clone(),
                     });
-                    if let Some(message_id) = message_id.clone() {
+                    self.recent_prompt_text = Some(text.clone());
+                    if let Some(message_id) = message_id.clone()
+                        && !self
+                            .undoable_turns
+                            .iter()
+                            .any(|turn| turn.message_id == message_id)
+                    {
                         self.undoable_turns.push(UndoableTurn {
                             turn_id: message_id.clone(),
                             message_id,
@@ -412,14 +488,21 @@ impl App {
             EventKind::UserMessageStored { content } => {
                 let text = content_to_string(content);
                 if !text.is_empty() {
-                    let dup = matches!(
-                        self.messages.last(),
-                        Some(ChatEntry::User { text: last, .. }) if last == &text
-                    ) || self
-                        .undoable_turns
-                        .last()
-                        .map(|turn| turn.text == text)
-                        .unwrap_or(false);
+                    // If undo_state is still active during a live event, the matching
+                    // PromptReceived was suppressed as the reverted frontier turn.
+                    if !is_replay && (self.undo_state.is_some() || self.suppress_turn_output) {
+                        return;
+                    }
+                    let dup = self.recent_prompt_text.as_deref() == Some(text.as_str())
+                        || matches!(
+                            self.messages.last(),
+                            Some(ChatEntry::User { text: last, .. }) if last == &text
+                        )
+                        || self
+                            .undoable_turns
+                            .last()
+                            .map(|turn| turn.text == text)
+                            .unwrap_or(false);
                     if !dup {
                         self.messages.push(ChatEntry::User {
                             text,
@@ -477,7 +560,9 @@ impl App {
                 self.set_status(LogLevel::Info, "activity", "context compacted");
             }
             EventKind::AssistantMessageStored {
-                content, thinking, ..
+                content,
+                thinking,
+                message_id,
             } => {
                 let thinking_text = thinking.clone().or_else(|| {
                     if self.streaming_thinking.is_empty() {
@@ -492,9 +577,21 @@ impl App {
                     self.activity = ActivityState::Thinking;
                 }
                 if !content.is_empty() {
+                    self.recent_prompt_text = None;
+                    if self.suppress_turn_output {
+                        return;
+                    }
+                    if let Some(message_id) = message_id.as_deref()
+                        && self.messages.iter().any(|entry| {
+                            matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } if mid == message_id)
+                        })
+                    {
+                        return;
+                    }
                     self.messages.push(ChatEntry::Assistant {
                         content: content.clone(),
                         thinking: thinking_text,
+                        message_id: message_id.clone(),
                     });
                 }
             }
@@ -503,6 +600,9 @@ impl App {
                 tool_name,
                 arguments,
             } => {
+                if self.suppress_turn_output {
+                    return;
+                }
                 self.activity = ActivityState::RunningTool {
                     name: tool_name.clone(),
                 };
@@ -623,6 +723,13 @@ impl App {
             EventKind::Cancelled => {
                 self.activity = ActivityState::Idle;
                 self.clear_cancel_confirm();
+                if self.suppress_turn_output {
+                    self.streaming_content.clear();
+                    self.streaming_thinking.clear();
+                    self.invalidate_streaming_caches();
+                    self.set_status(LogLevel::Warn, "activity", "cancelled");
+                    return;
+                }
                 if !self.streaming_content.is_empty() {
                     let partial = std::mem::take(&mut self.streaming_content);
                     self.streaming_cache.invalidate();
@@ -631,16 +738,97 @@ impl App {
                     } else {
                         Some(std::mem::take(&mut self.streaming_thinking))
                     };
-                    self.streaming_thinking_cache.invalidate();
                     self.messages.push(ChatEntry::Assistant {
                         content: format!("{partial} [cancelled]"),
                         thinking,
+                        message_id: None,
                     });
                 }
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
+            // ── Delegation lifecycle events ─────────────────────────────────────
+            EventKind::DelegationRequested { delegation } => {
+                // Idempotent upsert: the parent session can be replayed more than
+                // once (session_loaded audit + parent session_events replay). Keep
+                // exactly one DelegateEntry per delegation.public_id.
+                if let Some(entry) = self
+                    .delegate_entries
+                    .iter_mut()
+                    .find(|e| e.delegation_id == delegation.public_id)
+                {
+                    // Refresh metadata in case a later replay has more fields.
+                    if entry.target_agent_id.is_none() {
+                        entry.target_agent_id = delegation.target_agent_id.clone();
+                    }
+                    if entry.objective.is_empty() {
+                        entry.objective = delegation.objective.clone().unwrap_or_default();
+                    }
+                } else {
+                    self.delegate_entries.push(DelegateEntry {
+                        delegation_id: delegation.public_id.clone(),
+                        child_session_id: None,
+                        target_agent_id: delegation.target_agent_id.clone(),
+                        objective: delegation.objective.clone().unwrap_or_default(),
+                        status: DelegateStatus::InProgress,
+                        stats: DelegateStats::default(),
+                    });
+                }
+            }
+            EventKind::SessionForked {
+                child_session_id,
+                origin,
+                fork_point_ref,
+                target_agent_id,
+            } => {
+                if origin.as_deref() == Some("delegation") {
+                    if let Some(sid) = child_session_id {
+                        // Update the matching delegation entry.
+                        if let Some(delegation_id) = fork_point_ref {
+                            if let Some(entry) = self
+                                .delegate_entries
+                                .iter_mut()
+                                .find(|e| e.delegation_id == *delegation_id)
+                            {
+                                entry.child_session_id = Some(sid.clone());
+                            }
+                        }
+                        // Subscribe to the child session using the delegation's
+                        // target agent_id — matching the web UI behaviour.
+                        // Fall back to parent agent_id if not present.
+                        let agent_id = target_agent_id.clone().or_else(|| self.agent_id.clone());
+                        self.pending_commands.push(ClientMsg::SubscribeSession {
+                            session_id: sid.clone(),
+                            agent_id,
+                        });
+                    }
+                }
+            }
+            EventKind::DelegationCompleted { delegation_id, .. } => {
+                if let Some(entry) = self
+                    .delegate_entries
+                    .iter_mut()
+                    .find(|e| e.delegation_id == *delegation_id)
+                {
+                    entry.status = DelegateStatus::Completed;
+                }
+            }
+            EventKind::DelegationFailed { delegation_id, .. } => {
+                if let Some(entry) = self
+                    .delegate_entries
+                    .iter_mut()
+                    .find(|e| e.delegation_id == *delegation_id)
+                {
+                    entry.status = DelegateStatus::Failed;
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Drain any commands queued by event handlers (e.g. SubscribeSession
+    /// for delegation child sessions) and return them to the caller.
+    fn drain_pending(&mut self) -> Vec<ClientMsg> {
+        std::mem::take(&mut self.pending_commands)
     }
 
     pub(crate) fn replay_audit(&mut self, audit: &serde_json::Value) {
@@ -675,6 +863,36 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// Update per-delegation stats from a single event arriving on a child session.
+pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventKind) {
+    match kind {
+        EventKind::ToolCallStart { .. } => {
+            stats.tool_calls = stats.tool_calls.saturating_add(1);
+        }
+        EventKind::AssistantMessageStored { .. } => {
+            stats.messages = stats.messages.saturating_add(1);
+        }
+        EventKind::LlmRequestEnd {
+            cost_usd,
+            context_tokens,
+            ..
+        } => {
+            if let Some(c) = cost_usd {
+                stats.cost_usd += c;
+            }
+            if let Some(ctx) = context_tokens {
+                stats.context_tokens = *ctx;
+            }
+        }
+        EventKind::ProviderChanged { context_limit, .. } => {
+            if let Some(limit) = context_limit {
+                stats.context_limit = *limit;
+            }
+        }
+        _ => {}
     }
 }
 

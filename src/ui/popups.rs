@@ -3,17 +3,17 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AuthPanel, LogLevel};
 use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
-use super::{
-    ARROW_DOWN, ARROW_UP, COLLAPSE_CLOSED, COLLAPSE_OPEN, COLOR_SWATCH, ELLIPSIS, relative_time,
-    short_cwd,
-};
+use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
+use super::start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, short_cwd};
+use super::{ARROW_DOWN, ARROW_UP, COLOR_SWATCH, ELLIPSIS, relative_time};
 
 // ── Single-line input scroll helper ──────────────────────────────────────────
 
@@ -456,6 +456,297 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
 
+// ── Delegate session popup ─────────────────────────────────────────────────────
+
+const DELEGATE_POPUP_MAX_W: u16 = 72;
+const DELEGATE_POPUP_MIN_W: u16 = 36;
+const DELEGATE_STATUS_COL_W: usize = 1;
+const DELEGATE_ICON_TOOLS: &str = "\u{2692}"; // ⚒
+const DELEGATE_ICON_MSG: &str = "\u{1F5E9}"; // 🗩
+const DELEGATE_ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪
+
+struct DelegateRowData {
+    status_badge: String,
+    badge_style: ratatui::style::Style,
+    objective_source: String,
+    tools: String,
+    msgs: String,
+    ctx: String,
+    cost: String,
+}
+
+fn format_delegate_tools(stats: &crate::app::DelegateStats) -> String {
+    if stats.tool_calls > 0 {
+        format!("{DELEGATE_ICON_TOOLS}{}", stats.tool_calls)
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_messages(stats: &crate::app::DelegateStats) -> String {
+    if stats.messages > 0 {
+        format!("{DELEGATE_ICON_MSG}{}", stats.messages)
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_context(stats: &crate::app::DelegateStats) -> String {
+    if let Some(pct) = stats.context_pct() {
+        format!("{DELEGATE_ICON_CONTEXT}{pct}%")
+    } else if stats.context_tokens > 0 {
+        let abbrev = if stats.context_tokens >= 1_000 {
+            format!("{}k", stats.context_tokens / 1_000)
+        } else {
+            stats.context_tokens.to_string()
+        };
+        format!("{DELEGATE_ICON_CONTEXT}{abbrev}")
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_cost(stats: &crate::app::DelegateStats) -> String {
+    if stats.cost_usd > 0.0 {
+        format!("${:.2}", stats.cost_usd)
+    } else {
+        String::new()
+    }
+}
+
+fn delegate_display_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text) as u16
+}
+
+pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
+    use crate::app::DelegateStatus;
+
+    let area = f.area();
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(DELEGATE_POPUP_MIN_W, DELEGATE_POPUP_MAX_W);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
+        width: popup_width,
+        height: area.height * 60 / 100,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // spacer
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    // title
+    f.render_widget(
+        Paragraph::new(Span::styled("delegates", Theme::popup_title())).style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    // filter
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (filter_display, filter_cur) =
+        scroll_input(&app.delegate_filter, app.delegate_filter.len(), avail);
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(filter_display, Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+
+    // delegate entry list (built from event stream)
+    let entries = app.visible_delegate_entries();
+
+    if entries.is_empty() {
+        let list = List::new(vec![ListItem::new(Line::from(Span::styled(
+            " no delegations",
+            Theme::status(),
+        )))])
+        .block(Block::default().style(Theme::popup_bg()));
+        let mut state = ListState::default();
+        f.render_stateful_widget(list, chunks[3], &mut state);
+    } else {
+        let rows_data: Vec<DelegateRowData> = entries
+            .iter()
+            .map(|entry| {
+                let status_badge = match entry.status {
+                    DelegateStatus::InProgress => {
+                        spinner(SpinnerKind::Braille, app.tick).to_string()
+                    }
+                    DelegateStatus::Completed => CHECK_CHECKED.to_string(),
+                    DelegateStatus::Failed => CHECK_FAILED.to_string(),
+                };
+                let badge_style = match entry.status {
+                    DelegateStatus::InProgress => Theme::status_accent(),
+                    DelegateStatus::Completed => Theme::session_time(),
+                    DelegateStatus::Failed => Theme::error_on_dim(),
+                };
+                let objective_source = if entry.objective.is_empty() {
+                    "(no objective)".to_string()
+                } else {
+                    entry.objective.clone()
+                };
+
+                DelegateRowData {
+                    status_badge,
+                    badge_style,
+                    objective_source,
+                    tools: format_delegate_tools(&entry.stats),
+                    msgs: format_delegate_messages(&entry.stats),
+                    ctx: format_delegate_context(&entry.stats),
+                    cost: format_delegate_cost(&entry.stats),
+                }
+            })
+            .collect();
+
+        let tools_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.tools))
+            .max()
+            .unwrap_or(0);
+        let msgs_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.msgs))
+            .max()
+            .unwrap_or(0);
+        let ctx_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.ctx))
+            .max()
+            .unwrap_or(0);
+        let cost_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.cost))
+            .max()
+            .unwrap_or(0);
+
+        let show_tools = tools_col_w > 0;
+        let show_msgs = msgs_col_w > 0;
+        let show_ctx = ctx_col_w > 0;
+        let show_cost = cost_col_w > 0;
+
+        let mut fixed_w = DELEGATE_STATUS_COL_W as u16;
+        if show_tools {
+            fixed_w += tools_col_w;
+        }
+        if show_msgs {
+            fixed_w += msgs_col_w;
+        }
+        if show_ctx {
+            fixed_w += ctx_col_w;
+        }
+        if show_cost {
+            fixed_w += cost_col_w;
+        }
+        // Keep stat columns visible; objective shrinks and ellipsizes first.
+        // Ratatui tables insert one cell of spacing between adjacent columns, so
+        // reserve that spacing up front to keep the trailing ellipsis visible.
+        let visible_cols = 2
+            + u16::from(show_tools)
+            + u16::from(show_msgs)
+            + u16::from(show_ctx)
+            + u16::from(show_cost);
+        let column_spacing = visible_cols.saturating_sub(1);
+        let objective_w = chunks[3]
+            .width
+            .saturating_sub(fixed_w)
+            .saturating_sub(column_spacing)
+            .max(1) as usize;
+
+        let main_style = Theme::popup_bg();
+        let dim_style = Theme::status();
+        let rows: Vec<Row> = rows_data
+            .into_iter()
+            .map(|row| {
+                let objective = truncate_with_ellipsis(&row.objective_source, objective_w);
+
+                let mut cells = vec![
+                    Cell::from(Span::styled(row.status_badge, row.badge_style)),
+                    Cell::from(Span::styled(objective, main_style)),
+                ];
+                if show_tools {
+                    cells.push(Cell::from(Span::styled(row.tools, dim_style)));
+                }
+                if show_msgs {
+                    cells.push(Cell::from(Span::styled(row.msgs, dim_style)));
+                }
+                if show_ctx {
+                    cells.push(Cell::from(Span::styled(row.ctx, dim_style)));
+                }
+                if show_cost {
+                    cells.push(Cell::from(Span::styled(row.cost, dim_style)));
+                }
+
+                Row::new(cells)
+            })
+            .collect();
+
+        let mut constraints = vec![
+            Constraint::Length(DELEGATE_STATUS_COL_W as u16),
+            Constraint::Length(objective_w as u16),
+        ];
+        if show_tools {
+            constraints.push(Constraint::Length(tools_col_w));
+        }
+        if show_msgs {
+            constraints.push(Constraint::Length(msgs_col_w));
+        }
+        if show_ctx {
+            constraints.push(Constraint::Length(ctx_col_w));
+        }
+        if show_cost {
+            constraints.push(Constraint::Length(cost_col_w));
+        }
+
+        let table = Table::new(rows, constraints)
+            .block(Block::default().style(Theme::popup_bg()))
+            .style(Theme::popup_bg())
+            .row_highlight_style(Theme::selected());
+
+        let selected = Some(app.delegate_cursor.min(entries.len().saturating_sub(1)));
+        let mut state = TableState::default().with_selected(selected);
+        f.render_stateful_widget(table, chunks[3], &mut state);
+    }
+
+    // hint
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("cancel  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("load", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+pub(crate) fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let t: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{t}{ELLIPSIS}")
+    } else {
+        text.to_string()
+    }
+}
+
 // ── Theme list item builder ───────────────────────────────────────────────────
 
 /// Builds a single [`ListItem`] for the theme picker list.
@@ -875,6 +1166,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             rows: &[
                 ("?", "this help"),
                 ("a", "provider auth"),
+                ("d", "delegate sessions"),
                 ("e", "external editor"),
                 ("m", "model selector"),
                 ("n", "new session"),
@@ -945,6 +1237,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ),
                 ("/theme", "open theme picker"),
                 ("/sessions", "open session switcher"),
+                ("/delegates", "list delegate sessions"),
                 ("/new", "new session"),
                 ("/help", "show help"),
                 ("/logs", "open logs popup"),

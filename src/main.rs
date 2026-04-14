@@ -2425,6 +2425,115 @@ mod session_popup_key_tests {
 }
 
 #[cfg(test)]
+mod delegate_popup_key_tests {
+    use super::*;
+    use crate::handlers::*;
+    use app::{DelegateEntry, DelegateStatus, Popup};
+    use crossterm::event::KeyCode;
+
+    fn make_entry(id: &str, objective: &str, child_sid: Option<&str>) -> DelegateEntry {
+        DelegateEntry {
+            delegation_id: id.into(),
+            child_session_id: child_sid.map(String::from),
+            target_agent_id: Some("coder".into()),
+            objective: objective.into(),
+            status: DelegateStatus::Completed,
+            stats: app::DelegateStats::default(),
+        }
+    }
+
+    fn setup_delegate_app() -> App {
+        let mut app = App::new();
+        app.session_id = Some("parent-1".into());
+        app.popup = Popup::DelegateList;
+        app.delegate_entries = vec![
+            make_entry("d1", "Build feature", Some("child-1")),
+            make_entry("d2", "Fix tests", Some("child-2")),
+            make_entry("d3", "Write docs", Some("child-3")),
+        ];
+        app
+    }
+
+    #[test]
+    fn delegate_navigation_clamps_cursor_within_bounds() {
+        let mut app = setup_delegate_app();
+        apply_delegate_popup_key(&mut app, KeyCode::Up);
+        assert_eq!(app.delegate_cursor, 0);
+
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        assert_eq!(app.delegate_cursor, 2);
+
+        apply_delegate_popup_key(&mut app, KeyCode::Up);
+        assert_eq!(app.delegate_cursor, 1);
+    }
+
+    #[test]
+    fn delegate_enter_loads_selected_child_session() {
+        let mut app = setup_delegate_app();
+        app.delegate_cursor = 1;
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child-2".into()
+            }
+        );
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn delegate_enter_noop_when_child_session_is_unavailable() {
+        let mut app = App::new();
+        app.popup = Popup::DelegateList;
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "d1".into(),
+            child_session_id: None,
+            target_agent_id: None,
+            objective: "pending task".into(),
+            status: DelegateStatus::InProgress,
+            stats: app::DelegateStats::default(),
+        }];
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(app.popup, Popup::DelegateList);
+    }
+
+    #[test]
+    fn delegate_filter_updates_cursor_and_loads_filtered_result() {
+        let mut app = setup_delegate_app();
+        app.delegate_cursor = 2;
+        for c in "docs".chars() {
+            apply_delegate_popup_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.delegate_filter, "docs");
+        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.visible_delegate_entries().len(), 1);
+        assert_eq!(app.visible_delegate_entries()[0].delegation_id, "d3");
+
+        apply_delegate_popup_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.delegate_filter, "doc");
+        assert_eq!(app.delegate_cursor, 0);
+
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child-3".into()
+            }
+        );
+    }
+
+    #[test]
+    fn delegate_esc_closes_popup() {
+        let mut app = setup_delegate_app();
+        apply_delegate_popup_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.popup, Popup::None);
+    }
+}
+
+#[cfg(test)]
 mod chord_reasoning_effort_tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

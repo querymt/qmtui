@@ -62,6 +62,7 @@ pub enum Popup {
     Help,
     Log,
     ProviderAuth,
+    DelegateList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -103,6 +104,52 @@ pub struct AppLogEntry {
     pub message: String,
 }
 
+// ── Delegation tracking ───────────────────────────────────────────────────────
+
+/// Per-delegation stats accumulated from child session events.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DelegateStats {
+    pub tool_calls: u32,
+    pub messages: u32,
+    /// Cumulative cost in USD from LlmRequestEnd events.
+    pub cost_usd: f64,
+    /// Latest context token count (last LlmRequestEnd wins).
+    pub context_tokens: u64,
+    /// Context limit from ProviderChanged events.
+    pub context_limit: u64,
+}
+
+impl DelegateStats {
+    pub fn context_pct(&self) -> Option<u32> {
+        if self.context_limit > 0 {
+            Some(
+                ((self.context_tokens as f64 / self.context_limit as f64) * 100.0)
+                    .round()
+                    .min(100.0) as u32,
+            )
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelegateEntry {
+    pub delegation_id: String,
+    pub child_session_id: Option<String>,
+    pub target_agent_id: Option<String>,
+    pub objective: String,
+    pub status: DelegateStatus,
+    pub stats: DelegateStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegateStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     User {
@@ -112,6 +159,7 @@ pub enum ChatEntry {
     Assistant {
         content: String,
         thinking: Option<String>,
+        message_id: Option<String>,
     },
     ToolCall {
         tool_call_id: Option<String>,
@@ -798,6 +846,9 @@ pub struct App {
     // of reverted turns plus a frontier that marks the current branch point.
     pub undo_state: Option<UndoState>,
     pub undoable_turns: Vec<UndoableTurn>,
+    /// Tracks the latest prompt text so the follow-up `user_message_stored`
+    /// event can behave like a backfill instead of a duplicate row.
+    pub recent_prompt_text: Option<String>,
 
     // session stats
     pub cumulative_cost: Option<f64>,
@@ -837,6 +888,17 @@ pub struct App {
     pub auth_result_message: Option<(bool, String)>,
     /// When clipboard copy fails, store the URL here for a fallback display popup.
     pub auth_clipboard_fallback: Option<String>,
+
+    // delegate session listing (built from event stream)
+    pub delegate_entries: Vec<DelegateEntry>,
+    pub delegate_cursor: usize,
+    pub delegate_filter: String,
+    /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
+    /// Drained by handle_server_msg after each event/replay batch.
+    pub pending_commands: Vec<ClientMsg>,
+    /// While a reverted frontier turn is being suppressed, ignore any
+    /// follow-up assistant/tool/cancelled events until a new prompt arrives.
+    pub suppress_turn_output: bool,
 
     pub tick: u64,
     pub should_quit: bool,
@@ -902,6 +964,7 @@ impl App {
             log_level_filter: LogLevel::Info,
             undo_state: None,
             undoable_turns: Vec::new(),
+            recent_prompt_text: None,
             cumulative_cost: None,
             context_limit: 0,
             session_stats: SessionStatsLite::default(),
@@ -925,6 +988,11 @@ impl App {
             auth_oauth_response_cursor: 0,
             auth_result_message: None,
             auth_clipboard_fallback: None,
+            delegate_entries: Vec::new(),
+            delegate_cursor: 0,
+            delegate_filter: String::new(),
+            pending_commands: Vec::new(),
+            suppress_turn_output: false,
             status: "connecting...".into(),
             tick: 0,
             should_quit: false,
@@ -2154,6 +2222,992 @@ mod reasoning_effort_tests {
     }
 }
 
+// ── delegate_entry_tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod delegate_entry_tests {
+    use super::*;
+    use crate::server_msg::accumulate_delegate_stats;
+
+    fn make_entry(delegation_id: &str, objective: &str, status: DelegateStatus) -> DelegateEntry {
+        DelegateEntry {
+            delegation_id: delegation_id.into(),
+            child_session_id: Some(format!("child-{delegation_id}")),
+            target_agent_id: Some("coder".into()),
+            objective: objective.into(),
+            status,
+            stats: DelegateStats::default(),
+        }
+    }
+
+    // ── visible_delegate_entries ───────────────────────────────────────────────
+
+    #[test]
+    fn visible_entries_empty_when_no_entries() {
+        let app = App::new();
+        assert!(app.visible_delegate_entries().is_empty());
+    }
+
+    #[test]
+    fn visible_entries_returns_all_when_no_filter() {
+        let mut app = App::new();
+        app.delegate_entries = vec![
+            make_entry("d1", "Build feature", DelegateStatus::Completed),
+            make_entry("d2", "Fix tests", DelegateStatus::InProgress),
+        ];
+        assert_eq!(app.visible_delegate_entries().len(), 2);
+    }
+
+    #[test]
+    fn visible_entries_filters_by_objective() {
+        let mut app = App::new();
+        app.delegate_entries = vec![
+            make_entry("d1", "Build feature", DelegateStatus::Completed),
+            make_entry("d2", "Fix tests", DelegateStatus::InProgress),
+        ];
+        app.delegate_filter = "build".into();
+        let entries = app.visible_delegate_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delegation_id, "d1");
+    }
+
+    #[test]
+    fn visible_entries_filters_by_delegation_id() {
+        let mut app = App::new();
+        app.delegate_entries = vec![
+            make_entry("abc123", "Build feature", DelegateStatus::Completed),
+            make_entry("xyz789", "Fix tests", DelegateStatus::InProgress),
+        ];
+        app.delegate_filter = "xyz".into();
+        let entries = app.visible_delegate_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delegation_id, "xyz789");
+    }
+
+    #[test]
+    fn visible_entries_filters_by_target_agent() {
+        let mut app = App::new();
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "d1".into(),
+                child_session_id: None,
+                target_agent_id: Some("planner".into()),
+                objective: "Plan work".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats::default(),
+            },
+            DelegateEntry {
+                delegation_id: "d2".into(),
+                child_session_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: "Write code".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+            },
+        ];
+        app.delegate_filter = "planner".into();
+        let entries = app.visible_delegate_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].delegation_id, "d1");
+    }
+
+    #[test]
+    fn visible_entries_filter_is_case_insensitive() {
+        let mut app = App::new();
+        app.delegate_entries = vec![make_entry("d1", "Build Feature", DelegateStatus::Completed)];
+        app.delegate_filter = "BUILD".into();
+        assert_eq!(app.visible_delegate_entries().len(), 1);
+    }
+
+    // ── delegation event processing ───────────────────────────────────────────
+
+    #[test]
+    fn delegation_requested_creates_entry() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::DelegationRequested {
+                delegation: DelegationData {
+                    public_id: "del-1".into(),
+                    target_agent_id: Some("coder".into()),
+                    objective: Some("Fix the bug".into()),
+                },
+            },
+            false,
+        );
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert_eq!(app.delegate_entries[0].delegation_id, "del-1");
+        assert_eq!(app.delegate_entries[0].objective, "Fix the bug");
+        assert_eq!(
+            app.delegate_entries[0].target_agent_id.as_deref(),
+            Some("coder")
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::InProgress);
+        assert!(app.delegate_entries[0].child_session_id.is_none());
+    }
+
+    #[test]
+    fn session_forked_sets_child_session_id() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix the bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: None,
+            },
+            false,
+        );
+        assert_eq!(
+            app.delegate_entries[0].child_session_id.as_deref(),
+            Some("child-sess-1")
+        );
+    }
+
+    #[test]
+    fn session_forked_ignores_user_origin() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("user".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: None,
+            },
+            false,
+        );
+        assert!(app.delegate_entries[0].child_session_id.is_none());
+    }
+
+    #[test]
+    fn delegation_completed_sets_status() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::DelegationCompleted {
+                delegation_id: "del-1".into(),
+                result: Some("done".into()),
+            },
+            false,
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Completed);
+    }
+
+    #[test]
+    fn delegation_failed_sets_status() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::DelegationFailed {
+                delegation_id: "del-1".into(),
+                error: Some("boom".into()),
+            },
+            false,
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Failed);
+    }
+
+    #[test]
+    fn delegation_completed_unknown_id_is_noop() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::DelegationCompleted {
+                delegation_id: "unknown".into(),
+                result: None,
+            },
+            false,
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::InProgress);
+    }
+
+    #[test]
+    fn session_loaded_clears_delegate_entries() {
+        let mut app = App::new();
+        app.delegate_entries
+            .push(make_entry("d1", "old", DelegateStatus::Completed));
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "audit": { "events": [] }
+            })),
+        });
+        assert!(app.delegate_entries.is_empty());
+    }
+
+    #[test]
+    fn session_created_clears_delegate_entries() {
+        let mut app = App::new();
+        app.delegate_entries
+            .push(make_entry("d1", "old", DelegateStatus::Completed));
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1"
+            })),
+        });
+        assert!(app.delegate_entries.is_empty());
+    }
+
+    #[test]
+    fn replay_audit_builds_delegate_entries() {
+        let mut app = App::new();
+        let audit = serde_json::json!({
+            "events": [
+                {
+                    "kind": {
+                        "type": "delegation_requested",
+                        "data": {
+                            "delegation": {
+                                "public_id": "del-1",
+                                "target_agent_id": "coder",
+                                "objective": "Fix bug"
+                            }
+                        }
+                    }
+                },
+                {
+                    "kind": {
+                        "type": "session_forked",
+                        "data": {
+                            "parent_session_id": "parent",
+                            "child_session_id": "child-1",
+                            "target_agent_id": "coder",
+                            "origin": "delegation",
+                            "fork_point_type": "progress_entry",
+                            "fork_point_ref": "del-1"
+                        }
+                    }
+                },
+                {
+                    "kind": {
+                        "type": "delegation_completed",
+                        "data": {
+                            "delegation_id": "del-1",
+                            "result": "done"
+                        }
+                    }
+                }
+            ]
+        });
+        app.replay_audit(&audit);
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert_eq!(app.delegate_entries[0].delegation_id, "del-1");
+        assert_eq!(app.delegate_entries[0].objective, "Fix bug");
+        assert_eq!(
+            app.delegate_entries[0].child_session_id.as_deref(),
+            Some("child-1")
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Completed);
+    }
+
+    // ── DelegateStats accumulation ────────────────────────────────────────────
+
+    #[test]
+    fn stats_tool_call_increments() {
+        let mut stats = DelegateStats::default();
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::ToolCallStart {
+                tool_call_id: None,
+                tool_name: "read_tool".into(),
+                arguments: None,
+            },
+        );
+        assert_eq!(stats.tool_calls, 1);
+    }
+
+    #[test]
+    fn stats_message_increments_on_assistant_message() {
+        let mut stats = DelegateStats::default();
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::AssistantMessageStored {
+                content: "hello".into(),
+                thinking: None,
+                message_id: None,
+            },
+        );
+        assert_eq!(stats.messages, 1);
+    }
+
+    #[test]
+    fn stats_cost_accumulates_across_llm_requests() {
+        let mut stats = DelegateStats::default();
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::LlmRequestEnd {
+                finish_reason: None,
+                cost_usd: Some(0.01),
+                cumulative_cost_usd: None,
+                context_tokens: None,
+                tool_calls: None,
+                metrics: None,
+            },
+        );
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::LlmRequestEnd {
+                finish_reason: None,
+                cost_usd: Some(0.02),
+                cumulative_cost_usd: None,
+                context_tokens: None,
+                tool_calls: None,
+                metrics: None,
+            },
+        );
+        assert!((stats.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_context_tokens_takes_latest_value() {
+        let mut stats = DelegateStats::default();
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::LlmRequestEnd {
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: Some(1000),
+                tool_calls: None,
+                metrics: None,
+            },
+        );
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::LlmRequestEnd {
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: Some(2048),
+                tool_calls: None,
+                metrics: None,
+            },
+        );
+        assert_eq!(stats.context_tokens, 2048);
+    }
+
+    #[test]
+    fn stats_context_limit_set_from_provider_changed() {
+        let mut stats = DelegateStats::default();
+        accumulate_delegate_stats(
+            &mut stats,
+            &EventKind::ProviderChanged {
+                provider: "anthropic".into(),
+                model: "claude-sonnet".into(),
+                config_id: None,
+                context_limit: Some(200_000),
+            },
+        );
+        assert_eq!(stats.context_limit, 200_000);
+    }
+
+    #[test]
+    fn stats_context_pct_computes_correctly() {
+        let stats = DelegateStats {
+            context_tokens: 50_000,
+            context_limit: 200_000,
+            ..DelegateStats::default()
+        };
+        assert_eq!(stats.context_pct(), Some(25));
+    }
+
+    #[test]
+    fn stats_context_pct_none_when_no_limit() {
+        let stats = DelegateStats {
+            context_tokens: 1000,
+            context_limit: 0,
+            ..DelegateStats::default()
+        };
+        assert_eq!(stats.context_pct(), None);
+    }
+
+    // ── child session event routing ───────────────────────────────────────────
+
+    #[test]
+    fn child_session_events_route_to_delegate_stats() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        // Simulate a session_events message for the child session
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "events": [
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "tool_call_start", "data": {
+                                "tool_call_id": "t1",
+                                "tool_name": "read_tool",
+                                "arguments": null
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "tool_call_start", "data": {
+                                "tool_call_id": "t2",
+                                "tool_name": "write_file",
+                                "arguments": null
+                            }},
+                            "timestamp": null
+                        }
+                    }
+                ]
+            })),
+        });
+        assert_eq!(app.delegate_entries[0].stats.tool_calls, 2);
+    }
+
+    #[test]
+    fn child_session_events_with_unknown_kind_still_counts_known_events() {
+        // If the batch contains an unknown event kind with a data payload
+        // (e.g. a new server-side event type the TUI hasn't seen), the known
+        // events in the same batch must still be counted. Previously the whole
+        // Vec<EventEnvelope> deserialization failed on the first unknown kind.
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "events": [
+                    // known event — should be counted
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "tool_call_start", "data": {
+                                "tool_call_id": "t1",
+                                "tool_name": "read_tool",
+                                "arguments": null
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    // unknown event kind with a data payload — must NOT blow up the batch
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "brand_new_unknown_event_2099", "data": {
+                                "some_field": "some_value",
+                                "nested": { "deep": true }
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    // another known event after the unknown one — must still be counted
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "tool_call_start", "data": {
+                                "tool_call_id": "t2",
+                                "tool_name": "write_file",
+                                "arguments": null
+                            }},
+                            "timestamp": null
+                        }
+                    }
+                ]
+            })),
+        });
+        assert_eq!(
+            app.delegate_entries[0].stats.tool_calls, 2,
+            "both known tool_call_start events must be counted despite unknown event in batch"
+        );
+    }
+
+    #[test]
+    fn child_session_events_unknown_session_ignored() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "unknown-sess",
+                "agent_id": "coder",
+                "events": []
+            })),
+        });
+        assert_eq!(app.delegate_entries[0].stats.tool_calls, 0);
+    }
+
+    // ── subscribe on SessionForked ────────────────────────────────────────────
+
+    #[test]
+    fn session_forked_queues_subscribe_command() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: None,
+            },
+            false,
+        );
+        assert_eq!(app.pending_commands.len(), 1);
+        assert!(matches!(
+            &app.pending_commands[0],
+            ClientMsg::SubscribeSession { session_id, .. } if session_id == "child-sess-1"
+        ));
+    }
+
+    #[test]
+    fn session_forked_user_origin_does_not_queue_subscribe() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("user".into()),
+                fork_point_ref: None,
+                target_agent_id: None,
+            },
+            false,
+        );
+        assert!(app.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn replay_audit_emits_subscribe_for_delegation_forks() {
+        let mut app = App::new();
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "audit": {
+                    "events": [
+                        {
+                            "kind": {
+                                "type": "delegation_requested",
+                                "data": { "delegation": {
+                                    "public_id": "del-1",
+                                    "target_agent_id": "coder",
+                                    "objective": "task"
+                                }}
+                            }
+                        },
+                        {
+                            "kind": {
+                                "type": "session_forked",
+                                "data": {
+                                    "parent_session_id": "parent",
+                                    "child_session_id": "child-1",
+                                    "target_agent_id": "coder",
+                                    "origin": "delegation",
+                                    "fork_point_type": "progress_entry",
+                                    "fork_point_ref": "del-1"
+                                }
+                            }
+                        }
+                    ]
+                }
+            })),
+        });
+        let subscribe_cmds: Vec<_> = cmds
+            .iter()
+            .filter(|c| matches!(c, ClientMsg::SubscribeSession { session_id, .. } if session_id == "child-1"))
+            .collect();
+        assert_eq!(subscribe_cmds.len(), 1);
+    }
+
+    #[test]
+    fn session_forked_subscribe_uses_target_agent_id() {
+        // The subscribe command sent for a child session must use the
+        // delegation's target_agent_id, not the parent session's agent_id.
+        // This matches the web UI which sends kindData.target_agent_id.
+        let mut app = App::new();
+        app.agent_id = Some("parent-agent".into()); // parent session's agent
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()), // delegation target
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+        );
+        assert_eq!(app.pending_commands.len(), 1);
+        match &app.pending_commands[0] {
+            ClientMsg::SubscribeSession {
+                session_id,
+                agent_id,
+            } => {
+                assert_eq!(session_id, "child-1");
+                // Must be the delegation target agent, not the parent agent
+                assert_eq!(agent_id.as_deref(), Some("coder"));
+                assert_ne!(agent_id.as_deref(), Some("parent-agent"));
+            }
+            other => panic!("expected SubscribeSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_events_deser_failure_is_logged_not_silently_dropped() {
+        // Garbled JSON must produce a log entry rather than being silently
+        // ignored — otherwise debugging missing stats is impossible.
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({ "bad": "shape" })),
+        });
+        // A log entry should have been pushed
+        assert!(
+            app.logs
+                .iter()
+                .any(|e| e.message.contains("session_events")),
+            "expected a log warning about session_events parse failure"
+        );
+    }
+
+    #[test]
+    fn delegate_child_events_do_not_inflate_multi_session_badge() {
+        // Subscribing to delegate child sessions must NOT add them to
+        // session_activity — otherwise other_active_session_count() would
+        // count every child as a separate "other" session, inflating the
+        // multi-session badge (𐬽 N).
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+
+        // Simulate session_events arriving for the child (from subscribe replay)
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-1",
+                "agent_id": "coder",
+                "events": [
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "tool_call_start", "data": {
+                                "tool_call_id": "t1",
+                                "tool_name": "read_tool",
+                                "arguments": null
+                            }},
+                            "timestamp": null
+                        }
+                    }
+                ]
+            })),
+        });
+
+        // Child events should still accumulate stats
+        assert_eq!(app.delegate_entries[0].stats.tool_calls, 1);
+        // But the child must NOT appear in session_activity
+        assert_eq!(
+            app.other_active_session_count(),
+            0,
+            "delegate child sessions must not inflate multi-session badge"
+        );
+
+        // Simulate a live "event" arriving for the child
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "tool_call_start", "data": {
+                            "tool_call_id": "t2",
+                            "tool_name": "write_file",
+                            "arguments": null
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert_eq!(app.delegate_entries[0].stats.tool_calls, 2);
+        assert_eq!(
+            app.other_active_session_count(),
+            0,
+            "delegate child live events must not inflate multi-session badge"
+        );
+    }
+
+    #[test]
+    fn parent_replay_does_not_duplicate_delegate_entries() {
+        // Regression: the parent session can be replayed twice:
+        // 1) via session_loaded audit replay
+        // 2) via subscribed parent session_events replay
+        // DelegationRequested must be idempotent, otherwise the delegate badge
+        // shows e.g. 4/8 instead of 4/4.
+        let mut app = App::new();
+
+        // First load the parent session (audit replay path)
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "parent-agent",
+                "audit": {
+                    "events": [
+                        {
+                            "kind": { "type": "delegation_requested", "data": {
+                                "delegation": {
+                                    "public_id": "del-1",
+                                    "target_agent_id": "coder",
+                                    "objective": "task one"
+                                }
+                            }}
+                        },
+                        {
+                            "kind": { "type": "session_forked", "data": {
+                                "parent_session_id": "parent",
+                                "child_session_id": "child-1",
+                                "target_agent_id": "coder",
+                                "origin": "delegation",
+                                "fork_point_type": "progress_entry",
+                                "fork_point_ref": "del-1"
+                            }}
+                        },
+                        {
+                            "kind": { "type": "delegation_completed", "data": {
+                                "delegation_id": "del-1",
+                                "result": "done"
+                            }}
+                        },
+                        {
+                            "kind": { "type": "delegation_requested", "data": {
+                                "delegation": {
+                                    "public_id": "del-2",
+                                    "target_agent_id": "coder",
+                                    "objective": "task two"
+                                }
+                            }}
+                        },
+                        {
+                            "kind": { "type": "session_forked", "data": {
+                                "parent_session_id": "parent",
+                                "child_session_id": "child-2",
+                                "target_agent_id": "coder",
+                                "origin": "delegation",
+                                "fork_point_type": "progress_entry",
+                                "fork_point_ref": "del-2"
+                            }}
+                        },
+                        {
+                            "kind": { "type": "delegation_completed", "data": {
+                                "delegation_id": "del-2",
+                                "result": "done"
+                            }}
+                        }
+                    ]
+                }
+            })),
+        });
+
+        // Sanity check after initial audit replay.
+        assert_eq!(app.delegate_entries.len(), 2);
+        assert_eq!(
+            app.delegate_entries
+                .iter()
+                .filter(|e| e.status == DelegateStatus::Completed)
+                .count(),
+            2
+        );
+
+        // Simulate replay of the same parent session via session_events after subscribe.
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "parent-agent",
+                "events": [
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "delegation_requested", "data": {
+                                "delegation": {
+                                    "public_id": "del-1",
+                                    "target_agent_id": "coder",
+                                    "objective": "task one"
+                                }
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "session_forked", "data": {
+                                "parent_session_id": "parent",
+                                "child_session_id": "child-1",
+                                "target_agent_id": "coder",
+                                "origin": "delegation",
+                                "fork_point_type": "progress_entry",
+                                "fork_point_ref": "del-1"
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "delegation_completed", "data": {
+                                "delegation_id": "del-1",
+                                "result": "done"
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "delegation_requested", "data": {
+                                "delegation": {
+                                    "public_id": "del-2",
+                                    "target_agent_id": "coder",
+                                    "objective": "task two"
+                                }
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "session_forked", "data": {
+                                "parent_session_id": "parent",
+                                "child_session_id": "child-2",
+                                "target_agent_id": "coder",
+                                "origin": "delegation",
+                                "fork_point_type": "progress_entry",
+                                "fork_point_ref": "del-2"
+                            }},
+                            "timestamp": null
+                        }
+                    },
+                    {
+                        "type": "durable",
+                        "data": {
+                            "kind": { "type": "delegation_completed", "data": {
+                                "delegation_id": "del-2",
+                                "result": "done"
+                            }},
+                            "timestamp": null
+                        }
+                    }
+                ]
+            })),
+        });
+
+        // Must remain unique by delegation_id, not duplicate to 4.
+        assert_eq!(
+            app.delegate_entries.len(),
+            2,
+            "parent replay must not duplicate delegate entries"
+        );
+        assert_eq!(
+            app.delegate_entries
+                .iter()
+                .filter(|e| e.status == DelegateStatus::Completed)
+                .count(),
+            2,
+            "completed count must remain 2/2, not 2/4"
+        );
+
+        // Also ensure the initial session_loaded returned the child subscriptions.
+        let subscribe_count = cmds
+            .iter()
+            .filter(|c| matches!(c, ClientMsg::SubscribeSession { .. }))
+            .count();
+        assert_eq!(subscribe_count, 2);
+    }
+}
+
 // ── session_cache_tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2707,6 +3761,74 @@ mod tests {
                 message_id: (*id).into(),
             })
             .collect()
+    }
+
+    fn durable_event(kind_type: &str, data: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "durable",
+            "data": {
+                "kind": {
+                    "type": kind_type,
+                    "data": data
+                },
+                "timestamp": null
+            }
+        })
+    }
+
+    fn durable_prompt(text: &str, message_id: &str) -> serde_json::Value {
+        durable_event(
+            "prompt_received",
+            serde_json::json!({
+                "content": text,
+                "message_id": message_id,
+            }),
+        )
+    }
+
+    fn durable_user_stored(text: &str) -> serde_json::Value {
+        durable_event(
+            "user_message_stored",
+            serde_json::json!({
+                "content": text,
+            }),
+        )
+    }
+
+    fn durable_assistant(content: &str, message_id: &str) -> serde_json::Value {
+        durable_event(
+            "assistant_message_stored",
+            serde_json::json!({
+                "content": content,
+                "thinking": null,
+                "message_id": message_id,
+            }),
+        )
+    }
+
+    fn session_events_msg(events: Vec<serde_json::Value>) -> RawServerMsg {
+        RawServerMsg {
+            msg_type: "session_events".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "events": events,
+            })),
+        }
+    }
+
+    fn durable_progress_recorded() -> serde_json::Value {
+        durable_event(
+            "progress_recorded",
+            serde_json::json!({
+                "progress_entry": {
+                    "kind": "note",
+                    "content": "received response",
+                    "metadata": null,
+                    "created_at": "2026-04-13T00:00:00Z"
+                }
+            }),
+        )
     }
 
     #[test]
@@ -3348,6 +4470,490 @@ mod tests {
         assert!(app.can_redo());
     }
 
+    #[test]
+    fn prompt_received_with_same_message_id_is_not_duplicated() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::PromptReceived {
+                content: serde_json::json!("test ping"),
+                message_id: Some("msg-1".into()),
+            },
+            false,
+        );
+
+        app.handle_event_kind(
+            &EventKind::PromptReceived {
+                content: serde_json::json!("test ping"),
+                message_id: Some("msg-1".into()),
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.undoable_turns.len(), 1);
+    }
+
+    #[test]
+    fn assistant_message_stored_with_same_message_id_is_not_duplicated() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "Pong".into(),
+                thinking: None,
+                message_id: Some("a-1".into()),
+            },
+            false,
+        );
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "Pong".into(),
+                thinking: None,
+                message_id: Some("a-1".into()),
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn user_message_stored_only_backfills_when_prompt_received_missing() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::PromptReceived {
+                content: serde_json::json!("test ping"),
+                message_id: Some("msg-1".into()),
+            },
+            false,
+        );
+        app.handle_event_kind(
+            &EventKind::UserMessageStored {
+                content: serde_json::json!("test ping"),
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(
+            &app.messages[0],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "test ping" && message_id == "msg-1"
+        ));
+
+        let mut fallback_only = App::new();
+        fallback_only.handle_event_kind(
+            &EventKind::UserMessageStored {
+                content: serde_json::json!("fallback prompt"),
+            },
+            false,
+        );
+        assert_eq!(fallback_only.messages.len(), 1);
+        assert!(matches!(
+            &fallback_only.messages[0],
+            ChatEntry::User { text, message_id: None } if text == "fallback prompt"
+        ));
+    }
+
+    #[test]
+    fn live_frontier_events_do_not_resurrect_undone_prompt() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User {
+            text: "first".into(),
+            message_id: Some("msg-1".into()),
+        });
+        app.messages.push(ChatEntry::Assistant {
+            content: "reply one".into(),
+            thinking: None,
+            message_id: None,
+        });
+        app.undoable_turns = vec![UndoableTurn {
+            turn_id: "turn-msg-1".into(),
+            message_id: "msg-1".into(),
+            text: "first".into(),
+        }];
+        app.undo_state = Some(UndoState {
+            stack: vec![UndoFrame {
+                turn_id: "turn-msg-2".into(),
+                message_id: "msg-2".into(),
+                status: UndoFrameStatus::Confirmed,
+                reverted_files: vec![],
+            }],
+            frontier_message_id: Some("msg-2".into()),
+        });
+
+        app.handle_event_kind(
+            &EventKind::PromptReceived {
+                content: serde_json::json!([{ "type": "text", "text": "second" }]),
+                message_id: Some("msg-2".into()),
+            },
+            false,
+        );
+        app.handle_event_kind(
+            &EventKind::UserMessageStored {
+                content: serde_json::json!("second"),
+            },
+            false,
+        );
+
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::User { message_id: Some(message_id), .. } if message_id == "msg-2")
+        ));
+        assert!(
+            app.messages
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::User { text, .. } if text == "second"))
+        );
+        assert_eq!(app.undoable_turns.len(), 1);
+        assert_eq!(app.undoable_turns[0].message_id, "msg-1");
+        assert_eq!(
+            app.undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("msg-2")
+        );
+    }
+
+    #[test]
+    fn parent_session_events_replay_is_idempotent_for_existing_history() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+
+        let events = vec![
+            durable_prompt("test ping", "msg-1"),
+            durable_user_stored("test ping"),
+            durable_assistant("Pong", "a-1"),
+            durable_prompt("nice", "msg-2"),
+            durable_user_stored("nice"),
+            durable_assistant("Great", "a-2"),
+        ];
+
+        app.handle_server_msg(session_events_msg(events.clone()));
+        app.handle_server_msg(session_events_msg(events));
+
+        assert_eq!(app.messages.len(), 4);
+        assert_eq!(app.undoable_turns.len(), 2);
+    }
+
+    #[test]
+    fn undo_then_session_loaded_prunes_reverted_turn_and_later_history() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+        app.messages = vec![
+            ChatEntry::User {
+                text: "test ping".into(),
+                message_id: Some("msg-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "Pong".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::User {
+                text: "nice".into(),
+                message_id: Some("msg-2".into()),
+            },
+            ChatEntry::Assistant {
+                content: "Great".into(),
+                thinking: None,
+                message_id: None,
+            },
+        ];
+        app.undoable_turns = vec![
+            UndoableTurn {
+                turn_id: "turn-msg-1".into(),
+                message_id: "msg-1".into(),
+                text: "test ping".into(),
+            },
+            UndoableTurn {
+                turn_id: "turn-msg-2".into(),
+                message_id: "msg-2".into(),
+                text: "nice".into(),
+            },
+        ];
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "undo_result".into(),
+            data: Some(serde_json::json!({
+                "success": true,
+                "message_id": "msg-2",
+                "reverted_files": [],
+                "undo_stack": [{ "message_id": "msg-2" }]
+            })),
+        });
+        assert!(
+            cmds.iter().any(
+                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
+            )
+        );
+
+        let loaded = RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "undo_stack": [{ "message_id": "msg-2" }],
+                "audit": {
+                    "events": [
+                        {
+                            "kind": {
+                                "type": "prompt_received",
+                                "data": {
+                                    "content": "test ping",
+                                    "message_id": "msg-1"
+                                }
+                            }
+                        },
+                        {
+                            "kind": {
+                                "type": "assistant_message_stored",
+                                "data": {
+                                    "content": "Pong",
+                                    "thinking": null,
+                                    "message_id": "a-1"
+                                }
+                            }
+                        },
+                        {
+                            "kind": {
+                                "type": "prompt_received",
+                                "data": {
+                                    "content": "nice",
+                                    "message_id": "msg-2"
+                                }
+                            }
+                        },
+                        {
+                            "kind": {
+                                "type": "assistant_message_stored",
+                                "data": {
+                                    "content": "Great",
+                                    "thinking": null,
+                                    "message_id": "a-2"
+                                }
+                            }
+                        }
+                    ]
+                }
+            })),
+        };
+        app.handle_server_msg(loaded);
+
+        assert_eq!(app.messages.len(), 2);
+        assert!(matches!(
+            &app.messages[0],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "test ping" && message_id == "msg-1"
+        ));
+        assert!(matches!(
+            &app.messages[1],
+            ChatEntry::Assistant { content, .. } if content == "Pong"
+        ));
+        assert_eq!(app.undoable_turns.len(), 1);
+        assert_eq!(app.undoable_turns[0].message_id, "msg-1");
+    }
+
+    #[test]
+    fn undo_reload_clears_stale_tool_and_cancelled_rows() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+        app.messages = vec![
+            ChatEntry::User {
+                text: "test".into(),
+                message_id: Some("msg-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "Hello! I'm ready to help. What can I do for you?".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::User {
+                text: "wdyt does undo functionaliy works?".into(),
+                message_id: Some("msg-2".into()),
+            },
+            ChatEntry::Assistant {
+                content: "Let me take a look at the codebase to understand what undo functionality exists and how it works.".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-1".into()),
+                name: "ls".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+            ChatEntry::Assistant {
+                content: "/projects/personal/test/\n(0 entries)\n [cancelled]".into(),
+                thinking: None,
+                message_id: None,
+            },
+        ];
+        app.undoable_turns = vec![
+            UndoableTurn {
+                turn_id: "turn-msg-1".into(),
+                message_id: "msg-1".into(),
+                text: "test".into(),
+            },
+            UndoableTurn {
+                turn_id: "turn-msg-2".into(),
+                message_id: "msg-2".into(),
+                text: "wdyt does undo functionaliy works?".into(),
+            },
+        ];
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "undo_result".into(),
+            data: Some(serde_json::json!({
+                "success": true,
+                "message_id": "msg-2",
+                "reverted_files": [],
+                "undo_stack": [{ "message_id": "msg-2" }]
+            })),
+        });
+        assert!(
+            cmds.iter().any(
+                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
+            )
+        );
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "undo_stack": [{ "message_id": "msg-2" }],
+                "audit": {
+                    "events": [
+                        {
+                            "kind": {
+                                "type": "prompt_received",
+                                "data": {
+                                    "content": "test",
+                                    "message_id": "msg-1"
+                                }
+                            }
+                        },
+                        {
+                            "kind": {
+                                "type": "assistant_message_stored",
+                                "data": {
+                                    "content": "Hello! I'm ready to help. What can I do for you?",
+                                    "thinking": null,
+                                    "message_id": "a-1"
+                                }
+                            }
+                        }
+                    ]
+                }
+            })),
+        });
+
+        assert_eq!(app.messages.len(), 2);
+        assert!(
+            app.messages
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::ToolCall { .. }))
+        );
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::Assistant { content, .. } if content.contains("cancelled"))
+        ));
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::User { text, .. } if text == "wdyt does undo functionaliy works?")
+        ));
+    }
+
+    #[test]
+    fn parent_session_events_with_unknown_kind_are_ignored_like_main() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+        app.messages.push(ChatEntry::User {
+            text: "existing".into(),
+            message_id: Some("existing-msg".into()),
+        });
+
+        app.handle_server_msg(session_events_msg(vec![
+            durable_prompt("hello", "msg-1"),
+            durable_progress_recorded(),
+            durable_assistant("reply", "a-1"),
+        ]));
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(
+            &app.messages[0],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "existing" && message_id == "existing-msg"
+        ));
+    }
+
+    #[test]
+    fn suppressed_frontier_turn_does_not_append_orphan_assistant_or_tools() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User {
+            text: "first".into(),
+            message_id: Some("msg-1".into()),
+        });
+        app.messages.push(ChatEntry::Assistant {
+            content: "reply one".into(),
+            thinking: None,
+            message_id: Some("a-1".into()),
+        });
+        app.undoable_turns = vec![UndoableTurn {
+            turn_id: "turn-msg-1".into(),
+            message_id: "msg-1".into(),
+            text: "first".into(),
+        }];
+        app.undo_state = Some(UndoState {
+            stack: vec![UndoFrame {
+                turn_id: "turn-msg-2".into(),
+                message_id: "msg-2".into(),
+                status: UndoFrameStatus::Confirmed,
+                reverted_files: vec![],
+            }],
+            frontier_message_id: Some("msg-2".into()),
+        });
+
+        app.handle_event_kind(
+            &EventKind::PromptReceived {
+                content: serde_json::json!("second"),
+                message_id: Some("msg-2".into()),
+            },
+            false,
+        );
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: "orphaned reply".into(),
+                thinking: None,
+                message_id: Some("a-2".into()),
+            },
+            false,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-2".into()),
+                tool_name: "ls".into(),
+                arguments: None,
+            },
+            false,
+        );
+        app.handle_event_kind(&EventKind::Cancelled, false);
+
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::Assistant { content, .. } if content == "orphaned reply")
+        ));
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. } if tool_call_id == "tool-2")
+        ));
+        assert!(app.messages.iter().all(
+            |entry| !matches!(entry, ChatEntry::Assistant { content, .. } if content.contains("[cancelled]"))
+        ));
+    }
+
     // ── ElicitationState::selected_display ────────────────────────────────────
 
     #[test]
@@ -3966,7 +5572,9 @@ mod thinking_content_tests {
 
         assert_eq!(app.messages.len(), 1);
         match &app.messages[0] {
-            ChatEntry::Assistant { content, thinking } => {
+            ChatEntry::Assistant {
+                content, thinking, ..
+            } => {
                 assert_eq!(content, "The answer is 42.");
                 assert_eq!(thinking.as_deref(), Some("I need to compute the answer."));
             }
@@ -3990,7 +5598,9 @@ mod thinking_content_tests {
 
         assert_eq!(app.messages.len(), 1);
         match &app.messages[0] {
-            ChatEntry::Assistant { content, thinking } => {
+            ChatEntry::Assistant {
+                content, thinking, ..
+            } => {
                 assert_eq!(content, "Hello!");
                 assert!(thinking.is_none());
             }
@@ -4023,7 +5633,9 @@ mod thinking_content_tests {
         );
 
         match &app.messages[0] {
-            ChatEntry::Assistant { content, thinking } => {
+            ChatEntry::Assistant {
+                content, thinking, ..
+            } => {
                 assert_eq!(content, "Final answer.");
                 assert_eq!(thinking.as_deref(), Some("Streamed thinking."));
             }
@@ -4056,7 +5668,9 @@ mod thinking_content_tests {
 
         assert_eq!(app.messages.len(), 1);
         match &app.messages[0] {
-            ChatEntry::Assistant { content, thinking } => {
+            ChatEntry::Assistant {
+                content, thinking, ..
+            } => {
                 assert!(content.contains("Partial answer"));
                 assert!(content.contains("[cancelled]"));
                 assert_eq!(thinking.as_deref(), Some("Deep thought."));

@@ -274,6 +274,10 @@ impl Theme {
     pub fn error_text() -> Style {
         Style::default().fg(Self::err()).bg(Self::bg())
     }
+    /// Error text on a dimmed surface such as popups and the status/header bar.
+    pub fn error_on_dim() -> Style {
+        Style::default().fg(Self::err()).bg(Self::bg_dim())
+    }
     pub fn info_text() -> Style {
         Style::default().fg(Self::info()).bg(Self::bg())
     }

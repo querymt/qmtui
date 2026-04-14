@@ -284,6 +284,10 @@ pub(crate) fn handle_key(
             handle_auth_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
         }
+        Popup::DelegateList => {
+            handle_delegate_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
         Popup::None => {}
     }
 
@@ -377,6 +381,20 @@ pub(crate) fn handle_chord(
             }
             app.open_auth_popup();
             cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+        KeyCode::Char('d') => {
+            if app.screen != Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "delegates",
+                    "delegates only available in chat",
+                );
+                return Ok(());
+            }
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_delegate_popup();
         }
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
@@ -592,6 +610,86 @@ pub(crate) fn apply_popup_session_key(
         KeyCode::Char(c) => {
             app.session_filter.push(c);
             app.session_cursor = 0;
+        }
+        _ => {}
+    }
+    SessionKeyAction::None
+}
+
+// ── Delegate popup key handler ────────────────────────────────────────────────
+
+pub(crate) fn handle_delegate_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match apply_delegate_popup_key(
+        app,
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            KeyCode::Null
+        } else {
+            key.code
+        },
+    ) {
+        SessionKeyAction::LoadSession { session_id } => {
+            cmd_tx.send(ClientMsg::LoadSession {
+                session_id: session_id.clone(),
+            })?;
+            cmd_tx.send(ClientMsg::SubscribeSession {
+                session_id,
+                agent_id: app.agent_id.clone(),
+            })?;
+        }
+        SessionKeyAction::NewSession
+        | SessionKeyAction::DeleteSession { .. }
+        | SessionKeyAction::None => {}
+    }
+    Ok(())
+}
+
+/// Pure key-handler for the delegate popup. Returns a [`SessionKeyAction`]
+/// that the caller should forward to the server.
+///
+/// Delegation entries are built from the parent session's event stream, not
+/// from the session list. Enter loads the child session if its ID is known.
+pub(crate) fn apply_delegate_popup_key(
+    app: &mut App,
+    key: crossterm::event::KeyCode,
+) -> SessionKeyAction {
+    match key {
+        KeyCode::Esc => {
+            app.popup = Popup::None;
+        }
+        KeyCode::Up => {
+            app.delegate_cursor = app.delegate_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = app.visible_delegate_entries().len().saturating_sub(1);
+            app.delegate_cursor = (app.delegate_cursor + 1).min(max);
+        }
+        KeyCode::Enter => {
+            let entries = app.visible_delegate_entries();
+            if let Some(entry) = entries.get(app.delegate_cursor) {
+                if let Some(ref child_sid) = entry.child_session_id {
+                    let sid = child_sid.clone();
+                    app.popup = Popup::None;
+                    return SessionKeyAction::LoadSession { session_id: sid };
+                } else {
+                    app.set_status(
+                        app::LogLevel::Warn,
+                        "delegates",
+                        "delegation still pending — no session to load",
+                    );
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.delegate_filter.pop();
+            app.delegate_cursor = 0;
+        }
+        KeyCode::Char(c) => {
+            app.delegate_filter.push(c);
+            app.delegate_cursor = 0;
         }
         _ => {}
     }
@@ -1140,6 +1238,21 @@ fn try_execute_slash_command(
             app.session_cursor = 0;
             app.session_filter.clear();
             cmd_tx.send(ClientMsg::ListSessions)?;
+        }
+        "delegates" => {
+            app.take_input();
+            if app.screen != crate::app::Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "delegates",
+                    "delegates only available in chat",
+                );
+                return Ok(SlashResult::Handled);
+            }
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.open_delegate_popup();
         }
         "new" => {
             app.take_input();

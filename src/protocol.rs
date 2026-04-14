@@ -234,11 +234,29 @@ pub struct EventData {
     pub event: EventEnvelope,
 }
 
+/// Like [`EventData`] but keeps the event as raw JSON so an unknown
+/// event kind doesn't prevent routing the message entirely.
+#[derive(Debug, Deserialize)]
+pub struct EventDataRaw {
+    pub agent_id: String,
+    pub session_id: String,
+    pub event: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SessionEventsData {
     pub session_id: String,
     pub agent_id: String,
     pub events: Vec<EventEnvelope>,
+}
+
+/// Like [`SessionEventsData`] but with raw JSON values for events so unknown
+/// event kinds don't blow up deserialization of the whole batch.
+#[derive(Debug, Deserialize)]
+pub struct SessionEventsDataRaw {
+    pub session_id: String,
+    pub agent_id: String,
+    pub events: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,8 +370,43 @@ pub enum EventKind {
     },
     Cancelled,
     SessionCreated,
+    DelegationRequested {
+        delegation: DelegationData,
+    },
+    DelegationCompleted {
+        delegation_id: String,
+        #[serde(default)]
+        result: Option<String>,
+    },
+    DelegationFailed {
+        delegation_id: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SessionForked {
+        #[serde(default)]
+        child_session_id: Option<String>,
+        #[serde(default)]
+        origin: Option<String>,
+        /// Delegation public_id when origin="delegation".
+        #[serde(default)]
+        fork_point_ref: Option<String>,
+        /// The agent the child session was delegated to.
+        #[serde(default)]
+        target_agent_id: Option<String>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// Subset of the server-side `Delegation` struct that we care about.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DelegationData {
+    pub public_id: String,
+    #[serde(default)]
+    pub target_agent_id: Option<String>,
+    #[serde(default)]
+    pub objective: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

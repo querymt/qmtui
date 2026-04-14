@@ -41,12 +41,14 @@ pub(crate) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
 // ── Elicitation symbols ───────────────────────────────────────────────────────
 const RADIO_SELECTED: &str = "\u{25CF} "; // ● filled circle  – single-select active
 const RADIO_UNSELECTED: &str = "\u{25CB} "; // ○ empty circle   – single-select inactive
-const CHECK_CHECKED: &str = "\u{2611} "; // ☑ ballot box checked   – multi-select on
+pub(crate) const CHECK_CHECKED: &str = "\u{2611}"; // ☑ ballot box checked   – success/done
+pub(crate) const CHECK_FAILED: &str = "\u{2612}"; // ☒ ballot box with X     – failed
 const CHECK_UNCHECKED: &str = "\u{2610} "; // ☐ ballot box unchecked – multi-select off
 
 // ── Status bar icons ──────────────────────────────────────────────────────────
 const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token usage
 const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
+pub(crate) const ICON_DELEGATES: &str = "\u{2387}"; // ⎇  alt/fork       – delegation count
 pub(crate) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
 
 // ── General text symbols ──────────────────────────────────────────────────────
@@ -268,7 +270,9 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 let lines = markdown::render(text, Theme::user_text(), &app.hl);
                 app.card_cache.cards.push(Card::new(CardKind::User, lines));
             }
-            ChatEntry::Assistant { content, thinking } => {
+            ChatEntry::Assistant {
+                content, thinking, ..
+            } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
                 let mut lines = Vec::new();
                 if app.show_thinking
@@ -558,6 +562,31 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         right_spans.push(Span::styled(
             format!(" ${cost:.4} "),
             Theme::status_accent(),
+        ));
+    }
+
+    // delegations
+    if !app.delegate_entries.is_empty() {
+        use crate::app::DelegateStatus;
+        let (mut done, mut has_failed, mut has_running) = (0usize, false, false);
+        for e in &app.delegate_entries {
+            match e.status {
+                DelegateStatus::Completed => done += 1,
+                DelegateStatus::Failed => has_failed = true,
+                DelegateStatus::InProgress => has_running = true,
+            }
+        }
+        let total = app.delegate_entries.len();
+        let style = if has_failed {
+            Theme::error_on_dim()
+        } else if has_running {
+            Theme::status_accent()
+        } else {
+            Theme::status()
+        };
+        right_spans.push(Span::styled(
+            format!(" {ICON_DELEGATES} {done}/{total} "),
+            style,
         ));
     }
 
