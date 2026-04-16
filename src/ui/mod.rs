@@ -2,8 +2,8 @@ mod chat;
 mod popups;
 mod start;
 
-use chat::draw_chat;
 pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
+use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_delegate_popup, draw_help_popup, draw_log_popup, draw_model_popup,
     draw_new_session_popup, draw_session_popup, draw_theme_popup,
@@ -300,6 +300,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Sessions => draw_start(f, app),
         Screen::Chat => draw_chat(f, app),
+        Screen::Delegate => draw_delegate_view(f, app),
     }
 
     match app.popup {

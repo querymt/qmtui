@@ -389,7 +389,14 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
                     let title = s.title.as_deref().unwrap_or("(untitled)");
 
                     let is_active = app.session_id.as_deref() == Some(s.session_id.as_str());
-                    let marker_part = if is_active { " ● " } else { "   " };
+                    let is_parent = app.parent_session_id.as_deref() == Some(s.session_id.as_str());
+                    let marker_part = if is_active {
+                        " ● "
+                    } else if is_parent {
+                        " \u{2b11} "
+                    } else {
+                        "   "
+                    };
                     let id_part = format!(" {id_short} ");
                     let time_part = format!(" {time_str:>7} ");
                     let avail = list_w.saturating_sub(
@@ -421,8 +428,9 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
                         )
                     };
                     let active_style = Theme::status_accent().bg(row_bg);
-                    let marker_style = if is_active { active_style } else { dim_style };
-                    let id_style = if is_active { active_style } else { dim_style };
+                    let highlight = is_active || is_parent;
+                    let marker_style = if highlight { active_style } else { dim_style };
+                    let id_style = if highlight { active_style } else { dim_style };
 
                     let mut spans = vec![
                         Span::styled(marker_part, marker_style),
@@ -473,6 +481,7 @@ struct DelegateRowData {
     msgs: String,
     ctx: String,
     cost: String,
+    is_current: bool,
 }
 
 fn format_delegate_tools(stats: &crate::app::DelegateStats) -> String {
@@ -607,6 +616,8 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                     entry.objective.clone()
                 };
 
+                let is_current = entry.child_session_id.as_deref() == app.session_id.as_deref();
+
                 DelegateRowData {
                     status_badge,
                     badge_style,
@@ -615,6 +626,7 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                     msgs: format_delegate_messages(&entry.stats),
                     ctx: format_delegate_context(&entry.stats),
                     cost: format_delegate_cost(&entry.stats),
+                    is_current,
                 }
             })
             .collect();
@@ -679,10 +691,15 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             .into_iter()
             .map(|row| {
                 let objective = truncate_with_ellipsis(&row.objective_source, objective_w);
+                let obj_style = if row.is_current {
+                    Theme::status_accent()
+                } else {
+                    main_style
+                };
 
                 let mut cells = vec![
                     Cell::from(Span::styled(row.status_badge, row.badge_style)),
-                    Cell::from(Span::styled(objective, main_style)),
+                    Cell::from(Span::styled(objective, obj_style)),
                 ];
                 if show_tools {
                     cells.push(Cell::from(Span::styled(row.tools, dim_style)));
@@ -1171,6 +1188,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ("m", "model selector"),
                 ("n", "new session"),
                 ("l", "logs popup"),
+                ("p", "jump to parent session"),
                 ("q", "quit"),
                 ("r", "redo"),
                 ("s", "session switcher"),

@@ -50,6 +50,8 @@ impl StreamingCache {
 pub enum Screen {
     Sessions,
     Chat,
+    /// Read-only view for delegate child sessions (no input box).
+    Delegate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,6 +895,10 @@ pub struct App {
     pub delegate_entries: Vec<DelegateEntry>,
     pub delegate_cursor: usize,
     pub delegate_filter: String,
+    /// Parent session ID (set when viewing a delegate child session).
+    pub parent_session_id: Option<String>,
+    /// Staging field: set by delegate popup before LoadSession, consumed by session_loaded.
+    pub pending_parent_session_id: Option<String>,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
     /// Drained by handle_server_msg after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
@@ -991,6 +997,8 @@ impl App {
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
             delegate_filter: String::new(),
+            parent_session_id: None,
+            pending_parent_session_id: None,
             pending_commands: Vec::new(),
             suppress_turn_output: false,
             status: "connecting...".into(),

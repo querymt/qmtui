@@ -463,6 +463,134 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
     &app.card_cache.cards
 }
 
+// ── Shared header builder ─────────────────────────────────────────────────────
+
+/// Build left + right span vectors for the chat/delegate header bar.
+fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let model_str = match (&app.current_provider, &app.current_model) {
+        (Some(p), Some(m)) => format!("{p}/{m}"),
+        _ => "no model".into(),
+    };
+    let sid = app
+        .session_id
+        .as_deref()
+        .map(|s| if s.len() > 8 { &s[..8] } else { s })
+        .unwrap_or("???");
+
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+
+    if let Some(dur) = app.llm_request_elapsed() {
+        let secs = dur.as_secs();
+        let time_str = if secs < 60 {
+            format!("{secs}s")
+        } else {
+            format!("{}m{}s", secs / 60, secs % 60)
+        };
+        right_spans.push(Span::styled(format!(" {time_str} "), Theme::status()));
+    }
+
+    if let Some(context_tokens) = app.session_stats.latest_context_tokens
+        && context_tokens > 0
+        && app.context_limit > 0
+    {
+        let pct = (context_tokens as f64 / app.context_limit as f64 * 100.0) as u32;
+        right_spans.push(Span::styled(
+            format!(" {ICON_CONTEXT} {pct}% "),
+            Theme::status(),
+        ));
+    }
+
+    if app.session_stats.total_tool_calls > 0 {
+        right_spans.push(Span::styled(
+            format!(" {ICON_TOOLS} {} ", app.session_stats.total_tool_calls),
+            Theme::status(),
+        ));
+    }
+
+    if let Some(cost) = app.cumulative_cost
+        && cost > 0.0
+    {
+        right_spans.push(Span::styled(
+            format!(" ${cost:.4} "),
+            Theme::status_accent(),
+        ));
+    }
+
+    if !app.delegate_entries.is_empty() {
+        use crate::app::DelegateStatus;
+        let (mut done, mut has_failed, mut has_running) = (0usize, false, false);
+        for e in &app.delegate_entries {
+            match e.status {
+                DelegateStatus::Completed => done += 1,
+                DelegateStatus::Failed => has_failed = true,
+                DelegateStatus::InProgress => has_running = true,
+            }
+        }
+        let total = app.delegate_entries.len();
+        let style = if has_failed {
+            Theme::error_on_dim()
+        } else if has_running {
+            Theme::status_accent()
+        } else {
+            Theme::status()
+        };
+        right_spans.push(Span::styled(
+            format!(" {ICON_DELEGATES} {done}/{total} "),
+            style,
+        ));
+    }
+
+    let other_active_session_count = app.other_active_session_count();
+    if other_active_session_count > 0 {
+        right_spans.push(Span::styled(
+            format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
+            Theme::status(),
+        ));
+    }
+
+    let effort_label = app.reasoning_effort_label().to_string();
+    right_spans.push(Span::styled(
+        format!(" {model_str}"),
+        Theme::status_accent(),
+    ));
+    right_spans.push(Span::styled(":", Theme::reasoning_effort_sep()));
+    right_spans.push(Span::styled(
+        format!("{effort_label} "),
+        Theme::reasoning_effort_level(),
+    ));
+
+    let mut left_spans = vec![
+        Span::styled(format!(" {sid}"), Theme::status()),
+        Span::styled(
+            format!(" {} ", app.agent_mode),
+            Theme::mode_badge(&app.agent_mode),
+        ),
+    ];
+    if app.parent_session_id.is_some() {
+        left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
+    }
+    left_spans.push(Span::styled(format!(" {}", app.status), Theme::status()));
+
+    (left_spans, right_spans)
+}
+
+// ── Draw delegate view (read-only child session) ─────────────────────────────
+
+pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Min(3),    // messages (all remaining space)
+        ])
+        .split(area);
+
+    let (left_spans, right_spans) = build_chat_header_spans(app);
+    draw_header(f, app, chunks[0], left_spans, right_spans);
+    draw_messages(f, app, chunks[1]);
+}
+
 // ── Draw chat screen ──────────────────────────────────────────────────────────
 
 pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
@@ -511,120 +639,8 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // header
-    let model_str = match (&app.current_provider, &app.current_model) {
-        (Some(p), Some(m)) => format!("{p}/{m}"),
-        _ => "no model".into(),
-    };
-    let sid = app
-        .session_id
-        .as_deref()
-        .map(|s| if s.len() > 8 { &s[..8] } else { s })
-        .unwrap_or("???");
-
-    let mut right_spans: Vec<Span<'static>> = Vec::new();
-
-    // time
-    if let Some(dur) = app.llm_request_elapsed() {
-        let secs = dur.as_secs();
-        let time_str = if secs < 60 {
-            format!("{secs}s")
-        } else {
-            format!("{}m{}s", secs / 60, secs % 60)
-        };
-        right_spans.push(Span::styled(format!(" {time_str} "), Theme::status()));
-    }
-
-    // context %
-    if let Some(context_tokens) = app.session_stats.latest_context_tokens
-        && context_tokens > 0
-        && app.context_limit > 0
-    {
-        let pct = (context_tokens as f64 / app.context_limit as f64 * 100.0) as u32;
-        right_spans.push(Span::styled(
-            format!(" {ICON_CONTEXT} {pct}% "),
-            Theme::status(),
-        ));
-    }
-
-    // tool calls
-    if app.session_stats.total_tool_calls > 0 {
-        right_spans.push(Span::styled(
-            format!(" {ICON_TOOLS} {} ", app.session_stats.total_tool_calls),
-            Theme::status(),
-        ));
-    }
-
-    // cost
-    if let Some(cost) = app.cumulative_cost
-        && cost > 0.0
-    {
-        right_spans.push(Span::styled(
-            format!(" ${cost:.4} "),
-            Theme::status_accent(),
-        ));
-    }
-
-    // delegations
-    if !app.delegate_entries.is_empty() {
-        use crate::app::DelegateStatus;
-        let (mut done, mut has_failed, mut has_running) = (0usize, false, false);
-        for e in &app.delegate_entries {
-            match e.status {
-                DelegateStatus::Completed => done += 1,
-                DelegateStatus::Failed => has_failed = true,
-                DelegateStatus::InProgress => has_running = true,
-            }
-        }
-        let total = app.delegate_entries.len();
-        let style = if has_failed {
-            Theme::error_on_dim()
-        } else if has_running {
-            Theme::status_accent()
-        } else {
-            Theme::status()
-        };
-        right_spans.push(Span::styled(
-            format!(" {ICON_DELEGATES} {done}/{total} "),
-            style,
-        ));
-    }
-
-    // show a badge when other sessions have produced recent websocket activity.
-    let other_active_session_count = app.other_active_session_count();
-    if other_active_session_count > 0 {
-        right_spans.push(Span::styled(
-            format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
-            Theme::status(),
-        ));
-    }
-
-    // model + thinking level: " provider/model:level "
-    let effort_label = app.reasoning_effort_label().to_string();
-    right_spans.push(Span::styled(
-        format!(" {model_str}"),
-        Theme::status_accent(),
-    ));
-    right_spans.push(Span::styled(":", Theme::reasoning_effort_sep()));
-    right_spans.push(Span::styled(
-        format!("{effort_label} "),
-        Theme::reasoning_effort_level(),
-    ));
-
-    draw_header(
-        f,
-        app,
-        chunks[0],
-        vec![
-            Span::styled(format!(" {sid}"), Theme::status()),
-            Span::styled(
-                format!(" {} ", app.agent_mode),
-                Theme::mode_badge(&app.agent_mode),
-            ),
-            Span::styled(format!(" {}", app.status), Theme::status()),
-        ],
-        right_spans,
-    );
+    let (left_spans, right_spans) = build_chat_header_spans(app);
+    draw_header(f, app, chunks[0], left_spans, right_spans);
 
     // messages
     draw_messages(f, app, chunks[1]);

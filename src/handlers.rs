@@ -303,6 +303,7 @@ pub(crate) fn handle_key(
     match app.screen {
         Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
         Screen::Chat => return handle_chat_key(app, key, cmd_tx),
+        Screen::Delegate => return handle_delegate_view_key(app, key, cmd_tx),
     }
     Ok(AppAction::None)
 }
@@ -383,7 +384,7 @@ pub(crate) fn handle_chord(
             cmd_tx.send(ClientMsg::ListAuthProviders)?;
         }
         KeyCode::Char('d') => {
-            if app.screen != Screen::Chat {
+            if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
                 app.set_status(
                     app::LogLevel::Warn,
                     "delegates",
@@ -395,6 +396,30 @@ pub(crate) fn handle_chord(
                 return Ok(());
             }
             app.open_delegate_popup();
+        }
+        KeyCode::Char('p') => {
+            if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "session",
+                    "parent jump only available in chat",
+                );
+                return Ok(());
+            }
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            if let Some(parent_sid) = app.parent_session_id.clone() {
+                cmd_tx.send(ClientMsg::LoadSession {
+                    session_id: parent_sid.clone(),
+                })?;
+                cmd_tx.send(ClientMsg::SubscribeSession {
+                    session_id: parent_sid,
+                    agent_id: app.agent_id.clone(),
+                })?;
+            } else {
+                app.set_status(app::LogLevel::Info, "session", "no parent session");
+            }
         }
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
@@ -616,6 +641,50 @@ pub(crate) fn apply_popup_session_key(
     SessionKeyAction::None
 }
 
+// ── Delegate view key handler (read-only child session) ──────────────────────
+
+fn handle_delegate_view_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<AppAction> {
+    match key.code {
+        KeyCode::Up => {
+            app.scroll_offset = app.scroll_offset.saturating_add(1);
+        }
+        KeyCode::Down => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        }
+        KeyCode::PageUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(10);
+        }
+        KeyCode::PageDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+        }
+        KeyCode::Home => {
+            // Scroll to top: set a large offset (draw_messages clamps it).
+            app.scroll_offset = u16::MAX;
+        }
+        KeyCode::End => {
+            app.scroll_offset = 0;
+        }
+        KeyCode::Esc => {
+            // Go back to parent session.
+            if let Some(parent_sid) = app.parent_session_id.clone() {
+                cmd_tx.send(ClientMsg::LoadSession {
+                    session_id: parent_sid.clone(),
+                })?;
+                cmd_tx.send(ClientMsg::SubscribeSession {
+                    session_id: parent_sid,
+                    agent_id: app.agent_id.clone(),
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(AppAction::None)
+}
+
 // ── Delegate popup key handler ────────────────────────────────────────────────
 
 pub(crate) fn handle_delegate_popup_key(
@@ -672,6 +741,11 @@ pub(crate) fn apply_delegate_popup_key(
             if let Some(entry) = entries.get(app.delegate_cursor) {
                 if let Some(ref child_sid) = entry.child_session_id {
                     let sid = child_sid.clone();
+                    // Use the real parent when navigating between siblings.
+                    app.pending_parent_session_id = app
+                        .parent_session_id
+                        .clone()
+                        .or_else(|| app.session_id.clone());
                     app.popup = Popup::None;
                     return SessionKeyAction::LoadSession { session_id: sid };
                 } else {

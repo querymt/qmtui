@@ -183,6 +183,8 @@ impl App {
                     self.recent_prompt_text = None;
                     self.suppress_turn_output = false;
                     self.delegate_entries.clear();
+                    self.parent_session_id = None;
+                    self.pending_parent_session_id = None;
                     self.file_index.clear();
                     self.file_index_generated_at = None;
                     self.file_index_loading = false;
@@ -211,6 +213,16 @@ impl App {
                         }
                         Ok(sl) => {
                             self.activity = ActivityState::Idle;
+                            // Resolve parent before moving sl.session_id: prefer explicit
+                            // pending value (from delegate popup), fall back to session_groups.
+                            self.parent_session_id =
+                                self.pending_parent_session_id.take().or_else(|| {
+                                    self.session_groups
+                                        .iter()
+                                        .flat_map(|g| &g.sessions)
+                                        .find(|s| s.session_id == sl.session_id)
+                                        .and_then(|s| s.parent_session_id.clone())
+                                });
                             self.session_id = Some(sl.session_id);
                             self.agent_id = Some(sl.agent_id);
                             self.messages.clear();
@@ -219,11 +231,19 @@ impl App {
                             self.scroll_offset = 0;
                             self.cumulative_cost = None;
                             self.session_stats = SessionStatsLite::default();
-                            self.screen = Screen::Chat;
+                            self.screen = if self.parent_session_id.is_some() {
+                                Screen::Delegate
+                            } else {
+                                Screen::Chat
+                            };
                             self.undoable_turns.clear();
                             self.recent_prompt_text = None;
                             self.suppress_turn_output = false;
-                            self.delegate_entries.clear();
+                            // Keep parent's delegate entries when navigating to a child
+                            // session; otherwise clear for unrelated session switches.
+                            if self.parent_session_id.is_none() {
+                                self.delegate_entries.clear();
+                            }
                             self.file_index.clear();
                             self.file_index_generated_at = None;
                             self.file_index_loading = false;
