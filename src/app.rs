@@ -3214,6 +3214,104 @@ mod delegate_entry_tests {
             .count();
         assert_eq!(subscribe_count, 2);
     }
+
+    // ── delegation view (parent tracking, Screen::Delegate) ──────────────────
+
+    #[test]
+    fn session_loaded_preserves_delegates_for_child() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries
+            .push(make_entry("d1", "task one", DelegateStatus::InProgress));
+        app.pending_parent_session_id = Some("parent".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-1",
+                "agent_id": "a1",
+                "audit": { "events": [] }
+            })),
+        });
+
+        assert_eq!(
+            app.delegate_entries.len(),
+            1,
+            "delegate entries must be preserved"
+        );
+        assert_eq!(
+            app.parent_session_id.as_deref(),
+            Some("parent"),
+            "parent_session_id must be set"
+        );
+        assert_eq!(
+            app.screen,
+            Screen::Delegate,
+            "child session must use Delegate screen"
+        );
+    }
+
+    #[test]
+    fn session_loaded_clears_delegates_for_non_child() {
+        let mut app = App::new();
+        app.session_id = Some("old".into());
+        app.delegate_entries
+            .push(make_entry("d1", "task", DelegateStatus::Completed));
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "unrelated",
+                "agent_id": "a1",
+                "audit": { "events": [] }
+            })),
+        });
+
+        assert!(
+            app.delegate_entries.is_empty(),
+            "delegate entries must be cleared"
+        );
+        assert!(
+            app.parent_session_id.is_none(),
+            "no parent for non-child session"
+        );
+        assert_eq!(app.screen, Screen::Chat, "non-child must use Chat screen");
+    }
+
+    #[test]
+    fn session_loaded_resolves_parent_from_session_groups() {
+        use crate::protocol::{SessionGroup, SessionSummary};
+        let mut app = App::new();
+        app.session_groups = vec![SessionGroup {
+            cwd: Some("/test".into()),
+            sessions: vec![SessionSummary {
+                session_id: "child-1".into(),
+                title: Some("child".into()),
+                cwd: Some("/test".into()),
+                created_at: None,
+                updated_at: None,
+                parent_session_id: Some("parent".into()),
+                has_children: false,
+            }],
+            latest_activity: None,
+        }];
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-1",
+                "agent_id": "a1",
+                "audit": { "events": [] }
+            })),
+        });
+
+        assert_eq!(
+            app.parent_session_id.as_deref(),
+            Some("parent"),
+            "parent resolved from session_groups"
+        );
+        assert_eq!(app.screen, Screen::Delegate);
+    }
 }
 
 // ── session_cache_tests ───────────────────────────────────────────────────────

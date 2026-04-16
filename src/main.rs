@@ -2531,6 +2531,25 @@ mod delegate_popup_key_tests {
         apply_delegate_popup_key(&mut app, KeyCode::Esc);
         assert_eq!(app.popup, Popup::None);
     }
+
+    #[test]
+    fn delegate_popup_enter_sets_parent_for_sibling_navigation() {
+        let mut app = setup_delegate_app();
+        // Simulate being in a child session (parent_session_id is set).
+        app.parent_session_id = Some("parent-1".into());
+        app.session_id = Some("child-old".into());
+
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(action, SessionKeyAction::LoadSession { .. }),
+            "enter must trigger LoadSession"
+        );
+        assert_eq!(
+            app.pending_parent_session_id.as_deref(),
+            Some("parent-1"),
+            "pending_parent must be the real parent, not the child session_id"
+        );
+    }
 }
 
 #[cfg(test)]

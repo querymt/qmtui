@@ -276,12 +276,22 @@ impl App {
             }
             "session_events" => {
                 if let Some(data) = raw.data {
-                    if let Ok(parent) = serde_json::from_value::<SessionEventsData>(data.clone()) {
-                        self.note_session_activity(&parent.session_id);
-                        if self.session_id.as_deref() == Some(parent.session_id.as_str()) {
-                            for envelope in parent.events {
+                    if let Ok(parsed) = serde_json::from_value::<SessionEventsData>(data.clone()) {
+                        if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
+                            self.note_session_activity(&parsed.session_id);
+                            for envelope in parsed.events {
                                 self.handle_event(&envelope);
                             }
+                        } else if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
+                            e.child_session_id.as_deref() == Some(parsed.session_id.as_str())
+                        }) {
+                            // Delegate child: accumulate stats without inflating
+                            // the multi-session activity badge.
+                            for envelope in &parsed.events {
+                                accumulate_delegate_stats(&mut entry.stats, envelope.kind());
+                            }
+                        } else {
+                            self.note_session_activity(&parsed.session_id);
                         }
                     } else {
                         match serde_json::from_value::<SessionEventsDataRaw>(data) {
@@ -320,10 +330,16 @@ impl App {
             }
             "event" => {
                 if let Some(data) = raw.data {
-                    if let Ok(parent) = serde_json::from_value::<EventData>(data.clone()) {
-                        self.note_session_activity(&parent.session_id);
-                        if self.session_id.as_deref() == Some(parent.session_id.as_str()) {
-                            self.handle_event(&parent.event);
+                    if let Ok(parsed) = serde_json::from_value::<EventData>(data.clone()) {
+                        if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
+                            self.note_session_activity(&parsed.session_id);
+                            self.handle_event(&parsed.event);
+                        } else if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
+                            e.child_session_id.as_deref() == Some(parsed.session_id.as_str())
+                        }) {
+                            accumulate_delegate_stats(&mut entry.stats, parsed.event.kind());
+                        } else {
+                            self.note_session_activity(&parsed.session_id);
                         }
                     } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
                         if let Some(entry) = self

@@ -2192,7 +2192,7 @@ mod tests {
         let mut app = App::new();
         app.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
-            thinking: Some("reasoning".into()),
+            thinking: None,
             message_id: None,
         });
 
