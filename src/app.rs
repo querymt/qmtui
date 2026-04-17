@@ -150,6 +150,7 @@ pub enum DelegateStatus {
     InProgress,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -3450,6 +3451,96 @@ mod delegate_entry_tests {
         assert!(
             app.messages.is_empty(),
             "delegation failure result message must be suppressed"
+        );
+    }
+
+    #[test]
+    fn delegation_cancelled_sets_status() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "delegation_cancelled", "data": {
+                            "delegation_id": "del-1"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Cancelled);
+        assert!(
+            app.suppress_delegation_result,
+            "suppress flag must be set after cancellation"
+        );
+    }
+
+    #[test]
+    fn delegation_cancelled_suppresses_next_user_message() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "delegation_cancelled", "data": {
+                            "delegation_id": "del-1"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "user_message_stored", "data": {
+                            "content": "Delegation cancelled."
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert!(
+            app.messages.is_empty(),
+            "delegation cancellation result must be suppressed"
         );
     }
 }

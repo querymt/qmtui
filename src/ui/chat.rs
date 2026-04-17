@@ -521,7 +521,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         let (mut done, mut has_failed, mut has_running) = (0usize, false, false);
         for e in &app.delegate_entries {
             match e.status {
-                DelegateStatus::Completed => done += 1,
+                DelegateStatus::Completed | DelegateStatus::Cancelled => done += 1,
                 DelegateStatus::Failed => has_failed = true,
                 DelegateStatus::InProgress => has_running = true,
             }

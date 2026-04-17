@@ -867,6 +867,16 @@ impl App {
                 }
                 self.suppress_delegation_result = true;
             }
+            EventKind::DelegationCancelled { delegation_id } => {
+                if let Some(entry) = self
+                    .delegate_entries
+                    .iter_mut()
+                    .find(|e| e.delegation_id == *delegation_id)
+                {
+                    entry.status = DelegateStatus::Cancelled;
+                }
+                self.suppress_delegation_result = true;
+            }
             _ => {}
         }
     }

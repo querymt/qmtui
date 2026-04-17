@@ -383,6 +383,9 @@ pub enum EventKind {
         #[serde(default)]
         error: Option<String>,
     },
+    DelegationCancelled {
+        delegation_id: String,
+    },
     SessionForked {
         #[serde(default)]
         child_session_id: Option<String>,

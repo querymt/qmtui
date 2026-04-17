@@ -604,11 +604,13 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                     }
                     DelegateStatus::Completed => CHECK_CHECKED.to_string(),
                     DelegateStatus::Failed => CHECK_FAILED.to_string(),
+                    DelegateStatus::Cancelled => "\u{2298}".to_string(), // ⊘
                 };
                 let badge_style = match entry.status {
                     DelegateStatus::InProgress => Theme::status_accent(),
                     DelegateStatus::Completed => Theme::session_time(),
                     DelegateStatus::Failed => Theme::error_on_dim(),
+                    DelegateStatus::Cancelled => Theme::status(),
                 };
                 let objective_source = if entry.objective.is_empty() {
                     "(no objective)".to_string()
