@@ -143,6 +143,10 @@ pub struct DelegateEntry {
     pub objective: String,
     pub status: DelegateStatus,
     pub stats: DelegateStats,
+    /// Server timestamp (unix seconds) when delegation was requested.
+    pub started_at: Option<i64>,
+    /// Server timestamp (unix seconds) when delegation completed/failed/cancelled.
+    pub ended_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2250,6 +2254,8 @@ mod delegate_entry_tests {
             objective: objective.into(),
             status,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         }
     }
 
@@ -2308,6 +2314,8 @@ mod delegate_entry_tests {
                 objective: "Plan work".into(),
                 status: DelegateStatus::Completed,
                 stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "d2".into(),
@@ -2316,6 +2324,8 @@ mod delegate_entry_tests {
                 objective: "Write code".into(),
                 status: DelegateStatus::InProgress,
                 stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
         ];
         app.delegate_filter = "planner".into();
@@ -2346,6 +2356,7 @@ mod delegate_entry_tests {
                 },
             },
             false,
+            None,
         );
         assert_eq!(app.delegate_entries.len(), 1);
         assert_eq!(app.delegate_entries[0].delegation_id, "del-1");
@@ -2368,6 +2379,8 @@ mod delegate_entry_tests {
             objective: "Fix the bug".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2377,6 +2390,7 @@ mod delegate_entry_tests {
                 target_agent_id: None,
             },
             false,
+            None,
         );
         assert_eq!(
             app.delegate_entries[0].child_session_id.as_deref(),
@@ -2394,6 +2408,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2403,6 +2419,7 @@ mod delegate_entry_tests {
                 target_agent_id: None,
             },
             false,
+            None,
         );
         assert!(app.delegate_entries[0].child_session_id.is_none());
     }
@@ -2417,6 +2434,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::DelegationCompleted {
@@ -2424,6 +2443,7 @@ mod delegate_entry_tests {
                 result: Some("done".into()),
             },
             false,
+            None,
         );
         assert_eq!(app.delegate_entries[0].status, DelegateStatus::Completed);
     }
@@ -2438,6 +2458,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::DelegationFailed {
@@ -2445,6 +2467,7 @@ mod delegate_entry_tests {
                 error: Some("boom".into()),
             },
             false,
+            None,
         );
         assert_eq!(app.delegate_entries[0].status, DelegateStatus::Failed);
     }
@@ -2459,6 +2482,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::DelegationCompleted {
@@ -2466,6 +2491,7 @@ mod delegate_entry_tests {
                 result: None,
             },
             false,
+            None,
         );
         assert_eq!(app.delegate_entries[0].status, DelegateStatus::InProgress);
     }
@@ -2686,6 +2712,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         // Simulate a session_events message for the child session
         app.handle_server_msg(RawServerMsg {
@@ -2736,6 +2764,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_events".into(),
@@ -2797,6 +2827,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_events".into(),
@@ -2821,6 +2853,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2830,6 +2864,7 @@ mod delegate_entry_tests {
                 target_agent_id: None,
             },
             false,
+            None,
         );
         assert_eq!(app.pending_commands.len(), 1);
         assert!(matches!(
@@ -2849,6 +2884,7 @@ mod delegate_entry_tests {
                 target_agent_id: None,
             },
             false,
+            None,
         );
         assert!(app.pending_commands.is_empty());
     }
@@ -2911,6 +2947,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2920,6 +2958,7 @@ mod delegate_entry_tests {
                 target_agent_id: Some("coder".into()),
             },
             false,
+            None,
         );
         assert_eq!(app.pending_commands.len(), 1);
         match &app.pending_commands[0] {
@@ -2969,6 +3008,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
 
         // Simulate session_events arriving for the child (from subscribe replay)
@@ -3331,6 +3372,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
 
         // delegation_completed fires
@@ -3411,6 +3454,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -3465,6 +3510,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -3502,6 +3549,8 @@ mod delegate_entry_tests {
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -3543,6 +3592,8 @@ mod delegate_entry_tests {
             "delegation cancellation result must be suppressed"
         );
     }
+
+    // ── delegation duration tracking ─────────────────────────────────────────
 }
 
 // ── session_cache_tests ───────────────────────────────────────────────────────
@@ -3870,6 +3921,7 @@ mod session_mode_tests {
                 mode: "plan".into(),
             },
             false,
+            None,
         );
         assert_eq!(app.agent_mode, "plan");
     }
@@ -3883,6 +3935,7 @@ mod session_mode_tests {
                 mode: "build".into(),
             },
             false,
+            None,
         );
         assert_eq!(app.agent_mode, "build");
     }
@@ -4271,6 +4324,7 @@ mod tests {
                 token_estimate: 12_000,
             },
             false,
+            None,
         );
         assert_eq!(
             app.activity,
@@ -4291,6 +4345,7 @@ mod tests {
                 summary_len: 19,
             },
             false,
+            None,
         );
 
         assert_eq!(app.activity, ActivityState::Thinking);
@@ -4695,7 +4750,7 @@ mod tests {
     fn turn_activity_transitions_across_tool_and_completion_events() {
         let mut app = App::new();
 
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
         assert_eq!(app.activity, ActivityState::Thinking);
 
         app.handle_event_kind(
@@ -4705,6 +4760,7 @@ mod tests {
                 message_id: None,
             },
             false,
+            None,
         );
         assert_eq!(app.activity, ActivityState::Thinking);
 
@@ -4715,6 +4771,7 @@ mod tests {
                 arguments: None,
             },
             false,
+            None,
         );
         assert_eq!(
             app.activity,
@@ -4733,6 +4790,7 @@ mod tests {
                 metrics: None,
             },
             false,
+            None,
         );
         assert_eq!(app.activity, ActivityState::Idle);
     }
@@ -4816,6 +4874,7 @@ mod tests {
                 message_id: Some("msg-1".into()),
             },
             false,
+            None,
         );
 
         app.handle_event_kind(
@@ -4824,6 +4883,7 @@ mod tests {
                 message_id: Some("msg-1".into()),
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
@@ -4840,6 +4900,7 @@ mod tests {
                 message_id: Some("a-1".into()),
             },
             false,
+            None,
         );
 
         app.handle_event_kind(
@@ -4849,6 +4910,7 @@ mod tests {
                 message_id: Some("a-1".into()),
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
@@ -4863,12 +4925,14 @@ mod tests {
                 message_id: Some("msg-1".into()),
             },
             false,
+            None,
         );
         app.handle_event_kind(
             &EventKind::UserMessageStored {
                 content: serde_json::json!("test ping"),
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
@@ -4884,6 +4948,7 @@ mod tests {
                 content: serde_json::json!("fallback prompt"),
             },
             false,
+            None,
         );
         assert_eq!(fallback_only.messages.len(), 1);
         assert!(matches!(
@@ -4925,12 +4990,14 @@ mod tests {
                 message_id: Some("msg-2".into()),
             },
             false,
+            None,
         );
         app.handle_event_kind(
             &EventKind::UserMessageStored {
                 content: serde_json::json!("second"),
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 2);
@@ -5260,6 +5327,7 @@ mod tests {
                 message_id: Some("msg-2".into()),
             },
             false,
+            None,
         );
         app.handle_event_kind(
             &EventKind::AssistantMessageStored {
@@ -5268,6 +5336,7 @@ mod tests {
                 message_id: Some("a-2".into()),
             },
             false,
+            None,
         );
         app.handle_event_kind(
             &EventKind::ToolCallStart {
@@ -5276,8 +5345,9 @@ mod tests {
                 arguments: None,
             },
             false,
+            None,
         );
-        app.handle_event_kind(&EventKind::Cancelled, false);
+        app.handle_event_kind(&EventKind::Cancelled, false, None);
 
         assert_eq!(app.messages.len(), 2);
         assert!(app.messages.iter().all(
@@ -5397,6 +5467,7 @@ mod tests {
                 arguments: None,
             },
             false,
+            None,
         );
         assert!(
             !app.messages
@@ -5415,6 +5486,7 @@ mod tests {
                 arguments: None,
             },
             false,
+            None,
         );
         assert!(
             app.messages
@@ -5717,6 +5789,7 @@ mod tests {
                 source: "builtin:question".into(),
             },
             true,
+            None,
         );
         // Simulate replay of ToolCallEnd for question
         app.handle_event_kind(
@@ -5727,6 +5800,7 @@ mod tests {
                 result: Some(r#"{"answers":[{"question":"Which?","answers":["Alpha"]}]}"#.into()),
             },
             true,
+            None,
         );
         assert!(app.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Alpha")
@@ -5750,6 +5824,7 @@ mod tests {
                 source: "builtin:question".into(),
             },
             true, // is_replay
+            None,
         );
 
         // No popup should be opened
@@ -5783,6 +5858,7 @@ mod tests {
                 source: "builtin:question".into(),
             },
             false,
+            None,
         );
 
         // State should be populated
@@ -5862,7 +5938,7 @@ mod thinking_content_tests {
     #[test]
     fn thinking_delta_accumulates_in_streaming_thinking() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         app.handle_event_kind(
             &EventKind::AssistantThinkingDelta {
@@ -5870,6 +5946,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
         assert_eq!(app.streaming_thinking, "Let me ");
 
@@ -5879,6 +5956,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
         assert_eq!(app.streaming_thinking, "Let me think about this.");
     }
@@ -5888,7 +5966,7 @@ mod thinking_content_tests {
         let mut app = App::new();
         app.streaming_thinking = "old thinking".into();
 
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         assert!(app.streaming_thinking.is_empty());
     }
@@ -5896,7 +5974,7 @@ mod thinking_content_tests {
     #[test]
     fn assistant_message_stored_captures_thinking_field() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         app.handle_event_kind(
             &EventKind::AssistantMessageStored {
@@ -5905,6 +5983,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
@@ -5922,7 +6001,7 @@ mod thinking_content_tests {
     #[test]
     fn assistant_message_stored_without_thinking_sets_none() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         app.handle_event_kind(
             &EventKind::AssistantMessageStored {
@@ -5931,6 +6010,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
@@ -5948,7 +6028,7 @@ mod thinking_content_tests {
     #[test]
     fn streaming_thinking_falls_back_when_stored_thinking_is_none() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         // Simulate thinking deltas arriving before the stored message
         app.handle_event_kind(
@@ -5957,6 +6037,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         // AssistantMessageStored arrives without thinking field
@@ -5967,6 +6048,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         match &app.messages[0] {
@@ -5985,7 +6067,7 @@ mod thinking_content_tests {
     #[test]
     fn cancelled_with_thinking_preserves_thinking_in_entry() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
 
         app.handle_event_kind(
             &EventKind::AssistantThinkingDelta {
@@ -5993,6 +6075,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
         app.handle_event_kind(
             &EventKind::AssistantContentDelta {
@@ -6000,8 +6083,9 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
-        app.handle_event_kind(&EventKind::Cancelled, false);
+        app.handle_event_kind(&EventKind::Cancelled, false, None);
 
         assert_eq!(app.messages.len(), 1);
         match &app.messages[0] {
@@ -6019,7 +6103,7 @@ mod thinking_content_tests {
     #[test]
     fn thinking_delta_keeps_activity_as_thinking() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
         assert_eq!(app.activity, ActivityState::Thinking);
 
         app.handle_event_kind(
@@ -6028,6 +6112,7 @@ mod thinking_content_tests {
                 message_id: None,
             },
             false,
+            None,
         );
         // Should still be Thinking (not Streaming) during thinking phase
         assert_eq!(app.activity, ActivityState::Thinking);

@@ -453,10 +453,15 @@ impl App {
 
     fn handle_event(&mut self, envelope: &EventEnvelope) {
         self.apply_event_stats(envelope.kind(), envelope.timestamp());
-        self.handle_event_kind(envelope.kind(), false);
+        self.handle_event_kind(envelope.kind(), false, envelope.timestamp());
     }
 
-    pub(crate) fn handle_event_kind(&mut self, kind: &EventKind, is_replay: bool) {
+    pub(crate) fn handle_event_kind(
+        &mut self,
+        kind: &EventKind,
+        is_replay: bool,
+        timestamp: Option<i64>,
+    ) {
         match kind {
             EventKind::PromptReceived {
                 content,
@@ -815,6 +820,8 @@ impl App {
                         objective: delegation.objective.clone().unwrap_or_default(),
                         status: DelegateStatus::InProgress,
                         stats: DelegateStats::default(),
+                        started_at: timestamp,
+                        ended_at: None,
                     });
                 }
             }
@@ -854,6 +861,7 @@ impl App {
                     .find(|e| e.delegation_id == *delegation_id)
                 {
                     entry.status = DelegateStatus::Completed;
+                    entry.ended_at = timestamp;
                 }
                 self.suppress_delegation_result = true;
             }
@@ -864,6 +872,7 @@ impl App {
                     .find(|e| e.delegation_id == *delegation_id)
                 {
                     entry.status = DelegateStatus::Failed;
+                    entry.ended_at = timestamp;
                 }
                 self.suppress_delegation_result = true;
             }
@@ -874,6 +883,7 @@ impl App {
                     .find(|e| e.delegation_id == *delegation_id)
                 {
                     entry.status = DelegateStatus::Cancelled;
+                    entry.ended_at = timestamp;
                 }
                 self.suppress_delegation_result = true;
             }
@@ -915,7 +925,7 @@ impl App {
             for event_val in events.iter().take(replay_cutoff) {
                 if let Ok(agent_event) = serde_json::from_value::<AgentEvent>(event_val.clone()) {
                     self.apply_event_stats(&agent_event.kind, agent_event.timestamp);
-                    self.handle_event_kind(&agent_event.kind, true);
+                    self.handle_event_kind(&agent_event.kind, true, agent_event.timestamp);
                 }
             }
         }
@@ -1256,7 +1266,7 @@ mod scroll_tests {
     #[test]
     fn content_delta_preserves_scroll_when_scrolled_up() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
         app.scroll_offset = 20;
 
         app.handle_event_kind(
@@ -1265,6 +1275,7 @@ mod scroll_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         assert_eq!(
@@ -1319,7 +1330,7 @@ mod scroll_tests {
     #[test]
     fn content_delta_stays_at_bottom_when_following() {
         let mut app = App::new();
-        app.handle_event_kind(&EventKind::TurnStarted, false);
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
         app.scroll_offset = 0; // at bottom
 
         app.handle_event_kind(
@@ -1328,6 +1339,7 @@ mod scroll_tests {
                 message_id: None,
             },
             false,
+            None,
         );
 
         assert_eq!(

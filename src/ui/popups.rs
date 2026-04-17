@@ -481,6 +481,7 @@ struct DelegateRowData {
     msgs: String,
     ctx: String,
     cost: String,
+    duration: String,
     is_current: bool,
 }
 
@@ -619,6 +620,23 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                 };
 
                 let is_current = entry.child_session_id.as_deref() == app.session_id.as_deref();
+                let duration = entry
+                    .started_at
+                    .map(|start| {
+                        let end = entry.ended_at.unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(start)
+                        });
+                        let secs = (end - start).max(0) as u64;
+                        if secs < 60 {
+                            format!("{secs}s")
+                        } else {
+                            format!("{}m{}s", secs / 60, secs % 60)
+                        }
+                    })
+                    .unwrap_or_default();
 
                 DelegateRowData {
                     status_badge,
@@ -628,6 +646,7 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                     msgs: format_delegate_messages(&entry.stats),
                     ctx: format_delegate_context(&entry.stats),
                     cost: format_delegate_cost(&entry.stats),
+                    duration,
                     is_current,
                 }
             })
@@ -653,11 +672,17 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             .map(|row| delegate_display_width(&row.cost))
             .max()
             .unwrap_or(0);
+        let dur_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.duration))
+            .max()
+            .unwrap_or(0);
 
         let show_tools = tools_col_w > 0;
         let show_msgs = msgs_col_w > 0;
         let show_ctx = ctx_col_w > 0;
         let show_cost = cost_col_w > 0;
+        let show_dur = dur_col_w > 0;
 
         let mut fixed_w = DELEGATE_STATUS_COL_W as u16;
         if show_tools {
@@ -672,6 +697,9 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
         if show_cost {
             fixed_w += cost_col_w;
         }
+        if show_dur {
+            fixed_w += dur_col_w;
+        }
         // Keep stat columns visible; objective shrinks and ellipsizes first.
         // Ratatui tables insert one cell of spacing between adjacent columns, so
         // reserve that spacing up front to keep the trailing ellipsis visible.
@@ -679,7 +707,8 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             + u16::from(show_tools)
             + u16::from(show_msgs)
             + u16::from(show_ctx)
-            + u16::from(show_cost);
+            + u16::from(show_cost)
+            + u16::from(show_dur);
         let column_spacing = visible_cols.saturating_sub(1);
         let objective_w = chunks[3]
             .width
@@ -715,6 +744,9 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                 if show_cost {
                     cells.push(Cell::from(Span::styled(row.cost, dim_style)));
                 }
+                if show_dur {
+                    cells.push(Cell::from(Span::styled(row.duration, dim_style)));
+                }
 
                 Row::new(cells)
             })
@@ -735,6 +767,9 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
         }
         if show_cost {
             constraints.push(Constraint::Length(cost_col_w));
+        }
+        if show_dur {
+            constraints.push(Constraint::Length(dur_col_w));
         }
 
         let table = Table::new(rows, constraints)

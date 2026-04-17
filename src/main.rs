@@ -2439,6 +2439,8 @@ mod delegate_popup_key_tests {
             objective: objective.into(),
             status: DelegateStatus::Completed,
             stats: app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         }
     }
 
@@ -2494,6 +2496,8 @@ mod delegate_popup_key_tests {
             objective: "pending task".into(),
             status: DelegateStatus::InProgress,
             stats: app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         }];
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);

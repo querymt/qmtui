@@ -524,6 +524,8 @@ mod tests {
                 objective: "a".into(),
                 status: DelegateStatus::Completed,
                 stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "d2".into(),
@@ -532,6 +534,8 @@ mod tests {
                 objective: "b".into(),
                 status: DelegateStatus::Completed,
                 stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "d3".into(),
@@ -540,6 +544,8 @@ mod tests {
                 objective: "c".into(),
                 status: DelegateStatus::InProgress,
                 stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
         ];
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -568,6 +574,8 @@ mod tests {
             objective: "a".into(),
             status: DelegateStatus::Failed,
             stats: crate::app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
         }];
 
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -601,6 +609,8 @@ mod tests {
                     context_tokens: 50_000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -615,6 +625,8 @@ mod tests {
                     context_tokens: 20_000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
         ];
 
@@ -656,6 +668,8 @@ mod tests {
                     context_tokens: 1000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -670,6 +684,8 @@ mod tests {
                     context_tokens: 2000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
         ];
 
@@ -715,6 +731,8 @@ mod tests {
                 context_tokens: 180_000,
                 context_limit: 200_000,
             },
+            started_at: None,
+            ended_at: None,
         }];
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
@@ -749,6 +767,8 @@ mod tests {
                 objective: "Selected row".into(),
                 status: DelegateStatus::Completed,
                 stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -757,6 +777,8 @@ mod tests {
                 objective: "Failed row".into(),
                 status: DelegateStatus::Failed,
                 stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
             },
         ];
 
@@ -795,6 +817,8 @@ mod tests {
                     context_tokens: 50_000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -809,6 +833,8 @@ mod tests {
                     context_tokens: 10_000,
                     context_limit: 200_000,
                 },
+                started_at: None,
+                ended_at: None,
             },
         ];
 
