@@ -263,6 +263,8 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         }
     };
 
+    let mut delegate_idx = 0usize;
+
     for entry in &app.messages[start_idx..] {
         match entry {
             ChatEntry::User { text, .. } => {
@@ -306,6 +308,29 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 };
                 let sym = if *is_error { "x" } else { ">" };
 
+                // For delegate tool calls, compute duration from delegate_entries.
+                let delegate_duration = if name == "delegate" {
+                    let dur = app.delegate_entries.get(delegate_idx).and_then(|e| {
+                        let start = e.started_at?;
+                        let end = e.ended_at.unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(start)
+                        });
+                        let secs = (end - start).max(0) as u64;
+                        Some(if secs < 60 {
+                            format!(":{secs}s")
+                        } else {
+                            format!(":{}m{}s", secs / 60, secs % 60)
+                        })
+                    });
+                    delegate_idx += 1;
+                    dur.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
                 match detail {
                     ToolDetail::Edit {
                         file, cached_lines, ..
@@ -338,7 +363,24 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         }
                     }
                     ToolDetail::Summary(info) => {
-                        if info.contains('\n') {
+                        // Delegate tool calls: split "(agent:dur) objective" into
+                        // accent-colored label + normal objective.
+                        if name == "delegate" && info.starts_with('(') {
+                            let close = info.find(')').unwrap_or(0);
+                            let label_inner = &info[1..close]; // "coder"
+                            let objective = info[close + 1..].trim_start();
+                            let label = if delegate_duration.is_empty() {
+                                format!("({label_inner})")
+                            } else {
+                                format!("({label_inner}{delegate_duration})")
+                            };
+                            let mut spans = vec![Span::styled(format!("{sym} {name} "), style)];
+                            spans.push(Span::styled(format!("{label} "), Theme::status_accent()));
+                            if !objective.is_empty() {
+                                spans.push(Span::styled(objective.to_string(), Theme::diff_file()));
+                            }
+                            pending_tools.push(Line::from(spans));
+                        } else if info.contains('\n') {
                             pending_tools
                                 .push(Line::from(Span::styled(format!("{sym} {name}"), style)));
                             for line in info.lines() {

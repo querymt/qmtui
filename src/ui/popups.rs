@@ -476,6 +476,7 @@ const DELEGATE_ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪
 struct DelegateRowData {
     status_badge: String,
     badge_style: ratatui::style::Style,
+    agent: String,
     objective_source: String,
     tools: String,
     msgs: String,
@@ -641,6 +642,7 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                 DelegateRowData {
                     status_badge,
                     badge_style,
+                    agent: entry.target_agent_id.clone().unwrap_or_default(),
                     objective_source,
                     tools: format_delegate_tools(&entry.stats),
                     msgs: format_delegate_messages(&entry.stats),
@@ -652,6 +654,11 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             })
             .collect();
 
+        let agent_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.agent))
+            .max()
+            .unwrap_or(0);
         let tools_col_w = rows_data
             .iter()
             .map(|row| delegate_display_width(&row.tools))
@@ -678,6 +685,7 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             .max()
             .unwrap_or(0);
 
+        let show_agent = agent_col_w > 0;
         let show_tools = tools_col_w > 0;
         let show_msgs = msgs_col_w > 0;
         let show_ctx = ctx_col_w > 0;
@@ -685,6 +693,9 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
         let show_dur = dur_col_w > 0;
 
         let mut fixed_w = DELEGATE_STATUS_COL_W as u16;
+        if show_agent {
+            fixed_w += agent_col_w;
+        }
         if show_tools {
             fixed_w += tools_col_w;
         }
@@ -704,6 +715,7 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
         // Ratatui tables insert one cell of spacing between adjacent columns, so
         // reserve that spacing up front to keep the trailing ellipsis visible.
         let visible_cols = 2
+            + u16::from(show_agent)
             + u16::from(show_tools)
             + u16::from(show_msgs)
             + u16::from(show_ctx)
@@ -728,10 +740,11 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
                     main_style
                 };
 
-                let mut cells = vec![
-                    Cell::from(Span::styled(row.status_badge, row.badge_style)),
-                    Cell::from(Span::styled(objective, obj_style)),
-                ];
+                let mut cells = vec![Cell::from(Span::styled(row.status_badge, row.badge_style))];
+                if show_agent {
+                    cells.push(Cell::from(Span::styled(row.agent, dim_style)));
+                }
+                cells.push(Cell::from(Span::styled(objective, obj_style)));
                 if show_tools {
                     cells.push(Cell::from(Span::styled(row.tools, dim_style)));
                 }
@@ -752,10 +765,11 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
             })
             .collect();
 
-        let mut constraints = vec![
-            Constraint::Length(DELEGATE_STATUS_COL_W as u16),
-            Constraint::Length(objective_w as u16),
-        ];
+        let mut constraints = vec![Constraint::Length(DELEGATE_STATUS_COL_W as u16)];
+        if show_agent {
+            constraints.push(Constraint::Length(agent_col_w));
+        }
+        constraints.push(Constraint::Length(objective_w as u16));
         if show_tools {
             constraints.push(Constraint::Length(tools_col_w));
         }

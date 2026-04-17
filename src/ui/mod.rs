@@ -879,6 +879,99 @@ mod tests {
     }
 
     #[test]
+    fn draw_delegate_popup_shows_agent_name_column() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::DelegateList;
+        app.session_id = Some("parent".into());
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: "Fix bug".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-2".into(),
+                child_session_id: None,
+                target_agent_id: Some("planner".into()),
+                objective: "Plan work".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("coder"),
+            "agent name 'coder' must appear in popup, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("planner"),
+            "agent name 'planner' must appear in popup"
+        );
+    }
+
+    #[test]
+    fn delegate_tool_call_label_uses_accent_color() {
+        use crate::app::{ChatEntry, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail};
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "delegate".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+        });
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix the bug".into(),
+            status: DelegateStatus::Completed,
+            stats: DelegateStats::default(),
+            started_at: Some(1700000000),
+            ended_at: Some(1700000045),
+        });
+
+        let buffer = render_chat_buffer(&mut app, 60, 10);
+
+        // Find the row with "delegate"
+        let (_, row) = find_buffer_text(&buffer, "delegate").expect("missing delegate tool call");
+        // Find "(coder" on that row
+        let (label_x, _) = find_buffer_text(&buffer, "(coder").expect("missing label");
+        let label_cell = &buffer[(label_x, row)];
+
+        let accent_fg = Theme::status_accent().fg.expect("accent must define fg");
+        assert_eq!(
+            label_cell.style().fg,
+            Some(accent_fg),
+            "delegate label must use accent color"
+        );
+    }
+
+    #[test]
     fn draw_chat_preserves_hard_line_breaks_in_input() {
         let mut app = App::new();
         app.screen = Screen::Chat;

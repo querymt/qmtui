@@ -1142,11 +1142,17 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
         }
         "apply_patch" => ToolDetail::Summary("patch".into()),
         "delegate" => {
+            let agent = str_field("target_agent_id");
             let objective = str_field("objective");
-            let display = if objective.len() > 50 {
+            let obj_display = if objective.len() > 50 {
                 format!("{}{ELLIPSIS}", &objective[..50])
             } else {
                 objective
+            };
+            let display = if agent.is_empty() {
+                obj_display
+            } else {
+                format!("({agent}) {obj_display}")
             };
             ToolDetail::Summary(display)
         }
@@ -1257,6 +1263,48 @@ fn content_to_string(v: &serde_json::Value) -> String {
 }
 
 // ── scroll_tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tool_detail_tests {
+    use super::parse_tool_detail;
+    use crate::app::ToolDetail;
+
+    #[test]
+    fn delegate_tool_shows_agent_and_objective() {
+        let args = serde_json::json!({
+            "target_agent_id": "coder",
+            "objective": "List the contents of /tmp"
+        });
+        let detail = parse_tool_detail("delegate", Some(&args));
+        match detail {
+            ToolDetail::Summary(s) => {
+                assert!(s.contains("coder"), "must contain agent name, got: {s}");
+                assert!(
+                    s.contains("List the contents"),
+                    "must contain objective, got: {s}"
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delegate_tool_without_agent_shows_objective_only() {
+        let args = serde_json::json!({
+            "objective": "Do something"
+        });
+        let detail = parse_tool_detail("delegate", Some(&args));
+        match detail {
+            ToolDetail::Summary(s) => {
+                assert!(
+                    s.contains("Do something"),
+                    "must contain objective, got: {s}"
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod scroll_tests {
