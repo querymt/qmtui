@@ -185,6 +185,7 @@ impl App {
                     self.delegate_entries.clear();
                     self.parent_session_id = None;
                     self.pending_parent_session_id = None;
+                    self.suppress_delegation_result = false;
                     self.file_index.clear();
                     self.file_index_generated_at = None;
                     self.file_index_loading = false;
@@ -239,6 +240,7 @@ impl App {
                             self.undoable_turns.clear();
                             self.recent_prompt_text = None;
                             self.suppress_turn_output = false;
+                            self.suppress_delegation_result = false;
                             // Keep parent's delegate entries when navigating to a child
                             // session; otherwise clear for unrelated session switches.
                             if self.parent_session_id.is_none() {
@@ -524,6 +526,12 @@ impl App {
             EventKind::UserMessageStored { content } => {
                 let text = content_to_string(content);
                 if !text.is_empty() {
+                    // Suppress the noisy batch-result message that immediately
+                    // follows DelegationCompleted / DelegationFailed.
+                    if self.suppress_delegation_result {
+                        self.suppress_delegation_result = false;
+                        return;
+                    }
                     // If undo_state is still active during a live event, the matching
                     // PromptReceived was suppressed as the reverted frontier turn.
                     if !is_replay && (self.undo_state.is_some() || self.suppress_turn_output) {
@@ -847,6 +855,7 @@ impl App {
                 {
                     entry.status = DelegateStatus::Completed;
                 }
+                self.suppress_delegation_result = true;
             }
             EventKind::DelegationFailed { delegation_id, .. } => {
                 if let Some(entry) = self
@@ -856,6 +865,7 @@ impl App {
                 {
                     entry.status = DelegateStatus::Failed;
                 }
+                self.suppress_delegation_result = true;
             }
             _ => {}
         }

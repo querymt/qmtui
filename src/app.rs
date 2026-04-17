@@ -899,6 +899,9 @@ pub struct App {
     pub parent_session_id: Option<String>,
     /// Staging field: set by delegate popup before LoadSession, consumed by session_loaded.
     pub pending_parent_session_id: Option<String>,
+    /// Set after DelegationCompleted/DelegationFailed; consumed by the next
+    /// UserMessageStored to suppress the noisy batch-result message.
+    pub suppress_delegation_result: bool,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
     /// Drained by handle_server_msg after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
@@ -999,6 +1002,7 @@ impl App {
             delegate_filter: String::new(),
             parent_session_id: None,
             pending_parent_session_id: None,
+            suppress_delegation_result: false,
             pending_commands: Vec::new(),
             suppress_turn_output: false,
             status: "connecting...".into(),
@@ -3311,6 +3315,142 @@ mod delegate_entry_tests {
             "parent resolved from session_groups"
         );
         assert_eq!(app.screen, Screen::Delegate);
+    }
+
+    // ── delegation result suppression ────────────────────────────────────────
+
+    #[test]
+    fn delegation_completed_suppresses_next_user_message() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+
+        // delegation_completed fires
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "delegation_completed", "data": {
+                            "delegation_id": "del-1",
+                            "result": "some result"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        // The immediately following user_message_stored is the noisy batch result
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "user_message_stored", "data": {
+                            "content": "Delegation batch completed.\n\nResults:\n- del-1: completed"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert!(
+            app.messages.is_empty(),
+            "delegation batch result message must be suppressed"
+        );
+
+        // A subsequent real user message must NOT be suppressed
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "user_message_stored", "data": {
+                            "content": "real user message"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "real user message must not be suppressed"
+        );
+    }
+
+    #[test]
+    fn delegation_failed_suppresses_next_user_message() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            target_agent_id: None,
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "delegation_failed", "data": {
+                            "delegation_id": "del-1",
+                            "error": "boom"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "a1",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "user_message_stored", "data": {
+                            "content": "Delegation batch failed.\n\nErrors:\n- del-1: boom"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert!(
+            app.messages.is_empty(),
+            "delegation failure result message must be suppressed"
+        );
     }
 }
 
