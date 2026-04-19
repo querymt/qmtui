@@ -1742,8 +1742,8 @@ pub(crate) fn handle_model_popup_key(
                 if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
                     // Mode tab (Planner / Build): store preference for that mode
                     app.set_mode_model_preference(mode, &model.provider, &model.model);
-                    // If current mode matches, also apply to the live session
                     if app.agent_mode == mode {
+                        // If current mode matches, also apply to the live session
                         if let Some(sid) = app.session_id.clone() {
                             cmd_tx.send(ClientMsg::SetSessionModel {
                                 session_id: sid,
@@ -1760,6 +1760,10 @@ pub(crate) fn handle_model_popup_key(
                             })?;
                         }
                         app.cache_session_mode_state();
+                    } else {
+                        // Update the session cache for the target mode so that a later
+                        // switch_mode does not restore a stale cached model.
+                        app.update_cached_mode_model(mode, &model.provider, &model.model);
                     }
                     let tab_label = app
                         .model_popup_tab_label(app.model_popup_agent_tab)
@@ -1912,4 +1916,168 @@ pub(crate) fn apply_sessions_key(
         _ => {}
     }
     SessionKeyAction::None
+}
+
+// ── model popup tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod model_popup_tests {
+    use super::*;
+    use crate::app::{App, Popup};
+    use crate::config::TestPersistenceGuard;
+    use crate::protocol::ModelEntry;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn make_model(provider: &str, model: &str) -> ModelEntry {
+        ModelEntry {
+            id: format!("{provider}/{model}"),
+            label: model.into(),
+            provider: provider.into(),
+            model: model.into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }
+    }
+
+    #[test]
+    fn select_model_for_inactive_build_tab_updates_build_cache() {
+        let _guard = TestPersistenceGuard::new("inactive-build");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "plan".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+
+        // Pre-populate stale build cache
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            crate::app::CachedModeState {
+                model: "old/stale".into(),
+                effort: Some("high".into()),
+            },
+        );
+
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 1; // build tab
+        app.model_cursor = 3; // anthropic/claude-sonnet (skipping headers)
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        // No live SetSessionModel should be sent because build is not active
+        assert!(rx.try_recv().is_err());
+
+        // Build cache should be updated, plan cache should not exist yet
+        let build_cache = &app.session_cache["s1"]["build"];
+        assert_eq!(build_cache.model, "anthropic/claude-sonnet");
+        assert_eq!(build_cache.effort, None);
+
+        // Live plan state must be untouched
+        assert_eq!(app.current_provider.as_deref(), Some("openai"));
+        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
+
+        // Preference should be persisted
+        assert_eq!(
+            app.get_mode_model_preference("build"),
+            Some(("anthropic", "claude-sonnet"))
+        );
+    }
+
+    #[test]
+    fn select_model_for_inactive_plan_tab_updates_plan_cache() {
+        let _guard = TestPersistenceGuard::new("inactive-plan");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-opus".into());
+
+        // Pre-populate stale plan cache
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            crate::app::CachedModeState {
+                model: "old/stale".into(),
+                effort: Some("max".into()),
+            },
+        );
+
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 0; // plan tab
+        app.model_cursor = 1; // openai/gpt-4o
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        // No live SetSessionModel should be sent because plan is not active
+        assert!(rx.try_recv().is_err());
+
+        // Plan cache should be updated
+        let plan_cache = &app.session_cache["s1"]["plan"];
+        assert_eq!(plan_cache.model, "openai/gpt-4o");
+        assert_eq!(plan_cache.effort, None);
+
+        // Live build state must be untouched
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
+
+        // Preference should be persisted
+        assert_eq!(
+            app.get_mode_model_preference("plan"),
+            Some(("openai", "gpt-4o"))
+        );
+    }
+
+    #[test]
+    fn select_model_for_active_mode_still_works() {
+        let _guard = TestPersistenceGuard::new("active-mode");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.reasoning_effort = Some("high".into());
+
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 1; // build tab (active)
+        app.model_cursor = 3; // anthropic/claude-sonnet
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        // Live commands should be sent
+        let msg1 = rx.try_recv().expect("expected SetSessionModel");
+        assert!(matches!(msg1, ClientMsg::SetSessionModel { .. }));
+        let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
+        assert!(
+            matches!(msg2, ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Live state updated
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.reasoning_effort, None);
+
+        // Cache updated for active mode
+        let build_cache = &app.session_cache["s1"]["build"];
+        assert_eq!(build_cache.model, "anthropic/claude-sonnet");
+        assert_eq!(build_cache.effort, None);
+    }
 }

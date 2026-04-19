@@ -1108,6 +1108,23 @@ impl App {
         );
     }
 
+    /// Update the cached model for a specific mode in the current session.
+    /// Resets effort to `None` (auto) to match active-mode model-selection behaviour.
+    /// No-op if there is no current session.
+    pub fn update_cached_mode_model(&mut self, mode: &str, provider: &str, model: &str) {
+        let Some(sid) = self.session_id.clone() else {
+            return;
+        };
+        let model_key = format!("{provider}/{model}");
+        self.session_cache.entry(sid).or_default().insert(
+            mode.to_string(),
+            CachedModeState {
+                model: model_key,
+                effort: None,
+            },
+        );
+    }
+
     /// Look up the cached mode state for the current `session_id` +
     /// `agent_mode` and restore the model and effort from it.
     ///
@@ -4055,6 +4072,59 @@ mod session_cache_tests {
         let mut app = App::new();
         app.cycle_reasoning_effort();
         assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(app.session_cache.is_empty());
+    }
+
+    // ── update_cached_mode_model ──────────────────────────────────────────────
+
+    #[test]
+    fn update_cached_mode_model_stores_model_and_resets_effort() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
+
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-sonnet");
+        assert_eq!(cms.effort, None);
+    }
+
+    #[test]
+    fn update_cached_mode_model_preserves_other_modes() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
+        app.update_cached_mode_model("plan", "openai", "gpt-4o");
+
+        assert_eq!(
+            app.session_cache["s1"]["build"].model,
+            "anthropic/claude-sonnet"
+        );
+        assert_eq!(app.session_cache["s1"]["plan"].model, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn update_cached_mode_model_overwrites_existing_entry() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "build".into(),
+            CachedModeState {
+                model: "old/model".into(),
+                effort: Some("high".into()),
+            },
+        );
+
+        app.update_cached_mode_model("build", "anthropic", "claude-opus");
+
+        let cms = &app.session_cache["s1"]["build"];
+        assert_eq!(cms.model, "anthropic/claude-opus");
+        assert_eq!(cms.effort, None);
+    }
+
+    #[test]
+    fn update_cached_mode_model_noop_without_session() {
+        let mut app = App::new();
+        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
         assert!(app.session_cache.is_empty());
     }
 }
