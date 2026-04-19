@@ -1314,6 +1314,16 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
+    for (agent_id, model_key) in &cfg.delegate_models {
+        if let Some((provider, model)) = model_key.split_once('/') {
+            app.set_delegate_model_preference(agent_id, provider, model);
+        }
+    }
+    for (mode, model_key) in &cfg.mode_models {
+        if let Some((provider, model)) = model_key.split_once('/') {
+            app.set_mode_model_preference(mode, provider, model);
+        }
+    }
     if let Some(session_id) = cli.session.clone() {
         app.session_id = Some(session_id);
         app.screen = Screen::Chat;
@@ -2208,8 +2218,9 @@ mod session_popup_key_tests {
     }
 
     #[test]
-    fn global_ctrl_x_l_opens_log_popup() {
+    fn global_ctrl_x_l_opens_session_popup() {
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         let (tx, _rx) = mpsc::unbounded_channel();
 
         handle_key(
@@ -2221,6 +2232,22 @@ mod session_popup_key_tests {
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, Popup::SessionSelect);
+        assert_eq!(app.session_popup_tab, 0);
+    }
+
+    #[test]
+    fn global_ctrl_l_opens_log_popup() {
+        let mut app = App::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
             &tx,
         )
         .unwrap();
@@ -2447,7 +2474,8 @@ mod delegate_popup_key_tests {
     fn setup_delegate_app() -> App {
         let mut app = App::new();
         app.session_id = Some("parent-1".into());
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_entries = vec![
             make_entry("d1", "Build feature", Some("child-1")),
             make_entry("d2", "Fix tests", Some("child-2")),
@@ -2488,7 +2516,8 @@ mod delegate_popup_key_tests {
     #[test]
     fn delegate_enter_noop_when_child_session_is_unavailable() {
         let mut app = App::new();
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: None,
@@ -2501,7 +2530,7 @@ mod delegate_popup_key_tests {
         }];
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);
-        assert_eq!(app.popup, Popup::DelegateList);
+        assert_eq!(app.popup, Popup::SessionSelect);
     }
 
     #[test]
@@ -2813,6 +2842,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
@@ -2850,6 +2880,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
@@ -2878,6 +2909,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = None; // already auto

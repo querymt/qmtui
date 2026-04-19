@@ -107,6 +107,13 @@ pub struct TuiConfig {
     pub theme: Option<String>,
     pub show_thinking: Option<bool>,
     pub server: ServerConfig,
+    /// Per-agent-id model preferences: agent_id → "provider/model".
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub delegate_models: HashMap<String, String>,
+    /// Per-mode model preferences: mode → "provider/model".
+    /// Applied as defaults when creating new sessions.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mode_models: HashMap<String, String>,
 }
 
 impl TuiConfig {
@@ -161,6 +168,16 @@ impl TuiConfig {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
         merged.show_thinking = Some(app.show_thinking);
+        merged.delegate_models = app
+            .delegate_model_preferences
+            .iter()
+            .map(|(id, (p, m))| (id.clone(), format!("{p}/{m}")))
+            .collect();
+        merged.mode_models = app
+            .mode_model_preferences
+            .iter()
+            .map(|(mode, (p, m))| (mode.clone(), format!("{p}/{m}")))
+            .collect();
         merged
     }
 }
@@ -320,6 +337,7 @@ mod tests {
                 tls: Some(false),
                 ..Default::default()
             },
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<TuiConfig>(&text).unwrap(), cfg);
@@ -493,6 +511,7 @@ mod tests {
                 tls: Some(false),
                 ..Default::default()
             },
+            ..Default::default()
         };
         cfg.save_to_path(&path);
         let loaded = TuiConfig::load_from_path(&path);
@@ -507,6 +526,7 @@ mod tests {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
             server: ServerConfig::default(),
+            ..Default::default()
         };
         cfg.save();
         let loaded = TuiConfig::load();
@@ -529,6 +549,7 @@ mod tests {
                 auto_start: Some(false),
                 shutdown_on_exit: Some(false),
             },
+            ..Default::default()
         };
         cfg.save();
         let loaded = TuiConfig::load();
@@ -554,6 +575,7 @@ mod tests {
                 auto_start: Some(false),
                 shutdown_on_exit: Some(false),
             },
+            ..Default::default()
         };
 
         let merged = existing.with_app_settings(&app);
@@ -655,5 +677,92 @@ mod tests {
                 effort: Some("max".into()),
             }
         );
+    }
+
+    // ── delegate_models persistence (via TuiConfig) ────────────────────────
+
+    #[test]
+    #[serial]
+    fn config_round_trip_with_delegate_models() {
+        let _guard = TestPathGuard::new("delegate-models-rt");
+        let mut app = App::new();
+        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        app.set_delegate_model_preference("planner", "openai", "gpt-4o");
+
+        let cfg = TuiConfig::load().with_app_settings(&app);
+        cfg.save();
+        let loaded = TuiConfig::load();
+
+        assert_eq!(
+            loaded.delegate_models.get("coder").map(String::as_str),
+            Some("anthropic/claude-sonnet")
+        );
+        assert_eq!(
+            loaded.delegate_models.get("planner").map(String::as_str),
+            Some("openai/gpt-4o")
+        );
+    }
+
+    #[test]
+    fn config_with_app_settings_empty_delegate_models() {
+        let app = App::new();
+        let cfg = TuiConfig::default().with_app_settings(&app);
+        assert!(cfg.delegate_models.is_empty());
+    }
+
+    #[test]
+    fn config_delegate_models_deserializes_from_toml() {
+        let toml_str = r#"
+[delegate_models]
+coder = "anthropic/claude-sonnet"
+"#;
+        let cfg: TuiConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.delegate_models.get("coder").map(String::as_str),
+            Some("anthropic/claude-sonnet")
+        );
+    }
+
+    // ── mode_models persistence ──────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn config_round_trip_with_mode_models() {
+        let _guard = TestPathGuard::new("mode-models-rt");
+        let mut app = App::new();
+        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
+        app.set_mode_model_preference("plan", "openai", "gpt-4o");
+
+        let cfg = TuiConfig::load().with_app_settings(&app);
+        cfg.save();
+        let loaded = TuiConfig::load();
+
+        assert_eq!(
+            loaded.mode_models.get("build").map(String::as_str),
+            Some("anthropic/claude-sonnet")
+        );
+        assert_eq!(
+            loaded.mode_models.get("plan").map(String::as_str),
+            Some("openai/gpt-4o")
+        );
+    }
+
+    #[test]
+    fn config_with_app_settings_serializes_mode_models() {
+        let mut app = App::new();
+        app.set_mode_model_preference("build", "anthropic", "claude-opus");
+
+        let cfg = TuiConfig::default().with_app_settings(&app);
+        assert_eq!(
+            cfg.mode_models.get("build").map(String::as_str),
+            Some("anthropic/claude-opus")
+        );
+    }
+
+    #[test]
+    fn config_with_app_settings_empty_mode_models() {
+        let app = App::new();
+        let cfg = TuiConfig::default().with_app_settings(&app);
+        assert!(cfg.mode_models.is_empty());
     }
 }

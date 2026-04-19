@@ -137,7 +137,7 @@ pub struct ReasoningEffortData {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
     pub name: String,

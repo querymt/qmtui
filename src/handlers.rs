@@ -236,6 +236,16 @@ pub(crate) fn handle_key(
         return Ok(AppAction::None);
     }
 
+    // direct: ctrl+l opens log popup
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+    {
+        app.popup = Popup::Log;
+        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        app.log_filter.clear();
+        return Ok(AppAction::None);
+    }
+
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.chord = true;
@@ -284,10 +294,7 @@ pub(crate) fn handle_key(
             handle_auth_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
         }
-        Popup::DelegateList => {
-            handle_delegate_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
+
         Popup::None => {}
     }
 
@@ -338,6 +345,7 @@ pub(crate) fn handle_chord(
             }
             app.popup = Popup::ModelSelect;
             app.model_filter.clear();
+            app.model_popup_agent_tab = if app.agent_mode == "plan" { 0 } else { 1 };
             app.model_cursor = app.current_mode_model_cursor();
         }
         KeyCode::Char('n') => {
@@ -356,15 +364,6 @@ pub(crate) fn handle_chord(
                 "external editor unavailable here",
             );
         }
-        KeyCode::Char('s') => {
-            if !can_send_server_commands(app) {
-                return Ok(());
-            }
-            app.popup = Popup::SessionSelect;
-            app.session_cursor = 0;
-            app.session_filter.clear();
-            cmd_tx.send(ClientMsg::ListSessions)?;
-        }
 
         KeyCode::Char('t') => {
             app.popup = Popup::ThemeSelect;
@@ -372,9 +371,14 @@ pub(crate) fn handle_chord(
             app.theme_cursor = theme::Theme::current_index();
         }
         KeyCode::Char('l') => {
-            app.popup = Popup::Log;
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-            app.log_filter.clear();
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.popup = Popup::SessionSelect;
+            app.session_popup_tab = 0;
+            app.session_cursor = 0;
+            app.session_filter.clear();
+            cmd_tx.send(ClientMsg::ListSessions)?;
         }
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
@@ -383,20 +387,7 @@ pub(crate) fn handle_chord(
             app.open_auth_popup();
             cmd_tx.send(ClientMsg::ListAuthProviders)?;
         }
-        KeyCode::Char('d') => {
-            if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "delegates",
-                    "delegates only available in chat",
-                );
-                return Ok(());
-            }
-            if !can_send_server_commands(app) {
-                return Ok(());
-            }
-            app.open_delegate_popup();
-        }
+
         KeyCode::Char('p') => {
             if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
                 app.set_status(
@@ -526,6 +517,18 @@ pub(crate) fn handle_session_popup_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
+    // Tab / BackTab: switch between sessions and delegates tabs
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.session_popup_tab = 1 - app.session_popup_tab;
+        return Ok(());
+    }
+
+    if app.session_popup_tab == 1 {
+        // Delegates tab
+        return handle_delegate_popup_key(app, key, cmd_tx);
+    }
+
+    // Sessions tab
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
         if !can_send_server_commands(app) {
             return Ok(());
@@ -1309,6 +1312,7 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.popup = crate::app::Popup::SessionSelect;
+            app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
             cmd_tx.send(ClientMsg::ListSessions)?;
@@ -1720,6 +1724,30 @@ pub(crate) fn handle_model_popup_key(
         KeyCode::Esc => {
             app.popup = Popup::None;
         }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let n = app.model_popup_tab_count();
+            if key.code == KeyCode::BackTab {
+                app.model_popup_agent_tab = if app.model_popup_agent_tab == 0 {
+                    n - 1
+                } else {
+                    app.model_popup_agent_tab - 1
+                };
+            } else {
+                app.model_popup_agent_tab = (app.model_popup_agent_tab + 1) % n;
+            }
+            app.model_filter.clear();
+            let agent_id = app
+                .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                .map(str::to_string);
+            app.model_cursor =
+                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
+                    app.mode_model_cursor(mode)
+                } else if let Some(ref aid) = agent_id {
+                    app.delegate_model_cursor(aid)
+                } else {
+                    0
+                };
+        }
         KeyCode::Up => {
             app.model_cursor = app.model_cursor.saturating_sub(1);
         }
@@ -1737,38 +1765,51 @@ pub(crate) fn handle_model_popup_key(
                 })
                 .cloned();
             if let Some(model) = selected {
-                if let Some(sid) = app.session_id.clone() {
-                    cmd_tx.send(ClientMsg::SetSessionModel {
-                        session_id: sid,
-                        model_id: model.id.clone(),
-                        node_id: model.node_id.clone(),
-                    })?;
+                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
+                    // Mode tab (Planner / Build): store preference for that mode
+                    app.set_mode_model_preference(mode, &model.provider, &model.model);
+                    // If current mode matches, also apply to the live session
+                    if app.agent_mode == mode {
+                        if let Some(sid) = app.session_id.clone() {
+                            cmd_tx.send(ClientMsg::SetSessionModel {
+                                session_id: sid,
+                                model_id: model.id.clone(),
+                                node_id: model.node_id.clone(),
+                            })?;
+                        }
+                        app.current_model = Some(model.model.clone());
+                        app.current_provider = Some(model.provider.clone());
+                        if app.reasoning_effort.is_some() {
+                            app.reasoning_effort = None;
+                            cmd_tx.send(ClientMsg::SetReasoningEffort {
+                                reasoning_effort: "auto".into(),
+                            })?;
+                        }
+                        app.cache_session_mode_state();
+                    }
+                    let tab_label = app
+                        .model_popup_tab_label(app.model_popup_agent_tab)
+                        .to_string();
+                    app.set_status(
+                        app::LogLevel::Info,
+                        "model",
+                        format!("{}: {}", tab_label, model.label),
+                    );
+                } else if let Some(agent_id) = app
+                    .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                    .map(str::to_string)
+                {
+                    // Agent tab: store delegate preference
+                    let tab_label = app
+                        .model_popup_tab_label(app.model_popup_agent_tab)
+                        .to_string();
+                    app.set_delegate_model_preference(&agent_id, &model.provider, &model.model);
+                    app.set_status(
+                        app::LogLevel::Info,
+                        "model",
+                        format!("{}: {}", tab_label, model.label),
+                    );
                 }
-                app.current_model = Some(model.model.clone());
-                app.current_provider = Some(model.provider.clone());
-                // Record this model as the preference for the current agent mode so
-                // it is automatically re-applied whenever the user switches back to
-                // this mode later in the same TUI session.
-                app.set_mode_model_preference(
-                    &app.agent_mode.clone(),
-                    &model.provider,
-                    &model.model,
-                );
-                // Drop reasoning effort to auto when switching model.
-                if app.reasoning_effort.is_some() {
-                    app.reasoning_effort = None;
-                    cmd_tx.send(ClientMsg::SetReasoningEffort {
-                        reasoning_effort: "auto".into(),
-                    })?;
-                }
-                // Cache the new model + auto effort for this session + mode.
-                app.cache_session_mode_state();
-                app.popup = Popup::None;
-                app.set_status(
-                    app::LogLevel::Info,
-                    "model",
-                    format!("model: {}", model.label),
-                );
                 save_config(app);
                 save_cache(app);
             }
@@ -1856,6 +1897,7 @@ pub(crate) fn apply_sessions_key(
                     }
                     StartPageItem::ShowMore { .. } => {
                         app.popup = Popup::SessionSelect;
+                        app.session_popup_tab = 0;
                         app.session_cursor = 0;
                         app.session_filter.clear();
                     }

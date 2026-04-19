@@ -198,6 +198,7 @@ impl Theme {
         match mode {
             "plan" => Self::orange(),
             "review" => Self::magenta(),
+            "delegate" => Self::accent(),
             _ => Self::ok(),
         }
     }

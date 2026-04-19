@@ -81,34 +81,38 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
     }
 }
 
-fn popup_mode_marker_modes<'a>(
-    app: &'a App,
-    model: &'a crate::protocol::ModelEntry,
+/// Single-mode marker: returns vec with the mode name if this model matches
+/// the preference for that specific mode, empty vec otherwise.
+fn popup_single_mode_marker(
+    app: &App,
+    model: &crate::protocol::ModelEntry,
+    mode: &'static str,
 ) -> Vec<&'static str> {
-    let fallback_current = match (
-        app.current_provider.as_deref(),
-        app.current_model.as_deref(),
-    ) {
-        (Some(provider), Some(model_name)) => Some((provider, model_name)),
-        _ => None,
+    let fallback_current = if app.agent_mode == mode {
+        match (
+            app.current_provider.as_deref(),
+            app.current_model.as_deref(),
+        ) {
+            (Some(provider), Some(model_name)) => Some((provider, model_name)),
+            _ => None,
+        }
+    } else {
+        None
     };
+    let target = app.get_mode_model_preference(mode).or(fallback_current);
+    if target.is_some_and(|(provider, model_name)| {
+        provider == model.provider && model_name == model.model
+    }) {
+        vec![mode]
+    } else {
+        vec![]
+    }
+}
 
-    // TODO: Extend marker support to include review mode once we want all mode-model bindings visible here.
-    ["build", "plan"]
-        .into_iter()
-        .filter(|mode| {
-            let target = app
-                .get_mode_model_preference(mode)
-                .or(if app.agent_mode == *mode {
-                    fallback_current
-                } else {
-                    None
-                });
-            target.is_some_and(|(provider, model_name)| {
-                provider == model.provider && model_name == model.model
-            })
-        })
-        .collect()
+/// Whether the given model matches a delegate agent's preferred model.
+fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
+    app.get_delegate_model_preference(agent_id)
+        .is_some_and(|(p, m)| p == model.provider && m == model.model)
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -120,6 +124,8 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     const MODEL_LABEL_MAX_W: u16 = 44;
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
+
+    let has_tabs = true;
 
     let area = f.area();
     let popup_width = area
@@ -143,23 +149,77 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         height: popup_area.height.saturating_sub(2),
     };
 
+    // Layout: title, [tab bar], filter, separator, list, hints
+    let constraints: Vec<Constraint> = if has_tabs {
+        vec![
+            Constraint::Length(1), // title
+            Constraint::Length(1), // tab bar
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hints
+        ]
+    } else {
+        vec![
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hints
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(inner);
 
+    // Chunk indices depend on whether tabs are shown.
+    let (tab_idx, filter_idx, list_idx, hint_idx) = if has_tabs {
+        (Some(1), 2, 4, 5)
+    } else {
+        (None, 1, 3, 4)
+    };
+
+    // Title
     f.render_widget(
         Paragraph::new(Span::styled("select model", Theme::popup_title())).style(Theme::popup_bg()),
         chunks[0],
     );
 
-    let avail = chunks[1].width.saturating_sub(2) as usize;
+    // Tab bar (multi-agent only)
+    if let Some(ti) = tab_idx {
+        let mut tab_spans = Vec::new();
+        for i in 0..app.model_popup_tab_count() {
+            let label = app.model_popup_tab_label(i);
+            let is_active = i == app.model_popup_agent_tab;
+            let style = if let Some(mode) = app.model_popup_tab_mode(i) {
+                let mut s = ratatui::style::Style::default()
+                    .fg(Theme::mode_color(mode))
+                    .bg(Theme::bg_dim())
+                    .add_modifier(Modifier::BOLD);
+                if is_active {
+                    s = s.add_modifier(Modifier::UNDERLINED);
+                }
+                s
+            } else if is_active {
+                Theme::popup_title().add_modifier(Modifier::UNDERLINED)
+            } else {
+                Theme::status()
+            };
+            if i > 0 {
+                tab_spans.push(Span::styled(" \u{2502} ", Theme::status()));
+            }
+            tab_spans.push(Span::styled(format!(" {label} "), style));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(tab_spans)).style(Theme::popup_bg()),
+            chunks[ti],
+        );
+    }
+
+    // Filter input
+    let filter_area = chunks[filter_idx];
+    let avail = filter_area.width.saturating_sub(2) as usize;
     let (model_filter_display, model_filter_cur) =
         scroll_input(&app.model_filter, app.model_filter.len(), avail);
     let filter_line = Line::from(vec![
@@ -168,11 +228,18 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
-        chunks[1],
+        filter_area,
     );
-    f.set_cursor_position((chunks[1].x + 2 + model_filter_cur as u16, chunks[1].y));
+    f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
 
-    let list_w = chunks[3].width as usize;
+    // Resolve current tab's mode (for mode tabs) or agent_id (for agent tabs).
+    let active_mode = app.model_popup_tab_mode(app.model_popup_agent_tab);
+    let active_agent_id = app
+        .model_popup_tab_agent_id(app.model_popup_agent_tab)
+        .map(str::to_string);
+
+    let list_area = chunks[list_idx];
+    let list_w = list_area.width as usize;
 
     let items: Vec<ListItem> = app
         .visible_model_popup_items()
@@ -215,7 +282,21 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
             ModelPopupItem::Model { model_idx } => {
                 let selected = i == app.model_cursor;
                 let model = &app.models[*model_idx];
-                let marker_modes = popup_mode_marker_modes(app, model);
+
+                // On a mode tab show that mode's marker;
+                // on an agent tab show a delegate preference marker.
+                let marker_modes: Vec<&str> = match (active_mode, active_agent_id.as_deref()) {
+                    (Some(mode), _) => popup_single_mode_marker(app, model, mode),
+                    (_, Some(aid)) => {
+                        if popup_delegate_marker(app, model, aid) {
+                            vec!["delegate"]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => vec![],
+                };
+
                 let marker_bg = if selected {
                     Theme::bg_hl()
                 } else {
@@ -239,7 +320,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 spans.push(Span::styled(" ", main_style));
                 for mode in &marker_modes {
                     spans.push(Span::styled(
-                        "●",
+                        "\u{25cf}",
                         ratatui::style::Style::default()
                             .fg(Theme::mode_color(mode))
                             .bg(marker_bg),
@@ -257,36 +338,33 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let visible_rows = chunks[3].height as usize;
+    let visible_rows = list_area.height as usize;
     let offset = app
         .model_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
         .with_selected(Some(app.model_cursor));
-    f.render_stateful_widget(list, chunks[3], &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 
-    let hint = Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
         Span::styled("select", Theme::status()),
-    ]);
-    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+    ];
+    hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
+    hint_spans.push(Span::styled("switch", Theme::status()));
+    f.render_widget(
+        Paragraph::new(Line::from(hint_spans)).style(Theme::popup_bg()),
+        chunks[hint_idx],
+    );
 }
 
 // ── Session popup ─────────────────────────────────────────────────────────────
 
 pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
-    use crate::app::PopupItem;
-
-    const SESSION_ID_COL_W: u16 = 12;
-    const SESSION_ACTIVE_COL_W: u16 = 3;
-    const SESSION_TIME_COL_W: u16 = 9;
-    const SESSION_TITLE_MAX_W: u16 = 44;
-    const SESSION_ROW_MAX_W: u16 =
-        SESSION_ID_COL_W + SESSION_TITLE_MAX_W + SESSION_ACTIVE_COL_W + SESSION_TIME_COL_W;
-    const SESSION_POPUP_MAX_W: u16 = SESSION_ROW_MAX_W + 2;
+    const SESSION_POPUP_MAX_W: u16 = 86;
     const SESSION_POPUP_MIN_W: u16 = 36;
 
     let area = f.area();
@@ -314,7 +392,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
+            Constraint::Length(1), // title / tab bar
             Constraint::Length(1), // filter
             Constraint::Length(1), // spacer
             Constraint::Min(1),    // list
@@ -322,11 +400,35 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // title
+    // Tab bar
+    let tab_labels = ["sessions", "delegates"];
+    let mut tab_spans = Vec::new();
+    for (i, label) in tab_labels.iter().enumerate() {
+        let is_active = i == app.session_popup_tab;
+        let style = if is_active {
+            Theme::popup_title().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Theme::status()
+        };
+        if i > 0 {
+            tab_spans.push(Span::styled(" \u{2502} ", Theme::status()));
+        }
+        tab_spans.push(Span::styled(format!(" {label} "), style));
+    }
     f.render_widget(
-        Paragraph::new(Span::styled("sessions", Theme::popup_title())).style(Theme::popup_bg()),
+        Paragraph::new(Line::from(tab_spans)).style(Theme::popup_bg()),
         chunks[0],
     );
+
+    if app.session_popup_tab == 0 {
+        draw_session_tab_content(f, app, &chunks);
+    } else {
+        draw_delegate_tab_content(f, app, &chunks);
+    }
+}
+
+fn draw_session_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
+    use crate::app::PopupItem;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
@@ -455,11 +557,11 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
-        Span::styled("load/collapse  ", Theme::status()),
+        Span::styled("load  ", Theme::status()),
         Span::styled("del ", Theme::status_accent()),
         Span::styled("delete  ", Theme::status()),
-        Span::styled("ctrl-n ", Theme::status_accent()),
-        Span::styled("new", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("switch", Theme::status()),
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
@@ -529,47 +631,8 @@ fn delegate_display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text) as u16
 }
 
-pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
+fn draw_delegate_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
     use crate::app::DelegateStatus;
-
-    let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(DELEGATE_POPUP_MIN_W, DELEGATE_POPUP_MAX_W);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
-        width: popup_width,
-        height: area.height * 60 / 100,
-    };
-
-    f.render_widget(Clear, popup_area);
-    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
-
-    let inner = Rect {
-        x: popup_area.x + 1,
-        y: popup_area.y + 1,
-        width: popup_area.width.saturating_sub(2),
-        height: popup_area.height.saturating_sub(2),
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(1), // filter
-            Constraint::Length(1), // spacer
-            Constraint::Min(1),    // list
-            Constraint::Length(1), // hint
-        ])
-        .split(inner);
-
-    // title
-    f.render_widget(
-        Paragraph::new(Span::styled("delegates", Theme::popup_title())).style(Theme::popup_bg()),
-        chunks[0],
-    );
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
@@ -801,7 +864,9 @@ pub(crate) fn draw_delegate_popup(f: &mut Frame, app: &App) {
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
-        Span::styled("load", Theme::status()),
+        Span::styled("load  ", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("switch", Theme::status()),
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }

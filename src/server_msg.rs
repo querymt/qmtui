@@ -18,6 +18,7 @@ impl App {
                     && let Ok(state) = serde_json::from_value::<StateData>(data)
                 {
                     self.agent_id = state.agents.first().map(|a| a.id.clone());
+                    self.agents = state.agents;
                     if let Some(mode) = state.agent_mode {
                         self.agent_mode = mode;
                     }
@@ -198,10 +199,36 @@ impl App {
                     self.session_stats = SessionStatsLite::default();
                     self.screen = Screen::Chat;
                     self.set_status(LogLevel::Info, "session", "session created");
-                    return vec![ClientMsg::SubscribeSession {
+                    let mut cmds = vec![ClientMsg::SubscribeSession {
                         session_id: sc.session_id,
                         agent_id: self.agent_id.clone(),
                     }];
+                    // Auto-apply mode model preference for the initial mode.
+                    if let Some((provider, model)) =
+                        self.get_mode_model_preference(&self.agent_mode)
+                    {
+                        let provider = provider.to_string();
+                        let model = model.to_string();
+                        if let Some(entry) = self
+                            .models
+                            .iter()
+                            .find(|m| {
+                                m.provider == provider && m.model == model && m.node_id.is_none()
+                            })
+                            .cloned()
+                        {
+                            self.current_provider = Some(entry.provider.clone());
+                            self.current_model = Some(entry.model.clone());
+                            if let Some(sid) = self.session_id.clone() {
+                                cmds.push(ClientMsg::SetSessionModel {
+                                    session_id: sid,
+                                    model_id: entry.id,
+                                    node_id: entry.node_id,
+                                });
+                            }
+                        }
+                    }
+                    return cmds;
                 }
                 vec![]
             }
@@ -851,6 +878,28 @@ impl App {
                             session_id: sid.clone(),
                             agent_id,
                         });
+                        // Auto-apply delegate model preference if configured.
+                        if let Some(target_id) = target_agent_id.as_deref() {
+                            if let Some((prov, mdl)) = self.get_delegate_model_preference(target_id)
+                            {
+                                let prov = prov.to_string();
+                                let mdl = mdl.to_string();
+                                if let Some(entry) = self
+                                    .models
+                                    .iter()
+                                    .find(|m| {
+                                        m.provider == prov && m.model == mdl && m.node_id.is_none()
+                                    })
+                                    .cloned()
+                                {
+                                    self.pending_commands.push(ClientMsg::SetSessionModel {
+                                        session_id: sid.clone(),
+                                        model_id: entry.id,
+                                        node_id: entry.node_id,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }

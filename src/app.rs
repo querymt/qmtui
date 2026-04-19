@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
@@ -64,7 +66,6 @@ pub enum Popup {
     Help,
     Log,
     ProviderAuth,
-    DelegateList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -768,6 +769,8 @@ pub struct App {
     pub session_groups: Vec<SessionGroup>,
     pub session_cursor: usize,
     pub session_filter: String,
+    /// Active tab in the session popup: 0 = sessions, 1 = delegates.
+    pub session_popup_tab: usize,
     /// Groups whose header has been collapsed by the user on the start page.
     pub collapsed_groups: HashSet<String>,
     /// Groups whose header has been collapsed by the user in the session popup.
@@ -834,6 +837,17 @@ pub struct App {
     /// Per-mode model preferences: mode -> (provider, model).
     /// Set when the user manually selects a model; applied automatically on mode switch.
     pub mode_model_preferences: HashMap<String, (String, String)>,
+
+    // delegate agent model preferences
+    /// Known agents from the server's `state` message.
+    /// Single-element or empty in single-agent mode.
+    pub agents: Vec<crate::protocol::AgentInfo>,
+    /// Currently selected tab index in the model popup.
+    /// 0 = "Planner" (plan mode), 1 = "Build" (build mode), 2..N = delegate agents.
+    pub model_popup_agent_tab: usize,
+    /// Per-agent-id model preferences: agent_id → (provider, model).
+    /// Applied automatically when `SessionForked` creates a child for that agent.
+    pub delegate_model_preferences: HashMap<String, (String, String)>,
 
     // theme selector
     pub theme_cursor: usize,
@@ -927,6 +941,7 @@ impl App {
             session_groups: Vec::new(),
             session_cursor: 0,
             session_filter: String::new(),
+            session_popup_tab: 0,
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
             start_page_scroll: 0,
@@ -968,6 +983,9 @@ impl App {
             model_cursor: 0,
             model_filter: String::new(),
             mode_model_preferences: HashMap::new(),
+            agents: Vec::new(),
+            model_popup_agent_tab: 0,
+            delegate_model_preferences: HashMap::new(),
             theme_cursor: 0,
             theme_filter: String::new(),
             help_scroll: 0,
@@ -1204,15 +1222,20 @@ impl App {
         if self.model_filter.is_empty() {
             self.models.iter().collect()
         } else {
-            let q = self.model_filter.to_lowercase();
-            self.models
+            let matcher = SkimMatcherV2::default();
+            let mut scored: Vec<(i64, &ModelEntry)> = self
+                .models
                 .iter()
-                .filter(|m| {
-                    m.label.to_lowercase().contains(&q)
-                        || m.provider.to_lowercase().contains(&q)
-                        || m.model.to_lowercase().contains(&q)
+                .filter_map(|m| {
+                    let score = [&m.label, &m.provider, &m.model]
+                        .iter()
+                        .filter_map(|field| matcher.fuzzy_match(field, &self.model_filter))
+                        .max();
+                    score.map(|s| (s, m))
                 })
-                .collect()
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.into_iter().map(|(_, m)| m).collect()
         }
     }
 
@@ -1243,15 +1266,24 @@ impl App {
     }
 
     pub fn current_mode_model_cursor(&self) -> usize {
-        let target = self.get_mode_model_preference(&self.agent_mode).or(
-            match (
-                self.current_provider.as_deref(),
-                self.current_model.as_deref(),
-            ) {
-                (Some(provider), Some(model)) => Some((provider, model)),
-                _ => None,
-            },
-        );
+        self.mode_model_cursor(&self.agent_mode.clone())
+    }
+
+    /// Cursor position for a given mode's preferred model in the popup list.
+    pub fn mode_model_cursor(&self, mode: &str) -> usize {
+        let target = self
+            .get_mode_model_preference(mode)
+            .or(if self.agent_mode == mode {
+                match (
+                    self.current_provider.as_deref(),
+                    self.current_model.as_deref(),
+                ) {
+                    (Some(provider), Some(model)) => Some((provider, model)),
+                    _ => None,
+                }
+            } else {
+                None
+            });
 
         let Some((provider, model)) = target else {
             return self
@@ -1689,6 +1721,85 @@ impl App {
             "plan" => "build",
             _ => "build",
         }
+    }
+
+    // ── delegate model preferences ───────────────────────────────────────────
+
+    /// Whether there are multiple agents (multi-agent / delegation mode).
+    pub fn is_multi_agent(&self) -> bool {
+        self.agents.len() > 1
+    }
+
+    /// Total number of tabs in the model popup.
+    /// Always at least 2 (Planner + Build), plus one tab per delegation agent.
+    pub fn model_popup_tab_count(&self) -> usize {
+        2 + self.agents.len().saturating_sub(1)
+    }
+
+    /// Label for a model popup tab.
+    /// 0 = "Plan", 1 = "Build", 2+ maps to `agents[1..].name`.
+    pub fn model_popup_tab_label(&self, tab_idx: usize) -> &str {
+        match tab_idx {
+            0 => "plan",
+            1 => "build",
+            _ => self
+                .agents
+                .get(tab_idx - 1)
+                .map(|a| a.name.as_str())
+                .unwrap_or("???"),
+        }
+    }
+
+    /// The agent_id for an agent tab (index 2+), None for mode tabs (0, 1).
+    pub fn model_popup_tab_agent_id(&self, tab_idx: usize) -> Option<&str> {
+        if tab_idx < 2 {
+            None
+        } else {
+            self.agents.get(tab_idx - 1).map(|a| a.id.as_str())
+        }
+    }
+
+    /// The mode name for a mode tab (0 = "plan", 1 = "build"), None for agent tabs.
+    pub fn model_popup_tab_mode(&self, tab_idx: usize) -> Option<&'static str> {
+        match tab_idx {
+            0 => Some("plan"),
+            1 => Some("build"),
+            _ => None,
+        }
+    }
+
+    pub fn set_delegate_model_preference(&mut self, agent_id: &str, provider: &str, model: &str) {
+        self.delegate_model_preferences.insert(
+            agent_id.to_string(),
+            (provider.to_string(), model.to_string()),
+        );
+    }
+
+    pub fn get_delegate_model_preference(&self, agent_id: &str) -> Option<(&str, &str)> {
+        self.delegate_model_preferences
+            .get(agent_id)
+            .map(|(p, m)| (p.as_str(), m.as_str()))
+    }
+
+    /// Cursor position for a delegate agent's preferred model in the popup list.
+    pub fn delegate_model_cursor(&self, agent_id: &str) -> usize {
+        let items = self.visible_model_popup_items();
+        let Some((provider, model)) = self.get_delegate_model_preference(agent_id) else {
+            return items
+                .iter()
+                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
+                .unwrap_or(0);
+        };
+        items
+            .iter()
+            .position(|item| match item {
+                ModelPopupItem::Model { model_idx } => {
+                    let m = &self.models[*model_idx];
+                    m.provider == provider && m.model == model
+                }
+                _ => false,
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -2976,6 +3087,84 @@ mod delegate_entry_tests {
     }
 
     #[test]
+    fn session_forked_applies_delegate_model_preference() {
+        let mut app = App::new();
+        app.agent_id = Some("parent-agent".into());
+        app.models = vec![crate::protocol::ModelEntry {
+            id: "anthropic/claude-sonnet".into(),
+            label: "claude-sonnet".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+        // Should have SubscribeSession + SetSessionModel
+        assert_eq!(app.pending_commands.len(), 2);
+        assert!(
+            app.pending_commands
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetSessionModel { session_id, .. } if session_id == "child-1")),
+            "expected SetSessionModel for child-1: {:?}",
+            app.pending_commands
+        );
+    }
+
+    #[test]
+    fn session_forked_no_preference_does_not_send_model() {
+        let mut app = App::new();
+        app.agent_id = Some("parent-agent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+        // Only SubscribeSession, no SetSessionModel
+        assert_eq!(app.pending_commands.len(), 1);
+        assert!(
+            matches!(&app.pending_commands[0], ClientMsg::SubscribeSession { .. }),
+            "expected only SubscribeSession: {:?}",
+            app.pending_commands
+        );
+    }
+
+    #[test]
     fn session_events_deser_failure_is_logged_not_silently_dropped() {
         // Garbled JSON must produce a log entry rather than being silently
         // ignored — otherwise debugging missing stats is impossible.
@@ -4128,6 +4317,57 @@ mod session_mode_tests {
         assert!(
             cmds.iter().any(|m| matches!(m, ClientMsg::SubscribeSession { session_id, .. } if session_id == "s99")),
             "expected SubscribeSession in {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn session_created_applies_mode_model_preference() {
+        let mut app = App::new();
+        app.models = vec![crate::protocol::ModelEntry {
+            id: "anthropic/claude-sonnet".into(),
+            label: "claude-sonnet".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "request_id": null
+            })),
+        });
+        assert!(
+            cmds.iter().any(
+                |m| matches!(m, ClientMsg::SetSessionModel { session_id, .. } if session_id == "s1")
+            ),
+            "expected SetSessionModel for new session: {cmds:?}"
+        );
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn session_created_no_preference_uses_server_default() {
+        let mut app = App::new();
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "request_id": null
+            })),
+        });
+        // Only SubscribeSession, no SetSessionModel
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], ClientMsg::SubscribeSession { .. }),
+            "expected only SubscribeSession: {cmds:?}"
         );
     }
 }
@@ -6997,5 +7237,159 @@ mod popup_item_tests {
         app.input_cursor = 6;
         app.slash_state = None;
         assert!(!app.accept_selected_slash_completion());
+    }
+}
+
+// ── delegate_model_preference_tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod delegate_model_preference_tests {
+    use super::*;
+    use crate::protocol::{AgentInfo, ModelEntry};
+
+    fn make_agent(id: &str, name: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn make_model(provider: &str, model: &str) -> ModelEntry {
+        ModelEntry {
+            id: format!("{provider}/{model}"),
+            label: format!("{provider}/{model}"),
+            provider: provider.into(),
+            model: model.into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }
+    }
+
+    #[test]
+    fn is_multi_agent_false_when_no_agents() {
+        let app = App::new();
+        assert!(!app.is_multi_agent());
+    }
+
+    #[test]
+    fn is_multi_agent_false_when_single_agent() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main")];
+        assert!(!app.is_multi_agent());
+    }
+
+    #[test]
+    fn is_multi_agent_true_when_two_agents() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
+        assert!(app.is_multi_agent());
+    }
+
+    #[test]
+    fn tab_label_plan_at_zero() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_label(0), "plan");
+    }
+
+    #[test]
+    fn tab_label_build_at_one() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_label(1), "build");
+    }
+
+    #[test]
+    fn tab_label_agent_at_two() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
+        assert_eq!(app.model_popup_tab_label(2), "Coder");
+    }
+
+    #[test]
+    fn tab_agent_id_none_at_zero() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_agent_id(0), None);
+    }
+
+    #[test]
+    fn tab_agent_id_none_at_one() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_agent_id(1), None);
+    }
+
+    #[test]
+    fn tab_agent_id_some_at_two() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
+        assert_eq!(app.model_popup_tab_agent_id(2), Some("coder"));
+    }
+
+    #[test]
+    fn tab_count_no_agents() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_count(), 2);
+    }
+
+    #[test]
+    fn tab_count_single_agent() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main")];
+        assert_eq!(app.model_popup_tab_count(), 2);
+    }
+
+    #[test]
+    fn tab_count_multi_agent() {
+        let mut app = App::new();
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
+        assert_eq!(app.model_popup_tab_count(), 3);
+    }
+
+    #[test]
+    fn delegate_pref_round_trip() {
+        let mut app = App::new();
+        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        assert_eq!(
+            app.get_delegate_model_preference("coder"),
+            Some(("anthropic", "claude-sonnet"))
+        );
+    }
+
+    #[test]
+    fn delegate_pref_missing_returns_none() {
+        let app = App::new();
+        assert_eq!(app.get_delegate_model_preference("coder"), None);
+    }
+
+    #[test]
+    fn delegate_model_cursor_with_preference() {
+        let mut app = App::new();
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        let cursor = app.delegate_model_cursor("coder");
+        // Should point to the second item (index 1 in models, but popup items
+        // include provider headers — exact index depends on visible_model_popup_items).
+        let items = app.visible_model_popup_items();
+        match &items[cursor] {
+            ModelPopupItem::Model { model_idx } => {
+                assert_eq!(app.models[*model_idx].model, "claude-sonnet");
+            }
+            _ => panic!("expected Model item at cursor"),
+        }
+    }
+
+    #[test]
+    fn delegate_model_cursor_without_preference() {
+        let mut app = App::new();
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        let cursor = app.delegate_model_cursor("coder");
+        // Should land on the first Model item.
+        let items = app.visible_model_popup_items();
+        assert!(matches!(&items[cursor], ModelPopupItem::Model { .. }));
     }
 }

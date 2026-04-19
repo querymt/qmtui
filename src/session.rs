@@ -212,7 +212,8 @@ impl App {
     }
 
     pub fn open_delegate_popup(&mut self) {
-        self.popup = Popup::DelegateList;
+        self.popup = Popup::SessionSelect;
+        self.session_popup_tab = 1;
         self.delegate_cursor = 0;
         self.delegate_filter.clear();
     }

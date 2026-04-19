@@ -5,8 +5,8 @@ mod start;
 pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
-    draw_auth_popup, draw_delegate_popup, draw_help_popup, draw_log_popup, draw_model_popup,
-    draw_new_session_popup, draw_session_popup, draw_theme_popup,
+    draw_auth_popup, draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup,
+    draw_session_popup, draw_theme_popup,
 };
 use start::draw_start;
 
@@ -311,7 +311,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::Help => draw_help_popup(f, app),
         Popup::Log => draw_log_popup(f, app),
         Popup::ProviderAuth => draw_auth_popup(f, app),
-        Popup::DelegateList => draw_delegate_popup(f, app),
         Popup::None => {}
     }
 }
@@ -593,7 +592,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.session_id = Some("parent".into());
         app.delegate_entries = vec![
             DelegateEntry {
@@ -632,7 +632,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
@@ -653,7 +653,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -691,7 +692,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -717,7 +718,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
@@ -737,7 +739,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -757,7 +759,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_cursor = 0; // keep first row selected; failed row remains unselected
         app.delegate_entries = vec![
             DelegateEntry {
@@ -784,7 +787,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
         assert_eq!(
@@ -801,7 +804,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.delegate_cursor = 1;
         app.delegate_entries = vec![
             DelegateEntry {
@@ -840,7 +844,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
@@ -884,7 +888,8 @@ mod tests {
 
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.popup = Popup::DelegateList;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
         app.session_id = Some("parent".into());
         app.delegate_entries = vec![
             DelegateEntry {
@@ -911,7 +916,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1151,13 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_markers() {
+    fn draw_model_popup_colors_mode_marker_on_build_tab() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             crate::protocol::ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
@@ -1185,18 +1190,53 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let (build_x, build_y) =
             find_buffer_text(&buffer, "Claude Sonnet").expect("build model missing");
-        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
         let build_marker_x = (0..build_x)
             .find(|x| buffer[(*x, build_y)].symbol() == "●")
             .expect("build marker missing");
-        let plan_marker_x = (0..plan_x)
-            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
-            .expect("plan marker missing");
 
         assert_eq!(
             buffer[(build_marker_x, build_y)].fg,
             crate::theme::Theme::mode_color("build")
         );
+    }
+
+    #[test]
+    fn draw_model_popup_colors_mode_marker_on_planner_tab() {
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 0; // Planner tab
+        app.set_mode_model_preference("plan", "openai", "gpt-4o");
+        app.models = vec![
+            crate::protocol::ModelEntry {
+                id: "anthropic/claude-sonnet".into(),
+                label: "Claude Sonnet".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet".into(),
+                node_id: None,
+                family: None,
+                quant: None,
+            },
+            crate::protocol::ModelEntry {
+                id: "openai/gpt-4o".into(),
+                label: "GPT-4o".into(),
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                node_id: None,
+                family: None,
+                quant: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
+        let plan_marker_x = (0..plan_x)
+            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
+            .expect("plan marker missing");
+
         assert_eq!(
             buffer[(plan_marker_x, plan_y)].fg,
             crate::theme::Theme::mode_color("plan")
