@@ -363,7 +363,8 @@ fn draw_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ChatEntry, ToolDetail};
+    use crate::app::{App, ChatEntry, Screen, ToolDetail};
+    use crate::protocol::RawServerMsg;
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -384,6 +385,63 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_chat(f, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn render_delegate_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_delegate_view(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn session_loaded_msg(
+        session_id: &str,
+        agent_id: &str,
+        audit: serde_json::Value,
+    ) -> RawServerMsg {
+        RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "audit": audit,
+            })),
+        }
+    }
+
+    fn prompt_event(text: &str, message_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "prompt_received",
+                "data": {
+                    "content": text,
+                    "message_id": message_id,
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
+    fn assistant_event(text: &str, message_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "assistant_message_stored",
+                "data": {
+                    "content": text,
+                    "thinking": null,
+                    "message_id": message_id,
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
     }
 
     #[test]
@@ -1682,6 +1740,150 @@ mod tests {
         };
 
         assert_eq!(incremental_kinds, full_kinds);
+    }
+
+    #[test]
+    fn session_loaded_invalidates_card_cache_before_replay() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User {
+            text: "parent prompt".into(),
+            message_id: Some("parent-user-1".into()),
+        });
+        app.messages.push(ChatEntry::Assistant {
+            content: "parent reply".into(),
+            thinking: None,
+            message_id: Some("parent-assistant-1".into()),
+        });
+        app.messages.push(ChatEntry::User {
+            text: "parent follow-up".into(),
+            message_id: Some("parent-user-2".into()),
+        });
+        app.messages.push(ChatEntry::Assistant {
+            content: "parent final".into(),
+            thinking: None,
+            message_id: Some("parent-assistant-2".into()),
+        });
+        build_message_cards(&mut app);
+        assert_eq!(app.card_cache.processed_messages, 4);
+        assert_eq!(app.card_cache.cards.len(), 4);
+
+        let new_session_audit = serde_json::json!({
+            "events": [
+                prompt_event("delegate prompt 1", "delegate-user-1"),
+                assistant_event("delegate reply 1", "delegate-assistant-1"),
+                prompt_event("delegate prompt 2", "delegate-user-2"),
+                assistant_event("delegate reply 2", "delegate-assistant-2"),
+            ]
+        });
+
+        app.handle_server_msg(session_loaded_msg(
+            "delegate-session",
+            "agent-2",
+            new_session_audit,
+        ));
+
+        assert_eq!(
+            app.messages.len(),
+            4,
+            "replayed session should have the new message count"
+        );
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "session_loaded should invalidate cached cards before replay"
+        );
+        assert!(
+            app.card_cache.cards.is_empty(),
+            "session_loaded should clear cached cards before replay"
+        );
+    }
+
+    #[test]
+    fn session_switch_rebuilds_chat_cards_without_parent_bleed() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.handle_server_msg(session_loaded_msg(
+            "parent-session",
+            "agent-1",
+            serde_json::json!({
+                "events": [
+                    prompt_event("parent prompt 1", "parent-user-1"),
+                    assistant_event("parent reply 1", "parent-assistant-1"),
+                ]
+            }),
+        ));
+        let initial = buffer_text(&render_chat_buffer(&mut app, 80, 12));
+        assert!(initial.contains("parent prompt 1"));
+        assert!(initial.contains("parent reply 1"));
+
+        app.handle_server_msg(session_loaded_msg(
+            "fresh-session",
+            "agent-2",
+            serde_json::json!({
+                "events": [
+                    prompt_event("fresh prompt 1", "fresh-user-1"),
+                    assistant_event("fresh reply 1", "fresh-assistant-1"),
+                    prompt_event("fresh prompt 2", "fresh-user-2"),
+                    assistant_event("fresh reply 2", "fresh-assistant-2"),
+                ]
+            }),
+        ));
+
+        let rendered = buffer_text(&render_chat_buffer(&mut app, 80, 16));
+        assert!(rendered.contains("fresh prompt 1"));
+        assert!(rendered.contains("fresh reply 2"));
+        assert!(
+            !rendered.contains("parent prompt 1"),
+            "stale parent cards leaked into the newly loaded chat session"
+        );
+        assert!(
+            !rendered.contains("parent reply 1"),
+            "stale parent cards leaked into the newly loaded chat session"
+        );
+    }
+
+    #[test]
+    fn session_switch_rebuilds_delegate_view_without_parent_bleed() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.handle_server_msg(session_loaded_msg(
+            "parent-session",
+            "agent-1",
+            serde_json::json!({
+                "events": [
+                    prompt_event("parent prompt 1", "parent-user-1"),
+                    assistant_event("parent reply 1", "parent-assistant-1"),
+                ]
+            }),
+        ));
+        let initial = buffer_text(&render_chat_buffer(&mut app, 80, 12));
+        assert!(initial.contains("parent prompt 1"));
+
+        app.pending_parent_session_id = Some("parent-session".into());
+        app.handle_server_msg(session_loaded_msg(
+            "delegate-session",
+            "agent-2",
+            serde_json::json!({
+                "events": [
+                    prompt_event("delegate prompt 1", "delegate-user-1"),
+                    assistant_event("delegate reply 1", "delegate-assistant-1"),
+                    prompt_event("delegate prompt 2", "delegate-user-2"),
+                    assistant_event("delegate reply 2", "delegate-assistant-2"),
+                ]
+            }),
+        ));
+
+        assert_eq!(app.screen, Screen::Delegate);
+        let rendered = buffer_text(&render_delegate_buffer(&mut app, 80, 16));
+        assert!(rendered.contains("delegate prompt 1"));
+        assert!(rendered.contains("delegate reply 2"));
+        assert!(
+            !rendered.contains("parent prompt 1"),
+            "stale parent cards leaked into the delegate session view"
+        );
+        assert!(
+            !rendered.contains("parent reply 1"),
+            "stale parent cards leaked into the delegate session view"
+        );
     }
 
     #[test]

@@ -178,6 +178,7 @@ impl App {
                     self.messages.clear();
                     self.streaming_content.clear();
                     self.streaming_cache.invalidate();
+                    self.card_cache.invalidate();
                     self.scroll_offset = 0;
                     self.undo_state = None;
                     self.undoable_turns.clear();
@@ -256,6 +257,7 @@ impl App {
                             self.messages.clear();
                             self.streaming_content.clear();
                             self.streaming_cache.invalidate();
+                            self.card_cache.invalidate();
                             self.scroll_offset = 0;
                             self.cumulative_cost = None;
                             self.session_stats = SessionStatsLite::default();
