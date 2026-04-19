@@ -1041,24 +1041,20 @@ pub(crate) fn handle_chat_key(
                 cmd_tx.send(ClientMsg::Prompt { prompt })?;
             }
         }
-        KeyCode::Tab => {
-            if !input_blocked {
-                if app.slash_state.is_some() {
-                    app.accept_selected_slash_completion();
-                } else if app.mention_state.is_some()
-                    && app.accept_selected_mention()
-                    && let Some(msg) = app.request_file_index_if_needed()
-                {
-                    cmd_tx.send(msg)?;
-                }
+        KeyCode::Tab if !input_blocked => {
+            if app.slash_state.is_some() {
+                app.accept_selected_slash_completion();
+            } else if app.mention_state.is_some()
+                && app.accept_selected_mention()
+                && let Some(msg) = app.request_file_index_if_needed()
+            {
+                cmd_tx.send(msg)?;
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if !input_blocked {
-                app.input_insert(c);
-                if let Some(msg) = app.request_file_index_if_needed() {
-                    cmd_tx.send(msg)?;
-                }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
+            app.input_insert(c);
+            if let Some(msg) = app.request_file_index_if_needed() {
+                cmd_tx.send(msg)?;
             }
         }
         KeyCode::Up => {
@@ -1091,30 +1087,20 @@ pub(crate) fn handle_chat_key(
         KeyCode::PageDown => {
             app.scroll_offset = app.scroll_offset.saturating_sub(10);
         }
-        KeyCode::Backspace => {
-            if !input_blocked {
-                app.input_backspace();
-            }
+        KeyCode::Backspace if !input_blocked => {
+            app.input_backspace();
         }
-        KeyCode::Delete => {
-            if !input_blocked {
-                app.input_delete();
-            }
+        KeyCode::Delete if !input_blocked => {
+            app.input_delete();
         }
-        KeyCode::Left => {
-            if !input_blocked {
-                app.input_left();
-            }
+        KeyCode::Left if !input_blocked => {
+            app.input_left();
         }
-        KeyCode::Right => {
-            if !input_blocked {
-                app.input_right();
-            }
+        KeyCode::Right if !input_blocked => {
+            app.input_right();
         }
-        KeyCode::Home => {
-            if !input_blocked {
-                app.input_home();
-            }
+        KeyCode::Home if !input_blocked => {
+            app.input_home();
         }
         KeyCode::End => {
             if input_blocked {
@@ -1579,34 +1565,28 @@ pub(crate) fn handle_auth_popup_key(
                 app.auth_api_key_input.insert(app.auth_api_key_cursor, c);
                 app.auth_api_key_cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if app.auth_api_key_cursor > 0 {
-                    let cursor = app.auth_api_key_cursor;
-                    let ch = app.auth_api_key_input[..cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_api_key_input.remove(cursor - ch.len_utf8());
-                    app.auth_api_key_cursor -= ch.len_utf8();
-                }
+            KeyCode::Backspace if app.auth_api_key_cursor > 0 => {
+                let cursor = app.auth_api_key_cursor;
+                let ch = app.auth_api_key_input[..cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_api_key_input.remove(cursor - ch.len_utf8());
+                app.auth_api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Left => {
-                if app.auth_api_key_cursor > 0 {
-                    let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_api_key_cursor -= ch.len_utf8();
-                }
+            KeyCode::Left if app.auth_api_key_cursor > 0 => {
+                let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Right => {
-                if app.auth_api_key_cursor < app.auth_api_key_input.len() {
-                    let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
-                        .chars()
-                        .next()
-                        .unwrap();
-                    app.auth_api_key_cursor += ch.len_utf8();
-                }
+            KeyCode::Right if app.auth_api_key_cursor < app.auth_api_key_input.len() => {
+                let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap();
+                app.auth_api_key_cursor += ch.len_utf8();
             }
             _ => {}
         },
@@ -1644,34 +1624,28 @@ pub(crate) fn handle_auth_popup_key(
                     .insert(app.auth_oauth_response_cursor, c);
                 app.auth_oauth_response_cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if app.auth_oauth_response_cursor > 0 {
-                    let cursor = app.auth_oauth_response_cursor;
-                    let ch = app.auth_oauth_response[..cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_oauth_response.remove(cursor - ch.len_utf8());
-                    app.auth_oauth_response_cursor -= ch.len_utf8();
-                }
+            KeyCode::Backspace if app.auth_oauth_response_cursor > 0 => {
+                let cursor = app.auth_oauth_response_cursor;
+                let ch = app.auth_oauth_response[..cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_oauth_response.remove(cursor - ch.len_utf8());
+                app.auth_oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Left => {
-                if app.auth_oauth_response_cursor > 0 {
-                    let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_oauth_response_cursor -= ch.len_utf8();
-                }
+            KeyCode::Left if app.auth_oauth_response_cursor > 0 => {
+                let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Right => {
-                if app.auth_oauth_response_cursor < app.auth_oauth_response.len() {
-                    let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
-                        .chars()
-                        .next()
-                        .unwrap();
-                    app.auth_oauth_response_cursor += ch.len_utf8();
-                }
+            KeyCode::Right if app.auth_oauth_response_cursor < app.auth_oauth_response.len() => {
+                let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap();
+                app.auth_oauth_response_cursor += ch.len_utf8();
             }
             _ => {}
         },

@@ -858,47 +858,43 @@ impl App {
                 fork_point_ref,
                 target_agent_id,
             } => {
-                if origin.as_deref() == Some("delegation") {
-                    if let Some(sid) = child_session_id {
-                        // Update the matching delegation entry.
-                        if let Some(delegation_id) = fork_point_ref {
-                            if let Some(entry) = self
-                                .delegate_entries
-                                .iter_mut()
-                                .find(|e| e.delegation_id == *delegation_id)
-                            {
-                                entry.child_session_id = Some(sid.clone());
-                            }
-                        }
-                        // Subscribe to the child session using the delegation's
-                        // target agent_id — matching the web UI behaviour.
-                        // Fall back to parent agent_id if not present.
-                        let agent_id = target_agent_id.clone().or_else(|| self.agent_id.clone());
-                        self.pending_commands.push(ClientMsg::SubscribeSession {
-                            session_id: sid.clone(),
-                            agent_id,
-                        });
-                        // Auto-apply delegate model preference if configured.
-                        if let Some(target_id) = target_agent_id.as_deref() {
-                            if let Some((prov, mdl)) = self.get_delegate_model_preference(target_id)
-                            {
-                                let prov = prov.to_string();
-                                let mdl = mdl.to_string();
-                                if let Some(entry) = self
-                                    .models
-                                    .iter()
-                                    .find(|m| {
-                                        m.provider == prov && m.model == mdl && m.node_id.is_none()
-                                    })
-                                    .cloned()
-                                {
-                                    self.pending_commands.push(ClientMsg::SetSessionModel {
-                                        session_id: sid.clone(),
-                                        model_id: entry.id,
-                                        node_id: entry.node_id,
-                                    });
-                                }
-                            }
+                if origin.as_deref() == Some("delegation")
+                    && let Some(sid) = child_session_id
+                {
+                    // Update the matching delegation entry.
+                    if let Some(delegation_id) = fork_point_ref
+                        && let Some(entry) = self
+                            .delegate_entries
+                            .iter_mut()
+                            .find(|e| e.delegation_id == *delegation_id)
+                    {
+                        entry.child_session_id = Some(sid.clone());
+                    }
+                    // Subscribe to the child session using the delegation's
+                    // target agent_id — matching the web UI behaviour.
+                    // Fall back to parent agent_id if not present.
+                    let agent_id = target_agent_id.clone().or_else(|| self.agent_id.clone());
+                    self.pending_commands.push(ClientMsg::SubscribeSession {
+                        session_id: sid.clone(),
+                        agent_id,
+                    });
+                    // Auto-apply delegate model preference if configured.
+                    if let Some(target_id) = target_agent_id.as_deref()
+                        && let Some((prov, mdl)) = self.get_delegate_model_preference(target_id)
+                    {
+                        let prov = prov.to_string();
+                        let mdl = mdl.to_string();
+                        if let Some(entry) = self
+                            .models
+                            .iter()
+                            .find(|m| m.provider == prov && m.model == mdl && m.node_id.is_none())
+                            .cloned()
+                        {
+                            self.pending_commands.push(ClientMsg::SetSessionModel {
+                                session_id: sid.clone(),
+                                model_id: entry.id,
+                                node_id: entry.node_id,
+                            });
                         }
                     }
                 }
@@ -1002,10 +998,11 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
                 stats.context_tokens = *ctx;
             }
         }
-        EventKind::ProviderChanged { context_limit, .. } => {
-            if let Some(limit) = context_limit {
-                stats.context_limit = *limit;
-            }
+        EventKind::ProviderChanged {
+            context_limit: Some(limit),
+            ..
+        } => {
+            stats.context_limit = *limit;
         }
         _ => {}
     }
