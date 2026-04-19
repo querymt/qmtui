@@ -168,6 +168,26 @@ impl App {
         items
     }
 
+    /// Flat list of delegate entries that match `delegate_filter`.
+    /// Built from the parent session's event stream (DelegationRequested /
+    /// SessionForked / DelegationCompleted / DelegationFailed events).
+    pub fn visible_delegate_entries(&self) -> Vec<&DelegateEntry> {
+        let q = self.delegate_filter.to_lowercase();
+        self.delegate_entries
+            .iter()
+            .filter(|e| {
+                q.is_empty()
+                    || e.objective.to_lowercase().contains(&q)
+                    || e.delegation_id.to_lowercase().contains(&q)
+                    || e.target_agent_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
+            })
+            .collect()
+    }
+
     pub fn resolve_new_session_default_cwd(&self) -> Option<String> {
         if let Some(active_session_id) = self.session_id.as_deref() {
             for group in &self.session_groups {
@@ -189,6 +209,13 @@ impl App {
             .as_ref()
             .filter(|cwd| !cwd.trim().is_empty())
             .cloned()
+    }
+
+    pub fn open_delegate_popup(&mut self) {
+        self.popup = Popup::SessionSelect;
+        self.session_popup_tab = 1;
+        self.delegate_cursor = 0;
+        self.delegate_filter.clear();
     }
 
     pub fn open_new_session_popup(&mut self) {

@@ -3,17 +3,17 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AuthPanel, LogLevel};
 use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
-use super::{
-    ARROW_DOWN, ARROW_UP, COLLAPSE_CLOSED, COLLAPSE_OPEN, COLOR_SWATCH, ELLIPSIS, relative_time,
-    short_cwd,
-};
+use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
+use super::start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, short_cwd};
+use super::{ARROW_DOWN, ARROW_UP, COLOR_SWATCH, ELLIPSIS, relative_time};
 
 // ── Single-line input scroll helper ──────────────────────────────────────────
 
@@ -81,34 +81,38 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
     }
 }
 
-fn popup_mode_marker_modes<'a>(
-    app: &'a App,
-    model: &'a crate::protocol::ModelEntry,
+/// Single-mode marker: returns vec with the mode name if this model matches
+/// the preference for that specific mode, empty vec otherwise.
+fn popup_single_mode_marker(
+    app: &App,
+    model: &crate::protocol::ModelEntry,
+    mode: &'static str,
 ) -> Vec<&'static str> {
-    let fallback_current = match (
-        app.current_provider.as_deref(),
-        app.current_model.as_deref(),
-    ) {
-        (Some(provider), Some(model_name)) => Some((provider, model_name)),
-        _ => None,
+    let fallback_current = if app.agent_mode == mode {
+        match (
+            app.current_provider.as_deref(),
+            app.current_model.as_deref(),
+        ) {
+            (Some(provider), Some(model_name)) => Some((provider, model_name)),
+            _ => None,
+        }
+    } else {
+        None
     };
+    let target = app.get_mode_model_preference(mode).or(fallback_current);
+    if target.is_some_and(|(provider, model_name)| {
+        provider == model.provider && model_name == model.model
+    }) {
+        vec![mode]
+    } else {
+        vec![]
+    }
+}
 
-    // TODO: Extend marker support to include review mode once we want all mode-model bindings visible here.
-    ["build", "plan"]
-        .into_iter()
-        .filter(|mode| {
-            let target = app
-                .get_mode_model_preference(mode)
-                .or(if app.agent_mode == *mode {
-                    fallback_current
-                } else {
-                    None
-                });
-            target.is_some_and(|(provider, model_name)| {
-                provider == model.provider && model_name == model.model
-            })
-        })
-        .collect()
+/// Whether the given model matches a delegate agent's preferred model.
+fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
+    app.get_delegate_model_preference(agent_id)
+        .is_some_and(|(p, m)| p == model.provider && m == model.model)
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -120,6 +124,8 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     const MODEL_LABEL_MAX_W: u16 = 44;
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
+
+    let has_tabs = true;
 
     let area = f.area();
     let popup_width = area
@@ -143,23 +149,77 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         height: popup_area.height.saturating_sub(2),
     };
 
+    // Layout: title, [tab bar], filter, separator, list, hints
+    let constraints: Vec<Constraint> = if has_tabs {
+        vec![
+            Constraint::Length(1), // title
+            Constraint::Length(1), // tab bar
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hints
+        ]
+    } else {
+        vec![
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hints
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(inner);
 
+    // Chunk indices depend on whether tabs are shown.
+    let (tab_idx, filter_idx, list_idx, hint_idx) = if has_tabs {
+        (Some(1), 2, 4, 5)
+    } else {
+        (None, 1, 3, 4)
+    };
+
+    // Title
     f.render_widget(
         Paragraph::new(Span::styled("select model", Theme::popup_title())).style(Theme::popup_bg()),
         chunks[0],
     );
 
-    let avail = chunks[1].width.saturating_sub(2) as usize;
+    // Tab bar (multi-agent only)
+    if let Some(ti) = tab_idx {
+        let mut tab_spans = Vec::new();
+        for i in 0..app.model_popup_tab_count() {
+            let label = app.model_popup_tab_label(i);
+            let is_active = i == app.model_popup_agent_tab;
+            let style = if let Some(mode) = app.model_popup_tab_mode(i) {
+                let mut s = ratatui::style::Style::default()
+                    .fg(Theme::mode_color(mode))
+                    .bg(Theme::bg_dim())
+                    .add_modifier(Modifier::BOLD);
+                if is_active {
+                    s = s.add_modifier(Modifier::UNDERLINED);
+                }
+                s
+            } else if is_active {
+                Theme::popup_title().add_modifier(Modifier::UNDERLINED)
+            } else {
+                Theme::status()
+            };
+            if i > 0 {
+                tab_spans.push(Span::styled(" \u{2502} ", Theme::status()));
+            }
+            tab_spans.push(Span::styled(format!(" {label} "), style));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(tab_spans)).style(Theme::popup_bg()),
+            chunks[ti],
+        );
+    }
+
+    // Filter input
+    let filter_area = chunks[filter_idx];
+    let avail = filter_area.width.saturating_sub(2) as usize;
     let (model_filter_display, model_filter_cur) =
         scroll_input(&app.model_filter, app.model_filter.len(), avail);
     let filter_line = Line::from(vec![
@@ -168,11 +228,18 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
-        chunks[1],
+        filter_area,
     );
-    f.set_cursor_position((chunks[1].x + 2 + model_filter_cur as u16, chunks[1].y));
+    f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
 
-    let list_w = chunks[3].width as usize;
+    // Resolve current tab's mode (for mode tabs) or agent_id (for agent tabs).
+    let active_mode = app.model_popup_tab_mode(app.model_popup_agent_tab);
+    let active_agent_id = app
+        .model_popup_tab_agent_id(app.model_popup_agent_tab)
+        .map(str::to_string);
+
+    let list_area = chunks[list_idx];
+    let list_w = list_area.width as usize;
 
     let items: Vec<ListItem> = app
         .visible_model_popup_items()
@@ -215,7 +282,21 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
             ModelPopupItem::Model { model_idx } => {
                 let selected = i == app.model_cursor;
                 let model = &app.models[*model_idx];
-                let marker_modes = popup_mode_marker_modes(app, model);
+
+                // On a mode tab show that mode's marker;
+                // on an agent tab show a delegate preference marker.
+                let marker_modes: Vec<&str> = match (active_mode, active_agent_id.as_deref()) {
+                    (Some(mode), _) => popup_single_mode_marker(app, model, mode),
+                    (_, Some(aid)) => {
+                        if popup_delegate_marker(app, model, aid) {
+                            vec!["delegate"]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => vec![],
+                };
+
                 let marker_bg = if selected {
                     Theme::bg_hl()
                 } else {
@@ -239,7 +320,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 spans.push(Span::styled(" ", main_style));
                 for mode in &marker_modes {
                     spans.push(Span::styled(
-                        "●",
+                        "\u{25cf}",
                         ratatui::style::Style::default()
                             .fg(Theme::mode_color(mode))
                             .bg(marker_bg),
@@ -257,36 +338,33 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let visible_rows = chunks[3].height as usize;
+    let visible_rows = list_area.height as usize;
     let offset = app
         .model_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
         .with_selected(Some(app.model_cursor));
-    f.render_stateful_widget(list, chunks[3], &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 
-    let hint = Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
         Span::styled("select", Theme::status()),
-    ]);
-    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+    ];
+    hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
+    hint_spans.push(Span::styled("switch", Theme::status()));
+    f.render_widget(
+        Paragraph::new(Line::from(hint_spans)).style(Theme::popup_bg()),
+        chunks[hint_idx],
+    );
 }
 
 // ── Session popup ─────────────────────────────────────────────────────────────
 
 pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
-    use crate::app::PopupItem;
-
-    const SESSION_ID_COL_W: u16 = 12;
-    const SESSION_ACTIVE_COL_W: u16 = 3;
-    const SESSION_TIME_COL_W: u16 = 9;
-    const SESSION_TITLE_MAX_W: u16 = 44;
-    const SESSION_ROW_MAX_W: u16 =
-        SESSION_ID_COL_W + SESSION_TITLE_MAX_W + SESSION_ACTIVE_COL_W + SESSION_TIME_COL_W;
-    const SESSION_POPUP_MAX_W: u16 = SESSION_ROW_MAX_W + 2;
+    const SESSION_POPUP_MAX_W: u16 = 86;
     const SESSION_POPUP_MIN_W: u16 = 36;
 
     let area = f.area();
@@ -314,7 +392,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
+            Constraint::Length(1), // title / tab bar
             Constraint::Length(1), // filter
             Constraint::Length(1), // spacer
             Constraint::Min(1),    // list
@@ -322,11 +400,35 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    // title
+    // Tab bar
+    let tab_labels = ["sessions", "delegates"];
+    let mut tab_spans = Vec::new();
+    for (i, label) in tab_labels.iter().enumerate() {
+        let is_active = i == app.session_popup_tab;
+        let style = if is_active {
+            Theme::popup_title().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Theme::status()
+        };
+        if i > 0 {
+            tab_spans.push(Span::styled(" \u{2502} ", Theme::status()));
+        }
+        tab_spans.push(Span::styled(format!(" {label} "), style));
+    }
     f.render_widget(
-        Paragraph::new(Span::styled("sessions", Theme::popup_title())).style(Theme::popup_bg()),
+        Paragraph::new(Line::from(tab_spans)).style(Theme::popup_bg()),
         chunks[0],
     );
+
+    if app.session_popup_tab == 0 {
+        draw_session_tab_content(f, app, &chunks);
+    } else {
+        draw_delegate_tab_content(f, app, &chunks);
+    }
+}
+
+fn draw_session_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
+    use crate::app::PopupItem;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
@@ -389,7 +491,14 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
                     let title = s.title.as_deref().unwrap_or("(untitled)");
 
                     let is_active = app.session_id.as_deref() == Some(s.session_id.as_str());
-                    let marker_part = if is_active { " ● " } else { "   " };
+                    let is_parent = app.parent_session_id.as_deref() == Some(s.session_id.as_str());
+                    let marker_part = if is_active {
+                        " ● "
+                    } else if is_parent {
+                        " \u{2b11} "
+                    } else {
+                        "   "
+                    };
                     let id_part = format!(" {id_short} ");
                     let time_part = format!(" {time_str:>7} ");
                     let avail = list_w.saturating_sub(
@@ -421,8 +530,9 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
                         )
                     };
                     let active_style = Theme::status_accent().bg(row_bg);
-                    let marker_style = if is_active { active_style } else { dim_style };
-                    let id_style = if is_active { active_style } else { dim_style };
+                    let highlight = is_active || is_parent;
+                    let marker_style = if highlight { active_style } else { dim_style };
+                    let id_style = if highlight { active_style } else { dim_style };
 
                     let mut spans = vec![
                         Span::styled(marker_part, marker_style),
@@ -447,13 +557,327 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
-        Span::styled("load/collapse  ", Theme::status()),
+        Span::styled("load  ", Theme::status()),
         Span::styled("del ", Theme::status_accent()),
         Span::styled("delete  ", Theme::status()),
-        Span::styled("ctrl-n ", Theme::status_accent()),
-        Span::styled("new", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("switch", Theme::status()),
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+// ── Delegate session popup ─────────────────────────────────────────────────────
+
+const DELEGATE_POPUP_MAX_W: u16 = 72;
+const DELEGATE_POPUP_MIN_W: u16 = 36;
+const DELEGATE_STATUS_COL_W: usize = 1;
+const DELEGATE_ICON_TOOLS: &str = "\u{2692}"; // ⚒
+const DELEGATE_ICON_MSG: &str = "\u{1F5E9}"; // 🗩
+const DELEGATE_ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪
+
+struct DelegateRowData {
+    status_badge: String,
+    badge_style: ratatui::style::Style,
+    agent: String,
+    objective_source: String,
+    tools: String,
+    msgs: String,
+    ctx: String,
+    cost: String,
+    duration: String,
+    is_current: bool,
+}
+
+fn format_delegate_tools(stats: &crate::app::DelegateStats) -> String {
+    if stats.tool_calls > 0 {
+        format!("{DELEGATE_ICON_TOOLS}{}", stats.tool_calls)
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_messages(stats: &crate::app::DelegateStats) -> String {
+    if stats.messages > 0 {
+        format!("{DELEGATE_ICON_MSG}{}", stats.messages)
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_context(stats: &crate::app::DelegateStats) -> String {
+    if let Some(pct) = stats.context_pct() {
+        format!("{DELEGATE_ICON_CONTEXT}{pct}%")
+    } else if stats.context_tokens > 0 {
+        let abbrev = if stats.context_tokens >= 1_000 {
+            format!("{}k", stats.context_tokens / 1_000)
+        } else {
+            stats.context_tokens.to_string()
+        };
+        format!("{DELEGATE_ICON_CONTEXT}{abbrev}")
+    } else {
+        String::new()
+    }
+}
+
+fn format_delegate_cost(stats: &crate::app::DelegateStats) -> String {
+    if stats.cost_usd > 0.0 {
+        format!("${:.2}", stats.cost_usd)
+    } else {
+        String::new()
+    }
+}
+
+fn delegate_display_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text) as u16
+}
+
+fn draw_delegate_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
+    use crate::app::DelegateStatus;
+
+    // filter
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (filter_display, filter_cur) =
+        scroll_input(&app.delegate_filter, app.delegate_filter.len(), avail);
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(filter_display, Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+
+    // delegate entry list (built from event stream)
+    let entries = app.visible_delegate_entries();
+
+    if entries.is_empty() {
+        let list = List::new(vec![ListItem::new(Line::from(Span::styled(
+            " no delegations",
+            Theme::status(),
+        )))])
+        .block(Block::default().style(Theme::popup_bg()));
+        let mut state = ListState::default();
+        f.render_stateful_widget(list, chunks[3], &mut state);
+    } else {
+        let rows_data: Vec<DelegateRowData> = entries
+            .iter()
+            .map(|entry| {
+                let status_badge = match entry.status {
+                    DelegateStatus::InProgress => {
+                        spinner(SpinnerKind::Braille, app.tick).to_string()
+                    }
+                    DelegateStatus::Completed => CHECK_CHECKED.to_string(),
+                    DelegateStatus::Failed => CHECK_FAILED.to_string(),
+                    DelegateStatus::Cancelled => "\u{2298}".to_string(), // ⊘
+                };
+                let badge_style = match entry.status {
+                    DelegateStatus::InProgress => Theme::status_accent(),
+                    DelegateStatus::Completed => Theme::session_time(),
+                    DelegateStatus::Failed => Theme::error_on_dim(),
+                    DelegateStatus::Cancelled => Theme::status(),
+                };
+                let objective_source = if entry.objective.is_empty() {
+                    "(no objective)".to_string()
+                } else {
+                    entry.objective.clone()
+                };
+
+                let is_current = entry.child_session_id.as_deref() == app.session_id.as_deref();
+                let duration = entry
+                    .started_at
+                    .map(|start| {
+                        let end = entry.ended_at.unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(start)
+                        });
+                        let secs = (end - start).max(0) as u64;
+                        if secs < 60 {
+                            format!("{secs}s")
+                        } else {
+                            format!("{}m{}s", secs / 60, secs % 60)
+                        }
+                    })
+                    .unwrap_or_default();
+
+                DelegateRowData {
+                    status_badge,
+                    badge_style,
+                    agent: entry.target_agent_id.clone().unwrap_or_default(),
+                    objective_source,
+                    tools: format_delegate_tools(&entry.stats),
+                    msgs: format_delegate_messages(&entry.stats),
+                    ctx: format_delegate_context(&entry.stats),
+                    cost: format_delegate_cost(&entry.stats),
+                    duration,
+                    is_current,
+                }
+            })
+            .collect();
+
+        let agent_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.agent))
+            .max()
+            .unwrap_or(0);
+        let tools_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.tools))
+            .max()
+            .unwrap_or(0);
+        let msgs_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.msgs))
+            .max()
+            .unwrap_or(0);
+        let ctx_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.ctx))
+            .max()
+            .unwrap_or(0);
+        let cost_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.cost))
+            .max()
+            .unwrap_or(0);
+        let dur_col_w = rows_data
+            .iter()
+            .map(|row| delegate_display_width(&row.duration))
+            .max()
+            .unwrap_or(0);
+
+        let show_agent = agent_col_w > 0;
+        let show_tools = tools_col_w > 0;
+        let show_msgs = msgs_col_w > 0;
+        let show_ctx = ctx_col_w > 0;
+        let show_cost = cost_col_w > 0;
+        let show_dur = dur_col_w > 0;
+
+        let mut fixed_w = DELEGATE_STATUS_COL_W as u16;
+        if show_agent {
+            fixed_w += agent_col_w;
+        }
+        if show_tools {
+            fixed_w += tools_col_w;
+        }
+        if show_msgs {
+            fixed_w += msgs_col_w;
+        }
+        if show_ctx {
+            fixed_w += ctx_col_w;
+        }
+        if show_cost {
+            fixed_w += cost_col_w;
+        }
+        if show_dur {
+            fixed_w += dur_col_w;
+        }
+        // Keep stat columns visible; objective shrinks and ellipsizes first.
+        // Ratatui tables insert one cell of spacing between adjacent columns, so
+        // reserve that spacing up front to keep the trailing ellipsis visible.
+        let visible_cols = 2
+            + u16::from(show_agent)
+            + u16::from(show_tools)
+            + u16::from(show_msgs)
+            + u16::from(show_ctx)
+            + u16::from(show_cost)
+            + u16::from(show_dur);
+        let column_spacing = visible_cols.saturating_sub(1);
+        let objective_w = chunks[3]
+            .width
+            .saturating_sub(fixed_w)
+            .saturating_sub(column_spacing)
+            .max(1) as usize;
+
+        let main_style = Theme::popup_bg();
+        let dim_style = Theme::status();
+        let rows: Vec<Row> = rows_data
+            .into_iter()
+            .map(|row| {
+                let objective = truncate_with_ellipsis(&row.objective_source, objective_w);
+                let obj_style = if row.is_current {
+                    Theme::status_accent()
+                } else {
+                    main_style
+                };
+
+                let mut cells = vec![Cell::from(Span::styled(row.status_badge, row.badge_style))];
+                if show_agent {
+                    cells.push(Cell::from(Span::styled(row.agent, dim_style)));
+                }
+                cells.push(Cell::from(Span::styled(objective, obj_style)));
+                if show_tools {
+                    cells.push(Cell::from(Span::styled(row.tools, dim_style)));
+                }
+                if show_msgs {
+                    cells.push(Cell::from(Span::styled(row.msgs, dim_style)));
+                }
+                if show_ctx {
+                    cells.push(Cell::from(Span::styled(row.ctx, dim_style)));
+                }
+                if show_cost {
+                    cells.push(Cell::from(Span::styled(row.cost, dim_style)));
+                }
+                if show_dur {
+                    cells.push(Cell::from(Span::styled(row.duration, dim_style)));
+                }
+
+                Row::new(cells)
+            })
+            .collect();
+
+        let mut constraints = vec![Constraint::Length(DELEGATE_STATUS_COL_W as u16)];
+        if show_agent {
+            constraints.push(Constraint::Length(agent_col_w));
+        }
+        constraints.push(Constraint::Length(objective_w as u16));
+        if show_tools {
+            constraints.push(Constraint::Length(tools_col_w));
+        }
+        if show_msgs {
+            constraints.push(Constraint::Length(msgs_col_w));
+        }
+        if show_ctx {
+            constraints.push(Constraint::Length(ctx_col_w));
+        }
+        if show_cost {
+            constraints.push(Constraint::Length(cost_col_w));
+        }
+        if show_dur {
+            constraints.push(Constraint::Length(dur_col_w));
+        }
+
+        let table = Table::new(rows, constraints)
+            .block(Block::default().style(Theme::popup_bg()))
+            .style(Theme::popup_bg())
+            .row_highlight_style(Theme::selected());
+
+        let selected = Some(app.delegate_cursor.min(entries.len().saturating_sub(1)));
+        let mut state = TableState::default().with_selected(selected);
+        f.render_stateful_widget(table, chunks[3], &mut state);
+    }
+
+    // hint
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("cancel  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("load  ", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("switch", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+pub(crate) fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let t: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{t}{ELLIPSIS}")
+    } else {
+        text.to_string()
+    }
 }
 
 // ── Theme list item builder ───────────────────────────────────────────────────
@@ -875,10 +1299,12 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             rows: &[
                 ("?", "this help"),
                 ("a", "provider auth"),
+                ("d", "delegate sessions"),
                 ("e", "external editor"),
                 ("m", "model selector"),
                 ("n", "new session"),
                 ("l", "logs popup"),
+                ("p", "jump to parent session"),
                 ("q", "quit"),
                 ("r", "redo"),
                 ("s", "session switcher"),
@@ -945,6 +1371,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
                 ),
                 ("/theme", "open theme picker"),
                 ("/sessions", "open session switcher"),
+                ("/delegates", "list delegate sessions"),
                 ("/new", "new session"),
                 ("/help", "show help"),
                 ("/logs", "open logs popup"),

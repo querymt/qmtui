@@ -1314,6 +1314,16 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
+    for (agent_id, model_key) in &cfg.delegate_models {
+        if let Some((provider, model)) = model_key.split_once('/') {
+            app.set_delegate_model_preference(agent_id, provider, model);
+        }
+    }
+    for (mode, model_key) in &cfg.mode_models {
+        if let Some((provider, model)) = model_key.split_once('/') {
+            app.set_mode_model_preference(mode, provider, model);
+        }
+    }
     if let Some(session_id) = cli.session.clone() {
         app.session_id = Some(session_id);
         app.screen = Screen::Chat;
@@ -2208,8 +2218,9 @@ mod session_popup_key_tests {
     }
 
     #[test]
-    fn global_ctrl_x_l_opens_log_popup() {
+    fn global_ctrl_x_l_opens_session_popup() {
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         let (tx, _rx) = mpsc::unbounded_channel();
 
         handle_key(
@@ -2221,6 +2232,22 @@ mod session_popup_key_tests {
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.popup, Popup::SessionSelect);
+        assert_eq!(app.session_popup_tab, 0);
+    }
+
+    #[test]
+    fn global_ctrl_l_opens_log_popup() {
+        let mut app = App::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
             &tx,
         )
         .unwrap();
@@ -2421,6 +2448,140 @@ mod session_popup_key_tests {
         assert!(app.popup_collapsed_groups.contains("/a"));
         // start page state untouched
         assert!(!app.collapsed_groups.contains("/a"));
+    }
+}
+
+#[cfg(test)]
+mod delegate_popup_key_tests {
+    use super::*;
+    use crate::handlers::*;
+    use app::{DelegateEntry, DelegateStatus, Popup};
+    use crossterm::event::KeyCode;
+
+    fn make_entry(id: &str, objective: &str, child_sid: Option<&str>) -> DelegateEntry {
+        DelegateEntry {
+            delegation_id: id.into(),
+            child_session_id: child_sid.map(String::from),
+            target_agent_id: Some("coder".into()),
+            objective: objective.into(),
+            status: DelegateStatus::Completed,
+            stats: app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    fn setup_delegate_app() -> App {
+        let mut app = App::new();
+        app.session_id = Some("parent-1".into());
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_entries = vec![
+            make_entry("d1", "Build feature", Some("child-1")),
+            make_entry("d2", "Fix tests", Some("child-2")),
+            make_entry("d3", "Write docs", Some("child-3")),
+        ];
+        app
+    }
+
+    #[test]
+    fn delegate_navigation_clamps_cursor_within_bounds() {
+        let mut app = setup_delegate_app();
+        apply_delegate_popup_key(&mut app, KeyCode::Up);
+        assert_eq!(app.delegate_cursor, 0);
+
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        apply_delegate_popup_key(&mut app, KeyCode::Down);
+        assert_eq!(app.delegate_cursor, 2);
+
+        apply_delegate_popup_key(&mut app, KeyCode::Up);
+        assert_eq!(app.delegate_cursor, 1);
+    }
+
+    #[test]
+    fn delegate_enter_loads_selected_child_session() {
+        let mut app = setup_delegate_app();
+        app.delegate_cursor = 1;
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child-2".into()
+            }
+        );
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn delegate_enter_noop_when_child_session_is_unavailable() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "d1".into(),
+            child_session_id: None,
+            target_agent_id: None,
+            objective: "pending task".into(),
+            status: DelegateStatus::InProgress,
+            stats: app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+        }];
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(app.popup, Popup::SessionSelect);
+    }
+
+    #[test]
+    fn delegate_filter_updates_cursor_and_loads_filtered_result() {
+        let mut app = setup_delegate_app();
+        app.delegate_cursor = 2;
+        for c in "docs".chars() {
+            apply_delegate_popup_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.delegate_filter, "docs");
+        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.visible_delegate_entries().len(), 1);
+        assert_eq!(app.visible_delegate_entries()[0].delegation_id, "d3");
+
+        apply_delegate_popup_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.delegate_filter, "doc");
+        assert_eq!(app.delegate_cursor, 0);
+
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child-3".into()
+            }
+        );
+    }
+
+    #[test]
+    fn delegate_esc_closes_popup() {
+        let mut app = setup_delegate_app();
+        apply_delegate_popup_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn delegate_popup_enter_sets_parent_for_sibling_navigation() {
+        let mut app = setup_delegate_app();
+        // Simulate being in a child session (parent_session_id is set).
+        app.parent_session_id = Some("parent-1".into());
+        app.session_id = Some("child-old".into());
+
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(action, SessionKeyAction::LoadSession { .. }),
+            "enter must trigger LoadSession"
+        );
+        assert_eq!(
+            app.pending_parent_session_id.as_deref(),
+            Some("parent-1"),
+            "pending_parent must be the real parent, not the child session_id"
+        );
     }
 }
 
@@ -2681,6 +2842,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
@@ -2718,6 +2880,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
@@ -2746,6 +2909,7 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = None; // already auto

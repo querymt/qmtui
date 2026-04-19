@@ -30,6 +30,11 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         chat_only: false,
     },
     SlashCommandDef {
+        name: "delegates",
+        description: "list delegate sessions",
+        chat_only: true,
+    },
+    SlashCommandDef {
         name: "new",
         description: "new session",
         chat_only: false,

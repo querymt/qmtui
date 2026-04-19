@@ -2,22 +2,23 @@ mod chat;
 mod popups;
 mod start;
 
-use chat::draw_chat;
 pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
+use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup,
     draw_session_popup, draw_theme_popup,
 };
-use start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, draw_start, short_cwd};
+use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
 pub(crate) use chat::{
-    Card, CardKind, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
+    Card, CardKind, ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
 };
 #[cfg(test)]
 pub(crate) use popups::{
     build_theme_list_item, scroll_input, scroll_input_chars, shortcut_sections,
+    truncate_with_ellipsis,
 };
 #[cfg(test)]
 pub(crate) use start::build_start_page_rows;
@@ -299,6 +300,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Sessions => draw_start(f, app),
         Screen::Chat => draw_chat(f, app),
+        Screen::Delegate => draw_delegate_view(f, app),
     }
 
     match app.popup {
@@ -497,6 +499,484 @@ mod tests {
     }
 
     #[test]
+    fn draw_chat_shows_delegate_badge_when_entries_exist() {
+        use crate::app::{DelegateEntry, DelegateStatus};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+
+        // No delegates → no badge
+        let buffer = render_chat_buffer(&mut app, 100, 8);
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!rendered.contains(ICON_DELEGATES));
+
+        // 2 completed + 1 running = "2/3"
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "d1".into(),
+                child_session_id: Some("c1".into()),
+                target_agent_id: None,
+                objective: "a".into(),
+                status: DelegateStatus::Completed,
+                stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "d2".into(),
+                child_session_id: Some("c2".into()),
+                target_agent_id: None,
+                objective: "b".into(),
+                status: DelegateStatus::Completed,
+                stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "d3".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "c".into(),
+                status: DelegateStatus::InProgress,
+                stats: crate::app::DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+        let buffer = render_chat_buffer(&mut app, 100, 8);
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains(&format!("{ICON_DELEGATES} 2/3")),
+            "expected delegate badge '2/3' in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn draw_chat_failed_delegate_badge_uses_dim_surface_background() {
+        use crate::app::{DelegateEntry, DelegateStatus};
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "d1".into(),
+            child_session_id: Some("c1".into()),
+            target_agent_id: None,
+            objective: "a".into(),
+            status: DelegateStatus::Failed,
+            stats: crate::app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+        }];
+
+        let buffer = render_chat_buffer(&mut app, 100, 8);
+        let (x, y) = find_buffer_text(&buffer, ICON_DELEGATES).expect("missing delegate badge");
+        assert_eq!(
+            buffer[(x, y)].style().bg,
+            Theme::error_on_dim().bg,
+            "failed delegate badge should use dim-surface error background"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.session_id = Some("parent".into());
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: Some("child-1".into()),
+                target_agent_id: None,
+                objective: "Fix the bug".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats {
+                    tool_calls: 7,
+                    messages: 3,
+                    cost_usd: 0.0125,
+                    context_tokens: 50_000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-2".into(),
+                child_session_id: Some("child-2".into()),
+                target_agent_id: None,
+                objective: "Write docs".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats {
+                    tool_calls: 12,
+                    messages: 1,
+                    cost_usd: 0.0345,
+                    context_tokens: 20_000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
+        let (tool_x2, row2) = find_buffer_text(&buffer, "⚒12").expect("missing row2 tools");
+        let (cost_x1, cost_row1) = find_buffer_text(&buffer, "$0.01").expect("missing row1 cost");
+        let (cost_x2, cost_row2) = find_buffer_text(&buffer, "$0.03").expect("missing row2 cost");
+
+        assert_ne!(row1, row2, "expected separate rows for each delegate entry");
+        assert_eq!(tool_x1, tool_x2, "tool column must align across rows");
+        assert_eq!(cost_x1, cost_x2, "cost column must align across rows");
+        assert_eq!(row1, cost_row1, "row1 stats must share same row");
+        assert_eq!(row2, cost_row2, "row2 stats must share same row");
+    }
+
+    #[test]
+    fn draw_delegate_popup_hides_cost_column_when_all_rows_have_zero_cost() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "Pending task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats {
+                    tool_calls: 2,
+                    messages: 1,
+                    cost_usd: 0.0,
+                    context_tokens: 1000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-2".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "Another task".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats {
+                    tool_calls: 4,
+                    messages: 2,
+                    cost_usd: 0.0,
+                    context_tokens: 2000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(rendered.contains("Pending task"));
+        assert!(rendered.contains("Another task"));
+        assert!(rendered.contains("⚒2"));
+        assert!(rendered.contains("⚒4"));
+        assert!(!rendered.contains("$0.0000"), "unexpected zero cost");
+        assert!(
+            !rendered.contains('$'),
+            "cost column should be hidden when all rows have zero cost"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_truncates_long_objectives_with_unicode_ellipsis() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: None,
+            objective: "List the contents of the repository root directory as a simulated user request for the delegate popup".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats {
+                tool_calls: 0,
+                messages: 0,
+                cost_usd: 0.0,
+                context_tokens: 180_000,
+                context_limit: 200_000,
+            },
+            started_at: None,
+            ended_at: None,
+        }];
+
+        let backend = ratatui::backend::TestBackend::new(70, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn draw_delegate_popup_failed_symbol_uses_dim_surface_background() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_cursor = 0; // keep first row selected; failed row remains unselected
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-0".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "Selected row".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "Failed row".into(),
+                status: DelegateStatus::Failed,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
+        assert_eq!(
+            buffer[(x, y)].style().bg,
+            Theme::error_on_dim().bg,
+            "failed popup symbol should use dim-surface error background"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_highlights_full_selected_row() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_cursor = 1;
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "First row".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats {
+                    tool_calls: 7,
+                    messages: 3,
+                    cost_usd: 0.0125,
+                    context_tokens: 50_000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-2".into(),
+                child_session_id: None,
+                target_agent_id: None,
+                objective: "Second row".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats {
+                    tool_calls: 4,
+                    messages: 1,
+                    cost_usd: 0.0, // empty cost cell on selected row
+                    context_tokens: 10_000,
+                    context_limit: 200_000,
+                },
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
+        let (_, second_y) = find_buffer_text(&buffer, "Second row").expect("missing second row");
+        assert_ne!(first_y, second_y);
+
+        // Pick cells on the selected row: one in the objective column, one in a
+        // stats column, and one in an empty cost cell. All should use the
+        // selected row background.
+        let (obj_x, _) = find_buffer_text(&buffer, "Second row").expect("missing second row");
+        let (tool_x, _) = find_buffer_text(&buffer, "⚒4").expect("missing second row tools");
+        let (cost_x, _) = find_buffer_text(&buffer, "$0.01").expect("missing first row cost");
+
+        let selected_bg = Theme::selected().bg.expect("selected style must define bg");
+        assert_eq!(buffer[(obj_x, second_y)].style().bg, Some(selected_bg));
+        assert_eq!(buffer[(tool_x, second_y)].style().bg, Some(selected_bg));
+        assert_eq!(
+            buffer[(cost_x, second_y)].style().bg,
+            Some(selected_bg),
+            "empty selected-row cost cell should also be highlighted"
+        );
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_adds_ellipsis_for_long_text() {
+        let truncated = truncate_with_ellipsis(
+            "This is a very long delegate objective that should be truncated nicely",
+            12,
+        );
+        assert_eq!(truncated, "This is a v…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_text_unchanged() {
+        assert_eq!(truncate_with_ellipsis("short", 12), "short");
+    }
+
+    #[test]
+    fn draw_delegate_popup_shows_agent_name_column() {
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.session_id = Some("parent".into());
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-1".into(),
+                child_session_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: "Fix bug".into(),
+                status: DelegateStatus::Completed,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+            DelegateEntry {
+                delegation_id: "del-2".into(),
+                child_session_id: None,
+                target_agent_id: Some("planner".into()),
+                objective: "Plan work".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("coder"),
+            "agent name 'coder' must appear in popup, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("planner"),
+            "agent name 'planner' must appear in popup"
+        );
+    }
+
+    #[test]
+    fn delegate_tool_call_label_uses_accent_color() {
+        use crate::app::{ChatEntry, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail};
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "delegate".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+        });
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix the bug".into(),
+            status: DelegateStatus::Completed,
+            stats: DelegateStats::default(),
+            started_at: Some(1700000000),
+            ended_at: Some(1700000045),
+        });
+
+        let buffer = render_chat_buffer(&mut app, 60, 10);
+
+        // Find the row with "delegate"
+        let (_, row) = find_buffer_text(&buffer, "delegate").expect("missing delegate tool call");
+        // Find "(coder" on that row
+        let (label_x, _) = find_buffer_text(&buffer, "(coder").expect("missing label");
+        let label_cell = &buffer[(label_x, row)];
+
+        let accent_fg = Theme::status_accent().fg.expect("accent must define fg");
+        assert_eq!(
+            label_cell.style().fg,
+            Some(accent_fg),
+            "delegate label must use accent color"
+        );
+    }
+
+    #[test]
     fn draw_chat_preserves_hard_line_breaks_in_input() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -676,13 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_markers() {
+    fn draw_model_popup_colors_mode_marker_on_build_tab() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 1; // Build tab
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             crate::protocol::ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
@@ -710,18 +1190,53 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let (build_x, build_y) =
             find_buffer_text(&buffer, "Claude Sonnet").expect("build model missing");
-        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
         let build_marker_x = (0..build_x)
             .find(|x| buffer[(*x, build_y)].symbol() == "●")
             .expect("build marker missing");
-        let plan_marker_x = (0..plan_x)
-            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
-            .expect("plan marker missing");
 
         assert_eq!(
             buffer[(build_marker_x, build_y)].fg,
             crate::theme::Theme::mode_color("build")
         );
+    }
+
+    #[test]
+    fn draw_model_popup_colors_mode_marker_on_planner_tab() {
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 0; // Planner tab
+        app.set_mode_model_preference("plan", "openai", "gpt-4o");
+        app.models = vec![
+            crate::protocol::ModelEntry {
+                id: "anthropic/claude-sonnet".into(),
+                label: "Claude Sonnet".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet".into(),
+                node_id: None,
+                family: None,
+                quant: None,
+            },
+            crate::protocol::ModelEntry {
+                id: "openai/gpt-4o".into(),
+                label: "GPT-4o".into(),
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                node_id: None,
+                family: None,
+                quant: None,
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
+        let plan_marker_x = (0..plan_x)
+            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
+            .expect("plan marker missing");
+
         assert_eq!(
             buffer[(plan_marker_x, plan_y)].fg,
             crate::theme::Theme::mode_color("plan")
@@ -1016,6 +1531,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "world".into(),
             thinking: None,
+            message_id: None,
         });
         {
             let cards = build_message_cards(&mut app);
@@ -1116,6 +1632,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "world".into(),
             thinking: None,
+            message_id: None,
         });
         build_message_cards(&mut app);
         assert_eq!(app.card_cache.processed_messages, 2);
@@ -1141,6 +1658,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "a1".into(),
             thinking: None,
+            message_id: None,
         });
         build_message_cards(&mut app);
 
@@ -1172,6 +1690,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "thinking...".into(),
             thinking: None,
+            message_id: None,
         });
         app.messages.push(tool_call("read"));
 
@@ -1813,6 +2332,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: Some("reasoning".into()),
+            message_id: None,
         });
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
@@ -1832,7 +2352,9 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: None,
+            message_id: None,
         });
+
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         let first_line = &cards[0].lines[0];
@@ -1854,6 +2376,7 @@ mod tests {
         app.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: Some("reasoning".into()),
+            message_id: None,
         });
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);

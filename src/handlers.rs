@@ -236,6 +236,16 @@ pub(crate) fn handle_key(
         return Ok(AppAction::None);
     }
 
+    // direct: ctrl+l opens log popup
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+    {
+        app.popup = Popup::Log;
+        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        app.log_filter.clear();
+        return Ok(AppAction::None);
+    }
+
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.chord = true;
@@ -284,6 +294,7 @@ pub(crate) fn handle_key(
             handle_auth_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
         }
+
         Popup::None => {}
     }
 
@@ -299,6 +310,7 @@ pub(crate) fn handle_key(
     match app.screen {
         Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
         Screen::Chat => return handle_chat_key(app, key, cmd_tx),
+        Screen::Delegate => return handle_delegate_view_key(app, key, cmd_tx),
     }
     Ok(AppAction::None)
 }
@@ -333,6 +345,7 @@ pub(crate) fn handle_chord(
             }
             app.popup = Popup::ModelSelect;
             app.model_filter.clear();
+            app.model_popup_agent_tab = if app.agent_mode == "plan" { 0 } else { 1 };
             app.model_cursor = app.current_mode_model_cursor();
         }
         KeyCode::Char('n') => {
@@ -351,15 +364,6 @@ pub(crate) fn handle_chord(
                 "external editor unavailable here",
             );
         }
-        KeyCode::Char('s') => {
-            if !can_send_server_commands(app) {
-                return Ok(());
-            }
-            app.popup = Popup::SessionSelect;
-            app.session_cursor = 0;
-            app.session_filter.clear();
-            cmd_tx.send(ClientMsg::ListSessions)?;
-        }
 
         KeyCode::Char('t') => {
             app.popup = Popup::ThemeSelect;
@@ -367,9 +371,14 @@ pub(crate) fn handle_chord(
             app.theme_cursor = theme::Theme::current_index();
         }
         KeyCode::Char('l') => {
-            app.popup = Popup::Log;
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-            app.log_filter.clear();
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.popup = Popup::SessionSelect;
+            app.session_popup_tab = 0;
+            app.session_cursor = 0;
+            app.session_filter.clear();
+            cmd_tx.send(ClientMsg::ListSessions)?;
         }
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
@@ -377,6 +386,31 @@ pub(crate) fn handle_chord(
             }
             app.open_auth_popup();
             cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+
+        KeyCode::Char('p') => {
+            if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "session",
+                    "parent jump only available in chat",
+                );
+                return Ok(());
+            }
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            if let Some(parent_sid) = app.parent_session_id.clone() {
+                cmd_tx.send(ClientMsg::LoadSession {
+                    session_id: parent_sid.clone(),
+                })?;
+                cmd_tx.send(ClientMsg::SubscribeSession {
+                    session_id: parent_sid,
+                    agent_id: app.agent_id.clone(),
+                })?;
+            } else {
+                app.set_status(app::LogLevel::Info, "session", "no parent session");
+            }
         }
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
@@ -483,6 +517,18 @@ pub(crate) fn handle_session_popup_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
+    // Tab / BackTab: switch between sessions and delegates tabs
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.session_popup_tab = 1 - app.session_popup_tab;
+        return Ok(());
+    }
+
+    if app.session_popup_tab == 1 {
+        // Delegates tab
+        return handle_delegate_popup_key(app, key, cmd_tx);
+    }
+
+    // Sessions tab
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
         if !can_send_server_commands(app) {
             return Ok(());
@@ -592,6 +638,135 @@ pub(crate) fn apply_popup_session_key(
         KeyCode::Char(c) => {
             app.session_filter.push(c);
             app.session_cursor = 0;
+        }
+        _ => {}
+    }
+    SessionKeyAction::None
+}
+
+// ── Delegate view key handler (read-only child session) ──────────────────────
+
+fn handle_delegate_view_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<AppAction> {
+    match key.code {
+        KeyCode::Up => {
+            app.scroll_offset = app.scroll_offset.saturating_add(1);
+        }
+        KeyCode::Down => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        }
+        KeyCode::PageUp => {
+            app.scroll_offset = app.scroll_offset.saturating_add(10);
+        }
+        KeyCode::PageDown => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+        }
+        KeyCode::Home => {
+            // Scroll to top: set a large offset (draw_messages clamps it).
+            app.scroll_offset = u16::MAX;
+        }
+        KeyCode::End => {
+            app.scroll_offset = 0;
+        }
+        KeyCode::Esc => {
+            // Go back to parent session.
+            if let Some(parent_sid) = app.parent_session_id.clone() {
+                cmd_tx.send(ClientMsg::LoadSession {
+                    session_id: parent_sid.clone(),
+                })?;
+                cmd_tx.send(ClientMsg::SubscribeSession {
+                    session_id: parent_sid,
+                    agent_id: app.agent_id.clone(),
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(AppAction::None)
+}
+
+// ── Delegate popup key handler ────────────────────────────────────────────────
+
+pub(crate) fn handle_delegate_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match apply_delegate_popup_key(
+        app,
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            KeyCode::Null
+        } else {
+            key.code
+        },
+    ) {
+        SessionKeyAction::LoadSession { session_id } => {
+            cmd_tx.send(ClientMsg::LoadSession {
+                session_id: session_id.clone(),
+            })?;
+            cmd_tx.send(ClientMsg::SubscribeSession {
+                session_id,
+                agent_id: app.agent_id.clone(),
+            })?;
+        }
+        SessionKeyAction::NewSession
+        | SessionKeyAction::DeleteSession { .. }
+        | SessionKeyAction::None => {}
+    }
+    Ok(())
+}
+
+/// Pure key-handler for the delegate popup. Returns a [`SessionKeyAction`]
+/// that the caller should forward to the server.
+///
+/// Delegation entries are built from the parent session's event stream, not
+/// from the session list. Enter loads the child session if its ID is known.
+pub(crate) fn apply_delegate_popup_key(
+    app: &mut App,
+    key: crossterm::event::KeyCode,
+) -> SessionKeyAction {
+    match key {
+        KeyCode::Esc => {
+            app.popup = Popup::None;
+        }
+        KeyCode::Up => {
+            app.delegate_cursor = app.delegate_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = app.visible_delegate_entries().len().saturating_sub(1);
+            app.delegate_cursor = (app.delegate_cursor + 1).min(max);
+        }
+        KeyCode::Enter => {
+            let entries = app.visible_delegate_entries();
+            if let Some(entry) = entries.get(app.delegate_cursor) {
+                if let Some(ref child_sid) = entry.child_session_id {
+                    let sid = child_sid.clone();
+                    // Use the real parent when navigating between siblings.
+                    app.pending_parent_session_id = app
+                        .parent_session_id
+                        .clone()
+                        .or_else(|| app.session_id.clone());
+                    app.popup = Popup::None;
+                    return SessionKeyAction::LoadSession { session_id: sid };
+                } else {
+                    app.set_status(
+                        app::LogLevel::Warn,
+                        "delegates",
+                        "delegation still pending — no session to load",
+                    );
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            app.delegate_filter.pop();
+            app.delegate_cursor = 0;
+        }
+        KeyCode::Char(c) => {
+            app.delegate_filter.push(c);
+            app.delegate_cursor = 0;
         }
         _ => {}
     }
@@ -866,24 +1041,20 @@ pub(crate) fn handle_chat_key(
                 cmd_tx.send(ClientMsg::Prompt { prompt })?;
             }
         }
-        KeyCode::Tab => {
-            if !input_blocked {
-                if app.slash_state.is_some() {
-                    app.accept_selected_slash_completion();
-                } else if app.mention_state.is_some()
-                    && app.accept_selected_mention()
-                    && let Some(msg) = app.request_file_index_if_needed()
-                {
-                    cmd_tx.send(msg)?;
-                }
+        KeyCode::Tab if !input_blocked => {
+            if app.slash_state.is_some() {
+                app.accept_selected_slash_completion();
+            } else if app.mention_state.is_some()
+                && app.accept_selected_mention()
+                && let Some(msg) = app.request_file_index_if_needed()
+            {
+                cmd_tx.send(msg)?;
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if !input_blocked {
-                app.input_insert(c);
-                if let Some(msg) = app.request_file_index_if_needed() {
-                    cmd_tx.send(msg)?;
-                }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
+            app.input_insert(c);
+            if let Some(msg) = app.request_file_index_if_needed() {
+                cmd_tx.send(msg)?;
             }
         }
         KeyCode::Up => {
@@ -916,30 +1087,20 @@ pub(crate) fn handle_chat_key(
         KeyCode::PageDown => {
             app.scroll_offset = app.scroll_offset.saturating_sub(10);
         }
-        KeyCode::Backspace => {
-            if !input_blocked {
-                app.input_backspace();
-            }
+        KeyCode::Backspace if !input_blocked => {
+            app.input_backspace();
         }
-        KeyCode::Delete => {
-            if !input_blocked {
-                app.input_delete();
-            }
+        KeyCode::Delete if !input_blocked => {
+            app.input_delete();
         }
-        KeyCode::Left => {
-            if !input_blocked {
-                app.input_left();
-            }
+        KeyCode::Left if !input_blocked => {
+            app.input_left();
         }
-        KeyCode::Right => {
-            if !input_blocked {
-                app.input_right();
-            }
+        KeyCode::Right if !input_blocked => {
+            app.input_right();
         }
-        KeyCode::Home => {
-            if !input_blocked {
-                app.input_home();
-            }
+        KeyCode::Home if !input_blocked => {
+            app.input_home();
         }
         KeyCode::End => {
             if input_blocked {
@@ -1137,9 +1298,25 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.popup = crate::app::Popup::SessionSelect;
+            app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
             cmd_tx.send(ClientMsg::ListSessions)?;
+        }
+        "delegates" => {
+            app.take_input();
+            if app.screen != crate::app::Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "delegates",
+                    "delegates only available in chat",
+                );
+                return Ok(SlashResult::Handled);
+            }
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            app.open_delegate_popup();
         }
         "new" => {
             app.take_input();
@@ -1388,34 +1565,28 @@ pub(crate) fn handle_auth_popup_key(
                 app.auth_api_key_input.insert(app.auth_api_key_cursor, c);
                 app.auth_api_key_cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if app.auth_api_key_cursor > 0 {
-                    let cursor = app.auth_api_key_cursor;
-                    let ch = app.auth_api_key_input[..cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_api_key_input.remove(cursor - ch.len_utf8());
-                    app.auth_api_key_cursor -= ch.len_utf8();
-                }
+            KeyCode::Backspace if app.auth_api_key_cursor > 0 => {
+                let cursor = app.auth_api_key_cursor;
+                let ch = app.auth_api_key_input[..cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_api_key_input.remove(cursor - ch.len_utf8());
+                app.auth_api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Left => {
-                if app.auth_api_key_cursor > 0 {
-                    let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_api_key_cursor -= ch.len_utf8();
-                }
+            KeyCode::Left if app.auth_api_key_cursor > 0 => {
+                let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Right => {
-                if app.auth_api_key_cursor < app.auth_api_key_input.len() {
-                    let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
-                        .chars()
-                        .next()
-                        .unwrap();
-                    app.auth_api_key_cursor += ch.len_utf8();
-                }
+            KeyCode::Right if app.auth_api_key_cursor < app.auth_api_key_input.len() => {
+                let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap();
+                app.auth_api_key_cursor += ch.len_utf8();
             }
             _ => {}
         },
@@ -1453,34 +1624,28 @@ pub(crate) fn handle_auth_popup_key(
                     .insert(app.auth_oauth_response_cursor, c);
                 app.auth_oauth_response_cursor += c.len_utf8();
             }
-            KeyCode::Backspace => {
-                if app.auth_oauth_response_cursor > 0 {
-                    let cursor = app.auth_oauth_response_cursor;
-                    let ch = app.auth_oauth_response[..cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_oauth_response.remove(cursor - ch.len_utf8());
-                    app.auth_oauth_response_cursor -= ch.len_utf8();
-                }
+            KeyCode::Backspace if app.auth_oauth_response_cursor > 0 => {
+                let cursor = app.auth_oauth_response_cursor;
+                let ch = app.auth_oauth_response[..cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_oauth_response.remove(cursor - ch.len_utf8());
+                app.auth_oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Left => {
-                if app.auth_oauth_response_cursor > 0 {
-                    let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
-                        .chars()
-                        .next_back()
-                        .unwrap();
-                    app.auth_oauth_response_cursor -= ch.len_utf8();
-                }
+            KeyCode::Left if app.auth_oauth_response_cursor > 0 => {
+                let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
+                    .chars()
+                    .next_back()
+                    .unwrap();
+                app.auth_oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Right => {
-                if app.auth_oauth_response_cursor < app.auth_oauth_response.len() {
-                    let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
-                        .chars()
-                        .next()
-                        .unwrap();
-                    app.auth_oauth_response_cursor += ch.len_utf8();
-                }
+            KeyCode::Right if app.auth_oauth_response_cursor < app.auth_oauth_response.len() => {
+                let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap();
+                app.auth_oauth_response_cursor += ch.len_utf8();
             }
             _ => {}
         },
@@ -1533,6 +1698,30 @@ pub(crate) fn handle_model_popup_key(
         KeyCode::Esc => {
             app.popup = Popup::None;
         }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let n = app.model_popup_tab_count();
+            if key.code == KeyCode::BackTab {
+                app.model_popup_agent_tab = if app.model_popup_agent_tab == 0 {
+                    n - 1
+                } else {
+                    app.model_popup_agent_tab - 1
+                };
+            } else {
+                app.model_popup_agent_tab = (app.model_popup_agent_tab + 1) % n;
+            }
+            app.model_filter.clear();
+            let agent_id = app
+                .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                .map(str::to_string);
+            app.model_cursor =
+                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
+                    app.mode_model_cursor(mode)
+                } else if let Some(ref aid) = agent_id {
+                    app.delegate_model_cursor(aid)
+                } else {
+                    0
+                };
+        }
         KeyCode::Up => {
             app.model_cursor = app.model_cursor.saturating_sub(1);
         }
@@ -1550,38 +1739,51 @@ pub(crate) fn handle_model_popup_key(
                 })
                 .cloned();
             if let Some(model) = selected {
-                if let Some(sid) = app.session_id.clone() {
-                    cmd_tx.send(ClientMsg::SetSessionModel {
-                        session_id: sid,
-                        model_id: model.id.clone(),
-                        node_id: model.node_id.clone(),
-                    })?;
+                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
+                    // Mode tab (Planner / Build): store preference for that mode
+                    app.set_mode_model_preference(mode, &model.provider, &model.model);
+                    // If current mode matches, also apply to the live session
+                    if app.agent_mode == mode {
+                        if let Some(sid) = app.session_id.clone() {
+                            cmd_tx.send(ClientMsg::SetSessionModel {
+                                session_id: sid,
+                                model_id: model.id.clone(),
+                                node_id: model.node_id.clone(),
+                            })?;
+                        }
+                        app.current_model = Some(model.model.clone());
+                        app.current_provider = Some(model.provider.clone());
+                        if app.reasoning_effort.is_some() {
+                            app.reasoning_effort = None;
+                            cmd_tx.send(ClientMsg::SetReasoningEffort {
+                                reasoning_effort: "auto".into(),
+                            })?;
+                        }
+                        app.cache_session_mode_state();
+                    }
+                    let tab_label = app
+                        .model_popup_tab_label(app.model_popup_agent_tab)
+                        .to_string();
+                    app.set_status(
+                        app::LogLevel::Info,
+                        "model",
+                        format!("{}: {}", tab_label, model.label),
+                    );
+                } else if let Some(agent_id) = app
+                    .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                    .map(str::to_string)
+                {
+                    // Agent tab: store delegate preference
+                    let tab_label = app
+                        .model_popup_tab_label(app.model_popup_agent_tab)
+                        .to_string();
+                    app.set_delegate_model_preference(&agent_id, &model.provider, &model.model);
+                    app.set_status(
+                        app::LogLevel::Info,
+                        "model",
+                        format!("{}: {}", tab_label, model.label),
+                    );
                 }
-                app.current_model = Some(model.model.clone());
-                app.current_provider = Some(model.provider.clone());
-                // Record this model as the preference for the current agent mode so
-                // it is automatically re-applied whenever the user switches back to
-                // this mode later in the same TUI session.
-                app.set_mode_model_preference(
-                    &app.agent_mode.clone(),
-                    &model.provider,
-                    &model.model,
-                );
-                // Drop reasoning effort to auto when switching model.
-                if app.reasoning_effort.is_some() {
-                    app.reasoning_effort = None;
-                    cmd_tx.send(ClientMsg::SetReasoningEffort {
-                        reasoning_effort: "auto".into(),
-                    })?;
-                }
-                // Cache the new model + auto effort for this session + mode.
-                app.cache_session_mode_state();
-                app.popup = Popup::None;
-                app.set_status(
-                    app::LogLevel::Info,
-                    "model",
-                    format!("model: {}", model.label),
-                );
                 save_config(app);
                 save_cache(app);
             }
@@ -1669,6 +1871,7 @@ pub(crate) fn apply_sessions_key(
                     }
                     StartPageItem::ShowMore { .. } => {
                         app.popup = Popup::SessionSelect;
+                        app.session_popup_tab = 0;
                         app.session_cursor = 0;
                         app.session_filter.clear();
                     }
