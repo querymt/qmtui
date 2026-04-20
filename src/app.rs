@@ -6,6 +6,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
+use crate::markdown::CardBlock;
 use crate::protocol::*;
 use crate::ui::{CardCache, OUTCOME_BULLET};
 
@@ -14,37 +15,37 @@ use crate::ui::{CardCache, OUTCOME_BULLET};
 pub struct StreamingCache {
     /// Length of `streaming_content` at the time of last render.
     rendered_len: usize,
-    /// Cached rendered lines (without the spinner).
-    lines: Vec<Line<'static>>,
+    /// Cached rendered blocks (without the spinner).
+    blocks: Vec<CardBlock>,
 }
 
 impl StreamingCache {
     pub fn new() -> Self {
         Self {
             rendered_len: 0,
-            lines: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
-    /// Returns cached lines if content length hasn't changed, otherwise None.
-    pub fn get(&self, content_len: usize) -> Option<&[Line<'static>]> {
+    /// Returns cached blocks if content length hasn't changed, otherwise None.
+    pub fn get(&self, content_len: usize) -> Option<&[CardBlock]> {
         if content_len > 0 && content_len == self.rendered_len {
-            Some(&self.lines)
+            Some(&self.blocks)
         } else {
             None
         }
     }
 
-    /// Store freshly rendered lines and the content length they correspond to.
-    pub fn store(&mut self, content_len: usize, lines: Vec<Line<'static>>) {
+    /// Store freshly rendered blocks and the content length they correspond to.
+    pub fn store(&mut self, content_len: usize, blocks: Vec<CardBlock>) {
         self.rendered_len = content_len;
-        self.lines = lines;
+        self.blocks = blocks;
     }
 
     /// Reset the cache (call when streaming_content is cleared).
     pub fn invalidate(&mut self) {
         self.rendered_len = 0;
-        self.lines.clear();
+        self.blocks.clear();
     }
 }
 

@@ -12,6 +12,8 @@ use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
+pub(crate) use crate::markdown::CardBlock;
+#[cfg(test)]
 pub(crate) use chat::{
     Card, CardKind, ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
 };
@@ -1560,7 +1562,7 @@ mod tests {
         assert_eq!(cards[0].kind, CardKind::User);
 
         let rendered: Vec<String> = cards[0]
-            .lines
+            .lines_for(80)
             .iter()
             .map(|line| {
                 line.spans
@@ -1625,7 +1627,7 @@ mod tests {
         // Two consecutive tools → one tool card
         assert_eq!(cards.len(), 1);
         assert!(matches!(cards[0].kind, CardKind::Tool { .. }));
-        assert_eq!(cards[0].lines.len(), 2);
+        assert_eq!(cards[0].lines_for(80).len(), 2);
     }
 
     #[test]
@@ -1635,7 +1637,7 @@ mod tests {
         {
             let cards = build_message_cards(&mut app);
             assert_eq!(cards.len(), 1);
-            assert_eq!(cards[0].lines.len(), 1);
+            assert_eq!(cards[0].lines_for(80).len(), 1);
         }
 
         // Add another tool — should merge into same batch
@@ -1643,7 +1645,7 @@ mod tests {
         {
             let cards = build_message_cards(&mut app);
             assert_eq!(cards.len(), 1); // still 1 card
-            assert_eq!(cards[0].lines.len(), 2); // but now 2 lines
+            assert_eq!(cards[0].lines_for(80).len(), 2); // but now 2 lines
         }
     }
 
@@ -1976,9 +1978,9 @@ mod tests {
         assert_eq!(cards.len(), 1);
         // header line + diff lines (at least equal + changed = 2 original lines)
         assert!(
-            cards[0].lines.len() > 1,
+            cards[0].lines_for(80).len() > 1,
             "tool card should include header + diff lines, got {} lines",
-            cards[0].lines.len()
+            cards[0].lines_for(80).len()
         );
     }
 
@@ -2000,7 +2002,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         // header line + 1 content line
-        assert_eq!(cards[0].lines.len(), 2);
+        assert_eq!(cards[0].lines_for(80).len(), 2);
     }
 
     // ── Card::height(width) wrapping tests ────────────────────────────────────
@@ -2009,7 +2011,7 @@ mod tests {
     /// regardless of how wide the area is.
     #[test]
     fn card_height_short_line_fits_in_one_row() {
-        let card = Card::new(CardKind::User, vec![Line::from("hello")]);
+        let card = Card::new(CardKind::User, vec![CardBlock::Text(Line::from("hello"))]);
         // top_pad=1, 1 line fits, bottom_pad=1 → 3
         assert_eq!(card.height(80), 3);
     }
@@ -2019,7 +2021,7 @@ mod tests {
     #[test]
     fn card_height_line_exactly_fills_width_no_wrap() {
         // inner_w = 10 - 4 = 6; line is exactly 6 chars
-        let card = Card::new(CardKind::User, vec![Line::from("abcdef")]);
+        let card = Card::new(CardKind::User, vec![CardBlock::Text(Line::from("abcdef"))]);
         assert_eq!(card.height(10), 3); // top=1, rows=1, bottom=1
     }
 
@@ -2027,7 +2029,7 @@ mod tests {
     #[test]
     fn card_height_line_one_over_wraps_to_two_rows() {
         // inner_w = 10 - 4 = 6; line is 7 chars → wraps to 2 rows
-        let card = Card::new(CardKind::User, vec![Line::from("abcdefg")]);
+        let card = Card::new(CardKind::User, vec![CardBlock::Text(Line::from("abcdefg"))]);
         // top=1, rows=2, bottom=1 → 4
         assert_eq!(card.height(10), 4);
     }
@@ -2036,7 +2038,10 @@ mod tests {
     #[test]
     fn card_height_long_line_wraps_proportionally() {
         // inner_w = 20 - 4 = 16; line is 32 chars → 2 rows
-        let card = Card::new(CardKind::User, vec![Line::from("a".repeat(32))]);
+        let card = Card::new(
+            CardKind::User,
+            vec![CardBlock::Text(Line::from("a".repeat(32)))],
+        );
         assert_eq!(card.height(20), 4); // top=1, rows=2, bottom=1
     }
 
@@ -2046,9 +2051,9 @@ mod tests {
         let card = Card::new(
             CardKind::Assistant,
             vec![
-                Line::from("line one"),
-                Line::from("line two"),
-                Line::from("line three"),
+                CardBlock::Text(Line::from("line one")),
+                CardBlock::Text(Line::from("line two")),
+                CardBlock::Text(Line::from("line three")),
             ],
         );
         // All fit in 80 cols → 3 rows; top=1, bottom=1 → 5
@@ -2058,7 +2063,10 @@ mod tests {
     /// Tool compact card has no padding, so height = just the content rows.
     #[test]
     fn card_height_compact_tool_no_padding() {
-        let card = Card::new(CardKind::Tool { compact: true }, vec![Line::from("short")]);
+        let card = Card::new(
+            CardKind::Tool { compact: true },
+            vec![CardBlock::Text(Line::from("short"))],
+        );
         // top=0, rows=1, bottom=0 → 1
         assert_eq!(card.height(80), 1);
     }
@@ -2066,7 +2074,10 @@ mod tests {
     /// Tool non-compact card has top padding only.
     #[test]
     fn card_height_non_compact_tool_top_pad_only() {
-        let card = Card::new(CardKind::Tool { compact: false }, vec![Line::from("short")]);
+        let card = Card::new(
+            CardKind::Tool { compact: false },
+            vec![CardBlock::Text(Line::from("short"))],
+        );
         // top=1, rows=1, bottom=0 → 2
         assert_eq!(card.height(80), 2);
     }
@@ -2075,7 +2086,10 @@ mod tests {
     #[test]
     fn card_height_very_narrow_wraps_many_rows() {
         // inner_w = 6 - 4 = 2; line is 10 chars → ceil(10/2)=5 rows
-        let card = Card::new(CardKind::User, vec![Line::from("0123456789")]);
+        let card = Card::new(
+            CardKind::User,
+            vec![CardBlock::Text(Line::from("0123456789"))],
+        );
         // top=1, rows=5, bottom=1 → 7
         assert_eq!(card.height(6), 7);
     }
@@ -2083,7 +2097,10 @@ mod tests {
     /// Width=4 means inner_w=0: degenerate case, line counts as 1 row.
     #[test]
     fn card_height_zero_inner_width_counts_as_one_row() {
-        let card = Card::new(CardKind::User, vec![Line::from("some text")]);
+        let card = Card::new(
+            CardKind::User,
+            vec![CardBlock::Text(Line::from("some text"))],
+        );
         // inner_w = 4 - 4 = 0 → treat as 1 row
         assert_eq!(card.height(4), 3); // top=1, rows=1, bottom=1
     }
@@ -2539,7 +2556,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         // First line should be the ● bullet
-        let first_line = &cards[0].lines[0];
+        let first_line = &cards[0].lines_for(80)[0];
         let text: String = first_line
             .spans
             .iter()
@@ -2559,7 +2576,7 @@ mod tests {
 
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
-        let first_line = &cards[0].lines[0];
+        let first_line = &cards[0].lines_for(80)[0];
         let text: String = first_line
             .spans
             .iter()
@@ -2583,7 +2600,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         // No line should contain the ● bullet
-        for line in &cards[0].lines {
+        for line in cards[0].lines_for(80).iter() {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(
                 !text.contains('\u{25CF}'),

@@ -1,3 +1,5 @@
+use std::cell::{Cell, Ref, RefCell};
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -96,13 +98,15 @@ pub(crate) enum CardKind {
 
 pub(crate) struct Card {
     pub(crate) kind: CardKind,
-    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) blocks: Vec<crate::markdown::CardBlock>,
     top_pad: u16,
     bottom_pad: u16,
+    cached_width: Cell<Option<u16>>,
+    cached_lines: RefCell<Vec<Line<'static>>>,
 }
 
 impl Card {
-    pub(crate) fn new(kind: CardKind, lines: Vec<Line<'static>>) -> Self {
+    pub(crate) fn new(kind: CardKind, blocks: Vec<crate::markdown::CardBlock>) -> Self {
         let (top_pad, bottom_pad): (u16, u16) = match kind {
             CardKind::Tool { compact: true } => (0, 0),
             CardKind::Tool { compact: false } => (1, 0),
@@ -110,26 +114,47 @@ impl Card {
         };
         Self {
             kind,
-            lines,
+            blocks,
             top_pad,
             bottom_pad,
+            cached_width: Cell::new(None),
+            cached_lines: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Rebuild cached lines if the width has changed, then return a borrow.
+    pub(crate) fn lines_for(&self, inner_w: u16) -> Ref<'_, Vec<Line<'static>>> {
+        if self.cached_width.get() != Some(inner_w) {
+            let mut lines = Vec::new();
+            for block in &self.blocks {
+                match block {
+                    crate::markdown::CardBlock::Text(line) => lines.push(line.clone()),
+                    crate::markdown::CardBlock::Table(table) => {
+                        lines.extend(table.layout(inner_w as usize));
+                    }
+                }
+            }
+            *self.cached_lines.borrow_mut() = lines;
+            self.cached_width.set(Some(inner_w));
+        }
+        self.cached_lines.borrow()
     }
 
     /// Compute the visual height of this card given the full card render width.
     /// Each logical line is wrapped at `(width - 4)` columns (the 2+2 horizontal
     /// padding used by `render()`), and the result is rounded up.
     pub(crate) fn height(&self, width: u16) -> u16 {
-        let inner_w = width.saturating_sub(4) as usize;
-        let line_rows: u16 = self
-            .lines
+        let inner_w = width.saturating_sub(4);
+        let lines = self.lines_for(inner_w);
+        let line_rows: u16 = lines
             .iter()
             .map(|l| {
                 let w = l.width();
-                if inner_w == 0 || w == 0 {
+                let iw = inner_w as usize;
+                if iw == 0 || w == 0 {
                     1
                 } else {
-                    w.div_ceil(inner_w) as u16
+                    w.div_ceil(iw) as u16
                 }
             })
             .sum::<u16>()
@@ -183,8 +208,9 @@ impl Card {
             height: content_h,
         };
 
-        let styled_lines: Vec<Line<'static>> = self
-            .lines
+        let inner_w = area.width.saturating_sub(4);
+        let lines = self.lines_for(inner_w);
+        let styled_lines: Vec<Line<'static>> = lines
             .iter()
             .map(|l| {
                 Line::from(
@@ -252,6 +278,10 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
     let flush_tools = |tools: &mut Vec<Line<'static>>, cards: &mut Vec<Card>| {
         if !tools.is_empty() {
             let lines = std::mem::take(tools);
+            let blocks = lines
+                .into_iter()
+                .map(crate::markdown::CardBlock::Text)
+                .collect();
             let prev_is_assistant = matches!(
                 cards.last().map(|c| &c.kind),
                 Some(CardKind::Assistant | CardKind::Streaming)
@@ -260,7 +290,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 CardKind::Tool {
                     compact: prev_is_assistant,
                 },
-                lines,
+                blocks,
             ));
         }
     };
@@ -271,31 +301,30 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         match entry {
             ChatEntry::User { text, .. } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                let lines = markdown::render(text, Theme::user_text(), &app.hl);
-                app.card_cache.cards.push(Card::new(CardKind::User, lines));
+                let blocks = markdown::render(text, Theme::user_text(), &app.hl);
+                app.card_cache.cards.push(Card::new(CardKind::User, blocks));
             }
             ChatEntry::Assistant {
                 content, thinking, ..
             } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                let mut lines = Vec::new();
+                let mut blocks = Vec::new();
                 if app.show_thinking
                     && let Some(thinking_text) = thinking
                 {
                     let mut rendered =
                         markdown::render(thinking_text, Theme::thinking_text(), &app.hl);
-                    if let Some(first) = rendered.first_mut() {
-                        first
-                            .spans
-                            .insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
-                    }
-                    lines.extend(rendered);
-                    lines.push(Line::default());
+                    markdown::prepend_span_to_first_text(
+                        &mut rendered,
+                        Span::styled("\u{25CF} ", Theme::thinking()),
+                    );
+                    blocks.extend(rendered);
+                    blocks.push(crate::markdown::CardBlock::Text(Line::default()));
                 }
-                lines.extend(markdown::render(content, Theme::assistant_text(), &app.hl));
+                blocks.extend(markdown::render(content, Theme::assistant_text(), &app.hl));
                 app.card_cache
                     .cards
-                    .push(Card::new(CardKind::Assistant, lines));
+                    .push(Card::new(CardKind::Assistant, blocks));
             }
             ChatEntry::ToolCall {
                 name,
@@ -410,14 +439,17 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 app.card_cache.cards.push(Card::new(
                     CardKind::Compaction,
                     vec![
-                        Line::from(vec![
+                        crate::markdown::CardBlock::Text(Line::from(vec![
                             Span::styled("[compact] ", Theme::status_accent()),
                             Span::styled(
                                 "Summarizing conversation history",
                                 Theme::status_accent(),
                             ),
-                        ]),
-                        Line::from(Span::styled(format!("  {token_str}"), Theme::status())),
+                        ])),
+                        crate::markdown::CardBlock::Text(Line::from(Span::styled(
+                            format!("  {token_str}"),
+                            Theme::status(),
+                        ))),
                     ],
                 ));
             }
@@ -427,38 +459,40 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 summary_len,
             } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                let mut lines = vec![Line::from(vec![
+                let mut blocks = vec![crate::markdown::CardBlock::Text(Line::from(vec![
                     Span::styled("[compact] ", Theme::status_accent()),
                     Span::styled("Conversation summarized", Theme::status_accent()),
-                ])];
+                ]))];
                 if let Some(token_estimate) = token_estimate {
-                    lines.push(Line::from(Span::styled(
+                    blocks.push(crate::markdown::CardBlock::Text(Line::from(Span::styled(
                         format!("  ~{} tokens -> {} chars", token_estimate, summary_len),
                         Theme::status(),
-                    )));
+                    ))));
                 } else {
-                    lines.push(Line::from(Span::styled(
+                    blocks.push(crate::markdown::CardBlock::Text(Line::from(Span::styled(
                         format!("  {} chars", summary_len),
                         Theme::status(),
-                    )));
+                    ))));
                 }
-                lines.push(Line::default());
-                lines.extend(markdown::render(summary, Theme::assistant_text(), &app.hl));
+                blocks.push(crate::markdown::CardBlock::Text(Line::default()));
+                blocks.extend(markdown::render(summary, Theme::assistant_text(), &app.hl));
                 app.card_cache
                     .cards
-                    .push(Card::new(CardKind::Compaction, lines));
+                    .push(Card::new(CardKind::Compaction, blocks));
             }
             ChatEntry::Info(text) => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                app.card_cache
-                    .cards
-                    .push(Card::new(CardKind::Info, vec![Line::from(text.clone())]));
+                app.card_cache.cards.push(Card::new(
+                    CardKind::Info,
+                    vec![crate::markdown::CardBlock::Text(Line::from(text.clone()))],
+                ));
             }
             ChatEntry::Error(text) => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                app.card_cache
-                    .cards
-                    .push(Card::new(CardKind::Error, vec![Line::from(text.clone())]));
+                app.card_cache.cards.push(Card::new(
+                    CardKind::Error,
+                    vec![crate::markdown::CardBlock::Text(Line::from(text.clone()))],
+                ));
             }
             ChatEntry::Elicitation {
                 message,
@@ -467,36 +501,36 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 ..
             } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-                let header = Line::from(vec![
+                let header = crate::markdown::CardBlock::Text(Line::from(vec![
                     Span::styled("[?] ", Theme::status_accent()),
                     Span::styled(message.clone(), Theme::status_accent()),
-                ]);
-                let mut card_lines = vec![header];
+                ]));
+                let mut card_blocks = vec![header];
                 match outcome.as_deref() {
                     None => {
-                        card_lines.push(Line::from(Span::styled(
-                            "  waiting for response\u{2026}",
-                            Theme::thinking(),
+                        card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
+                            Span::styled("  waiting for response\u{2026}", Theme::thinking()),
                         )));
                     }
                     Some("declined") | Some("cancelled") => {
-                        card_lines.push(Line::from(Span::styled(
-                            format!("  {}", outcome.as_deref().unwrap()),
-                            Theme::status(),
+                        card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
+                            Span::styled(
+                                format!("  {}", outcome.as_deref().unwrap()),
+                                Theme::status(),
+                            ),
                         )));
                     }
                     Some(text) => {
                         for part in text.lines() {
-                            card_lines.push(Line::from(Span::styled(
-                                format!("  {part}"),
-                                Theme::info_text(),
+                            card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
+                                Span::styled(format!("  {part}"), Theme::info_text()),
                             )));
                         }
                     }
                 }
                 app.card_cache
                     .cards
-                    .push(Card::new(CardKind::Elicitation, card_lines));
+                    .push(Card::new(CardKind::Elicitation, card_blocks));
             }
         }
     }
@@ -1138,11 +1172,11 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
     let has_content = !app.streaming_content.is_empty();
 
     if has_thinking || has_content {
-        let mut lines = Vec::new();
+        let mut blocks = Vec::new();
 
         if has_thinking {
             let thinking_len = app.streaming_thinking.len();
-            let mut thinking_lines =
+            let mut thinking_blocks =
                 if let Some(cached) = app.streaming_thinking_cache.get(thinking_len) {
                     cached.to_vec()
                 } else {
@@ -1152,20 +1186,19 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
                         .store(thinking_len, rendered.clone());
                     rendered
                 };
-            if let Some(first) = thinking_lines.first_mut() {
-                first
-                    .spans
-                    .insert(0, Span::styled("\u{25CF} ", Theme::thinking()));
-            }
-            lines.extend(thinking_lines);
+            markdown::prepend_span_to_first_text(
+                &mut thinking_blocks,
+                Span::styled("\u{25CF} ", Theme::thinking()),
+            );
+            blocks.extend(thinking_blocks);
             if has_content {
-                lines.push(Line::default());
+                blocks.push(crate::markdown::CardBlock::Text(Line::default()));
             }
         }
 
         if has_content {
             let content_len = app.streaming_content.len();
-            let content_lines = if let Some(cached) = app.streaming_cache.get(content_len) {
+            let content_blocks = if let Some(cached) = app.streaming_cache.get(content_len) {
                 cached.to_vec()
             } else {
                 let rendered =
@@ -1173,15 +1206,21 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
                 app.streaming_cache.store(content_len, rendered.clone());
                 rendered
             };
-            lines.extend(content_lines);
+            blocks.extend(content_blocks);
         }
 
-        lines.push(Line::from(Span::styled(activity_text, Theme::thinking())));
-        Some(Card::new(CardKind::Streaming, lines))
+        blocks.push(crate::markdown::CardBlock::Text(Line::from(Span::styled(
+            activity_text,
+            Theme::thinking(),
+        ))));
+        Some(Card::new(CardKind::Streaming, blocks))
     } else if app.is_turn_active() {
         Some(Card::new(
             CardKind::Thinking,
-            vec![Line::from(Span::styled(activity_text, Theme::thinking()))],
+            vec![crate::markdown::CardBlock::Text(Line::from(Span::styled(
+                activity_text,
+                Theme::thinking(),
+            )))],
         ))
     } else {
         None

@@ -1953,7 +1953,7 @@ mod model_popup_tests {
     use crate::app::{App, Popup};
     use crate::config::TestPersistenceGuard;
     use crate::protocol::ModelEntry;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())

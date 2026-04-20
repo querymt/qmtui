@@ -279,10 +279,18 @@ mod tests {
         app.card_cache.processed_messages = 1;
 
         // Populate streaming caches
-        app.streaming_cache
-            .store(5, vec![ratatui::text::Line::from("stream")]);
-        app.streaming_thinking_cache
-            .store(3, vec![ratatui::text::Line::from("think")]);
+        app.streaming_cache.store(
+            5,
+            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
+                "stream",
+            ))],
+        );
+        app.streaming_thinking_cache.store(
+            3,
+            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
+                "think",
+            ))],
+        );
 
         // Populate a ToolCall with cached_lines baked under theme 0
         let old_lines = build_diff_lines("aaa", "bbb", None);

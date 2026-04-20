@@ -8,13 +8,28 @@ use crate::highlight::Highlighter;
 use crate::theme::Theme;
 use crate::ui::{MD_BULLET, MD_HRULE_CHAR};
 
-/// Render a markdown string into styled ratatui Lines.
+/// A block inside a card — either plain text or a deferred table.
+#[derive(Clone)]
+pub enum CardBlock {
+    Text(Line<'static>),
+    Table(TableBlock),
+}
+
+/// Deferred table that can be re-laid-out at draw time.
+#[derive(Clone)]
+pub struct TableBlock {
+    pub alignments: Vec<Alignment>,
+    pub rows: Vec<Vec<Vec<Span<'static>>>>, // row → cell → spans
+    pub base_style: Style,
+}
+
+/// Render a markdown string into styled card blocks.
 /// `base_style` is applied to plain text (allows caller to set the card bg).
-pub fn render(md: &str, base_style: Style, hl: &Highlighter) -> Vec<Line<'static>> {
+pub fn render(md: &str, base_style: Style, hl: &Highlighter) -> Vec<CardBlock> {
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(md, opts);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut blocks: Vec<CardBlock> = Vec::new();
     let mut ctx = RenderCtx {
         base_style,
         hl,
@@ -37,30 +52,33 @@ pub fn render(md: &str, base_style: Style, hl: &Highlighter) -> Vec<Line<'static
 
     for event in parser {
         match event {
-            Event::Start(tag) => ctx.open_tag(&tag, &mut lines),
-            Event::End(tag) => ctx.close_tag(&tag, &mut lines),
+            Event::Start(tag) => ctx.open_tag(&tag, &mut blocks),
+            Event::End(tag) => ctx.close_tag(&tag, &mut blocks),
             Event::Text(text) => ctx.push_text(&text),
             Event::Code(code) => ctx.push_inline_code(&code),
             Event::SoftBreak => ctx.push_text(" "),
-            Event::HardBreak => ctx.flush_line(&mut lines),
+            Event::HardBreak => ctx.flush_line(&mut blocks),
             Event::Rule => {
-                ctx.flush_line(&mut lines);
-                lines.push(Line::from(Span::styled(
+                ctx.flush_line(&mut blocks);
+                blocks.push(CardBlock::Text(Line::from(Span::styled(
                     MD_HRULE_CHAR.repeat(40),
                     Theme::md_hr(),
-                )));
+                ))));
             }
             _ => {}
         }
     }
 
     // flush any remaining spans
-    ctx.flush_line(&mut lines);
+    ctx.flush_line(&mut blocks);
     // strip trailing blank lines — card padding handles vertical spacing
-    while lines.last().is_some_and(|l| l.spans.is_empty()) {
-        lines.pop();
+    while blocks
+        .last()
+        .is_some_and(|b| matches!(b, CardBlock::Text(l) if l.spans.is_empty()))
+    {
+        blocks.pop();
     }
-    lines
+    blocks
 }
 
 struct RenderCtx<'a> {
@@ -108,7 +126,7 @@ impl RenderCtx<'_> {
         }
     }
 
-    fn open_tag(&mut self, tag: &Tag, lines: &mut Vec<Line<'static>>) {
+    fn open_tag(&mut self, tag: &Tag, blocks: &mut Vec<CardBlock>) {
         match tag {
             Tag::Heading { level, .. } => {
                 self.in_heading = true;
@@ -144,7 +162,7 @@ impl RenderCtx<'_> {
             Tag::List(start) => {
                 // Flush any pending spans from the parent item so a nested
                 // list starts on its own line rather than being concatenated.
-                self.flush_line(lines);
+                self.flush_line(blocks);
                 self.list_depth += 1;
                 self.list_indices.push(*start);
             }
@@ -171,7 +189,7 @@ impl RenderCtx<'_> {
         }
     }
 
-    fn close_tag(&mut self, tag: &TagEnd, lines: &mut Vec<Line<'static>>) {
+    fn close_tag(&mut self, tag: &TagEnd, blocks: &mut Vec<CardBlock>) {
         match tag {
             TagEnd::Heading(_) => {
                 // prepend heading marker
@@ -185,7 +203,7 @@ impl RenderCtx<'_> {
                     .insert(0, Span::styled(marker.to_string(), Theme::md_heading()));
                 self.in_heading = false;
                 self.heading_level = 0;
-                self.flush_line(lines);
+                self.flush_line(blocks);
                 self.pop_style();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
@@ -202,16 +220,19 @@ impl RenderCtx<'_> {
                 self.in_code_block = false;
                 // lang label
                 if let Some(lang) = &self.code_lang {
-                    lines.push(Line::from(Span::styled(
+                    blocks.push(CardBlock::Text(Line::from(Span::styled(
                         format!("  {lang}"),
                         Theme::md_code_lang(),
-                    )));
+                    ))));
                 }
                 // syntax-highlighted code
                 let code = self.code_block_lines.join("\n");
                 let highlighted = self.hl.highlight_block(&code, self.code_lang.as_deref());
-                lines.extend(highlighted);
-                lines.push(Line::from(Span::styled(" ", Theme::md_code_block())));
+                blocks.extend(highlighted.into_iter().map(CardBlock::Text));
+                blocks.push(CardBlock::Text(Line::from(Span::styled(
+                    " ",
+                    Theme::md_code_block(),
+                ))));
                 self.code_block_lines.clear();
                 self.code_lang = None;
             }
@@ -220,18 +241,18 @@ impl RenderCtx<'_> {
                 self.list_indices.pop();
                 // add spacing after top-level lists (like paragraphs do)
                 if self.list_depth == 0 {
-                    lines.push(Line::default());
+                    blocks.push(CardBlock::Text(Line::default()));
                 }
             }
             TagEnd::Item => {
-                self.flush_line(lines);
+                self.flush_line(blocks);
             }
             TagEnd::Paragraph => {
-                self.flush_line(lines);
-                lines.push(Line::default());
+                self.flush_line(blocks);
+                blocks.push(CardBlock::Text(Line::default()));
             }
             TagEnd::Table => {
-                self.flush_table(lines);
+                self.flush_table(blocks);
                 self.in_table = false;
                 self.in_table_head = false;
                 self.table_alignments.clear();
@@ -317,41 +338,105 @@ impl RenderCtx<'_> {
             .push(Span::styled(code.to_string(), Theme::md_code_inline()));
     }
 
-    /// Render the collected table rows into styled Lines with box-drawing borders.
-    fn flush_table(&mut self, lines: &mut Vec<Line<'static>>) {
-        use unicode_width::UnicodeWidthStr;
-
+    /// Push the collected table rows as a deferred TableBlock.
+    fn flush_table(&mut self, blocks: &mut Vec<CardBlock>) {
         let num_cols = self.table_alignments.len();
         if num_cols == 0 || self.table_rows.is_empty() {
             return;
         }
+        let rows = std::mem::take(&mut self.table_rows);
+        blocks.push(CardBlock::Table(TableBlock {
+            alignments: self.table_alignments.clone(),
+            rows,
+            base_style: self.base_style,
+        }));
+    }
 
-        // Measure each cell's display width and compute max per column.
-        // Each cell is Vec<Span>; width = sum of span content widths.
+    fn flush_line(&mut self, blocks: &mut Vec<CardBlock>) {
+        if !self.current_spans.is_empty() {
+            let spans = std::mem::take(&mut self.current_spans);
+            blocks.push(CardBlock::Text(Line::from(spans)));
+        }
+    }
+}
+
+// ── Table layout engine ─────────────────────────────────────────────────────
+
+impl TableBlock {
+    /// Re-layout this table to fit inside `inner_w` columns.
+    pub fn layout(&self, inner_w: usize) -> Vec<Line<'static>> {
+        use unicode_width::UnicodeWidthStr;
+
+        let num_cols = self.alignments.len();
+        if num_cols == 0 || self.rows.is_empty() {
+            return Vec::new();
+        }
+
+        const MIN_COL: usize = 3;
+
         let cell_width = |cell: &[Span<'_>]| -> usize {
             cell.iter()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
                 .sum()
         };
 
-        let mut col_widths = vec![0usize; num_cols];
-        for row in &self.table_rows {
-            for (c, cell) in row.iter().enumerate() {
-                if c < num_cols {
-                    col_widths[c] = col_widths[c].max(cell_width(cell));
-                }
+        let mut natural_widths = vec![0usize; num_cols];
+        for row in &self.rows {
+            for (c, cell) in row.iter().enumerate().take(num_cols) {
+                natural_widths[c] = natural_widths[c].max(cell_width(cell));
             }
         }
-        // Minimum column width of 1 char + 2 padding spaces (1 each side)
-        for w in &mut col_widths {
+        for w in &mut natural_widths {
             *w = (*w).max(1);
         }
 
+        let chrome = num_cols * 3 + 1;
+        let natural_total: usize = natural_widths.iter().sum();
+
+        let col_widths = if natural_total + chrome <= inner_w {
+            natural_widths
+        } else {
+            let budget = inner_w.saturating_sub(chrome);
+            let min_needed = num_cols * MIN_COL;
+            if budget >= min_needed {
+                let total_natural = natural_total.max(1);
+                let mut widths: Vec<usize> = natural_widths
+                    .iter()
+                    .map(|&w| (w * budget / total_natural).max(MIN_COL))
+                    .collect();
+                let mut used: usize = widths.iter().sum();
+                while used < budget {
+                    let mut best = 0;
+                    let mut best_deficit = 0i64;
+                    for (i, &w) in natural_widths.iter().enumerate() {
+                        let target = w * budget / total_natural;
+                        let deficit = target as i64 - widths[i] as i64;
+                        if deficit > best_deficit {
+                            best_deficit = deficit;
+                            best = i;
+                        }
+                    }
+                    if best_deficit <= 0 {
+                        let i = widths
+                            .iter()
+                            .enumerate()
+                            .find(|(_, w)| **w < budget)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        widths[i] += 1;
+                    } else {
+                        widths[best] += 1;
+                    }
+                    used += 1;
+                }
+                widths
+            } else {
+                vec![MIN_COL; num_cols]
+            }
+        };
+
         let border_style = Theme::md_table_border();
 
-        // ── Helper closures ───────────────────────────────────────────
-
-        // Build a horizontal border line: e.g. ┌───┬───┐
         let h_border = |left: char, mid: char, right: char| -> Line<'static> {
             let mut s = String::new();
             for (i, &w) in col_widths.iter().enumerate() {
@@ -360,7 +445,6 @@ impl RenderCtx<'_> {
                 } else {
                     s.push(mid);
                 }
-                // w + 2 for 1-char padding each side
                 for _ in 0..w + 2 {
                     s.push('─');
                 }
@@ -369,7 +453,6 @@ impl RenderCtx<'_> {
             Line::from(Span::styled(s, border_style))
         };
 
-        // Pad text to `width` according to alignment, returning (left_pad, right_pad).
         let padding = |text_w: usize, col_w: usize, align: Alignment| -> (usize, usize) {
             let gap = col_w.saturating_sub(text_w);
             match align {
@@ -378,95 +461,236 @@ impl RenderCtx<'_> {
                     let left = gap / 2;
                     (left, gap - left)
                 }
-                // Left or None
                 _ => (0, gap),
             }
         };
 
-        // Build a data row Line from cell spans.
-        let build_row = |row: &[Vec<Span<'static>>], is_header: bool| -> Line<'static> {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (c, &col_w) in col_widths.iter().enumerate().take(num_cols) {
-                // left border
-                spans.push(Span::styled("│ ".to_string(), border_style));
-
-                let cell = row.get(c);
-                let w = cell.map(|cl| cell_width(cl)).unwrap_or(0);
-                let align = self
-                    .table_alignments
-                    .get(c)
-                    .copied()
-                    .unwrap_or(Alignment::None);
-                let (lpad, rpad) = padding(w, col_w, align);
-
-                // left padding
-                if lpad > 0 {
-                    spans.push(Span::styled(
-                        " ".repeat(lpad),
-                        if is_header {
-                            Theme::md_table_header()
-                        } else {
-                            self.base_style
-                        },
-                    ));
-                }
-
-                // cell content
-                if let Some(cell_spans) = cell {
-                    spans.extend(cell_spans.iter().cloned());
-                }
-
-                // right padding
-                if rpad > 0 {
-                    spans.push(Span::styled(
-                        " ".repeat(rpad),
-                        if is_header {
-                            Theme::md_table_header()
-                        } else {
-                            self.base_style
-                        },
-                    ));
-                }
-
-                // space before next border
-                spans.push(Span::styled(" ".to_string(), border_style));
-            }
-            // right border
-            spans.push(Span::styled("│".to_string(), border_style));
-            Line::from(spans)
-        };
-
-        // ── Emit lines ───────────────────────────────────────────────
+        let mut result = Vec::new();
 
         // Top border
-        lines.push(h_border('┌', '┬', '┐'));
+        result.push(h_border('┌', '┬', '┐'));
 
-        // Header row (first row)
-        if let Some(header) = self.table_rows.first() {
-            lines.push(build_row(header, true));
-        }
+        for (row_idx, row) in self.rows.iter().enumerate() {
+            let is_header = row_idx == 0;
+            let style = if is_header {
+                Theme::md_table_header()
+            } else {
+                self.base_style
+            };
 
-        // Header separator
-        lines.push(h_border('├', '┼', '┤'));
+            // Wrap each cell to its column budget
+            let mut cell_lines: Vec<Vec<Vec<Span<'static>>>> = Vec::new();
+            let mut max_lines = 1;
+            for (c, &col_w) in col_widths.iter().enumerate().take(num_cols) {
+                let cell = row.get(c).map(|v| v.as_slice()).unwrap_or(&[]);
+                let wrapped = if cell.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    wrap_spans(cell, col_w)
+                };
+                max_lines = max_lines.max(wrapped.len());
+                cell_lines.push(wrapped);
+            }
 
-        // Body rows
-        for row in self.table_rows.iter().skip(1) {
-            lines.push(build_row(row, false));
+            // Emit each sub-line of this logical row
+            for line_idx in 0..max_lines {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for (c, &col_w) in col_widths.iter().enumerate().take(num_cols) {
+                    spans.push(Span::styled("│ ".to_string(), border_style));
+
+                    let cell_spans = cell_lines[c].get(line_idx);
+                    let text_w = cell_spans
+                        .map(|s| {
+                            s.iter()
+                                .map(|sp| UnicodeWidthStr::width(sp.content.as_ref()))
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0);
+                    let align = self.alignments.get(c).copied().unwrap_or(Alignment::None);
+                    let (lpad, rpad) = padding(text_w, col_w, align);
+
+                    if lpad > 0 {
+                        spans.push(Span::styled(" ".repeat(lpad), style));
+                    }
+                    if let Some(cell) = cell_spans {
+                        spans.extend(cell.iter().cloned());
+                    }
+                    if rpad > 0 {
+                        spans.push(Span::styled(" ".repeat(rpad), style));
+                    }
+                    spans.push(Span::styled(" ".to_string(), border_style));
+                }
+                spans.push(Span::styled("│".to_string(), border_style));
+                result.push(Line::from(spans));
+            }
+
+            // Separator after header
+            if is_header {
+                result.push(h_border('├', '┼', '┤'));
+            }
         }
 
         // Bottom border
-        lines.push(h_border('└', '┴', '┘'));
+        result.push(h_border('└', '┴', '┘'));
 
         // Trailing blank line for spacing (like paragraphs)
-        lines.push(Line::default());
-    }
+        result.push(Line::default());
 
-    fn flush_line(&mut self, lines: &mut Vec<Line<'static>>) {
-        if !self.current_spans.is_empty() {
-            let spans = std::mem::take(&mut self.current_spans);
-            lines.push(Line::from(spans));
+        result
+    }
+}
+
+/// Word-wrap a sequence of spans into sub-lines of at most `width` display columns.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    use unicode_width::UnicodeWidthStr;
+
+    let width = width.max(1);
+
+    // Flatten to chars with their original styles.
+    let mut chars = Vec::new();
+    for span in spans {
+        let s = span.style;
+        for c in span.content.chars() {
+            chars.push((c, s));
         }
     }
+
+    if chars.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    // Collect words (non-whitespace sequences).  Inter-word whitespace is
+    // ignored; a single synthetic space is inserted when joining words.
+    let mut words: Vec<&[(char, Style)]> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].0.is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].0.is_ascii_whitespace() {
+            i += 1;
+        }
+        if start < i {
+            words.push(&chars[start..i]);
+        }
+    }
+
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut cur_w: usize = 0;
+
+    for word in words {
+        let w = word
+            .iter()
+            .map(|(c, _)| UnicodeWidthStr::width(c.encode_utf8(&mut [0; 4])))
+            .sum::<usize>();
+        if cur.is_empty() {
+            if w <= width {
+                cur.extend_from_slice(word);
+                cur_w = w;
+            } else {
+                // Hard-break the word into chunks.
+                let mut idx = 0;
+                while idx < word.len() {
+                    let mut chunk = Vec::new();
+                    let mut chunk_w = 0;
+                    while idx < word.len() {
+                        let cw = UnicodeWidthStr::width(word[idx].0.encode_utf8(&mut [0; 4]));
+                        if chunk_w + cw > width {
+                            break;
+                        }
+                        chunk_w += cw;
+                        chunk.push(word[idx]);
+                        idx += 1;
+                    }
+                    if chunk.is_empty() {
+                        // Single char wider than width — take it anyway.
+                        chunk.push(word[idx]);
+                        idx += 1;
+                    }
+                    lines.push(chunk);
+                }
+            }
+        } else if cur_w + 1 + w <= width {
+            let space_style = cur.last().map(|(_, s)| *s).unwrap_or_default();
+            cur.push((' ', space_style));
+            cur.extend_from_slice(word);
+            cur_w += 1 + w;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            if w <= width {
+                cur.extend_from_slice(word);
+                cur_w = w;
+            } else {
+                let mut idx = 0;
+                while idx < word.len() {
+                    let mut chunk = Vec::new();
+                    let mut chunk_w = 0;
+                    while idx < word.len() {
+                        let cw = UnicodeWidthStr::width(word[idx].0.encode_utf8(&mut [0; 4]));
+                        if chunk_w + cw > width {
+                            break;
+                        }
+                        chunk_w += cw;
+                        chunk.push(word[idx]);
+                        idx += 1;
+                    }
+                    if chunk.is_empty() {
+                        chunk.push(word[idx]);
+                        idx += 1;
+                    }
+                    lines.push(chunk);
+                }
+            }
+        }
+    }
+
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+
+    // Merge consecutive chars of the same style into spans.
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = Vec::new();
+            let mut text = String::new();
+            let mut style = None;
+            for &(ch, s) in &line {
+                if style == Some(s) {
+                    text.push(ch);
+                } else {
+                    if let Some(prev) = style {
+                        spans.push(Span::styled(std::mem::take(&mut text), prev));
+                    }
+                    text.push(ch);
+                    style = Some(s);
+                }
+            }
+            if let Some(s) = style {
+                spans.push(Span::styled(text, s));
+            }
+            spans
+        })
+        .collect()
+}
+
+/// Insert `span` at the front of the first `CardBlock::Text` in `blocks`.
+/// If there is no text block, push a new one containing only `span`.
+pub fn prepend_span_to_first_text(blocks: &mut Vec<CardBlock>, span: Span<'static>) {
+    for block in blocks.iter_mut() {
+        if let CardBlock::Text(line) = block {
+            line.spans.insert(0, span);
+            return;
+        }
+    }
+    blocks.push(CardBlock::Text(Line::from(vec![span])));
 }
 
 #[cfg(test)]
@@ -493,7 +717,15 @@ mod tests {
         Theme::begin_frame();
         let hl = Highlighter::new();
         let base = Style::default();
-        render(md, base, &hl)
+        let blocks = render(md, base, &hl);
+        let mut lines = Vec::new();
+        for block in blocks {
+            match block {
+                CardBlock::Text(line) => lines.push(line),
+                CardBlock::Table(table) => lines.extend(table.layout(200)),
+            }
+        }
+        lines
     }
 
     // ── Basic table structure ──────────────────────────────────────────
@@ -871,5 +1103,104 @@ mod tests {
             bottom.len(),
             "Top and bottom borders should be same width"
         );
+    }
+
+    // ── Width-aware layout tests ───────────────────────────────────────
+
+    #[test]
+    fn table_wraps_when_narrower_than_natural() {
+        let md = "| Name | Description |\n|------|-------------|\n| Alice | A very long description that exceeds budget |\n";
+        let blocks = render(md, Style::default(), &Highlighter::new());
+        let table = match &blocks[0] {
+            CardBlock::Table(t) => t,
+            _ => panic!("Expected a table block"),
+        };
+
+        let inner_w = 30;
+        let lines = table.layout(inner_w);
+        for line in &lines {
+            let w = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum::<usize>();
+            assert!(
+                w <= inner_w,
+                "Line width {w} exceeds inner_w {inner_w}: {line:?}"
+            );
+        }
+        // Borders should be present
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains('┌')))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains('└')))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.content.contains('├')))
+        );
+    }
+
+    #[test]
+    fn table_natural_width_preserved_when_fits() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = render(md, Style::default(), &Highlighter::new());
+        let table = match &blocks[0] {
+            CardBlock::Table(t) => t,
+            _ => panic!("Expected a table block"),
+        };
+
+        let inner_w = 80;
+        let lines = table.layout(inner_w);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // At a wide width the header row should still be a single line
+        let header = text
+            .iter()
+            .find(|l| l.contains("A") && l.contains("B"))
+            .expect("header row");
+        assert!(
+            header.contains("│ A │ B │"),
+            "Expected natural-width header, got: {header}"
+        );
+    }
+
+    #[test]
+    fn table_relayout_on_width_change() {
+        let md = "| Name | Value |\n|------|-------|\n| LongWordHere | abcdef |\n";
+        let blocks = render(md, Style::default(), &Highlighter::new());
+        let table = match &blocks[0] {
+            CardBlock::Table(t) => t,
+            _ => panic!("Expected a table block"),
+        };
+
+        let wide = table.layout(80);
+        let narrow = table.layout(20);
+
+        assert_ne!(
+            wide.len(),
+            narrow.len(),
+            "Narrow layout should produce more lines due to wrapping"
+        );
+
+        for lines in [&wide, &narrow] {
+            for line in lines.iter() {
+                let w = line
+                    .spans
+                    .iter()
+                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum::<usize>();
+                let limit = if std::ptr::eq(lines, &wide) { 80 } else { 20 };
+                assert!(w <= limit, "Line width {w} exceeds limit {limit}: {line:?}");
+            }
+        }
     }
 }
