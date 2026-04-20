@@ -1,6 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
@@ -9,6 +10,7 @@ use crate::app::{ActivityState, App, ChatEntry, SessionOp, ToolDetail};
 use crate::markdown;
 use crate::theme::Theme;
 
+use super::start::short_cwd;
 use super::{INPUT_OVERLINE, OUTCOME_BULLET, build_input_visual_layout, draw_header};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
@@ -601,13 +603,18 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         Theme::reasoning_effort_level(),
     ));
 
-    let mut left_spans = vec![
-        Span::styled(format!(" {sid}"), Theme::status()),
-        Span::styled(
-            format!(" {} ", app.agent_mode),
-            Theme::mode_badge(&app.agent_mode),
-        ),
-    ];
+    let sid_span = Span::styled(format!(" {sid}"), Theme::status());
+    let mut left_spans = vec![sid_span];
+    if let Some(cwd) = app.current_session_cwd() {
+        left_spans.push(Span::styled(
+            format!(":{}", short_cwd(&cwd, 20)),
+            Style::default().fg(Theme::ok()).bg(Theme::bg_dim()),
+        ));
+    }
+    left_spans.push(Span::styled(
+        format!(" {} ", app.agent_mode),
+        Theme::mode_badge(&app.agent_mode),
+    ));
     if app.parent_session_id.is_some() {
         left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
     }

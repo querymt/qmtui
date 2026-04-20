@@ -222,6 +222,11 @@ impl App {
             .cloned()
     }
 
+    /// Semantic alias for the active session's effective cwd.
+    pub fn current_session_cwd(&self) -> Option<String> {
+        self.resolve_new_session_default_cwd()
+    }
+
     pub fn open_delegate_popup(&mut self) {
         self.popup = Popup::SessionSelect;
         self.session_popup_tab = 1;
