@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
 use crate::app::{self, ActivityState, App, Popup, Screen};
@@ -329,6 +329,22 @@ pub(crate) fn handle_key(
         Screen::Delegate => return handle_delegate_view_key(app, key, cmd_tx),
     }
     Ok(AppAction::None)
+}
+
+pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if matches!(app.screen, Screen::Chat | Screen::Delegate) && app.popup == Popup::None {
+                app.scroll_offset = app.scroll_offset.saturating_add(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if matches!(app.screen, Screen::Chat | Screen::Delegate) && app.popup == Popup::None {
+                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Persist current app state to `~/.qmt/tui.toml`.  Called at every
@@ -1937,7 +1953,7 @@ mod model_popup_tests {
     use crate::app::{App, Popup};
     use crate::config::TestPersistenceGuard;
     use crate::protocol::ModelEntry;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())

@@ -26,7 +26,7 @@ use std::{
 use app::{App, Screen};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, EventStream},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -1188,7 +1188,7 @@ fn system_editor_command() -> Option<EditorCommand> {
     editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
 }
 
-use handlers::{AppAction, handle_key, save_cache};
+use handlers::{AppAction, handle_key, handle_mouse, save_cache};
 
 fn temp_editor_file_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -1392,7 +1392,7 @@ async fn main() -> anyhow::Result<()> {
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1412,7 +1412,11 @@ async fn main() -> anyhow::Result<()> {
 
     // restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     if let Some(session_id) = &app.session_id {
@@ -1627,31 +1631,39 @@ async fn run_loop(
             }
             // terminal input — native async, no thread pool overhead
             Some(event_result) = term_events.next() => {
-                if let Ok(Event::Key(key)) = event_result
-                    && key.kind == crossterm::event::KeyEventKind::Press
-                {
-                    let action = handle_key(app, key, cmd_tx)?;
-                    if matches!(action, AppAction::OpenExternalEditor) {
-                        open_external_editor_with_terminal(terminal, app)?;
-                    }
-                    if app.should_quit {
-                        return Ok(());
-                    }
-                    // Drain any remaining buffered key events before redrawing,
-                    // so fast typing doesn't queue one redraw per keystroke.
-                    while let Ok(true) = event::poll(Duration::from_millis(0)) {
-                        if let Ok(Event::Key(key)) = event::read()
-                            && key.kind == crossterm::event::KeyEventKind::Press
-                        {
-                            let action = handle_key(app, key, cmd_tx)?;
-                            if matches!(action, AppAction::OpenExternalEditor) {
-                                open_external_editor_with_terminal(terminal, app)?;
-                            }
-                            if app.should_quit {
-                                return Ok(());
+                match event_result {
+                    Ok(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
+                        let action = handle_key(app, key, cmd_tx)?;
+                        if matches!(action, AppAction::OpenExternalEditor) {
+                            open_external_editor_with_terminal(terminal, app)?;
+                        }
+                        if app.should_quit {
+                            return Ok(());
+                        }
+                        // Drain any remaining buffered key events before redrawing,
+                        // so fast typing doesn't queue one redraw per keystroke.
+                        while let Ok(true) = event::poll(Duration::from_millis(0)) {
+                            match event::read() {
+                                Ok(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
+                                    let action = handle_key(app, key, cmd_tx)?;
+                                    if matches!(action, AppAction::OpenExternalEditor) {
+                                        open_external_editor_with_terminal(terminal, app)?;
+                                    }
+                                    if app.should_quit {
+                                        return Ok(());
+                                    }
+                                }
+                                Ok(Event::Mouse(mouse)) => {
+                                    handle_mouse(app, mouse);
+                                }
+                                _ => {}
                             }
                         }
                     }
+                    Ok(Event::Mouse(mouse)) => {
+                        handle_mouse(app, mouse);
+                    }
+                    _ => {}
                 }
             }
             // Spinner / animation refresh: when no events arrive, redraw
