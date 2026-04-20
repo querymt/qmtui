@@ -700,7 +700,9 @@ pub enum StartPageItem {
 /// Maximum number of recent sessions shown per group before a ShowMore row.
 pub const MAX_RECENT_SESSIONS: usize = 3;
 
-/// Maximum number of workspace groups shown on the start page before a ShowMore row.
+/// Maximum number of workspace groups shown on the start page.
+/// Groups beyond this cap are hidden from the start page but remain accessible
+/// through the session popup.
 pub const MAX_VISIBLE_GROUPS: usize = 3;
 
 /// In-memory per-mode cached state within a session.
@@ -6902,7 +6904,7 @@ mod start_page_tests {
     }
 
     #[test]
-    fn visible_items_four_groups_caps_at_three_plus_show_more() {
+    fn visible_items_four_groups_caps_at_three_no_trailing_show_more() {
         let mut app = App::new();
         app.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
@@ -6911,16 +6913,17 @@ mod start_page_tests {
             make_group(Some("/d"), &[("s4", None)]),
         ];
         let items = app.visible_start_items();
-        // 3 groups (3 headers + 3 sessions) + 1 trailing ShowMore = 7
-        assert_eq!(items.len(), 7);
-        assert!(matches!(
-            items.last(),
-            Some(StartPageItem::ShowMore { remaining: 1 })
-        ));
+        // 3 groups (3 headers + 3 sessions) = 6, no trailing ShowMore
+        assert_eq!(items.len(), 6);
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+        );
     }
 
     #[test]
-    fn visible_items_trailing_show_more_remaining_is_hidden_groups() {
+    fn visible_items_six_groups_caps_at_three_no_trailing_show_more() {
         let mut app = App::new();
         app.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
@@ -6931,11 +6934,13 @@ mod start_page_tests {
             make_group(Some("/f"), &[("s6", None)]),
         ];
         let items = app.visible_start_items();
-        // 3 shown groups + 1 trailing ShowMore(remaining=3)
-        assert!(matches!(
-            items.last(),
-            Some(StartPageItem::ShowMore { remaining: 3 })
-        ));
+        // 3 shown groups (3 headers + 3 sessions) = 6, no trailing ShowMore
+        assert_eq!(items.len(), 6);
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+        );
     }
 
     #[test]
@@ -6949,16 +6954,17 @@ mod start_page_tests {
         ];
         app.session_filter = "aaa".to_string();
         let items = app.visible_start_items();
-        // Filter active but group cap still applies → 3 groups + trailing ShowMore(1)
+        // Filter active but group cap still applies → 3 groups, no trailing ShowMore
         let headers = items
             .iter()
             .filter(|i| matches!(i, StartPageItem::GroupHeader { .. }))
             .count();
         assert_eq!(headers, 3);
-        assert!(matches!(
-            items.last(),
-            Some(StartPageItem::ShowMore { remaining: 1 })
-        ));
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+        );
     }
 }
 

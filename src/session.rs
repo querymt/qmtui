@@ -50,9 +50,6 @@ impl App {
         let q = self.session_filter.to_lowercase();
         let mut items = Vec::new();
 
-        // Cap the number of visible groups.
-        let hidden_groups = self.session_groups.len().saturating_sub(MAX_VISIBLE_GROUPS);
-
         let groups_iter = self
             .session_groups
             .iter()
@@ -93,13 +90,6 @@ impl App {
                     items.push(StartPageItem::ShowMore { remaining: hidden });
                 }
             }
-        }
-
-        // Trailing ShowMore for hidden groups.
-        if hidden_groups > 0 {
-            items.push(StartPageItem::ShowMore {
-                remaining: hidden_groups,
-            });
         }
 
         items

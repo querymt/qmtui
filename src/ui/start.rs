@@ -102,6 +102,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 ])
             }
 
+            // Per-group session overflow: show all N additional sessions in this group.
             crate::app::StartPageItem::ShowMore { remaining, .. } => {
                 let total = remaining + crate::app::MAX_RECENT_SESSIONS;
                 let label = format!("   \u{2026}  show all ({total} total)");
