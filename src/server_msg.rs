@@ -37,11 +37,10 @@ impl App {
             "reasoning_effort" => {
                 if let Some(data) = raw.data
                     && let Ok(re) = serde_json::from_value::<ReasoningEffortData>(data)
+                    && let Some(validated) =
+                        validate_reasoning_effort(re.reasoning_effort.as_deref())
                 {
-                    self.reasoning_effort = match re.reasoning_effort.as_deref() {
-                        None | Some("auto") => None,
-                        Some(s) => Some(s.to_string()),
-                    };
+                    self.reasoning_effort = validated;
                     // Server is authoritative — cache so this session + mode
                     // remembers the level across restarts.
                     self.cache_session_mode_state();

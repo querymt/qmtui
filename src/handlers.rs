@@ -225,14 +225,30 @@ pub(crate) fn handle_key(
 
     // direct: ctrl+t cycles thinking level
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-        let msg = app.cycle_reasoning_effort();
-        cmd_tx.send(msg)?;
-        app.set_status(
-            app::LogLevel::Info,
-            "model",
-            format!("thinking: {}", app.reasoning_effort_label()),
-        );
-        save_cache(app);
+        if !can_send_server_commands(app) {
+            return Ok(AppAction::None);
+        }
+        match app.cycle_reasoning_effort() {
+            Some(msg) => {
+                cmd_tx.send(msg)?;
+                app.set_status(
+                    app::LogLevel::Info,
+                    "model",
+                    format!("thinking: {}", app.reasoning_effort_label()),
+                );
+                save_cache(app);
+            }
+            None => {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "model",
+                    format!(
+                        "unknown reasoning effort {:?}; cannot cycle",
+                        app.reasoning_effort
+                    ),
+                );
+            }
+        }
         return Ok(AppAction::None);
     }
 
@@ -1257,32 +1273,27 @@ fn try_execute_slash_command(
                 );
             } else {
                 let level = arg.to_lowercase();
-                match level.as_str() {
-                    "auto" | "low" | "medium" | "med" | "high" | "max" => {
-                        let target = match level.as_str() {
-                            "auto" => None,
-                            "med" => Some("medium"),
-                            other => Some(other),
-                        };
-                        let msg = app.set_reasoning_effort(target);
-                        cmd_tx.send(msg)?;
-                        app.set_status(
-                            app::LogLevel::Info,
-                            "model",
-                            format!("thinking: {}", app.reasoning_effort_label()),
-                        );
-                        save_cache(app);
+                if app::validate_reasoning_effort(Some(&level)).is_none() {
+                    app.set_status(
+                        app::LogLevel::Warn,
+                        "model",
+                        format!(
+                            "unknown level: {} (try auto, low, medium, high, max)",
+                            level
+                        ),
+                    );
+                } else {
+                    if !can_send_server_commands(app) {
+                        return Ok(SlashResult::Handled);
                     }
-                    _ => {
-                        app.set_status(
-                            app::LogLevel::Warn,
-                            "model",
-                            format!(
-                                "unknown level: {} (try auto, low, medium, high, max)",
-                                level
-                            ),
-                        );
-                    }
+                    let msg = app.set_reasoning_effort(Some(&level)).unwrap();
+                    cmd_tx.send(msg)?;
+                    app.set_status(
+                        app::LogLevel::Info,
+                        "model",
+                        format!("thinking: {}", app.reasoning_effort_label()),
+                    );
+                    save_cache(app);
                 }
             }
         }

@@ -948,6 +948,27 @@ mod external_editor_tests {
     }
 
     #[test]
+    fn slash_thinking_when_disconnected_does_not_change_state() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.reasoning_effort = Some("high".into());
+        app.input = "/thinking max".into();
+        app.input_cursor = "/thinking max".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        // state must not change when disconnected
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert!(app.status.contains("not connected"));
+    }
+
+    #[test]
     fn slash_model_with_arg_prefilters_popup() {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
@@ -2604,6 +2625,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         assert_eq!(app.reasoning_effort, None);
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
@@ -2624,6 +2646,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         app.reasoning_effort = Some("max".into());
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
@@ -2644,6 +2667,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
         // status should reflect the new level
         assert!(
@@ -2651,6 +2675,19 @@ mod chord_reasoning_effort_tests {
             "expected status to mention 'low', got: {}",
             app.status
         );
+    }
+
+    #[test]
+    fn ctrl_t_when_disconnected_does_not_change_state() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.reasoning_effort = Some("high".into());
+
+        handle_key(&mut app, ctrl_t(), &tx).unwrap();
+
+        // state must not change when disconnected
+        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert!(app.status.contains("not connected"));
     }
 }
 

@@ -932,6 +932,23 @@ pub struct App {
     pub should_quit: bool,
 }
 
+/// Validate and normalize a reasoning-effort string.
+///
+/// * Returns `Some(Some(normalized))` for valid explicit levels:
+///   `"low"`, `"medium"` (also accepts alias `"med"`), `"high"`, `"max"`.
+/// * Returns `Some(None)` for `"auto"`, empty string, or `None`.
+/// * Returns `None` for any invalid/unrecognized level.
+pub fn validate_reasoning_effort(s: Option<&str>) -> Option<Option<String>> {
+    match s {
+        None | Some("auto") | Some("") => Some(None),
+        Some("low") => Some(Some("low".to_string())),
+        Some("medium") | Some("med") => Some(Some("medium".to_string())),
+        Some("high") => Some(Some("high".to_string())),
+        Some("max") => Some(Some("max".to_string())),
+        Some(_) => None,
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -1058,32 +1075,47 @@ impl App {
     /// Updates `self.reasoning_effort` optimistically, saves the new value as
     /// the preference for the current `(mode, provider, model)` context, and
     /// returns the [`ClientMsg`] to forward to the server.
-    pub fn cycle_reasoning_effort(&mut self) -> ClientMsg {
+    ///
+    /// Returns `None` if the current value is not a recognized level; in that
+    /// case the state is left unchanged and no message is emitted (the caller
+    /// should surface a warning to the user instead of silently coercing the
+    /// unknown value to `low`).
+    pub fn cycle_reasoning_effort(&mut self) -> Option<ClientMsg> {
         const LEVELS: &[Option<&str>] =
             &[None, Some("low"), Some("medium"), Some("high"), Some("max")];
         let current = self.reasoning_effort.as_deref();
-        let idx = LEVELS
-            .iter()
-            .position(|l| l.as_deref() == current)
-            .unwrap_or(0);
+        let Some(idx) = LEVELS.iter().position(|l| l.as_deref() == current) else {
+            // Unknown current value: leave state unchanged and let the caller
+            // surface a warning to the user instead of silently coercing to low.
+            return None;
+        };
         let next = LEVELS[(idx + 1) % LEVELS.len()];
-        self.set_reasoning_effort(next)
+        Some(
+            self.set_reasoning_effort(next)
+                .expect("cycle always produces a valid level"),
+        )
     }
 
     /// Set the reasoning effort to a specific level.
     /// `None` or `Some("auto")` both map to the "auto" (no override) state.
     /// Updates `self.reasoning_effort`, caches the session mode state, and
     /// returns the [`ClientMsg`] to forward to the server.
-    pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> ClientMsg {
-        let level = match level {
-            Some("auto") | None => None,
-            Some(s) => Some(s),
-        };
-        self.reasoning_effort = level.map(ToOwned::to_owned);
-        self.cache_session_mode_state();
-        let effort_str = level.unwrap_or("auto").to_string();
-        ClientMsg::SetReasoningEffort {
-            reasoning_effort: effort_str,
+    /// Returns `None` if the level is invalid (state is unchanged).
+    pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> Option<ClientMsg> {
+        match validate_reasoning_effort(level) {
+            Some(normalized) => {
+                self.reasoning_effort = normalized;
+                self.cache_session_mode_state();
+                let effort_str = self
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("auto")
+                    .to_string();
+                Some(ClientMsg::SetReasoningEffort {
+                    reasoning_effort: effort_str,
+                })
+            }
+            None => None,
         }
     }
 
@@ -1922,9 +1954,26 @@ mod reasoning_effort_tests {
     }
 
     #[test]
+    fn cycle_reasoning_effort_unknown_value_noop() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("invalid_level".into());
+        let result = app.cycle_reasoning_effort();
+        // unknown current value → no-op: returns None and leaves state unchanged
+        assert!(
+            result.is_none(),
+            "cycling an unknown value should return None"
+        );
+        assert_eq!(
+            app.reasoning_effort,
+            Some("invalid_level".into()),
+            "state must not change when cycling an unknown value"
+        );
+    }
+
+    #[test]
     fn cycle_returns_correct_client_msg() {
         let mut app = App::new(); // starts at auto
-        let msg = app.cycle_reasoning_effort();
+        let msg = app.cycle_reasoning_effort().expect("auto is a valid level");
         // auto → low: should send "low"
         match msg {
             ClientMsg::SetReasoningEffort { reasoning_effort } => {
@@ -1938,7 +1987,7 @@ mod reasoning_effort_tests {
     fn cycle_to_auto_sends_auto_string() {
         let mut app = App::new();
         app.reasoning_effort = Some("max".into());
-        let msg = app.cycle_reasoning_effort();
+        let msg = app.cycle_reasoning_effort().expect("max is a valid level");
         // max → auto: server expects "auto" string (not null)
         match msg {
             ClientMsg::SetReasoningEffort { reasoning_effort } => {
@@ -1956,7 +2005,7 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(Some("high"));
         assert_eq!(app.reasoning_effort, Some("high".into()));
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "high");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -1970,7 +2019,7 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(Some("auto"));
         assert_eq!(app.reasoning_effort, None);
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -1984,11 +2033,32 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(None);
         assert_eq!(app.reasoning_effort, None);
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_reasoning_effort_invalid_value_rejected() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        let msg = app.set_reasoning_effort(Some("ultra"));
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn validate_reasoning_effort_normalizes_med() {
+        assert_eq!(
+            validate_reasoning_effort(Some("med")),
+            Some(Some("medium".to_string()))
+        );
+        assert_eq!(
+            validate_reasoning_effort(Some("MED")),
+            None // case-sensitive
+        );
     }
 
     // ── state message populates reasoning_effort ──────────────────────────────
@@ -2072,6 +2142,17 @@ mod reasoning_effort_tests {
             data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
         });
         assert_eq!(app.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_effort_push_invalid_value_rejected() {
+        let mut app = App::new();
+        app.reasoning_effort = Some("medium".into());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "reasoning_effort".into(),
+            data: Some(serde_json::json!({ "reasoning_effort": "ultra" })),
+        });
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
     }
 
     #[test]
