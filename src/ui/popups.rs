@@ -363,7 +363,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
 
 // ── Session popup ─────────────────────────────────────────────────────────────
 
-pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
+pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
     const SESSION_POPUP_MAX_W: u16 = 86;
     const SESSION_POPUP_MIN_W: u16 = 36;
 
@@ -427,7 +427,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_session_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
+fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
     use crate::app::PopupItem;
 
     // filter
@@ -447,6 +447,8 @@ fn draw_session_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect
     // grouped session list
     let popup_items = app.visible_popup_items();
     let list_w = chunks[3].width as usize;
+    let visible_rows = chunks[3].height as usize;
+    app.session_popup_visible_rows = visible_rows;
 
     let items: Vec<ListItem> = popup_items
         .iter()
@@ -549,7 +551,12 @@ fn draw_session_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let mut state = ListState::default().with_selected(Some(app.session_cursor));
+    let offset = app
+        .session_cursor
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(Some(app.session_cursor));
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
@@ -631,7 +638,7 @@ fn delegate_display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text) as u16
 }
 
-fn draw_delegate_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rect]>) {
+fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
     use crate::app::DelegateStatus;
 
     // filter
@@ -649,6 +656,8 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rec
     f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
 
     // delegate entry list (built from event stream)
+    let visible_rows = chunks[3].height as usize;
+    app.delegate_popup_visible_rows = visible_rows;
     let entries = app.visible_delegate_entries();
 
     if entries.is_empty() {
@@ -854,8 +863,12 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &App, chunks: &std::rc::Rc<[Rec
             .style(Theme::popup_bg())
             .row_highlight_style(Theme::selected());
 
-        let selected = Some(app.delegate_cursor.min(entries.len().saturating_sub(1)));
-        let mut state = TableState::default().with_selected(selected);
+        let selected_idx = app.delegate_cursor.min(entries.len().saturating_sub(1));
+        let offset = selected_idx.saturating_sub(visible_rows.saturating_sub(1));
+        let selected = Some(selected_idx);
+        let mut state = TableState::default()
+            .with_offset(offset)
+            .with_selected(selected);
         f.render_stateful_widget(table, chunks[3], &mut state);
     }
 

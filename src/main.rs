@@ -2048,6 +2048,54 @@ mod session_popup_key_tests {
         assert_eq!(app.session_cursor, 0);
     }
 
+    #[test]
+    fn popup_page_down_uses_visible_rows_with_overlap() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(
+            Some("/a"),
+            &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
+        )];
+        app.session_popup_visible_rows = 4;
+
+        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.session_cursor, 3);
+
+        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.session_cursor, 6);
+    }
+
+    #[test]
+    fn popup_page_up_uses_visible_rows_with_overlap() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(
+            Some("/a"),
+            &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
+        )];
+        app.session_popup_visible_rows = 4;
+        app.session_cursor = 6;
+
+        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.session_cursor, 3);
+
+        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.session_cursor, 0);
+    }
+
+    #[test]
+    fn popup_page_keys_fallback_to_single_row_when_visible_rows_unknown() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
+
+        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.session_cursor, 1);
+
+        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.session_cursor, 0);
+    }
+
     // ── Enter on GroupHeader toggles popup collapse ───────────────────────────
 
     #[test]
@@ -2538,6 +2586,54 @@ mod delegate_popup_key_tests {
 
         apply_delegate_popup_key(&mut app, KeyCode::Up);
         assert_eq!(app.delegate_cursor, 1);
+    }
+
+    #[test]
+    fn delegate_page_down_uses_visible_rows_with_overlap() {
+        let mut app = setup_delegate_app();
+        app.delegate_entries.extend([
+            make_entry("d4", "Check logs", Some("child-4")),
+            make_entry("d5", "Refactor code", Some("child-5")),
+            make_entry("d6", "Polish UI", Some("child-6")),
+            make_entry("d7", "Ship release", Some("child-7")),
+        ]);
+        app.delegate_popup_visible_rows = 4;
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.delegate_cursor, 3);
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.delegate_cursor, 6);
+    }
+
+    #[test]
+    fn delegate_page_up_uses_visible_rows_with_overlap() {
+        let mut app = setup_delegate_app();
+        app.delegate_entries.extend([
+            make_entry("d4", "Check logs", Some("child-4")),
+            make_entry("d5", "Refactor code", Some("child-5")),
+            make_entry("d6", "Polish UI", Some("child-6")),
+            make_entry("d7", "Ship release", Some("child-7")),
+        ]);
+        app.delegate_popup_visible_rows = 4;
+        app.delegate_cursor = 6;
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.delegate_cursor, 3);
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.delegate_cursor, 0);
+    }
+
+    #[test]
+    fn delegate_page_keys_fallback_to_single_row_when_visible_rows_unknown() {
+        let mut app = setup_delegate_app();
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.delegate_cursor, 1);
+
+        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.delegate_cursor, 0);
     }
 
     #[test]

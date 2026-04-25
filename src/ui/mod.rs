@@ -692,7 +692,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
@@ -752,7 +752,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -799,7 +799,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -847,7 +847,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
         assert_eq!(
@@ -904,7 +904,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
@@ -976,7 +976,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1083,7 +1083,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -1104,7 +1104,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (marker_x, marker_y) = find_buffer_text(&buffer, "●").expect("active marker missing");
@@ -1127,7 +1127,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()

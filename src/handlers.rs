@@ -2,6 +2,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use tokio::sync::mpsc;
 
 use crate::app::{self, ActivityState, App, Popup, Screen};
+
+fn popup_page_step(visible_rows: usize) -> usize {
+    visible_rows.saturating_sub(1).max(1)
+}
 use crate::config;
 use crate::protocol::{self, ClientMsg, PromptBlock};
 use crate::theme;
@@ -617,6 +621,15 @@ pub(crate) fn apply_popup_session_key(
             let max = app.visible_popup_items().len().saturating_sub(1);
             app.session_cursor = (app.session_cursor + 1).min(max);
         }
+        KeyCode::PageUp => {
+            let step = popup_page_step(app.session_popup_visible_rows);
+            app.session_cursor = app.session_cursor.saturating_sub(step);
+        }
+        KeyCode::PageDown => {
+            let max = app.visible_popup_items().len().saturating_sub(1);
+            let step = popup_page_step(app.session_popup_visible_rows);
+            app.session_cursor = app.session_cursor.saturating_add(step).min(max);
+        }
         KeyCode::Enter => {
             let items = app.visible_popup_items();
             if let Some(item) = items.get(app.session_cursor).cloned() {
@@ -770,6 +783,15 @@ pub(crate) fn apply_delegate_popup_key(
         KeyCode::Down => {
             let max = app.visible_delegate_entries().len().saturating_sub(1);
             app.delegate_cursor = (app.delegate_cursor + 1).min(max);
+        }
+        KeyCode::PageUp => {
+            let step = popup_page_step(app.delegate_popup_visible_rows);
+            app.delegate_cursor = app.delegate_cursor.saturating_sub(step);
+        }
+        KeyCode::PageDown => {
+            let max = app.visible_delegate_entries().len().saturating_sub(1);
+            let step = popup_page_step(app.delegate_popup_visible_rows);
+            app.delegate_cursor = app.delegate_cursor.saturating_add(step).min(max);
         }
         KeyCode::Enter => {
             let entries = app.visible_delegate_entries();

@@ -781,6 +781,10 @@ pub struct App {
     pub popup_collapsed_groups: HashSet<String>,
     /// Scroll offset for the start-page session list (in visible rows).
     pub start_page_scroll: usize,
+    /// Last rendered visible row count for the sessions tab in the popup.
+    pub session_popup_visible_rows: usize,
+    /// Last rendered visible row count for the delegates tab in the popup.
+    pub delegate_popup_visible_rows: usize,
 
     // active session
     pub session_id: Option<String>,
@@ -965,6 +969,8 @@ impl App {
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
             start_page_scroll: 0,
+            session_popup_visible_rows: 0,
+            delegate_popup_visible_rows: 0,
             session_id: None,
             agent_id: None,
             agent_mode: "build".into(),
