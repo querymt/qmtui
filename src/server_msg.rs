@@ -21,6 +21,9 @@ impl App {
                     self.agents = state.agents;
                     if let Some(mode) = state.agent_mode {
                         self.agent_mode = mode;
+                        if self.agent_mode != "review" {
+                            self.mode_before_review = None;
+                        }
                     }
                     // Only update reasoning_effort when the key was present in
                     // the JSON; absent means the server didn't report it.
@@ -52,6 +55,9 @@ impl App {
                     && let Ok(am) = serde_json::from_value::<AgentModeData>(data)
                 {
                     self.agent_mode = am.mode;
+                    if self.agent_mode != "review" {
+                        self.mode_before_review = None;
+                    }
                 }
                 vec![]
             }
@@ -195,6 +201,7 @@ impl App {
                     self.last_compaction_token_estimate = None;
                     self.elicitation = None;
                     self.clear_cancel_confirm();
+                    self.mode_before_review = None;
                     self.cumulative_cost = None;
                     self.session_stats = SessionStatsLite::default();
                     self.screen = Screen::Chat;
@@ -282,6 +289,7 @@ impl App {
                             self.last_compaction_token_estimate = None;
                             self.elicitation = None;
                             self.clear_cancel_confirm();
+                            self.mode_before_review = None;
                             self.undo_state =
                                 self.build_undo_state_from_server_stack(&sl.undo_stack, None, None);
                             self.set_status(LogLevel::Debug, "activity", "ready");
@@ -796,6 +804,9 @@ impl App {
             }
             EventKind::SessionModeChanged { mode } => {
                 self.agent_mode = mode.clone();
+                if mode != "review" {
+                    self.mode_before_review = None;
+                }
             }
             EventKind::Cancelled => {
                 self.activity = ActivityState::Idle;

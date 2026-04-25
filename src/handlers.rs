@@ -323,7 +323,7 @@ pub(crate) fn handle_key(
         if !can_send_server_commands(app) {
             return Ok(AppAction::None);
         }
-        switch_mode(app, cmd_tx, app.next_mode())?;
+        switch_mode(app, cmd_tx, &app.next_mode())?;
         return Ok(AppAction::None);
     }
 
@@ -381,7 +381,11 @@ pub(crate) fn handle_chord(
             }
             app.popup = Popup::ModelSelect;
             app.model_filter.clear();
-            app.model_popup_agent_tab = if app.agent_mode == "plan" { 0 } else { 1 };
+            app.model_popup_agent_tab = match app.agent_mode.as_str() {
+                "plan" => 0,
+                "review" => 2,
+                _ => 1,
+            };
             app.model_cursor = app.current_mode_model_cursor();
         }
         KeyCode::Char('n') => {
@@ -1190,6 +1194,15 @@ fn switch_mode(
         let outgoing_mode = app.agent_mode.clone();
         app.set_mode_model_preference(&outgoing_mode, &provider, &model);
     }
+
+    if target == "review" {
+        if app.agent_mode != "review" {
+            app.mode_before_review = Some(app.agent_mode.clone());
+        }
+    } else {
+        app.mode_before_review = None;
+    }
+
     app.agent_mode = target.to_string();
 
     for msg in app.apply_cached_mode_state() {
@@ -1262,6 +1275,11 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.popup = crate::app::Popup::ModelSelect;
+            app.model_popup_agent_tab = match app.agent_mode.as_str() {
+                "plan" => 0,
+                "review" => 2,
+                _ => 1,
+            };
             if arg.is_empty() {
                 app.model_filter.clear();
                 app.model_cursor = app.current_mode_model_cursor();
@@ -1277,7 +1295,7 @@ fn try_execute_slash_command(
             }
             if arg.is_empty() {
                 // No arg: cycle to next mode (same as Tab).
-                switch_mode(app, cmd_tx, app.next_mode())?;
+                switch_mode(app, cmd_tx, &app.next_mode())?;
             } else {
                 match arg.as_str() {
                     "build" | "plan" => {
@@ -1299,6 +1317,17 @@ fn try_execute_slash_command(
                         );
                     }
                 }
+            }
+        }
+        "review" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if app.agent_mode == "review" {
+                app.set_status(app::LogLevel::Info, "mode", "already in review mode");
+            } else {
+                switch_mode(app, cmd_tx, "review")?;
             }
         }
         "thinking" => {
@@ -1789,7 +1818,7 @@ pub(crate) fn handle_model_popup_key(
                 .cloned();
             if let Some(model) = selected {
                 if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
-                    // Mode tab (Planner / Build): store preference for that mode
+                    // Mode tab (plan / build / review): store preference for that mode
                     app.set_mode_model_preference(mode, &model.provider, &model.model);
                     if app.agent_mode == mode {
                         // If current mode matches, also apply to the live session
@@ -1976,6 +2005,7 @@ mod model_popup_tests {
     use crate::config::TestPersistenceGuard;
     use crate::protocol::ModelEntry;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -2128,5 +2158,175 @@ mod model_popup_tests {
         let build_cache = &app.session_cache["s1"]["build"];
         assert_eq!(build_cache.model, "anthropic/claude-sonnet");
         assert_eq!(build_cache.effort, None);
+    }
+
+    #[test]
+    fn select_model_for_inactive_review_tab_updates_review_cache() {
+        let _guard = TestPersistenceGuard::new("inactive-review");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "review".into(),
+            crate::app::CachedModeState {
+                model: "old/stale".into(),
+                effort: Some("max".into()),
+            },
+        );
+
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 2; // review tab
+        app.model_cursor = 3; // anthropic/claude-sonnet
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+
+        let review_cache = &app.session_cache["s1"]["review"];
+        assert_eq!(review_cache.model, "anthropic/claude-sonnet");
+        assert_eq!(review_cache.effort, None);
+
+        assert_eq!(app.current_provider.as_deref(), Some("openai"));
+        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
+
+        assert_eq!(
+            app.get_mode_model_preference("review"),
+            Some(("anthropic", "claude-sonnet"))
+        );
+    }
+
+    #[test]
+    fn select_model_for_active_review_mode_updates_live_session() {
+        let _guard = TestPersistenceGuard::new("active-review");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "review".into();
+        app.mode_before_review = Some("plan".into());
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.reasoning_effort = Some("high".into());
+
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 2; // review tab (active)
+        app.model_cursor = 3; // anthropic/claude-sonnet
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        let msg1 = rx.try_recv().expect("expected SetSessionModel");
+        assert!(matches!(msg1, ClientMsg::SetSessionModel { .. }));
+        let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
+        assert!(
+            matches!(msg2, ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
+        );
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.reasoning_effort, None);
+
+        let review_cache = &app.session_cache["s1"]["review"];
+        assert_eq!(review_cache.model, "anthropic/claude-sonnet");
+        assert_eq!(review_cache.effort, None);
+    }
+
+    #[test]
+    fn opening_model_popup_in_review_starts_on_review_tab() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "review".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.models = vec![make_model("openai", "gpt-4o")];
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_chord(&mut app, key(KeyCode::Char('m')), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::ModelSelect));
+        assert_eq!(app.model_popup_agent_tab, 2);
+        assert_eq!(app.model_cursor, 1);
+    }
+
+    #[test]
+    fn slash_model_in_review_starts_on_review_tab() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.screen = Screen::Chat;
+        app.agent_mode = "review".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.models = vec![make_model("openai", "gpt-4o")];
+        app.input = "/model".into();
+        app.input_cursor = app.input.len();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(action, AppAction::None));
+        assert!(matches!(app.popup, Popup::ModelSelect));
+        assert_eq!(app.model_popup_agent_tab, 2);
+        assert_eq!(app.model_cursor, 1);
+    }
+
+    #[test]
+    fn review_slash_command_enters_review_and_tab_returns_to_previous_mode() {
+        let _guard = TestPersistenceGuard::new("review-cycle");
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.screen = Screen::Chat;
+        app.agent_mode = "plan".into();
+        app.input = "/review".into();
+        app.input_cursor = app.input.len();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert!(matches!(action, AppAction::None));
+        assert_eq!(app.agent_mode, "review");
+        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
+        assert!(matches!(
+            rx.try_recv().expect("expected SetAgentMode(review)"),
+            ClientMsg::SetAgentMode { mode } if mode == "review"
+        ));
+        assert!(rx.try_recv().is_err());
+
+        handle_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        assert_eq!(app.agent_mode, "plan");
+        assert_eq!(app.mode_before_review, None);
+        assert!(matches!(
+            rx.try_recv().expect("expected SetAgentMode(plan)"),
+            ClientMsg::SetAgentMode { mode } if mode == "plan"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn review_slash_command_is_noop_when_already_in_review() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.screen = Screen::Chat;
+        app.agent_mode = "review".into();
+        app.mode_before_review = Some("plan".into());
+        app.input = "/review".into();
+        app.input_cursor = app.input.len();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert!(matches!(action, AppAction::None));
+        assert_eq!(app.agent_mode, "review");
+        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.status, "already in review mode");
     }
 }

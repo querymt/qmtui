@@ -121,7 +121,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     use crate::app::ModelPopupItem;
 
     const MODEL_MARKER_COL_W: u16 = 4;
-    const MODEL_LABEL_MAX_W: u16 = 44;
+    const MODEL_LABEL_MAX_W: u16 = 48;
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
 
@@ -1378,6 +1378,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
             rows: &[
                 ("/model [q]", "model selector (optional filter)"),
                 ("/mode [m]", "switch mode (build, plan)"),
+                ("/review", "enter review mode"),
                 (
                     "/thinking [lvl]",
                     "set thinking (auto, low, med, high, max)",

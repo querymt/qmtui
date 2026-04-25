@@ -790,6 +790,7 @@ pub struct App {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     pub agent_mode: String,
+    pub mode_before_review: Option<String>,
     pub launch_cwd: Option<String>,
     pub new_session_path: String,
     pub new_session_cursor: usize,
@@ -974,6 +975,7 @@ impl App {
             session_id: None,
             agent_id: None,
             agent_mode: "build".into(),
+            mode_before_review: None,
             launch_cwd: None,
             new_session_path: String::new(),
             new_session_cursor: 0,
@@ -1773,11 +1775,15 @@ impl App {
             .map(|(p, m)| (p.as_str(), m.as_str()))
     }
 
-    pub fn next_mode(&self) -> &'static str {
+    pub fn next_mode(&self) -> String {
         match self.agent_mode.as_str() {
-            "build" => "plan",
-            "plan" => "build",
-            _ => "build",
+            "build" => "plan".into(),
+            "plan" => "build".into(),
+            "review" => self
+                .mode_before_review
+                .clone()
+                .unwrap_or_else(|| "build".into()),
+            _ => "build".into(),
         }
     }
 
@@ -1789,39 +1795,41 @@ impl App {
     }
 
     /// Total number of tabs in the model popup.
-    /// Always at least 2 (Planner + Build), plus one tab per delegation agent.
+    /// Always at least 3 (Plan + Build + Review), plus one tab per delegation agent.
     pub fn model_popup_tab_count(&self) -> usize {
-        2 + self.agents.len().saturating_sub(1)
+        3 + self.agents.len().saturating_sub(1)
     }
 
     /// Label for a model popup tab.
-    /// 0 = "Plan", 1 = "Build", 2+ maps to `agents[1..].name`.
+    /// 0 = "plan", 1 = "build", 2 = "review", 3+ maps to `agents[1..].name`.
     pub fn model_popup_tab_label(&self, tab_idx: usize) -> &str {
         match tab_idx {
             0 => "plan",
             1 => "build",
+            2 => "review",
             _ => self
                 .agents
-                .get(tab_idx - 1)
+                .get(tab_idx - 2)
                 .map(|a| a.name.as_str())
                 .unwrap_or("???"),
         }
     }
 
-    /// The agent_id for an agent tab (index 2+), None for mode tabs (0, 1).
+    /// The agent_id for an agent tab (index 3+), None for mode tabs (0, 1, 2).
     pub fn model_popup_tab_agent_id(&self, tab_idx: usize) -> Option<&str> {
-        if tab_idx < 2 {
+        if tab_idx < 3 {
             None
         } else {
-            self.agents.get(tab_idx - 1).map(|a| a.id.as_str())
+            self.agents.get(tab_idx - 2).map(|a| a.id.as_str())
         }
     }
 
-    /// The mode name for a mode tab (0 = "plan", 1 = "build"), None for agent tabs.
+    /// The mode name for a mode tab (0 = "plan", 1 = "build", 2 = "review"), None for agent tabs.
     pub fn model_popup_tab_mode(&self, tab_idx: usize) -> Option<&'static str> {
         match tab_idx {
             0 => Some("plan"),
             1 => Some("build"),
+            2 => Some("review"),
             _ => None,
         }
     }
@@ -4276,6 +4284,22 @@ mod session_mode_tests {
     }
 
     #[test]
+    fn next_mode_exits_review_to_previous_mode() {
+        let mut app = App::new();
+        app.agent_mode = "review".into();
+        app.mode_before_review = Some("plan".into());
+        assert_eq!(app.next_mode(), "plan");
+    }
+
+    #[test]
+    fn next_mode_from_review_defaults_to_build_without_previous_mode() {
+        let mut app = App::new();
+        app.agent_mode = "review".into();
+        app.mode_before_review = None;
+        assert_eq!(app.next_mode(), "build");
+    }
+
+    #[test]
     fn live_session_mode_changed_to_build_updates_agent_mode() {
         let mut app = App::new();
         app.agent_mode = "plan".into();
@@ -4322,6 +4346,22 @@ mod session_mode_tests {
         assert_eq!(app.agent_mode, "build");
     }
 
+    #[test]
+    fn live_session_mode_changed_away_from_review_clears_previous_mode() {
+        let mut app = App::new();
+        app.agent_mode = "review".into();
+        app.mode_before_review = Some("plan".into());
+        app.handle_event_kind(
+            &EventKind::SessionModeChanged {
+                mode: "build".into(),
+            },
+            false,
+            None,
+        );
+        assert_eq!(app.agent_mode, "build");
+        assert_eq!(app.mode_before_review, None);
+    }
+
     // ── session_loaded returns SetAgentMode ───────────────────────────────────
 
     #[test]
@@ -4353,6 +4393,23 @@ mod session_mode_tests {
             )),
             "expected SetAgentMode(build) in {cmds:?}"
         );
+    }
+
+    #[test]
+    fn session_loaded_review_mode_does_not_create_previous_mode() {
+        let mut app = App::new();
+        let audit = make_audit(&[mode_changed_event("review")]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+        assert!(
+            cmds.iter().any(|m| matches!(
+                m,
+                ClientMsg::SetAgentMode { mode } if mode == "review"
+            )),
+            "expected SetAgentMode(review) in {cmds:?}"
+        );
+        assert_eq!(app.agent_mode, "review");
+        assert_eq!(app.mode_before_review, None);
+        assert_eq!(app.next_mode(), "build");
     }
 
     // ── session_loaded restores mode state from session cache ──────────────────
@@ -7463,10 +7520,16 @@ mod delegate_model_preference_tests {
     }
 
     #[test]
-    fn tab_label_agent_at_two() {
+    fn tab_label_review_at_two() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_label(2), "review");
+    }
+
+    #[test]
+    fn tab_label_agent_at_three() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_label(2), "Coder");
+        assert_eq!(app.model_popup_tab_label(3), "Coder");
     }
 
     #[test]
@@ -7482,30 +7545,42 @@ mod delegate_model_preference_tests {
     }
 
     #[test]
-    fn tab_agent_id_some_at_two() {
+    fn tab_agent_id_none_at_two() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_agent_id(2), None);
+    }
+
+    #[test]
+    fn tab_agent_id_some_at_three() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_agent_id(2), Some("coder"));
+        assert_eq!(app.model_popup_tab_agent_id(3), Some("coder"));
+    }
+
+    #[test]
+    fn tab_mode_review_at_two() {
+        let app = App::new();
+        assert_eq!(app.model_popup_tab_mode(2), Some("review"));
     }
 
     #[test]
     fn tab_count_no_agents() {
         let app = App::new();
-        assert_eq!(app.model_popup_tab_count(), 2);
+        assert_eq!(app.model_popup_tab_count(), 3);
     }
 
     #[test]
     fn tab_count_single_agent() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main")];
-        assert_eq!(app.model_popup_tab_count(), 2);
+        assert_eq!(app.model_popup_tab_count(), 3);
     }
 
     #[test]
     fn tab_count_multi_agent() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_count(), 3);
+        assert_eq!(app.model_popup_tab_count(), 4);
     }
 
     #[test]

@@ -20,6 +20,11 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         chat_only: true,
     },
     SlashCommandDef {
+        name: "review",
+        description: "enter review mode",
+        chat_only: true,
+    },
+    SlashCommandDef {
         name: "theme",
         description: "open theme picker",
         chat_only: false,
