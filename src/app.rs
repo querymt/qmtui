@@ -436,26 +436,42 @@ impl ElicitationState {
     }
 
     /// For MultiSelect: toggle the highlighted option in the field's array value.
+    /// For BooleanToggle: flip between explicit true and false.
     pub fn toggle_current_option(&mut self) {
         let Some(field) = self.current_field() else {
             return;
         };
-        if let ElicitationFieldKind::MultiSelect { options } = &field.kind
-            && let Some(opt) = options.get(self.option_cursor)
-        {
-            let name = field.name.clone();
-            let val = opt.value.clone();
-            let arr = self
-                .selected
-                .entry(name)
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            if let serde_json::Value::Array(items) = arr {
-                if let Some(pos) = items.iter().position(|v| v == &val) {
-                    items.remove(pos);
-                } else {
-                    items.push(val);
+        match &field.kind {
+            ElicitationFieldKind::MultiSelect { options } => {
+                if let Some(opt) = options.get(self.option_cursor) {
+                    let name = field.name.clone();
+                    let val = opt.value.clone();
+                    let arr = self
+                        .selected
+                        .entry(name)
+                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                    if let serde_json::Value::Array(items) = arr {
+                        if let Some(pos) = items.iter().position(|v| v == &val) {
+                            items.remove(pos);
+                        } else {
+                            items.push(val);
+                        }
+                    }
                 }
             }
+            ElicitationFieldKind::BooleanToggle => {
+                let name = field.name.clone();
+                let next = self
+                    .selected
+                    .get(&name)
+                    .and_then(serde_json::Value::as_bool)
+                    .map(|value| !value)
+                    .unwrap_or(true);
+                self.selected.insert(name, serde_json::Value::Bool(next));
+            }
+            ElicitationFieldKind::SingleSelect { .. }
+            | ElicitationFieldKind::TextInput
+            | ElicitationFieldKind::NumberInput { .. } => {}
         }
     }
 

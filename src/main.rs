@@ -105,6 +105,16 @@ mod tests {
         app
     }
 
+    fn make_boolean_elicitation(required: bool) -> ElicitationState {
+        ElicitationState::new_for_test(vec![ElicitationField {
+            name: "confirm".into(),
+            title: "Confirm".into(),
+            description: None,
+            required,
+            kind: ElicitationFieldKind::BooleanToggle,
+        }])
+    }
+
     #[test]
     fn reconnect_delay_caps_after_five_steps() {
         assert_eq!(reconnect_delay_ms(0), 250);
@@ -258,6 +268,75 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
         assert_eq!(app.elicitation.as_ref().unwrap().text_input, "H");
+    }
+
+    #[test]
+    fn elicitation_enter_on_required_boolean_without_toggle_does_not_submit() {
+        let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_some(), "popup should remain open");
+        assert!(rx.try_recv().is_err(), "no response should be sent");
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m, ChatEntry::Elicitation { outcome: None, .. }))
+        );
+    }
+
+    #[test]
+    fn elicitation_boolean_space_toggles_true_then_enter_submits() {
+        let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        assert_eq!(
+            app.elicitation
+                .as_ref()
+                .and_then(|state| state.selected.get("confirm")),
+            Some(&serde_json::json!(true))
+        );
+
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_none());
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg,
+            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            if action == "accept" && c["confirm"] == true
+        ));
+        assert!(app.messages.iter().any(|m| matches!(m,
+            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "Yes"
+        )));
+    }
+
+    #[test]
+    fn elicitation_boolean_second_space_toggles_false_and_still_submits() {
+        let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        assert_eq!(
+            app.elicitation
+                .as_ref()
+                .and_then(|state| state.selected.get("confirm")),
+            Some(&serde_json::json!(false))
+        );
+
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_none());
+        let msg = rx.try_recv().expect("message sent");
+        assert!(matches!(msg,
+            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            if action == "accept" && c["confirm"] == false
+        ));
+        assert!(app.messages.iter().any(|m| matches!(m,
+            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "No"
+        )));
     }
 
     #[test]

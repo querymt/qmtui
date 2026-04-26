@@ -66,12 +66,15 @@ pub(crate) fn handle_elicitation_key(
             state.move_cursor(-1);
         }
 
-        // ── Space: toggle multi-select ────────────────────────────────────────
+        // ── Space: toggle multi-select / boolean ──────────────────────────────
         KeyCode::Char(' ') => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
             };
-            if matches!(kind, ElicitationFieldKind::MultiSelect { .. }) {
+            if matches!(
+                kind,
+                ElicitationFieldKind::MultiSelect { .. } | ElicitationFieldKind::BooleanToggle
+            ) {
                 state.toggle_current_option();
             }
         }
