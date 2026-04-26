@@ -592,6 +592,8 @@ struct DelegateRowData {
     ctx: String,
     cost: String,
     duration: String,
+    pending_label: String,
+    has_pending_input: bool,
     is_current: bool,
 }
 
@@ -710,6 +712,11 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
                         }
                     })
                     .unwrap_or_default();
+                let pending_label = if entry.awaiting_input() {
+                    "question pending".to_string()
+                } else {
+                    String::new()
+                };
 
                 DelegateRowData {
                     status_badge,
@@ -721,6 +728,8 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
                     ctx: format_delegate_context(&entry.stats),
                     cost: format_delegate_cost(&entry.stats),
                     duration,
+                    has_pending_input: !pending_label.is_empty(),
+                    pending_label,
                     is_current,
                 }
             })
@@ -756,7 +765,6 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
             .map(|row| delegate_display_width(&row.duration))
             .max()
             .unwrap_or(0);
-
         let show_agent = agent_col_w > 0;
         let show_tools = tools_col_w > 0;
         let show_msgs = msgs_col_w > 0;
@@ -805,8 +813,15 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
         let rows: Vec<Row> = rows_data
             .into_iter()
             .map(|row| {
-                let objective = truncate_with_ellipsis(&row.objective_source, objective_w);
-                let obj_style = if row.is_current {
+                let objective_with_pending = if row.pending_label.is_empty() {
+                    row.objective_source.clone()
+                } else {
+                    format!("{} [{}]", row.objective_source, row.pending_label)
+                };
+                let objective = truncate_with_ellipsis(&objective_with_pending, objective_w);
+                let obj_style = if row.has_pending_input {
+                    Theme::mode_badge("plan")
+                } else if row.is_current {
                     Theme::status_accent()
                 } else {
                     main_style
@@ -873,11 +888,23 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
     }
 
     // hint
+    let selected_entry = entries.get(app.delegate_cursor.min(entries.len().saturating_sub(1)));
+    let awaiting_selected = selected_entry.is_some_and(|entry| entry.awaiting_input());
+    let enter_help = if awaiting_selected {
+        "open child to answer"
+    } else {
+        "load"
+    };
+    let enter_help_style = if awaiting_selected {
+        Theme::mode_badge("plan")
+    } else {
+        Theme::status()
+    };
     let hint = Line::from(vec![
         Span::styled(" esc ", Theme::status_accent()),
         Span::styled("cancel  ", Theme::status()),
         Span::styled("enter ", Theme::status_accent()),
-        Span::styled("load  ", Theme::status()),
+        Span::styled(format!("{enter_help}  "), enter_help_style),
         Span::styled("tab ", Theme::status_accent()),
         Span::styled("switch", Theme::status()),
     ]);

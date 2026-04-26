@@ -8,12 +8,14 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{ActivityState, App, ChatEntry, SessionOp, ToolDetail};
+use crate::app::{ActivityState, App, ChatEntry, DelegateEntry, SessionOp, ToolDetail};
 use crate::markdown;
 use crate::theme::Theme;
 
 use super::start::short_cwd;
-use super::{INPUT_OVERLINE, OUTCOME_BULLET, build_input_visual_layout, draw_header};
+use super::{
+    INPUT_OVERLINE, InputVisualLayout, OUTCOME_BULLET, build_input_visual_layout, draw_header,
+};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 
@@ -295,7 +297,20 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         }
     };
 
-    let mut delegate_idx = 0usize;
+    let delegate_entry_for_tool =
+        |tool_call_id: Option<&String>, sequential_idx: usize| -> Option<&DelegateEntry> {
+            tool_call_id
+                .and_then(|id| {
+                    app.delegate_entries
+                        .iter()
+                        .find(|entry| entry.delegate_tool_call_id.as_deref() == Some(id.as_str()))
+                })
+                .or_else(|| app.delegate_entries.get(sequential_idx))
+        };
+    let mut delegate_idx = app.messages[..start_idx]
+        .iter()
+        .filter(|entry| matches!(entry, ChatEntry::ToolCall { name, .. } if name == "delegate"))
+        .count();
 
     for entry in &app.messages[start_idx..] {
         match entry {
@@ -330,7 +345,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 name,
                 is_error,
                 detail,
-                ..
+                tool_call_id,
             } => {
                 let style = if *is_error {
                     Theme::tool_error()
@@ -339,9 +354,10 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 };
                 let sym = if *is_error { "x" } else { ">" };
 
-                // For delegate tool calls, compute duration from delegate_entries.
-                let delegate_duration = if name == "delegate" {
-                    let dur = app.delegate_entries.get(delegate_idx).and_then(|e| {
+                // For delegate tool calls, compute duration and state from delegate_entries.
+                let (delegate_duration, delegate_awaiting_input) = if name == "delegate" {
+                    let entry = delegate_entry_for_tool(tool_call_id.as_ref(), delegate_idx);
+                    let dur = entry.and_then(|e| {
                         let start = e.started_at?;
                         let end = e.ended_at.unwrap_or_else(|| {
                             std::time::SystemTime::now()
@@ -356,10 +372,11 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             format!(":{}m{}s", secs / 60, secs % 60)
                         })
                     });
+                    let awaiting_input = entry.is_some_and(|e| e.awaiting_input());
                     delegate_idx += 1;
-                    dur.unwrap_or_default()
+                    (dur.unwrap_or_default(), awaiting_input)
                 } else {
-                    String::new()
+                    (String::new(), false)
                 };
 
                 match detail {
@@ -407,6 +424,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             };
                             let mut spans = vec![Span::styled(format!("{sym} {name} "), style)];
                             spans.push(Span::styled(format!("{label} "), Theme::status_accent()));
+                            if delegate_awaiting_input {
+                                spans.push(Span::styled(
+                                    "awaiting input ",
+                                    Theme::mode_badge("plan"),
+                                ));
+                            }
                             if !objective.is_empty() {
                                 spans.push(Span::styled(objective.to_string(), Theme::diff_file()));
                             }
@@ -596,13 +619,15 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
 
     if !app.delegate_entries.is_empty() {
         use crate::app::DelegateStatus;
-        let (mut done, mut has_failed, mut has_running) = (0usize, false, false);
+        let (mut done, mut has_failed, mut has_running, mut awaiting_input) =
+            (0usize, false, false, false);
         for e in &app.delegate_entries {
             match e.status {
                 DelegateStatus::Completed | DelegateStatus::Cancelled => done += 1,
                 DelegateStatus::Failed => has_failed = true,
                 DelegateStatus::InProgress => has_running = true,
             }
+            awaiting_input |= e.awaiting_input();
         }
         let total = app.delegate_entries.len();
         let style = if has_failed {
@@ -616,6 +641,9 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
             format!(" {ICON_DELEGATES} {done}/{total} "),
             style,
         ));
+        if awaiting_input {
+            right_spans.push(Span::styled(" awaiting input ", Theme::mode_badge("plan")));
+        }
     }
 
     let other_active_session_count = app.other_active_session_count();
@@ -661,17 +689,39 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
 
 pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(3),    // messages (all remaining space)
-        ])
-        .split(area);
+
+    let (input_height, input_layout) = input_layout_metrics(app, area);
+    let elicitation_height = elicitation_popup_height(app, area);
+
+    let chunks = if elicitation_height > 0 {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),                  // header
+                Constraint::Min(3),                     // messages
+                Constraint::Length(elicitation_height), // elicitation popup
+                Constraint::Length(1),                  // input border line
+                Constraint::Length(input_height),       // input hint area
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // header
+                Constraint::Min(3),    // messages (all remaining space)
+            ])
+            .split(area)
+    };
 
     let (left_spans, right_spans) = build_chat_header_spans(app);
     draw_header(f, app, chunks[0], left_spans, right_spans);
     draw_messages(f, app, chunks[1]);
+
+    if elicitation_height > 0 {
+        draw_elicitation_popup(f, app, chunks[2]);
+        draw_input_panel(f, app, chunks[3], chunks[4], input_layout);
+    }
 }
 
 // ── Draw chat screen ──────────────────────────────────────────────────────────
@@ -689,26 +739,8 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         0u16
     };
 
-    // Compute how many visual rows the input text needs when wrapped.
-    let input_inner_width = area.width.saturating_sub(4) as usize;
-    let prefix_width = 2usize; // "> "
-    let input_layout = build_input_visual_layout(
-        &app.input,
-        app.input_cursor,
-        input_inner_width.max(1),
-        prefix_width,
-    );
-    let max_input_lines: u16 = 5;
-    let input_height = (input_layout.total_rows() as u16).clamp(1, max_input_lines) + 1; // +1 bottom padding
-
-    // Elicitation popup height: header (2) + message (1) + blank (1) + options/field + hint (1)
-    let elicitation_height: u16 = if let Some(state) = &app.elicitation {
-        let option_rows = state.current_option_count() as u16;
-        // header line + message line + blank + options-or-input (min 1) + hint line
-        (2 + 1 + option_rows.max(1) + 1).min(area.height / 2)
-    } else {
-        0
-    };
+    let (input_height, input_layout) = input_layout_metrics(app, area);
+    let elicitation_height = elicitation_popup_height(app, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -740,6 +772,42 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         draw_elicitation_popup(f, app, chunks[3]);
     }
 
+    draw_input_panel(f, app, chunks[4], chunks[5], input_layout);
+}
+
+fn input_layout_metrics(app: &App, area: Rect) -> (u16, InputVisualLayout) {
+    // Compute how many visual rows the input text needs when wrapped.
+    let input_inner_width = area.width.saturating_sub(4) as usize;
+    let prefix_width = 2usize; // "> "
+    let input_layout = build_input_visual_layout(
+        &app.input,
+        app.input_cursor,
+        input_inner_width.max(1),
+        prefix_width,
+    );
+    let max_input_lines: u16 = 5;
+    let input_height = (input_layout.total_rows() as u16).clamp(1, max_input_lines) + 1; // +1 bottom padding
+
+    (input_height, input_layout)
+}
+
+fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
+    if let Some(state) = &app.elicitation {
+        let option_rows = state.current_option_count() as u16;
+        // header line + message line + options-or-input (min 1) + hint line
+        (2 + 1 + option_rows.max(1) + 1).min(area.height / 2)
+    } else {
+        0
+    }
+}
+
+fn draw_input_panel(
+    f: &mut Frame,
+    app: &mut App,
+    border_area: Rect,
+    input_area: Rect,
+    input_layout: InputVisualLayout,
+) {
     // input border line reflects active session state
     let border_style = match &app.activity {
         ActivityState::SessionOp(SessionOp::Undo) => Theme::input_border_undo(),
@@ -753,16 +821,16 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         _ => Theme::mode_border(&app.agent_mode),
     };
     let border_line =
-        Paragraph::new(INPUT_OVERLINE.repeat(chunks[4].width as usize)).style(border_style);
-    f.render_widget(border_line, chunks[4]);
+        Paragraph::new(INPUT_OVERLINE.repeat(border_area.width as usize)).style(border_style);
+    f.render_widget(border_line, border_area);
 
     // input area
     let input_bg = Block::default()
         .padding(Padding::new(2, 2, 0, 1))
         .style(Theme::input());
-    let inner = input_bg.inner(chunks[5]);
+    let inner = input_bg.inner(input_area);
     app.input_line_width = (inner.width as usize).max(1);
-    f.render_widget(input_bg, chunks[5]);
+    f.render_widget(input_bg, input_area);
 
     let (label_text, label_style) = match &app.activity {
         ActivityState::SessionOp(SessionOp::Undo) => (
@@ -803,12 +871,7 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
             inner,
         );
     } else {
-        let layout = build_input_visual_layout(
-            &app.input,
-            app.input_cursor,
-            app.input_line_width,
-            prefix_width,
-        );
+        let layout = input_layout;
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (idx, row) in layout.rows.iter().enumerate() {
             if idx == 0 {

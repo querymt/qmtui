@@ -293,7 +293,7 @@ pub struct AgentEvent {
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
     TurnStarted,

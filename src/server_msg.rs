@@ -4,13 +4,268 @@
 //! helper functions for parsing tool details, updating tool results, and
 //! building diff/write content lines.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::*;
 use crate::protocol::*;
 use crate::ui::{ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingElicitationSnapshot {
+    elicitation_id: String,
+    message: String,
+    requested_schema: serde_json::Value,
+    source: String,
+}
+
 impl App {
+    fn parse_delegate_tool_call(
+        tool_call_id: &Option<String>,
+        arguments: Option<&serde_json::Value>,
+    ) -> Option<PendingDelegateToolCall> {
+        let tool_call_id = tool_call_id.clone()?;
+        let args = arguments?;
+        let obj = if let Some(s) = args.as_str() {
+            serde_json::from_str::<serde_json::Value>(s).unwrap_or_default()
+        } else {
+            args.clone()
+        };
+        let str_field = |key: &str| -> String {
+            obj.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        Some(PendingDelegateToolCall {
+            tool_call_id,
+            target_agent_id: {
+                let agent = str_field("target_agent_id");
+                (!agent.is_empty()).then_some(agent)
+            },
+            objective: str_field("objective"),
+        })
+    }
+
+    fn find_pending_delegate_tool_call(
+        &self,
+        target_agent_id: Option<&str>,
+        objective: Option<&str>,
+    ) -> Option<usize> {
+        self.pending_delegate_tool_calls.iter().position(|pending| {
+            target_agent_id.is_none_or(|agent| pending.target_agent_id.as_deref() == Some(agent))
+                && objective.is_none_or(|obj| pending.objective == obj)
+        })
+    }
+
+    fn child_delegate_entry_index(&self, session_id: &str) -> Option<usize> {
+        self.delegate_entries
+            .iter()
+            .position(|e| e.child_session_id.as_deref() == Some(session_id))
+    }
+
+    fn unlinked_delegate_entry_index_for_agent(&self, agent_id: Option<&str>) -> Option<usize> {
+        let agent_id = agent_id?;
+        let mut matches = self
+            .delegate_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.status == DelegateStatus::InProgress
+                    && e.child_session_id.is_none()
+                    && e.target_agent_id.as_deref() == Some(agent_id)
+            })
+            .map(|(idx, _)| idx);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    fn apply_pending_child_state(&mut self, session_id: &str) {
+        let Some(state) = self.pending_delegate_child_states.remove(session_id) else {
+            return;
+        };
+        if let Some(idx) = self.child_delegate_entry_index(session_id) {
+            if self.delegate_entries[idx].child_state != state {
+                self.delegate_entries[idx].child_state = state;
+                self.invalidate_delegate_render_cache();
+            }
+        }
+    }
+
+    fn current_delegate_pending_elicitation(
+        &self,
+    ) -> Option<(&str, &str, &serde_json::Value, &str)> {
+        let session_id = self.session_id.as_deref()?;
+        self.delegate_entries.iter().find_map(|entry| {
+            if entry.child_session_id.as_deref() != Some(session_id) {
+                return None;
+            }
+            match &entry.child_state {
+                DelegateChildState::PendingElicitation {
+                    elicitation_id,
+                    message,
+                    requested_schema,
+                    source,
+                } => Some((
+                    elicitation_id.as_str(),
+                    message.as_str(),
+                    requested_schema,
+                    source.as_str(),
+                )),
+                _ => None,
+            }
+        })
+    }
+
+    fn current_delegate_pending_elicitation_snapshot(&self) -> Option<PendingElicitationSnapshot> {
+        self.current_delegate_pending_elicitation().map(
+            |(elicitation_id, message, requested_schema, source)| PendingElicitationSnapshot {
+                elicitation_id: elicitation_id.to_string(),
+                message: message.to_string(),
+                requested_schema: requested_schema.clone(),
+                source: source.to_string(),
+            },
+        )
+    }
+
+    fn remove_elicitation_cards(&mut self, elicitation_id: &str) {
+        let before = self.messages.len();
+        self.messages.retain(|entry| {
+            !matches!(
+                entry,
+                ChatEntry::Elicitation {
+                    elicitation_id: existing_id,
+                    ..
+                } if existing_id == elicitation_id
+            )
+        });
+        if self.messages.len() != before {
+            self.card_cache.invalidate();
+        }
+    }
+
+    fn reopen_pending_elicitation(&mut self, pending: &PendingElicitationSnapshot) {
+        self.remove_elicitation_cards(&pending.elicitation_id);
+        self.handle_elicitation_requested(
+            &pending.elicitation_id,
+            &pending.message,
+            &pending.source,
+            &pending.requested_schema,
+        );
+    }
+
+    fn handle_elicitation_requested(
+        &mut self,
+        elicitation_id: &str,
+        message: &str,
+        source: &str,
+        requested_schema: &serde_json::Value,
+    ) {
+        let fields = ElicitationState::parse_schema(requested_schema);
+        if fields.is_empty() {
+            let outcome = "unsupported schema - cannot answer in TUI";
+            self.messages.push(ChatEntry::Elicitation {
+                elicitation_id: elicitation_id.to_string(),
+                message: message.to_string(),
+                source: source.to_string(),
+                outcome: Some(outcome.into()),
+            });
+            self.scroll_offset = 0;
+            self.set_status(
+                LogLevel::Warn,
+                "elicitation",
+                "question skipped - unsupported schema",
+            );
+        } else {
+            self.elicitation = Some(ElicitationState {
+                elicitation_id: elicitation_id.to_string(),
+                message: message.to_string(),
+                source: source.to_string(),
+                fields,
+                field_cursor: 0,
+                option_cursor: 0,
+                selected: HashMap::new(),
+                text_input: String::new(),
+                text_cursor: 0,
+            });
+            self.messages.push(ChatEntry::Elicitation {
+                elicitation_id: elicitation_id.to_string(),
+                message: message.to_string(),
+                source: source.to_string(),
+                outcome: None,
+            });
+            self.scroll_offset = 0;
+            self.set_status(
+                LogLevel::Info,
+                "elicitation",
+                "question - answer in the panel above input",
+            );
+        }
+    }
+
+    fn link_delegate_child_session(
+        &mut self,
+        child_session_id: &str,
+        delegation_id: Option<&str>,
+        target_agent_id: Option<&str>,
+    ) -> bool {
+        let idx = delegation_id
+            .and_then(|id| {
+                self.delegate_entries
+                    .iter()
+                    .position(|e| e.delegation_id == id)
+            })
+            .or_else(|| self.unlinked_delegate_entry_index_for_agent(target_agent_id));
+
+        let Some(idx) = idx else {
+            return false;
+        };
+
+        if self.delegate_entries[idx].child_session_id.as_deref() != Some(child_session_id) {
+            self.delegate_entries[idx].child_session_id = Some(child_session_id.to_string());
+            self.invalidate_delegate_render_cache();
+        }
+        self.apply_pending_child_state(child_session_id);
+        true
+    }
+
+    fn apply_delegate_child_event(
+        &mut self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        kind: &EventKind,
+    ) -> bool {
+        let idx = self
+            .child_delegate_entry_index(session_id)
+            .or_else(|| self.unlinked_delegate_entry_index_for_agent(agent_id));
+
+        let Some(idx) = idx else {
+            let mut state = self
+                .pending_delegate_child_states
+                .remove(session_id)
+                .unwrap_or_default();
+            update_delegate_child_state(&mut state, kind);
+            if state != DelegateChildState::None {
+                self.pending_delegate_child_states
+                    .insert(session_id.to_string(), state);
+            }
+            return false;
+        };
+
+        let before_stats = self.delegate_entries[idx].stats.clone();
+        let before_state = self.delegate_entries[idx].child_state.clone();
+        if self.delegate_entries[idx].child_session_id.is_none() {
+            self.delegate_entries[idx].child_session_id = Some(session_id.to_string());
+        }
+        accumulate_delegate_stats(&mut self.delegate_entries[idx].stats, kind);
+        update_delegate_child_state(&mut self.delegate_entries[idx].child_state, kind);
+        if self.delegate_entries[idx].stats != before_stats
+            || self.delegate_entries[idx].child_state != before_state
+        {
+            self.invalidate_delegate_render_cache();
+        }
+        true
+    }
+
     pub fn handle_server_msg(&mut self, raw: RawServerMsg) -> Vec<ClientMsg> {
         match raw.msg_type.as_str() {
             "state" => {
@@ -190,6 +445,8 @@ impl App {
                     self.recent_prompt_text = None;
                     self.suppress_turn_output = false;
                     self.delegate_entries.clear();
+                    self.pending_delegate_child_states.clear();
+                    self.pending_delegate_tool_calls.clear();
                     self.parent_session_id = None;
                     self.pending_parent_session_id = None;
                     self.suppress_delegation_result = false;
@@ -280,6 +537,8 @@ impl App {
                             // session; otherwise clear for unrelated session switches.
                             if self.parent_session_id.is_none() {
                                 self.delegate_entries.clear();
+                                self.pending_delegate_child_states.clear();
+                                self.pending_delegate_tool_calls.clear();
                             }
                             self.file_index.clear();
                             self.file_index_generated_at = None;
@@ -293,9 +552,28 @@ impl App {
                             self.undo_state =
                                 self.build_undo_state_from_server_stack(&sl.undo_stack, None, None);
                             self.set_status(LogLevel::Debug, "activity", "ready");
+                            let parent_pending =
+                                self.current_delegate_pending_elicitation_snapshot();
+                            let audit_pending =
+                                pending_elicitation_from_audit(&sl.audit, parent_pending.as_ref());
+                            let session_loaded_pending_elicitation =
+                                parent_pending.or(audit_pending);
+
                             // Replay audit: sets current_provider/model (ProviderChanged)
                             // and agent_mode (SessionModeChanged).
-                            self.replay_audit(&sl.audit);
+                            self.replay_audit(
+                                &sl.audit,
+                                session_loaded_pending_elicitation.as_ref(),
+                            );
+
+                            if let Some(pending) = session_loaded_pending_elicitation.as_ref()
+                                && !matches!(
+                                    self.elicitation.as_ref(),
+                                    Some(active) if active.elicitation_id == pending.elicitation_id
+                                )
+                            {
+                                self.reopen_pending_elicitation(pending);
+                            }
 
                             // Restore the session's mode on the server.
                             let mut cmds = vec![ClientMsg::SetAgentMode {
@@ -320,16 +598,18 @@ impl App {
                             for envelope in parsed.events {
                                 self.handle_event_with_replay(&envelope, true);
                             }
-                        } else if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
-                            e.child_session_id.as_deref() == Some(parsed.session_id.as_str())
-                        }) {
-                            // Delegate child: accumulate stats without inflating
-                            // the multi-session activity badge.
-                            for envelope in &parsed.events {
-                                accumulate_delegate_stats(&mut entry.stats, envelope.kind());
-                            }
                         } else {
-                            self.note_session_activity(&parsed.session_id);
+                            let mut routed = false;
+                            for envelope in &parsed.events {
+                                routed |= self.apply_delegate_child_event(
+                                    &parsed.session_id,
+                                    Some(&parsed.agent_id),
+                                    envelope.kind(),
+                                );
+                            }
+                            if !routed {
+                                self.note_session_activity(&parsed.session_id);
+                            }
                         }
                     } else {
                         match serde_json::from_value::<SessionEventsDataRaw>(data) {
@@ -349,18 +629,15 @@ impl App {
                                     for val in se.events {
                                         self.handle_event_value_with_replay(&val, true, true);
                                     }
-                                } else if let Some(entry) =
-                                    self.delegate_entries.iter_mut().find(|e| {
-                                        e.child_session_id.as_deref()
-                                            == Some(se.session_id.as_str())
-                                    })
-                                {
+                                } else {
                                     let mut unknown_kinds = Vec::new();
+                                    let mut routed = false;
                                     for val in se.events {
                                         match serde_json::from_value::<EventEnvelope>(val.clone()) {
                                             Ok(envelope) => {
-                                                accumulate_delegate_stats(
-                                                    &mut entry.stats,
+                                                routed |= self.apply_delegate_child_event(
+                                                    &se.session_id,
+                                                    Some(&se.agent_id),
                                                     envelope.kind(),
                                                 );
                                             }
@@ -376,8 +653,9 @@ impl App {
                                     for kind_type in unknown_kinds {
                                         self.warn_unknown_event_kind(&kind_type, true);
                                     }
-                                } else {
-                                    self.note_session_activity(&se.session_id);
+                                    if !routed {
+                                        self.note_session_activity(&se.session_id);
+                                    }
                                 }
                             }
                         }
@@ -391,11 +669,11 @@ impl App {
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
                             self.note_session_activity(&parsed.session_id);
                             self.handle_event(&parsed.event);
-                        } else if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
-                            e.child_session_id.as_deref() == Some(parsed.session_id.as_str())
-                        }) {
-                            accumulate_delegate_stats(&mut entry.stats, parsed.event.kind());
-                        } else {
+                        } else if !self.apply_delegate_child_event(
+                            &parsed.session_id,
+                            Some(&parsed.agent_id),
+                            parsed.event.kind(),
+                        ) {
                             self.note_session_activity(&parsed.session_id);
                         }
                     } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
@@ -403,23 +681,24 @@ impl App {
                         if is_current {
                             self.note_session_activity(&ed.session_id);
                             self.handle_event_value(&ed.event, false);
-                        } else if let Some(entry) = self
-                            .delegate_entries
-                            .iter_mut()
-                            .find(|e| e.child_session_id.as_deref() == Some(ed.session_id.as_str()))
-                        {
+                        } else {
                             match serde_json::from_value::<EventEnvelope>(ed.event.clone()) {
                                 Ok(envelope) => {
-                                    accumulate_delegate_stats(&mut entry.stats, envelope.kind());
+                                    if !self.apply_delegate_child_event(
+                                        &ed.session_id,
+                                        Some(&ed.agent_id),
+                                        envelope.kind(),
+                                    ) {
+                                        self.note_session_activity(&ed.session_id);
+                                    }
                                 }
                                 Err(_) => {
                                     if let Some(kind_type) = extract_event_kind_type(&ed.event) {
                                         self.warn_unknown_event_kind(kind_type, true);
                                     }
+                                    self.note_session_activity(&ed.session_id);
                                 }
                             }
-                        } else {
-                            self.note_session_activity(&ed.session_id);
                         }
                     }
                 }
@@ -566,6 +845,16 @@ impl App {
         kind: &EventKind,
         is_replay: bool,
         timestamp: Option<i64>,
+    ) {
+        self.handle_event_kind_with_pending(kind, is_replay, timestamp, None);
+    }
+
+    fn handle_event_kind_with_pending(
+        &mut self,
+        kind: &EventKind,
+        is_replay: bool,
+        timestamp: Option<i64>,
+        pending_elicitation: Option<&PendingElicitationSnapshot>,
     ) {
         match kind {
             EventKind::PromptReceived {
@@ -780,6 +1069,29 @@ impl App {
                     {
                         return;
                     }
+                    if tool_name == "delegate"
+                        && let Some(pending) =
+                            Self::parse_delegate_tool_call(tool_call_id, arguments.as_ref())
+                        && !self
+                            .pending_delegate_tool_calls
+                            .iter()
+                            .any(|existing| existing.tool_call_id == pending.tool_call_id)
+                    {
+                        self.delegate_entries.push(DelegateEntry {
+                            delegation_id: pending.tool_call_id.clone(),
+                            child_session_id: None,
+                            delegate_tool_call_id: Some(pending.tool_call_id.clone()),
+                            target_agent_id: pending.target_agent_id.clone(),
+                            objective: pending.objective.clone(),
+                            status: DelegateStatus::InProgress,
+                            stats: DelegateStats::default(),
+                            started_at: timestamp,
+                            ended_at: None,
+                            child_state: DelegateChildState::None,
+                        });
+                        self.pending_delegate_tool_calls.push(pending);
+                        self.invalidate_delegate_render_cache();
+                    }
                     let detail = parse_tool_detail(tool_name, arguments.as_ref());
                     self.messages.push(ChatEntry::ToolCall {
                         tool_call_id: tool_call_id.clone(),
@@ -852,7 +1164,19 @@ impl App {
                 ..
             } => {
                 if is_replay {
-                    // Replay can include the same elicitation more than once
+                    let replay_pending = pending_elicitation
+                        .filter(|pending| pending.elicitation_id == *elicitation_id)
+                        .cloned()
+                        .or_else(|| {
+                            self.current_delegate_pending_elicitation_snapshot()
+                                .filter(|pending| pending.elicitation_id == *elicitation_id)
+                        });
+                    if let Some(pending) = replay_pending {
+                        self.reopen_pending_elicitation(&pending);
+                        return;
+                    }
+
+                    // Replay can include the same resolved elicitation more than once
                     // (session_loaded audit + current session_events history).
                     if self.messages.iter().any(|entry| {
                         matches!(
@@ -875,46 +1199,12 @@ impl App {
                     });
                     return;
                 }
-                let fields = ElicitationState::parse_schema(requested_schema);
-                if fields.is_empty() {
-                    let outcome = "unsupported schema - cannot answer in TUI";
-                    self.messages.push(ChatEntry::Elicitation {
-                        elicitation_id: elicitation_id.clone(),
-                        message: message.clone(),
-                        source: source.clone(),
-                        outcome: Some(outcome.into()),
-                    });
-                    self.scroll_offset = 0;
-                    self.set_status(
-                        LogLevel::Warn,
-                        "elicitation",
-                        "question skipped - unsupported schema",
-                    );
-                } else {
-                    self.elicitation = Some(ElicitationState {
-                        elicitation_id: elicitation_id.clone(),
-                        message: message.clone(),
-                        source: source.clone(),
-                        fields,
-                        field_cursor: 0,
-                        option_cursor: 0,
-                        selected: HashMap::new(),
-                        text_input: String::new(),
-                        text_cursor: 0,
-                    });
-                    self.messages.push(ChatEntry::Elicitation {
-                        elicitation_id: elicitation_id.clone(),
-                        message: message.clone(),
-                        source: source.clone(),
-                        outcome: None,
-                    });
-                    self.scroll_offset = 0;
-                    self.set_status(
-                        LogLevel::Info,
-                        "elicitation",
-                        "question — answer in the panel above input",
-                    );
-                }
+                self.handle_elicitation_requested(
+                    elicitation_id,
+                    message,
+                    source,
+                    requested_schema,
+                );
             }
             EventKind::SessionModeChanged { mode } => {
                 self.agent_mode = mode.clone();
@@ -951,32 +1241,78 @@ impl App {
             EventKind::SessionCreated => {}
             // ── Delegation lifecycle events ─────────────────────────────────────
             EventKind::DelegationRequested { delegation } => {
-                // Idempotent upsert: the parent session can be replayed more than
-                // once (session_loaded audit + parent session_events replay). Keep
-                // exactly one DelegateEntry per delegation.public_id.
-                if let Some(entry) = self
+                let objective = delegation.objective.clone().unwrap_or_default();
+                let pending_idx = self.find_pending_delegate_tool_call(
+                    delegation.target_agent_id.as_deref(),
+                    delegation.objective.as_deref(),
+                );
+                let pending = pending_idx.map(|idx| self.pending_delegate_tool_calls.remove(idx));
+                let mut changed = false;
+
+                if let Some(idx) = self
                     .delegate_entries
-                    .iter_mut()
-                    .find(|e| e.delegation_id == delegation.public_id)
+                    .iter()
+                    .position(|e| e.delegation_id == delegation.public_id)
                 {
-                    // Refresh metadata in case a later replay has more fields.
-                    if entry.target_agent_id.is_none() {
+                    let entry = &mut self.delegate_entries[idx];
+                    if entry.target_agent_id.is_none() && delegation.target_agent_id.is_some() {
                         entry.target_agent_id = delegation.target_agent_id.clone();
+                        changed = true;
                     }
-                    if entry.objective.is_empty() {
-                        entry.objective = delegation.objective.clone().unwrap_or_default();
+                    if entry.objective.is_empty() && !objective.is_empty() {
+                        entry.objective = objective.clone();
+                        changed = true;
                     }
+                    if let Some(pending) = pending.as_ref()
+                        && entry.delegate_tool_call_id.is_none()
+                    {
+                        entry.delegate_tool_call_id = Some(pending.tool_call_id.clone());
+                        changed = true;
+                    }
+                } else if let Some(pending) = pending {
+                    if let Some(idx) = self.delegate_entries.iter().position(|e| {
+                        e.delegate_tool_call_id.as_deref() == Some(pending.tool_call_id.as_str())
+                    }) {
+                        let entry = &mut self.delegate_entries[idx];
+                        entry.delegation_id = delegation.public_id.clone();
+                        if entry.target_agent_id.is_none() {
+                            entry.target_agent_id = delegation.target_agent_id.clone();
+                        }
+                        if entry.objective.is_empty() {
+                            entry.objective = objective.clone();
+                        }
+                    } else {
+                        self.delegate_entries.push(DelegateEntry {
+                            delegation_id: delegation.public_id.clone(),
+                            child_session_id: None,
+                            delegate_tool_call_id: Some(pending.tool_call_id),
+                            target_agent_id: delegation.target_agent_id.clone(),
+                            objective,
+                            status: DelegateStatus::InProgress,
+                            stats: DelegateStats::default(),
+                            started_at: timestamp,
+                            ended_at: None,
+                            child_state: DelegateChildState::None,
+                        });
+                    }
+                    changed = true;
                 } else {
                     self.delegate_entries.push(DelegateEntry {
                         delegation_id: delegation.public_id.clone(),
                         child_session_id: None,
+                        delegate_tool_call_id: None,
                         target_agent_id: delegation.target_agent_id.clone(),
-                        objective: delegation.objective.clone().unwrap_or_default(),
+                        objective,
                         status: DelegateStatus::InProgress,
                         stats: DelegateStats::default(),
                         started_at: timestamp,
                         ended_at: None,
+                        child_state: DelegateChildState::None,
                     });
+                    changed = true;
+                }
+                if changed {
+                    self.invalidate_delegate_render_cache();
                 }
             }
             EventKind::SessionForked {
@@ -988,15 +1324,13 @@ impl App {
                 if origin.as_deref() == Some("delegation")
                     && let Some(sid) = child_session_id
                 {
-                    // Update the matching delegation entry.
-                    if let Some(delegation_id) = fork_point_ref
-                        && let Some(entry) = self
-                            .delegate_entries
-                            .iter_mut()
-                            .find(|e| e.delegation_id == *delegation_id)
-                    {
-                        entry.child_session_id = Some(sid.clone());
-                    }
+                    // Prefer the explicit delegation id, but fall back to a
+                    // single unlinked in-progress delegate for this target agent.
+                    self.link_delegate_child_session(
+                        sid,
+                        fork_point_ref.as_deref(),
+                        target_agent_id.as_deref(),
+                    );
                     // Subscribe to the child session using the delegation's
                     // target agent_id — matching the web UI behaviour.
                     // Fall back to parent agent_id if not present.
@@ -1034,6 +1368,8 @@ impl App {
                 {
                     entry.status = DelegateStatus::Completed;
                     entry.ended_at = timestamp;
+                    entry.child_state = DelegateChildState::None;
+                    self.invalidate_delegate_render_cache();
                 }
                 self.suppress_delegation_result = true;
             }
@@ -1045,6 +1381,8 @@ impl App {
                 {
                     entry.status = DelegateStatus::Failed;
                     entry.ended_at = timestamp;
+                    entry.child_state = DelegateChildState::None;
+                    self.invalidate_delegate_render_cache();
                 }
                 self.suppress_delegation_result = true;
             }
@@ -1056,6 +1394,8 @@ impl App {
                 {
                     entry.status = DelegateStatus::Cancelled;
                     entry.ended_at = timestamp;
+                    entry.child_state = DelegateChildState::None;
+                    self.invalidate_delegate_render_cache();
                 }
                 self.suppress_delegation_result = true;
             }
@@ -1071,7 +1411,11 @@ impl App {
         std::mem::take(&mut self.pending_commands)
     }
 
-    pub(crate) fn replay_audit(&mut self, audit: &serde_json::Value) {
+    pub(crate) fn replay_audit(
+        &mut self,
+        audit: &serde_json::Value,
+        pending_elicitation: Option<&PendingElicitationSnapshot>,
+    ) {
         if let Some(events) = audit.get("events").and_then(|e| e.as_array()) {
             let frontier_message_id = self
                 .undo_state
@@ -1081,9 +1425,8 @@ impl App {
 
             if let Some(frontier_message_id) = frontier_message_id
                 && let Some(idx) = events.iter().position(|event_val| {
-                    serde_json::from_value::<AgentEvent>(event_val.clone())
-                        .ok()
-                        .and_then(|event| match event.kind {
+                    parse_audit_event(event_val)
+                        .and_then(|(kind, _)| match kind {
                             EventKind::PromptReceived {
                                 message_id: Some(message_id),
                                 ..
@@ -1097,13 +1440,83 @@ impl App {
             }
 
             for event_val in events.iter().take(replay_cutoff) {
-                if let Ok(agent_event) = serde_json::from_value::<AgentEvent>(event_val.clone()) {
-                    self.apply_event_stats(&agent_event.kind, agent_event.timestamp);
-                    self.handle_event_kind(&agent_event.kind, true, agent_event.timestamp);
+                if let Some((kind, timestamp)) = parse_audit_event(event_val) {
+                    self.apply_event_stats(&kind, timestamp);
+                    self.handle_event_kind_with_pending(
+                        &kind,
+                        true,
+                        timestamp,
+                        pending_elicitation,
+                    );
                 }
             }
         }
     }
+}
+
+fn parse_audit_event(value: &serde_json::Value) -> Option<(EventKind, Option<i64>)> {
+    if let Ok(agent_event) = serde_json::from_value::<AgentEvent>(value.clone()) {
+        return Some((agent_event.kind, agent_event.timestamp));
+    }
+    serde_json::from_value::<EventEnvelope>(value.clone())
+        .ok()
+        .map(|envelope| (envelope.kind().clone(), envelope.timestamp()))
+}
+
+fn pending_elicitation_from_audit(
+    audit: &serde_json::Value,
+    parent_pending: Option<&PendingElicitationSnapshot>,
+) -> Option<PendingElicitationSnapshot> {
+    let events = audit.get("events").and_then(|e| e.as_array())?;
+    let parent_pending_id = parent_pending.map(|pending| pending.elicitation_id.as_str());
+    let mut latest: Option<PendingElicitationSnapshot> = None;
+    let mut answered = HashSet::new();
+
+    for event_val in events {
+        let Some((kind, _)) = parse_audit_event(event_val) else {
+            continue;
+        };
+        match kind {
+            EventKind::ElicitationRequested {
+                elicitation_id,
+                message,
+                requested_schema,
+                source,
+                ..
+            } => {
+                answered.remove(elicitation_id.as_str());
+                latest = Some(PendingElicitationSnapshot {
+                    elicitation_id,
+                    message,
+                    requested_schema,
+                    source,
+                });
+            }
+            EventKind::ToolCallEnd {
+                tool_name, result, ..
+            } if tool_name == "question" && result.as_deref().is_some_and(is_answer_result) => {
+                if let Some(pending) = latest.as_ref() {
+                    answered.insert(pending.elicitation_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    latest.filter(|pending| {
+        parent_pending_id == Some(pending.elicitation_id.as_str())
+            || !answered.contains(&pending.elicitation_id)
+    })
+}
+
+fn is_answer_result(result: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else {
+        return false;
+    };
+    value
+        .get("answers")
+        .and_then(|answers| answers.as_array())
+        .is_some_and(|answers| !answers.is_empty())
 }
 
 fn extract_event_kind_type(value: &serde_json::Value) -> Option<&str> {
@@ -1143,6 +1556,59 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
         }
         EventKind::LlmRequestStart { .. } | EventKind::SessionCreated | EventKind::Unknown => {}
         _ => {}
+    }
+}
+
+pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: &EventKind) {
+    match kind {
+        EventKind::ElicitationRequested {
+            elicitation_id,
+            message,
+            source,
+            requested_schema,
+            ..
+        } => {
+            *state = DelegateChildState::PendingElicitation {
+                elicitation_id: elicitation_id.clone(),
+                message: message.clone(),
+                requested_schema: requested_schema.clone(),
+                source: source.clone(),
+            };
+        }
+        EventKind::ToolCallEnd { tool_name, .. } if tool_name == "question" => {
+            *state = DelegateChildState::QuestionToolFinished;
+        }
+        EventKind::AssistantMessageStored { .. } => {
+            *state = DelegateChildState::AssistantMessage;
+        }
+        EventKind::UserMessageStored { .. } => {
+            *state = DelegateChildState::UserMessage;
+        }
+        EventKind::ToolCallStart { .. }
+        | EventKind::AssistantContentDelta { .. }
+        | EventKind::AssistantThinkingDelta { .. }
+        | EventKind::PromptReceived { .. }
+        | EventKind::LlmRequestStart { .. }
+        | EventKind::LlmRequestEnd { .. }
+        | EventKind::CompactionStart { .. }
+        | EventKind::CompactionEnd { .. }
+        | EventKind::ProviderChanged { .. }
+        | EventKind::Error { .. }
+        | EventKind::Cancelled => {
+            *state = DelegateChildState::OtherProgress;
+        }
+        EventKind::TurnStarted
+        | EventKind::SessionModeChanged { .. }
+        | EventKind::SessionCreated
+        | EventKind::DelegationRequested { .. }
+        | EventKind::DelegationCompleted { .. }
+        | EventKind::DelegationFailed { .. }
+        | EventKind::DelegationCancelled { .. }
+        | EventKind::SessionForked { .. }
+        | EventKind::Unknown => {}
+        EventKind::ToolCallEnd { .. } => {
+            *state = DelegateChildState::OtherProgress;
+        }
     }
 }
 

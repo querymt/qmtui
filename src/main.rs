@@ -1891,7 +1891,8 @@ mod sessions_key_tests {
         assert_eq!(
             action,
             SessionKeyAction::LoadSession {
-                session_id: "abc12345".to_string()
+                session_id: "abc12345".to_string(),
+                agent_id: None,
             }
         );
     }
@@ -2243,7 +2244,8 @@ mod session_popup_key_tests {
         assert_eq!(
             action,
             SessionKeyAction::LoadSession {
-                session_id: "abc12345".to_string()
+                session_id: "abc12345".to_string(),
+                agent_id: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -2263,7 +2265,8 @@ mod session_popup_key_tests {
         assert_eq!(
             action,
             SessionKeyAction::LoadSession {
-                session_id: "s5".to_string()
+                session_id: "s5".to_string(),
+                agent_id: None,
             }
         );
     }
@@ -2645,12 +2648,14 @@ mod delegate_popup_key_tests {
         DelegateEntry {
             delegation_id: id.into(),
             child_session_id: child_sid.map(String::from),
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: objective.into(),
             status: DelegateStatus::Completed,
             stats: app::DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: app::DelegateChildState::None,
         }
     }
 
@@ -2738,7 +2743,8 @@ mod delegate_popup_key_tests {
         assert_eq!(
             action,
             SessionKeyAction::LoadSession {
-                session_id: "child-2".into()
+                session_id: "child-2".into(),
+                agent_id: Some("coder".into()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -2752,12 +2758,14 @@ mod delegate_popup_key_tests {
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "pending task".into(),
             status: DelegateStatus::InProgress,
             stats: app::DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: app::DelegateChildState::None,
         }];
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);
@@ -2784,9 +2792,32 @@ mod delegate_popup_key_tests {
         assert_eq!(
             action,
             SessionKeyAction::LoadSession {
-                session_id: "child-3".into()
+                session_id: "child-3".into(),
+                agent_id: Some("coder".into()),
             }
         );
+    }
+
+    #[test]
+    fn delegate_enter_loads_awaiting_input_child_session() {
+        let mut app = setup_delegate_app();
+        app.delegate_entries[0].status = DelegateStatus::InProgress;
+        app.delegate_entries[0].child_state = app::DelegateChildState::PendingElicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Need approval".into(),
+            requested_schema: serde_json::json!({ "properties": {} }),
+            source: "builtin:question".into(),
+        };
+
+        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child-1".into(),
+                agent_id: Some("coder".into()),
+            }
+        );
+        assert_eq!(app.popup, Popup::None);
     }
 
     #[test]

@@ -543,13 +543,16 @@ pub(crate) fn handle_sessions_key(
             key.code
         },
     ) {
-        SessionKeyAction::LoadSession { session_id } => {
+        SessionKeyAction::LoadSession {
+            session_id,
+            agent_id,
+        } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
-                agent_id: app.agent_id.clone(),
+                agent_id: agent_id.or_else(|| app.agent_id.clone()),
             })?;
         }
         SessionKeyAction::DeleteSession { session_id } => {
@@ -596,13 +599,16 @@ pub(crate) fn handle_session_popup_key(
             key.code
         },
     ) {
-        SessionKeyAction::LoadSession { session_id } => {
+        SessionKeyAction::LoadSession {
+            session_id,
+            agent_id,
+        } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
-                agent_id: app.agent_id.clone(),
+                agent_id: agent_id.or_else(|| app.agent_id.clone()),
             })?;
         }
         SessionKeyAction::DeleteSession { session_id } => {
@@ -665,7 +671,10 @@ pub(crate) fn apply_popup_session_key(
                             .session_id
                             .clone();
                         app.popup = Popup::None;
-                        return SessionKeyAction::LoadSession { session_id: sid };
+                        return SessionKeyAction::LoadSession {
+                            session_id: sid,
+                            agent_id: None,
+                        };
                     }
                 }
             }
@@ -763,13 +772,16 @@ pub(crate) fn handle_delegate_popup_key(
             key.code
         },
     ) {
-        SessionKeyAction::LoadSession { session_id } => {
+        SessionKeyAction::LoadSession {
+            session_id,
+            agent_id,
+        } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
-                agent_id: app.agent_id.clone(),
+                agent_id: agent_id.or_else(|| app.agent_id.clone()),
             })?;
         }
         SessionKeyAction::NewSession
@@ -809,17 +821,27 @@ pub(crate) fn apply_delegate_popup_key(
             app.delegate_cursor = app.delegate_cursor.saturating_add(step).min(max);
         }
         KeyCode::Enter => {
-            let entries = app.visible_delegate_entries();
-            if let Some(entry) = entries.get(app.delegate_cursor) {
-                if let Some(ref child_sid) = entry.child_session_id {
-                    let sid = child_sid.clone();
+            let selected = app
+                .visible_delegate_entries()
+                .get(app.delegate_cursor)
+                .map(|entry| {
+                    (
+                        entry.child_session_id.clone(),
+                        entry.target_agent_id.clone(),
+                    )
+                });
+            if let Some((child_session_id, target_agent_id)) = selected {
+                if let Some(sid) = child_session_id {
                     // Use the real parent when navigating between siblings.
                     app.pending_parent_session_id = app
                         .parent_session_id
                         .clone()
                         .or_else(|| app.session_id.clone());
                     app.popup = Popup::None;
-                    return SessionKeyAction::LoadSession { session_id: sid };
+                    return SessionKeyAction::LoadSession {
+                        session_id: sid,
+                        agent_id: target_agent_id,
+                    };
                 } else {
                     app.set_status(
                         app::LogLevel::Warn,
@@ -1906,7 +1928,10 @@ pub(crate) enum SessionKeyAction {
     /// Nothing to send to the server.
     None,
     /// Load the session with the given id and subscribe to it.
-    LoadSession { session_id: String },
+    LoadSession {
+        session_id: String,
+        agent_id: Option<String>,
+    },
     /// Delete the session with the given id.
     DeleteSession { session_id: String },
     /// Create a new session.
@@ -1960,7 +1985,10 @@ pub(crate) fn apply_sessions_key(
                         let sid = app.session_groups[group_idx].sessions[session_idx]
                             .session_id
                             .clone();
-                        return SessionKeyAction::LoadSession { session_id: sid };
+                        return SessionKeyAction::LoadSession {
+                            session_id: sid,
+                            agent_id: None,
+                        };
                     }
                     StartPageItem::ShowMore { .. } => {
                         app.popup = Popup::SessionSelect;
@@ -2318,6 +2346,41 @@ mod model_popup_tests {
         assert!(matches!(
             rx.try_recv().expect("expected SetAgentMode(plan)"),
             ClientMsg::SetAgentMode { mode } if mode == "plan"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn delegate_popup_subscribes_with_child_target_agent() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.agent_id = Some("planner".into());
+        app.popup = Popup::SessionSelect;
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_delegate_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("expected LoadSession"),
+            ClientMsg::LoadSession { session_id } if session_id == "child-1"
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("expected SubscribeSession"),
+            ClientMsg::SubscribeSession { session_id, agent_id }
+                if session_id == "child-1" && agent_id.as_deref() == Some("coder")
         ));
         assert!(rx.try_recv().is_err());
     }

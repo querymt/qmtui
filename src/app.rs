@@ -137,10 +137,28 @@ impl DelegateStats {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DelegateChildState {
+    #[default]
+    None,
+    PendingElicitation {
+        elicitation_id: String,
+        message: String,
+        requested_schema: serde_json::Value,
+        source: String,
+    },
+    QuestionToolFinished,
+    AssistantMessage,
+    UserMessage,
+    OtherProgress,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DelegateEntry {
     pub delegation_id: String,
     pub child_session_id: Option<String>,
+    /// Parent delegate tool call this row renders for, when known.
+    pub delegate_tool_call_id: Option<String>,
     pub target_agent_id: Option<String>,
     pub objective: String,
     pub status: DelegateStatus,
@@ -149,6 +167,30 @@ pub struct DelegateEntry {
     pub started_at: Option<i64>,
     /// Server timestamp (unix seconds) when delegation completed/failed/cancelled.
     pub ended_at: Option<i64>,
+    /// Compact state derived from the latest significant child-session event.
+    pub child_state: DelegateChildState,
+}
+
+impl DelegateEntry {
+    pub fn awaiting_input(&self) -> bool {
+        self.status == DelegateStatus::InProgress
+            && matches!(
+                self.child_state,
+                DelegateChildState::PendingElicitation { .. }
+            )
+    }
+
+    pub fn pending_elicitation(&self) -> Option<(&str, &str, &str)> {
+        match &self.child_state {
+            DelegateChildState::PendingElicitation {
+                elicitation_id,
+                message,
+                source,
+                ..
+            } => Some((elicitation_id.as_str(), message.as_str(), source.as_str())),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +199,13 @@ pub enum DelegateStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelegateToolCall {
+    pub tool_call_id: String,
+    pub target_agent_id: Option<String>,
+    pub objective: String,
 }
 
 #[derive(Debug, Clone)]
@@ -953,6 +1002,10 @@ pub struct App {
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
     /// Drained by handle_server_msg after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
+    /// Child-session state observed before a delegation entry can be linked.
+    pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
+    /// Parent delegate ToolCallStart records awaiting DelegationRequested linkage.
+    pub pending_delegate_tool_calls: Vec<PendingDelegateToolCall>,
     /// While a reverted frontier turn is being suppressed, ignore any
     /// follow-up assistant/tool/cancelled events until a new prompt arrives.
     pub suppress_turn_output: bool,
@@ -1076,6 +1129,8 @@ impl App {
             pending_parent_session_id: None,
             suppress_delegation_result: false,
             pending_commands: Vec::new(),
+            pending_delegate_child_states: HashMap::new(),
+            pending_delegate_tool_calls: Vec::new(),
             suppress_turn_output: false,
             status: "connecting...".into(),
             tick: 0,
@@ -1092,6 +1147,10 @@ impl App {
         self.streaming_cache.invalidate();
         self.streaming_thinking.clear();
         self.streaming_thinking_cache.invalidate();
+    }
+
+    pub fn invalidate_delegate_render_cache(&mut self) {
+        self.card_cache.invalidate();
     }
 
     /// Short display label for the current reasoning effort level.
@@ -2497,12 +2556,14 @@ mod delegate_entry_tests {
         DelegateEntry {
             delegation_id: delegation_id.into(),
             child_session_id: Some(format!("child-{delegation_id}")),
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: objective.into(),
             status,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         }
     }
 
@@ -2557,22 +2618,26 @@ mod delegate_entry_tests {
             DelegateEntry {
                 delegation_id: "d1".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: Some("planner".into()),
                 objective: "Plan work".into(),
                 status: DelegateStatus::Completed,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "d2".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: Some("coder".into()),
                 objective: "Write code".into(),
                 status: DelegateStatus::InProgress,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: DelegateChildState::None,
             },
         ];
         app.delegate_filter = "planner".into();
@@ -2622,12 +2687,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: "Fix the bug".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2651,12 +2718,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -2677,12 +2746,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::DelegationCompleted {
@@ -2701,12 +2772,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::DelegationFailed {
@@ -2725,12 +2798,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::DelegationCompleted {
@@ -2815,7 +2890,7 @@ mod delegate_entry_tests {
                 }
             ]
         });
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
         assert_eq!(app.delegate_entries.len(), 1);
         assert_eq!(app.delegate_entries[0].delegation_id, "del-1");
         assert_eq!(app.delegate_entries[0].objective, "Fix bug");
@@ -2955,12 +3030,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         // Simulate a session_events message for the child session
         app.handle_server_msg(RawServerMsg {
@@ -3007,12 +3084,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_events".into(),
@@ -3070,12 +3149,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_events".into(),
@@ -3088,6 +3169,453 @@ mod delegate_entry_tests {
         assert_eq!(app.delegate_entries[0].stats.tool_calls, 0);
     }
 
+    #[test]
+    fn child_elicitation_marks_delegate_awaiting_input() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "elicitation_requested", "data": {
+                            "elicitation_id": "elic-1",
+                            "session_id": "child-sess-1",
+                            "message": "Need approval",
+                            "requested_schema": {
+                                "properties": { "choice": { "oneOf": [{ "const": "a", "title": "A" }] } },
+                                "required": ["choice"]
+                            },
+                            "source": "builtin:question"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        let entry = &app.delegate_entries[0];
+        assert!(entry.awaiting_input());
+        assert_eq!(
+            entry.pending_elicitation(),
+            Some(("elic-1", "Need approval", "builtin:question"))
+        );
+    }
+
+    #[test]
+    fn child_elicitation_before_session_fork_marks_delegate_awaiting_after_link() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "elicitation_requested", "data": {
+                            "elicitation_id": "elic-1",
+                            "session_id": "child-sess-1",
+                            "message": "Need approval",
+                            "requested_schema": { "properties": {}, "required": [] },
+                            "source": "builtin:question"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: Some("del-1".into()),
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+
+        let entry = &app.delegate_entries[0];
+        assert_eq!(entry.child_session_id.as_deref(), Some("child-sess-1"));
+        assert!(entry.awaiting_input());
+    }
+
+    #[test]
+    fn session_forked_without_ref_links_single_matching_delegate_by_agent() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: None,
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "elicitation_requested", "data": {
+                            "elicitation_id": "elic-1",
+                            "session_id": "child-sess-1",
+                            "message": "Need approval",
+                            "requested_schema": { "properties": {}, "required": [] },
+                            "source": "builtin:question"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        let entry = &app.delegate_entries[0];
+        assert_eq!(entry.child_session_id.as_deref(), Some("child-sess-1"));
+        assert!(entry.awaiting_input());
+    }
+
+    #[test]
+    fn session_forked_without_ref_does_not_link_ambiguous_agent_match() {
+        let mut app = App::new();
+        for delegation_id in ["del-1", "del-2"] {
+            app.delegate_entries.push(DelegateEntry {
+                delegation_id: delegation_id.into(),
+                child_session_id: None,
+                delegate_tool_call_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: "task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            });
+        }
+
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: None,
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "elicitation_requested", "data": {
+                            "elicitation_id": "elic-1",
+                            "session_id": "child-sess-1",
+                            "message": "Need approval",
+                            "requested_schema": { "properties": {}, "required": [] },
+                            "source": "builtin:question"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        assert!(
+            app.delegate_entries
+                .iter()
+                .all(|e| e.child_session_id.is_none())
+        );
+        assert!(app.delegate_entries.iter().all(|e| !e.awaiting_input()));
+        assert!(
+            app.pending_delegate_child_states
+                .contains_key("child-sess-1")
+        );
+    }
+
+    #[test]
+    fn buffered_child_elicitation_applies_when_session_fork_later_links() {
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "elicitation_requested", "data": {
+                            "elicitation_id": "elic-1",
+                            "session_id": "child-sess-1",
+                            "message": "Need approval",
+                            "requested_schema": { "properties": {}, "required": [] },
+                            "source": "builtin:question"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+        app.handle_event_kind(
+            &EventKind::SessionForked {
+                child_session_id: Some("child-sess-1".into()),
+                origin: Some("delegation".into()),
+                fork_point_ref: None,
+                target_agent_id: Some("coder".into()),
+            },
+            false,
+            None,
+        );
+
+        assert!(app.delegate_entries[0].awaiting_input());
+        assert!(
+            !app.pending_delegate_child_states
+                .contains_key("child-sess-1")
+        );
+    }
+
+    #[test]
+    fn child_question_tool_end_clears_pending_elicitation() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "tool_call_end", "data": {
+                            "tool_call_id": "tool-1",
+                            "tool_name": "question",
+                            "is_error": false,
+                            "result": "answered"
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        let entry = &app.delegate_entries[0];
+        assert!(!entry.awaiting_input());
+        assert_eq!(entry.child_state, DelegateChildState::QuestionToolFinished);
+    }
+
+    #[test]
+    fn child_assistant_message_clears_pending_elicitation() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-sess-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": { "type": "assistant_message_stored", "data": {
+                            "content": "Done",
+                            "thinking": null,
+                            "message_id": null
+                        }},
+                        "timestamp": null
+                    }
+                }
+            })),
+        });
+
+        let entry = &app.delegate_entries[0];
+        assert!(!entry.awaiting_input());
+        assert_eq!(entry.child_state, DelegateChildState::AssistantMessage);
+    }
+
+    #[test]
+    fn delegation_completion_clears_pending_elicitation() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        });
+
+        app.handle_event_kind(
+            &EventKind::DelegationCompleted {
+                delegation_id: "del-1".into(),
+                result: Some("done".into()),
+            },
+            false,
+            None,
+        );
+
+        let entry = &app.delegate_entries[0];
+        assert_eq!(entry.status, DelegateStatus::Completed);
+        assert!(!entry.awaiting_input());
+        assert_eq!(entry.child_state, DelegateChildState::None);
+    }
+
+    #[test]
+    fn repeated_child_elicitation_replay_is_idempotent() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-sess-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        let event = serde_json::json!({
+            "session_id": "child-sess-1",
+            "agent_id": "coder",
+            "event": {
+                "type": "durable",
+                "data": {
+                    "kind": { "type": "elicitation_requested", "data": {
+                        "elicitation_id": "elic-1",
+                        "session_id": "child-sess-1",
+                        "message": "Need approval",
+                        "requested_schema": {
+                            "properties": { "choice": { "oneOf": [{ "const": "a", "title": "A" }] } },
+                            "required": ["choice"]
+                        },
+                        "source": "builtin:question"
+                    }},
+                    "timestamp": null
+                }
+            }
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(event.clone()),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(event),
+        });
+
+        let entry = &app.delegate_entries[0];
+        assert!(entry.awaiting_input());
+        assert_eq!(
+            entry.pending_elicitation(),
+            Some(("elic-1", "Need approval", "builtin:question"))
+        );
+    }
+
     // ── subscribe on SessionForked ────────────────────────────────────────────
 
     #[test]
@@ -3096,12 +3624,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -3190,12 +3720,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()), // delegation target
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -3239,12 +3771,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -3274,12 +3808,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
         app.handle_event_kind(
             &EventKind::SessionForked {
@@ -3329,12 +3865,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
 
         // Simulate session_events arriving for the child (from subscribe replay)
@@ -3693,12 +4231,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
 
         // delegation_completed fires
@@ -3775,12 +4315,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -3831,12 +4373,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -3870,12 +4414,14 @@ mod delegate_entry_tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "task".into(),
             status: DelegateStatus::InProgress,
             stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: DelegateChildState::None,
         });
 
         app.handle_server_msg(RawServerMsg {
@@ -4341,7 +4887,7 @@ mod session_mode_tests {
         let mut app = App::new();
         app.agent_mode = "build".into();
         let audit = make_audit(&[mode_changed_event("plan")]);
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
         assert_eq!(app.agent_mode, "plan");
     }
 
@@ -4354,7 +4900,7 @@ mod session_mode_tests {
             mode_changed_event("build"),
             mode_changed_event("plan"),
         ]);
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
         assert_eq!(app.agent_mode, "plan");
     }
 
@@ -4363,7 +4909,7 @@ mod session_mode_tests {
         let mut app = App::new();
         app.agent_mode = "build".into();
         let audit = make_audit(&[provider_changed_event("anthropic", "claude-sonnet")]);
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
         assert_eq!(app.agent_mode, "build");
     }
 
@@ -5420,7 +5966,7 @@ mod tests {
             ]
         });
 
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
 
         assert_eq!(app.messages.len(), 2);
         assert!(
@@ -6712,7 +7258,7 @@ mod tests {
             ]
         });
 
-        app.replay_audit(&audit);
+        app.replay_audit(&audit, None);
 
         assert!(app.can_redo());
         let state = app.undo_state.as_ref().expect("undo state");

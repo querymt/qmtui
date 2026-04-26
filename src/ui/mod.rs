@@ -382,6 +382,32 @@ mod tests {
         }
     }
 
+    fn delegate_tool_call(id: &str, agent: &str, objective: &str) -> ChatEntry {
+        ChatEntry::ToolCall {
+            tool_call_id: Some(id.into()),
+            name: "delegate".into(),
+            is_error: false,
+            detail: ToolDetail::Summary(format!("({agent}) {objective}")),
+        }
+    }
+
+    fn rendered_card_lines(app: &mut App) -> Vec<String> {
+        build_message_cards(app)
+            .iter()
+            .flat_map(|card| {
+                card.lines_for(120)
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn render_chat_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -435,6 +461,54 @@ mod tests {
                 }
             },
             "timestamp": null,
+        })
+    }
+
+    fn elicitation_event(schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "elicitation_requested",
+                "data": {
+                    "elicitation_id": "elic-1",
+                    "session_id": "child-1",
+                    "message": "Need approval",
+                    "requested_schema": schema,
+                    "source": "builtin:question",
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
+    fn question_tool_end_event() -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "tool_call_end",
+                "data": {
+                    "tool_call_id": "question-1",
+                    "tool_name": "question",
+                    "is_error": false,
+                    "result": "Question pending",
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
+    fn envelope_event(event: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "durable",
+            "data": event,
+        })
+    }
+
+    fn supported_elicitation_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": { "type": "string", "title": "Answer" }
+            },
+            "required": ["answer"]
         })
     }
 
@@ -579,32 +653,38 @@ mod tests {
             DelegateEntry {
                 delegation_id: "d1".into(),
                 child_session_id: Some("c1".into()),
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "a".into(),
                 status: DelegateStatus::Completed,
                 stats: crate::app::DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "d2".into(),
                 child_session_id: Some("c2".into()),
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "b".into(),
                 status: DelegateStatus::Completed,
                 stats: crate::app::DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "d3".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "c".into(),
                 status: DelegateStatus::InProgress,
                 stats: crate::app::DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -612,6 +692,49 @@ mod tests {
         assert!(
             rendered.contains(&format!("{ICON_DELEGATES} 2/3")),
             "expected delegate badge '2/3' in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn draw_chat_shows_delegate_awaiting_input_badge() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStatus};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("anthropic".into());
+        app.current_model = Some("claude-sonnet".into());
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "d1".into(),
+            child_session_id: Some("c1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "a".into(),
+            status: DelegateStatus::InProgress,
+            stats: crate::app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        }];
+
+        let buffer = render_chat_buffer(&mut app, 100, 8);
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("awaiting input"),
+            "missing awaiting-input badge: {rendered}"
+        );
+        let (x, y) = find_buffer_text(&buffer, "awaiting input").expect("missing badge");
+        assert_eq!(buffer[(x, y)].style().fg, Some(Theme::mode_color("plan")));
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
         );
     }
 
@@ -629,12 +752,14 @@ mod tests {
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: Some("c1".into()),
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "a".into(),
             status: DelegateStatus::Failed,
             stats: crate::app::DelegateStats::default(),
             started_at: None,
             ended_at: None,
+            child_state: crate::app::DelegateChildState::None,
         }];
 
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -659,6 +784,7 @@ mod tests {
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: Some("child-1".into()),
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Fix the bug".into(),
                 status: DelegateStatus::Completed,
@@ -671,10 +797,12 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
                 child_session_id: Some("child-2".into()),
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Write docs".into(),
                 status: DelegateStatus::InProgress,
@@ -687,6 +815,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
 
@@ -708,6 +837,56 @@ mod tests {
     }
 
     #[test]
+    fn draw_delegate_popup_shows_question_pending_marker_and_hint() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, Popup};
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::SessionSelect;
+        app.session_popup_tab = 1;
+        app.delegate_cursor = 1;
+        app.delegate_entries = vec![DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Pending task".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        }];
+
+        let backend = ratatui::backend::TestBackend::new(90, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            rendered.contains("question pending"),
+            "missing popup marker: {rendered}"
+        );
+        let (x, y) = find_buffer_text(&buffer, "open child to answer").expect("missing popup hint");
+        assert_eq!(buffer[(x, y)].style().fg, Some(Theme::mode_color("plan")));
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            rendered.contains("open child to answer"),
+            "missing popup hint: {rendered}"
+        );
+    }
+
+    #[test]
     fn draw_delegate_popup_hides_cost_column_when_all_rows_have_zero_cost() {
         use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
 
@@ -719,6 +898,7 @@ mod tests {
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Pending task".into(),
                 status: DelegateStatus::InProgress,
@@ -731,10 +911,12 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Another task".into(),
                 status: DelegateStatus::Completed,
@@ -747,6 +929,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
 
@@ -783,6 +966,7 @@ mod tests {
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "List the contents of the repository root directory as a simulated user request for the delegate popup".into(),
             status: DelegateStatus::InProgress,
@@ -795,6 +979,7 @@ mod tests {
             },
             started_at: None,
             ended_at: None,
+            child_state: crate::app::DelegateChildState::None,
         }];
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
@@ -826,22 +1011,26 @@ mod tests {
             DelegateEntry {
                 delegation_id: "del-0".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Selected row".into(),
                 status: DelegateStatus::Completed,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Failed row".into(),
                 status: DelegateStatus::Failed,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
 
@@ -871,6 +1060,7 @@ mod tests {
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "First row".into(),
                 status: DelegateStatus::Completed,
@@ -883,10 +1073,12 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: None,
                 objective: "Second row".into(),
                 status: DelegateStatus::InProgress,
@@ -899,6 +1091,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
 
@@ -955,22 +1148,26 @@ mod tests {
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: Some("coder".into()),
                 objective: "Fix bug".into(),
                 status: DelegateStatus::Completed,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
                 child_session_id: None,
+                delegate_tool_call_id: None,
                 target_agent_id: Some("planner".into()),
                 objective: "Plan work".into(),
                 status: DelegateStatus::InProgress,
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
+                child_state: crate::app::DelegateChildState::None,
             },
         ];
 
@@ -1012,12 +1209,14 @@ mod tests {
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
+            delegate_tool_call_id: None,
             target_agent_id: Some("coder".into()),
             objective: "Fix the bug".into(),
             status: DelegateStatus::Completed,
             stats: DelegateStats::default(),
             started_at: Some(1700000000),
             ended_at: Some(1700000045),
+            child_state: crate::app::DelegateChildState::None,
         });
 
         let buffer = render_chat_buffer(&mut app, 60, 10);
@@ -1033,6 +1232,54 @@ mod tests {
             label_cell.style().fg,
             Some(accent_fg),
             "delegate label must use accent color"
+        );
+    }
+
+    #[test]
+    fn delegate_tool_call_shows_awaiting_input_marker() {
+        use crate::app::{
+            ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "delegate".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+        });
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix the bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: Some(1700000000),
+            ended_at: Some(1700000045),
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: serde_json::json!({ "properties": {} }),
+                source: "builtin:question".into(),
+            },
+        });
+
+        let buffer = render_chat_buffer(&mut app, 90, 10);
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            rendered.contains("awaiting input"),
+            "delegate tool card should show pending marker: {rendered}"
+        );
+        let (x, y) = find_buffer_text(&buffer, "awaiting input").expect("missing marker");
+        assert_eq!(buffer[(x, y)].style().fg, Some(Theme::mode_color("plan")));
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
         );
     }
 
@@ -1082,6 +1329,91 @@ mod tests {
         app.elicitation = Some(crate::app::ElicitationState::new_for_test(vec![]));
 
         let _buffer = render_chat_buffer(&mut app, 80, 12);
+    }
+
+    #[test]
+    fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Delegate;
+        app.agent_mode = "build".into();
+        app.messages.push(ChatEntry::Assistant {
+            content: "Delegate context".into(),
+            thinking: None,
+            message_id: None,
+        });
+        app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: serde_json::json!("yes"),
+                        label: "Approve".into(),
+                        description: Some("allow changes".into()),
+                    },
+                    ElicitationOption {
+                        value: serde_json::json!("no"),
+                        label: "Decline".into(),
+                        description: None,
+                    },
+                ],
+            },
+        }]));
+
+        let buffer = render_delegate_buffer(&mut app, 100, 16);
+        let rendered = buffer_text(&buffer);
+
+        assert!(
+            rendered.contains("Question"),
+            "missing popup title: {rendered}"
+        );
+        assert!(
+            rendered.contains("Test question"),
+            "missing popup message: {rendered}"
+        );
+        assert!(rendered.contains("Approve"), "missing option: {rendered}");
+        assert!(
+            rendered.contains("Enter select"),
+            "missing single-select hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("answer above"),
+            "missing input hint below popup: {rendered}"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_view_without_elicitation_remains_read_only() {
+        let mut app = App::new();
+        app.screen = Screen::Delegate;
+        app.agent_mode = "build".into();
+        app.messages.push(ChatEntry::Assistant {
+            content: "Read-only child output".into(),
+            thinking: None,
+            message_id: None,
+        });
+
+        let buffer = render_delegate_buffer(&mut app, 80, 10);
+        let rendered = buffer_text(&buffer);
+
+        assert!(
+            rendered.contains("Read-only child output"),
+            "missing delegate message: {rendered}"
+        );
+        assert!(
+            !rendered.contains("answer above"),
+            "delegate without elicitation should not show input hint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Question"),
+            "delegate without elicitation should not show popup: {rendered}"
+        );
     }
 
     #[test]
@@ -1506,6 +1838,126 @@ mod tests {
     }
 
     #[test]
+    fn server_flow_marks_parent_delegate_row_awaiting_input() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.session_id = Some("parent".into());
+        app.agent_id = Some("parent-agent".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "parent-agent",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": {
+                            "type": "tool_call_start",
+                            "data": {
+                                "tool_call_id": "tool-delegate-1",
+                                "tool_name": "delegate",
+                                "arguments": {
+                                    "target_agent_id": "coder",
+                                    "objective": "Fix live bug"
+                                }
+                            }
+                        },
+                        "timestamp": 100
+                    }
+                }
+            })),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "parent-agent",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": {
+                            "type": "delegation_requested",
+                            "data": {
+                                "delegation": {
+                                    "public_id": "del-1",
+                                    "target_agent_id": "coder",
+                                    "objective": "Fix live bug"
+                                }
+                            }
+                        },
+                        "timestamp": 101
+                    }
+                }
+            })),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "parent-agent",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": {
+                            "type": "session_forked",
+                            "data": {
+                                "child_session_id": "child-1",
+                                "origin": "delegation",
+                                "fork_point_ref": "del-1",
+                                "target_agent_id": "coder"
+                            }
+                        },
+                        "timestamp": 102
+                    }
+                }
+            })),
+        });
+        build_message_cards(&mut app);
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "child-1",
+                "agent_id": "coder",
+                "event": {
+                    "type": "durable",
+                    "data": {
+                        "kind": {
+                            "type": "elicitation_requested",
+                            "data": {
+                                "elicitation_id": "elic-1",
+                                "session_id": "child-1",
+                                "message": "Need approval",
+                                "requested_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "answer": { "type": "string", "title": "Answer" }
+                                    },
+                                    "required": ["answer"]
+                                },
+                                "source": "builtin:question"
+                            }
+                        },
+                        "timestamp": 103
+                    }
+                }
+            })),
+        });
+
+        let lines = rendered_card_lines(&mut app);
+        let delegate_line = lines
+            .iter()
+            .find(|line| line.contains("Fix live bug"))
+            .expect("delegate row");
+        assert!(
+            delegate_line.contains("awaiting input"),
+            "child elicitation did not update parent delegate row: {delegate_line}"
+        );
+    }
+
+    #[test]
     fn draw_log_popup_shows_filter_level_and_entries() {
         let mut app = App::new();
         app.popup = Popup::Log;
@@ -1625,6 +2077,118 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(app.card_cache.processed_messages, 1);
+    }
+
+    #[test]
+    fn delegate_row_updates_after_child_state_change_without_message_append() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
+
+        let mut app = App::new();
+        app.messages
+            .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: Some("tool-1".into()),
+            target_agent_id: Some("coder".into()),
+            objective: "Fix cache bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(!lines.iter().any(|line| line.contains("awaiting input")));
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        app.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Need approval".into(),
+            requested_schema: serde_json::json!({ "properties": {} }),
+            source: "builtin:question".into(),
+        };
+        app.invalidate_delegate_render_cache();
+        let lines = rendered_card_lines(&mut app);
+
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "delegate state changed without appending messages"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("awaiting input")),
+            "stale card cache hid awaiting-input marker: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn delegate_row_awaiting_marker_uses_tool_call_identity_not_sequence() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
+
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User {
+            text: "first".into(),
+            message_id: None,
+        });
+        build_message_cards(&mut app);
+        app.messages
+            .push(delegate_tool_call("tool-a", "coder", "First task"));
+        build_message_cards(&mut app);
+        app.messages
+            .push(delegate_tool_call("tool-b", "coder", "Second task"));
+        app.delegate_entries = vec![
+            DelegateEntry {
+                delegation_id: "del-b".into(),
+                child_session_id: Some("child-b".into()),
+                delegate_tool_call_id: Some("tool-b".into()),
+                target_agent_id: Some("coder".into()),
+                objective: "Second task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::PendingElicitation {
+                    elicitation_id: "elic-b".into(),
+                    message: "Need input".into(),
+                    requested_schema: serde_json::json!({ "properties": {} }),
+                    source: "builtin:question".into(),
+                },
+            },
+            DelegateEntry {
+                delegation_id: "del-a".into(),
+                child_session_id: Some("child-a".into()),
+                delegate_tool_call_id: Some("tool-a".into()),
+                target_agent_id: Some("coder".into()),
+                objective: "First task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            },
+        ];
+        app.invalidate_delegate_render_cache();
+
+        let lines = rendered_card_lines(&mut app);
+        let first = lines
+            .iter()
+            .find(|line| line.contains("First task"))
+            .expect("first delegate line");
+        let second = lines
+            .iter()
+            .find(|line| line.contains("Second task"))
+            .expect("second delegate line");
+
+        assert!(
+            !first.contains("awaiting input"),
+            "wrong row marked: {first}"
+        );
+        assert!(
+            second.contains("awaiting input"),
+            "second row not marked: {second}"
+        );
     }
 
     #[test]
@@ -1807,6 +2371,224 @@ mod tests {
             app.card_cache.cards.is_empty(),
             "session_loaded should clear cached cards before replay"
         );
+    }
+
+    #[test]
+    fn entering_delegate_child_restores_pending_elicitation_popup() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
+
+        let schema = supported_elicitation_schema();
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: schema.clone(),
+                source: "builtin:question".into(),
+            },
+        });
+        app.pending_parent_session_id = Some("parent".into());
+
+        app.handle_server_msg(session_loaded_msg(
+            "child-1",
+            "coder",
+            serde_json::json!({ "events": [elicitation_event(schema), question_tool_end_event()] }),
+        ));
+
+        assert!(
+            app.elicitation.is_some(),
+            "pending child question should reopen"
+        );
+        assert_eq!(
+            app.elicitation.as_ref().map(|e| e.message.as_str()),
+            Some("Need approval")
+        );
+        assert!(app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: None, .. } if elicitation_id == "elic-1"
+        )));
+        assert!(!app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }
+                if elicitation_id == "elic-1" && outcome == "responded"
+        )));
+
+        let buffer = render_delegate_buffer(&mut app, 100, 16);
+        let rendered = buffer_text(&buffer);
+        assert!(
+            rendered.contains("Question"),
+            "restored child question popup should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("Need approval"),
+            "restored child question message should render: {rendered}"
+        );
+        assert!(
+            rendered.contains("answer above"),
+            "restored child question should show input hint: {rendered}"
+        );
+    }
+
+    #[test]
+    fn responded_synthetic_card_does_not_block_pending_elicitation_restore() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
+
+        let schema = supported_elicitation_schema();
+        let mut app = App::new();
+        app.messages.push(ChatEntry::Elicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Need approval".into(),
+            source: "builtin:question".into(),
+            outcome: Some("responded".into()),
+        });
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: schema.clone(),
+                source: "builtin:question".into(),
+            },
+        });
+        app.pending_parent_session_id = Some("parent".into());
+
+        app.handle_server_msg(session_loaded_msg(
+            "child-1",
+            "coder",
+            serde_json::json!({ "events": [elicitation_event(schema)] }),
+        ));
+
+        assert!(app.elicitation.is_some());
+        assert!(app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: None, .. } if elicitation_id == "elic-1"
+        )));
+        assert!(!app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }
+                if elicitation_id == "elic-1" && outcome == "responded"
+        )));
+    }
+
+    #[test]
+    fn child_session_group_parent_restores_pending_elicitation_from_audit() {
+        use crate::protocol::{SessionGroup, SessionSummary};
+
+        let schema = supported_elicitation_schema();
+        let mut app = App::new();
+        app.session_groups = vec![SessionGroup {
+            cwd: None,
+            sessions: vec![SessionSummary {
+                session_id: "child-1".into(),
+                title: None,
+                cwd: None,
+                created_at: None,
+                updated_at: None,
+                parent_session_id: Some("parent".into()),
+                has_children: false,
+            }],
+            latest_activity: None,
+        }];
+
+        app.handle_server_msg(session_loaded_msg(
+            "child-1",
+            "coder",
+            serde_json::json!({ "events": [elicitation_event(schema)] }),
+        ));
+
+        assert_eq!(app.parent_session_id.as_deref(), Some("parent"));
+        assert!(app.elicitation.is_some());
+        assert!(app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: None, .. } if elicitation_id == "elic-1"
+        )));
+    }
+
+    #[test]
+    fn envelope_shaped_audit_restores_pending_elicitation() {
+        let schema = supported_elicitation_schema();
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.pending_parent_session_id = Some("parent".into());
+
+        app.handle_server_msg(session_loaded_msg(
+            "child-1",
+            "coder",
+            serde_json::json!({
+                "events": [
+                    envelope_event(elicitation_event(schema)),
+                    envelope_event(question_tool_end_event()),
+                ]
+            }),
+        ));
+
+        assert!(app.elicitation.is_some());
+        assert!(app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: None, .. } if elicitation_id == "elic-1"
+        )));
+    }
+
+    #[test]
+    fn entering_delegate_child_with_unsupported_pending_elicitation_stays_local_only() {
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
+
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Fix bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::PendingElicitation {
+                elicitation_id: "elic-1".into(),
+                message: "Need approval".into(),
+                requested_schema: schema.clone(),
+                source: "builtin:question".into(),
+            },
+        });
+        app.pending_parent_session_id = Some("parent".into());
+
+        app.handle_server_msg(session_loaded_msg(
+            "child-1",
+            "coder",
+            serde_json::json!({ "events": [elicitation_event(schema)] }),
+        ));
+
+        assert!(
+            app.elicitation.is_none(),
+            "unsupported schema should not open popup"
+        );
+        assert!(app.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }
+                if elicitation_id == "elic-1" && outcome == "unsupported schema - cannot answer in TUI"
+        )));
     }
 
     #[test]
