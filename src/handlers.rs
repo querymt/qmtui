@@ -68,7 +68,9 @@ pub(crate) fn handle_elicitation_key(
 
         // ── Space: toggle multi-select ────────────────────────────────────────
         KeyCode::Char(' ') => {
-            let kind = state.current_field().kind.clone();
+            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
+                return Ok(());
+            };
             if matches!(kind, ElicitationFieldKind::MultiSelect { .. }) {
                 state.toggle_current_option();
             }
@@ -76,7 +78,9 @@ pub(crate) fn handle_elicitation_key(
 
         // ── Submit ────────────────────────────────────────────────────────────
         KeyCode::Enter => {
-            let kind = state.current_field().kind.clone();
+            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
+                return Ok(());
+            };
             match kind {
                 ElicitationFieldKind::SingleSelect { .. } => {
                     // Select the highlighted option first
@@ -106,7 +110,9 @@ pub(crate) fn handle_elicitation_key(
 
         // ── Text / number input ───────────────────────────────────────────────
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let kind = state.current_field().kind.clone();
+            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
+                return Ok(());
+            };
             if matches!(
                 kind,
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
@@ -117,7 +123,9 @@ pub(crate) fn handle_elicitation_key(
             }
         }
         KeyCode::Backspace => {
-            let kind = state.current_field().kind.clone();
+            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
+                return Ok(());
+            };
             if matches!(
                 kind,
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }

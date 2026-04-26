@@ -863,29 +863,45 @@ impl App {
                     return;
                 }
                 let fields = ElicitationState::parse_schema(requested_schema);
-                self.elicitation = Some(ElicitationState {
-                    elicitation_id: elicitation_id.clone(),
-                    message: message.clone(),
-                    source: source.clone(),
-                    fields,
-                    field_cursor: 0,
-                    option_cursor: 0,
-                    selected: HashMap::new(),
-                    text_input: String::new(),
-                    text_cursor: 0,
-                });
-                self.messages.push(ChatEntry::Elicitation {
-                    elicitation_id: elicitation_id.clone(),
-                    message: message.clone(),
-                    source: source.clone(),
-                    outcome: None,
-                });
-                self.scroll_offset = 0;
-                self.set_status(
-                    LogLevel::Info,
-                    "elicitation",
-                    "question — answer in the panel above input",
-                );
+                if fields.is_empty() {
+                    let outcome = "unsupported schema - cannot answer in TUI";
+                    self.messages.push(ChatEntry::Elicitation {
+                        elicitation_id: elicitation_id.clone(),
+                        message: message.clone(),
+                        source: source.clone(),
+                        outcome: Some(outcome.into()),
+                    });
+                    self.scroll_offset = 0;
+                    self.set_status(
+                        LogLevel::Warn,
+                        "elicitation",
+                        "question skipped - unsupported schema",
+                    );
+                } else {
+                    self.elicitation = Some(ElicitationState {
+                        elicitation_id: elicitation_id.clone(),
+                        message: message.clone(),
+                        source: source.clone(),
+                        fields,
+                        field_cursor: 0,
+                        option_cursor: 0,
+                        selected: HashMap::new(),
+                        text_input: String::new(),
+                        text_cursor: 0,
+                    });
+                    self.messages.push(ChatEntry::Elicitation {
+                        elicitation_id: elicitation_id.clone(),
+                        message: message.clone(),
+                        source: source.clone(),
+                        outcome: None,
+                    });
+                    self.scroll_offset = 0;
+                    self.set_status(
+                        LogLevel::Info,
+                        "elicitation",
+                        "question — answer in the panel above input",
+                    );
+                }
             }
             EventKind::SessionModeChanged { mode } => {
                 self.agent_mode = mode.clone();

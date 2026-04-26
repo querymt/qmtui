@@ -1075,6 +1075,16 @@ mod tests {
     }
 
     #[test]
+    fn draw_chat_does_not_panic_with_empty_elicitation_fields() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        app.elicitation = Some(crate::app::ElicitationState::new_for_test(vec![]));
+
+        let _buffer = render_chat_buffer(&mut app, 80, 12);
+    }
+
+    #[test]
     fn draw_session_popup_shows_active_marker_for_current_session() {
         let mut app = App::new();
         app.popup = Popup::SessionSelect;

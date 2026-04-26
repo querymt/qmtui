@@ -908,7 +908,9 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Field content ─────────────────────────────────────────────────────────
     if row < max_y {
-        let field = state.current_field();
+        let Some(field) = state.current_field() else {
+            return;
+        };
         match &field.kind {
             ElicitationFieldKind::SingleSelect { options }
             | ElicitationFieldKind::MultiSelect { options } => {
@@ -1023,9 +1025,12 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Hint row ──────────────────────────────────────────────────────────────
     if row < max_y {
+        let Some(field) = state.current_field() else {
+            return;
+        };
         let arrow_up = super::ARROW_UP;
         let arrow_down = super::ARROW_DOWN;
-        let hint = match state.current_field().kind {
+        let hint = match field.kind {
             ElicitationFieldKind::MultiSelect { .. } => {
                 format!(" {arrow_up}{arrow_down} navigate  Space toggle  Enter submit  Esc decline")
             }

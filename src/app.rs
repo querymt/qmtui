@@ -400,16 +400,17 @@ impl ElicitationState {
         fields
     }
 
-    /// Current active field (panics if fields is empty — callers should guard).
-    pub fn current_field(&self) -> &ElicitationField {
-        &self.fields[self.field_cursor.min(self.fields.len().saturating_sub(1))]
+    /// Current active field, if the schema produced at least one supported field.
+    pub fn current_field(&self) -> Option<&ElicitationField> {
+        self.fields
+            .get(self.field_cursor.min(self.fields.len().saturating_sub(1)))
     }
 
     /// Number of options in the current field's select list (0 for non-select).
     pub fn current_option_count(&self) -> usize {
-        match &self.current_field().kind {
-            ElicitationFieldKind::SingleSelect { options } => options.len(),
-            ElicitationFieldKind::MultiSelect { options } => options.len(),
+        match self.current_field().map(|field| &field.kind) {
+            Some(ElicitationFieldKind::SingleSelect { options }) => options.len(),
+            Some(ElicitationFieldKind::MultiSelect { options }) => options.len(),
             _ => 0,
         }
     }
@@ -422,7 +423,9 @@ impl ElicitationState {
 
     /// For SingleSelect: record the highlighted option as the field's value.
     pub fn select_current_option(&mut self) {
-        let field = self.current_field();
+        let Some(field) = self.current_field() else {
+            return;
+        };
         if let ElicitationFieldKind::SingleSelect { options } = &field.kind
             && let Some(opt) = options.get(self.option_cursor)
         {
@@ -434,7 +437,9 @@ impl ElicitationState {
 
     /// For MultiSelect: toggle the highlighted option in the field's array value.
     pub fn toggle_current_option(&mut self) {
-        let field = self.current_field();
+        let Some(field) = self.current_field() else {
+            return;
+        };
         if let ElicitationFieldKind::MultiSelect { options } = &field.kind
             && let Some(opt) = options.get(self.option_cursor)
         {
@@ -6567,6 +6572,29 @@ mod tests {
             ChatEntry::Elicitation { elicitation_id, outcome: None, .. }
             if elicitation_id == "elic-1"
         )));
+    }
+
+    #[test]
+    fn elicitation_requested_with_empty_schema_does_not_open_popup() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::ElicitationRequested {
+                elicitation_id: "elic-empty".into(),
+                session_id: "sess-1".into(),
+                message: "Unsupported question".into(),
+                requested_schema: serde_json::json!({}),
+                source: "builtin:question".into(),
+            },
+            false,
+            None,
+        );
+
+        assert!(app.elicitation.is_none());
+        assert!(app.messages.iter().any(|m| matches!(m,
+            ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }
+            if elicitation_id == "elic-empty" && outcome == "unsupported schema - cannot answer in TUI"
+        )));
+        assert_eq!(app.status, "question skipped - unsupported schema");
     }
 
     #[test]

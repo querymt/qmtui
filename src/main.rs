@@ -261,6 +261,21 @@ mod tests {
     }
 
     #[test]
+    fn elicitation_key_handler_ignores_empty_field_list() {
+        let mut app = make_app_with_elicitation(ElicitationState::new_for_test(vec![]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_some());
+        assert!(rx.try_recv().is_err(), "no response should be sent");
+    }
+
+    #[test]
     fn invalidate_theme_caches_clears_all_render_caches() {
         use crate::theme::Theme;
         use crate::ui::build_diff_lines;
