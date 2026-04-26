@@ -318,7 +318,7 @@ impl App {
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
                             self.note_session_activity(&parsed.session_id);
                             for envelope in parsed.events {
-                                self.handle_event(&envelope);
+                                self.handle_event_with_replay(&envelope, true);
                             }
                         } else if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
                             e.child_session_id.as_deref() == Some(parsed.session_id.as_str())
@@ -342,20 +342,39 @@ impl App {
                                 );
                             }
                             Ok(se) => {
-                                if let Some(entry) = self.delegate_entries.iter_mut().find(|e| {
-                                    e.child_session_id.as_deref() == Some(se.session_id.as_str())
-                                }) {
+                                let is_current =
+                                    self.session_id.as_deref() == Some(se.session_id.as_str());
+                                if is_current {
+                                    self.note_session_activity(&se.session_id);
                                     for val in se.events {
-                                        // Child sessions keep the raw parse path so
-                                        // unknown kinds do not block known stats updates.
-                                        if let Ok(envelope) =
-                                            serde_json::from_value::<EventEnvelope>(val)
-                                        {
-                                            accumulate_delegate_stats(
-                                                &mut entry.stats,
-                                                envelope.kind(),
-                                            );
+                                        self.handle_event_value_with_replay(&val, true, true);
+                                    }
+                                } else if let Some(entry) =
+                                    self.delegate_entries.iter_mut().find(|e| {
+                                        e.child_session_id.as_deref()
+                                            == Some(se.session_id.as_str())
+                                    })
+                                {
+                                    let mut unknown_kinds = Vec::new();
+                                    for val in se.events {
+                                        match serde_json::from_value::<EventEnvelope>(val.clone()) {
+                                            Ok(envelope) => {
+                                                accumulate_delegate_stats(
+                                                    &mut entry.stats,
+                                                    envelope.kind(),
+                                                );
+                                            }
+                                            Err(_) => {
+                                                if let Some(kind_type) =
+                                                    extract_event_kind_type(&val)
+                                                {
+                                                    unknown_kinds.push(kind_type.to_string());
+                                                }
+                                            }
                                         }
+                                    }
+                                    for kind_type in unknown_kinds {
+                                        self.warn_unknown_event_kind(&kind_type, true);
                                     }
                                 } else {
                                     self.note_session_activity(&se.session_id);
@@ -380,14 +399,24 @@ impl App {
                             self.note_session_activity(&parsed.session_id);
                         }
                     } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
-                        if let Some(entry) = self
+                        let is_current = self.session_id.as_deref() == Some(ed.session_id.as_str());
+                        if is_current {
+                            self.note_session_activity(&ed.session_id);
+                            self.handle_event_value(&ed.event, false);
+                        } else if let Some(entry) = self
                             .delegate_entries
                             .iter_mut()
                             .find(|e| e.child_session_id.as_deref() == Some(ed.session_id.as_str()))
                         {
-                            if let Ok(envelope) = serde_json::from_value::<EventEnvelope>(ed.event)
-                            {
-                                accumulate_delegate_stats(&mut entry.stats, envelope.kind());
+                            match serde_json::from_value::<EventEnvelope>(ed.event.clone()) {
+                                Ok(envelope) => {
+                                    accumulate_delegate_stats(&mut entry.stats, envelope.kind());
+                                }
+                                Err(_) => {
+                                    if let Some(kind_type) = extract_event_kind_type(&ed.event) {
+                                        self.warn_unknown_event_kind(kind_type, true);
+                                    }
+                                }
                             }
                         } else {
                             self.note_session_activity(&ed.session_id);
@@ -483,13 +512,53 @@ impl App {
                 }
                 vec![]
             }
-            _ => vec![],
+            _ => {
+                self.push_log(
+                    LogLevel::Warn,
+                    "protocol",
+                    format!("unknown server message type: {}", raw.msg_type),
+                );
+                vec![]
+            }
         }
     }
 
     fn handle_event(&mut self, envelope: &EventEnvelope) {
+        self.handle_event_with_replay(envelope, false);
+    }
+
+    fn handle_event_with_replay(&mut self, envelope: &EventEnvelope, is_replay: bool) {
         self.apply_event_stats(envelope.kind(), envelope.timestamp());
-        self.handle_event_kind(envelope.kind(), false, envelope.timestamp());
+        self.handle_event_kind(envelope.kind(), is_replay, envelope.timestamp());
+    }
+
+    fn handle_event_value(&mut self, value: &serde_json::Value, is_batch: bool) {
+        self.handle_event_value_with_replay(value, false, is_batch);
+    }
+
+    fn handle_event_value_with_replay(
+        &mut self,
+        value: &serde_json::Value,
+        is_replay: bool,
+        is_batch: bool,
+    ) {
+        match serde_json::from_value::<EventEnvelope>(value.clone()) {
+            Ok(envelope) => self.handle_event_with_replay(&envelope, is_replay),
+            Err(_) => {
+                if let Some(kind_type) = extract_event_kind_type(value) {
+                    self.warn_unknown_event_kind(kind_type, is_batch);
+                }
+            }
+        }
+    }
+
+    fn warn_unknown_event_kind(&mut self, kind_type: &str, is_batch: bool) {
+        let source = if is_batch { "session_events" } else { "event" };
+        self.push_log(
+            LogLevel::Warn,
+            "protocol",
+            format!("unknown {source} kind: {kind_type}"),
+        );
     }
 
     pub(crate) fn handle_event_kind(
@@ -603,6 +672,7 @@ impl App {
                 self.invalidate_streaming_caches();
                 self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
+            EventKind::LlmRequestStart { .. } => {}
             EventKind::AssistantThinkingDelta { content, .. } => {
                 self.streaming_thinking.push_str(content);
             }
@@ -695,6 +765,21 @@ impl App {
                 // The question tool renders as an ElicitationCard — skip the
                 // redundant "> question …" tool call entry in the chat.
                 if tool_name != "question" {
+                    if is_replay
+                        && let Some(tool_call_id) = tool_call_id.as_deref()
+                        && self.messages.iter().any(|entry| {
+                            matches!(
+                                entry,
+                                ChatEntry::ToolCall {
+                                    tool_call_id: Some(existing_id),
+                                    is_error: false,
+                                    ..
+                                } if existing_id == tool_call_id
+                            )
+                        })
+                    {
+                        return;
+                    }
                     let detail = parse_tool_detail(tool_name, arguments.as_ref());
                     self.messages.push(ChatEntry::ToolCall {
                         tool_call_id: tool_call_id.clone(),
@@ -834,6 +919,7 @@ impl App {
                 }
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
+            EventKind::SessionCreated => {}
             // ── Delegation lifecycle events ─────────────────────────────────────
             EventKind::DelegationRequested { delegation } => {
                 // Idempotent upsert: the parent session can be replayed more than
@@ -944,7 +1030,9 @@ impl App {
                 }
                 self.suppress_delegation_result = true;
             }
-            _ => {}
+            EventKind::Unknown => {
+                self.warn_unknown_event_kind("unknown", false);
+            }
         }
     }
 
@@ -989,6 +1077,14 @@ impl App {
     }
 }
 
+fn extract_event_kind_type(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("data")
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.get("type"))
+        .and_then(|kind_type| kind_type.as_str())
+}
+
 /// Update per-delegation stats from a single event arriving on a child session.
 pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventKind) {
     match kind {
@@ -1016,6 +1112,7 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
         } => {
             stats.context_limit = *limit;
         }
+        EventKind::LlmRequestStart { .. } | EventKind::SessionCreated | EventKind::Unknown => {}
         _ => {}
     }
 }

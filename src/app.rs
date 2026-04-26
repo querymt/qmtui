@@ -4610,16 +4610,20 @@ mod tests {
             .collect()
     }
 
+    fn audit_event(kind_type: &str, data: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": kind_type,
+                "data": data
+            },
+            "timestamp": null
+        })
+    }
+
     fn durable_event(kind_type: &str, data: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "type": "durable",
-            "data": {
-                "kind": {
-                    "type": kind_type,
-                    "data": data
-                },
-                "timestamp": null
-            }
+            "data": audit_event(kind_type, data)
         })
     }
 
@@ -4653,6 +4657,33 @@ mod tests {
         )
     }
 
+    fn durable_tool_call_start(tool_call_id: &str, tool_name: &str) -> serde_json::Value {
+        durable_event(
+            "tool_call_start",
+            serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": null,
+            }),
+        )
+    }
+
+    fn durable_tool_call_end(
+        tool_call_id: &str,
+        tool_name: &str,
+        result: &str,
+    ) -> serde_json::Value {
+        durable_event(
+            "tool_call_end",
+            serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "is_error": false,
+                "result": result,
+            }),
+        )
+    }
+
     fn session_events_msg(events: Vec<serde_json::Value>) -> RawServerMsg {
         RawServerMsg {
             msg_type: "session_events".into(),
@@ -4660,6 +4691,18 @@ mod tests {
                 "session_id": "s1",
                 "agent_id": "a1",
                 "events": events,
+            })),
+        }
+    }
+
+    fn make_session_loaded(audit: serde_json::Value) -> RawServerMsg {
+        RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "audit": audit,
+                "undo_stack": []
             })),
         }
     }
@@ -4676,6 +4719,54 @@ mod tests {
                 }
             }),
         )
+    }
+
+    #[test]
+    fn unknown_server_message_type_logs_warning() {
+        let mut app = App::new();
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "future_server_message".into(),
+            data: Some(serde_json::json!({ "ignored": true })),
+        });
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.status, "connecting...");
+        let last = app.logs.last().expect("missing warning log entry");
+        assert_eq!(last.level, LogLevel::Warn);
+        assert_eq!(last.target, "protocol");
+        assert!(last.message.contains("future_server_message"));
+    }
+
+    #[test]
+    fn session_events_unknown_kind_logs_warning_and_keeps_known_events() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+
+        app.handle_server_msg(session_events_msg(vec![
+            durable_prompt("hello", "msg-1"),
+            durable_event(
+                "brand_new_unknown_event_2099",
+                serde_json::json!({
+                    "some_field": "some_value",
+                    "nested": { "deep": true }
+                }),
+            ),
+            durable_assistant("world", "msg-2"),
+        ]));
+
+        assert!(matches!(
+            app.messages.first(),
+            Some(ChatEntry::User { text, message_id }) if text == "hello" && message_id.as_deref() == Some("msg-1")
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::Assistant { content, message_id, .. }) if content == "world" && message_id.as_deref() == Some("msg-2")
+        ));
+        let last = app.logs.last().expect("missing warning log entry");
+        assert_eq!(last.level, LogLevel::Warn);
+        assert_eq!(last.target, "protocol");
+        assert!(last.message.contains("brand_new_unknown_event_2099"));
     }
 
     #[test]
@@ -5499,6 +5590,139 @@ mod tests {
     }
 
     #[test]
+    fn current_session_history_replay_keeps_tool_calls_with_their_turns() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+
+        let history = vec![
+            durable_prompt("first", "msg-1"),
+            durable_tool_call_start("tool-1", "read_tool"),
+            durable_tool_call_end("tool-1", "read_tool", "first output"),
+            durable_assistant("first reply", "a-1"),
+            durable_prompt("second", "msg-2"),
+            durable_tool_call_start("tool-2", "ls"),
+            durable_tool_call_end("tool-2", "ls", "second output"),
+            durable_assistant("second reply", "a-2"),
+        ];
+
+        app.handle_server_msg(make_session_loaded(serde_json::json!({
+            "events": [
+                audit_event(
+                    "prompt_received",
+                    serde_json::json!({
+                        "content": "first",
+                        "message_id": "msg-1"
+                    }),
+                ),
+                audit_event(
+                    "tool_call_start",
+                    serde_json::json!({
+                        "tool_call_id": "tool-1",
+                        "tool_name": "read_tool",
+                        "arguments": null
+                    }),
+                ),
+                audit_event(
+                    "tool_call_end",
+                    serde_json::json!({
+                        "tool_call_id": "tool-1",
+                        "tool_name": "read_tool",
+                        "is_error": false,
+                        "result": "first output"
+                    }),
+                ),
+                audit_event(
+                    "assistant_message_stored",
+                    serde_json::json!({
+                        "content": "first reply",
+                        "thinking": null,
+                        "message_id": "a-1"
+                    }),
+                ),
+                audit_event(
+                    "prompt_received",
+                    serde_json::json!({
+                        "content": "second",
+                        "message_id": "msg-2"
+                    }),
+                ),
+                audit_event(
+                    "tool_call_start",
+                    serde_json::json!({
+                        "tool_call_id": "tool-2",
+                        "tool_name": "ls",
+                        "arguments": null
+                    }),
+                ),
+                audit_event(
+                    "tool_call_end",
+                    serde_json::json!({
+                        "tool_call_id": "tool-2",
+                        "tool_name": "ls",
+                        "is_error": false,
+                        "result": "second output"
+                    }),
+                ),
+                audit_event(
+                    "assistant_message_stored",
+                    serde_json::json!({
+                        "content": "second reply",
+                        "thinking": null,
+                        "message_id": "a-2"
+                    }),
+                ),
+            ],
+        })));
+        app.handle_server_msg(session_events_msg(vec![
+            history[0].clone(),
+            durable_event(
+                "brand_new_unknown_event_2099",
+                serde_json::json!({ "some_field": true }),
+            ),
+            history[1].clone(),
+            history[2].clone(),
+            history[3].clone(),
+            history[4].clone(),
+            history[5].clone(),
+            history[6].clone(),
+            history[7].clone(),
+        ]));
+
+        assert_eq!(app.messages.len(), 6);
+        assert!(matches!(
+            &app.messages[0],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "first" && message_id == "msg-1"
+        ));
+        assert!(matches!(
+            &app.messages[1],
+            ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), name, .. }
+                if tool_call_id == "tool-1" && name == "read_tool"
+        ));
+        assert!(matches!(
+            &app.messages[2],
+            ChatEntry::Assistant { content, message_id: Some(message_id), .. }
+                if content == "first reply" && message_id == "a-1"
+        ));
+        assert!(matches!(
+            &app.messages[3],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "second" && message_id == "msg-2"
+        ));
+        assert!(matches!(
+            &app.messages[4],
+            ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), name, .. }
+                if tool_call_id == "tool-2" && name == "ls"
+        ));
+        assert!(matches!(
+            &app.messages[5],
+            ChatEntry::Assistant { content, message_id: Some(message_id), .. }
+                if content == "second reply" && message_id == "a-2"
+        ));
+    }
+
+    #[test]
     fn undo_then_session_loaded_prunes_reverted_turn_and_later_history() {
         let mut app = App::new();
         app.session_id = Some("s1".into());
@@ -5728,7 +5952,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_session_events_with_unknown_kind_are_ignored_like_main() {
+    fn parent_session_events_with_unknown_kind_warns_and_keeps_known_events() {
         let mut app = App::new();
         app.session_id = Some("s1".into());
         app.agent_id = Some("a1".into());
@@ -5743,12 +5967,26 @@ mod tests {
             durable_assistant("reply", "a-1"),
         ]));
 
-        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages.len(), 3);
         assert!(matches!(
             &app.messages[0],
             ChatEntry::User { text, message_id: Some(message_id) }
                 if text == "existing" && message_id == "existing-msg"
         ));
+        assert!(matches!(
+            &app.messages[1],
+            ChatEntry::User { text, message_id: Some(message_id) }
+                if text == "hello" && message_id == "msg-1"
+        ));
+        assert!(matches!(
+            &app.messages[2],
+            ChatEntry::Assistant { content, message_id: Some(message_id), .. }
+                if content == "reply" && message_id == "a-1"
+        ));
+        let last = app.logs.last().expect("missing warning log entry");
+        assert_eq!(last.level, LogLevel::Warn);
+        assert_eq!(last.target, "protocol");
+        assert!(last.message.contains("progress_recorded"));
     }
 
     #[test]
