@@ -6553,6 +6553,60 @@ mod tests {
     }
 
     #[test]
+    fn replayed_elicitation_request_is_idempotent_across_history_replays() {
+        let mut app = App::new();
+        let requested_schema = serde_json::json!({
+            "properties": {
+                "choice": {
+                    "oneOf": [
+                        { "const": "a", "title": "Alpha" },
+                        { "const": "b", "title": "Beta" }
+                    ]
+                }
+            },
+            "required": ["choice"]
+        });
+        let replayed_request = EventKind::ElicitationRequested {
+            elicitation_id: "elic-dup".into(),
+            session_id: "sess-1".into(),
+            message: "Which option?".into(),
+            requested_schema,
+            source: "builtin:question".into(),
+        };
+
+        // Simulate session_loaded replay, then current-session history replay of the same request.
+        app.handle_event_kind(&replayed_request, true, None);
+        app.handle_event_kind(&replayed_request, true, None);
+        app.handle_event_kind(
+            &EventKind::ToolCallEnd {
+                tool_call_id: Some("call-1".into()),
+                tool_name: "question".into(),
+                is_error: Some(false),
+                result: Some(
+                    r#"{"answers":[{"question":"Which option?","answers":["Beta"]}]}"#.into(),
+                ),
+            },
+            true,
+            None,
+        );
+
+        let elicitation_cards: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Elicitation { elicitation_id, .. } if elicitation_id == "elic-dup"
+                )
+            })
+            .collect();
+        assert_eq!(elicitation_cards.len(), 1);
+        assert!(matches!(elicitation_cards[0],
+            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
+        ));
+    }
+
+    #[test]
     fn elicitation_requested_event_creates_state_and_chat_card() {
         let mut app = App::new();
         app.handle_event_kind(

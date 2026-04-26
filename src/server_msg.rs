@@ -852,6 +852,19 @@ impl App {
                 ..
             } => {
                 if is_replay {
+                    // Replay can include the same elicitation more than once
+                    // (session_loaded audit + current session_events history).
+                    if self.messages.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            ChatEntry::Elicitation {
+                                elicitation_id: existing_id,
+                                ..
+                            } if existing_id == elicitation_id
+                        )
+                    }) {
+                        return;
+                    }
                     // During replay the elicitation was already answered —
                     // show the card as resolved without reopening the popup.
                     self.messages.push(ChatEntry::Elicitation {
