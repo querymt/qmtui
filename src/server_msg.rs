@@ -786,7 +786,7 @@ impl App {
                 if let Some(data) = raw.data
                     && let Ok(e) = serde_json::from_value::<ErrorData>(data)
                 {
-                    self.messages.push(ChatEntry::Error(e.message.clone()));
+                    push_error_message(&mut self.messages, &e.message);
                     self.set_status(LogLevel::Error, "server", format!("error: {}", e.message));
                 }
                 vec![]
@@ -1182,7 +1182,7 @@ impl App {
             EventKind::Error { message } => {
                 self.activity = ActivityState::Idle;
                 self.clear_cancel_confirm();
-                self.messages.push(ChatEntry::Error(message.clone()));
+                push_error_message(&mut self.messages, message);
                 self.set_status(LogLevel::Error, "server", format!("error: {message}"));
             }
             EventKind::ElicitationRequested {
@@ -1883,6 +1883,18 @@ fn is_same_tool_call(existing_id: &Option<String>, tool_call_id: Option<&str>) -
     existing_id.as_deref() == tool_call_id
 }
 
+fn push_error_message(messages: &mut Vec<ChatEntry>, message: &str) -> bool {
+    if messages
+        .iter()
+        .any(|entry| matches!(entry, ChatEntry::Error(existing) if existing == message))
+    {
+        return false;
+    }
+
+    messages.push(ChatEntry::Error(message.to_string()));
+    true
+}
+
 fn failed_tool_call_exists(
     messages: &[ChatEntry],
     tool_call_id: Option<&str>,
@@ -2167,10 +2179,11 @@ fn content_to_string(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tool_detail_tests {
     use super::{
-        failed_tool_call_exists, mark_tool_call_failed, parse_tool_detail,
+        failed_tool_call_exists, mark_tool_call_failed, parse_tool_detail, push_error_message,
         reconcile_tool_call_start, update_tool_detail,
     };
-    use crate::app::{ChatEntry, ToolDetail};
+    use crate::app::{App, ChatEntry, ToolDetail};
+    use crate::protocol::{EventKind, RawServerMsg};
 
     fn summary_text(entry: &ChatEntry) -> &str {
         match entry {
@@ -2180,6 +2193,108 @@ mod tool_detail_tests {
             } => s,
             other => panic!("expected Summary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_error_replay_does_not_append_stale_card() {
+        let mut messages = Vec::new();
+
+        assert!(push_error_message(&mut messages, "LLM streaming error"));
+        messages.push(ChatEntry::User {
+            text: "continue".into(),
+            message_id: Some("user-continue".into()),
+        });
+        messages.push(ChatEntry::Assistant {
+            content: "latest assistant summary".into(),
+            thinking: None,
+            message_id: Some("assistant-latest".into()),
+        });
+
+        assert!(!push_error_message(&mut messages, "LLM streaming error"));
+        assert_eq!(messages.len(), 3, "replayed error must not append");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |entry| matches!(entry, ChatEntry::Error(text) if text == "LLM streaming error")
+                )
+                .count(),
+            1
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(ChatEntry::Assistant { content, .. }) if content == "latest assistant summary"
+        ));
+    }
+
+    #[test]
+    fn distinct_error_messages_are_preserved() {
+        let mut messages = Vec::new();
+
+        assert!(push_error_message(&mut messages, "first error"));
+        assert!(push_error_message(&mut messages, "second error"));
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], ChatEntry::Error(text) if text == "first error"));
+        assert!(matches!(&messages[1], ChatEntry::Error(text) if text == "second error"));
+    }
+
+    #[test]
+    fn event_error_replay_does_not_append_stale_card() {
+        let mut app = App::new();
+        let error = EventKind::Error {
+            message: "LLM streaming error".into(),
+        };
+
+        app.handle_event_kind(&error, false, None);
+        app.messages.push(ChatEntry::User {
+            text: "continue".into(),
+            message_id: Some("user-continue".into()),
+        });
+        app.messages.push(ChatEntry::Assistant {
+            content: "latest assistant summary".into(),
+            thinking: None,
+            message_id: Some("assistant-latest".into()),
+        });
+        app.handle_event_kind(&error, true, None);
+
+        assert_eq!(app.messages.len(), 3, "replayed error must not append");
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(
+                    |entry| matches!(entry, ChatEntry::Error(text) if text == "LLM streaming error")
+                )
+                .count(),
+            1
+        );
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::Assistant { content, .. }) if content == "latest assistant summary"
+        ));
+    }
+
+    #[test]
+    fn raw_server_error_duplicate_does_not_append() {
+        let mut app = App::new();
+        let raw = || RawServerMsg {
+            msg_type: "error".into(),
+            data: Some(serde_json::json!({ "message": "raw server error" })),
+        };
+
+        app.handle_server_msg(raw());
+        app.messages.push(ChatEntry::Assistant {
+            content: "still latest".into(),
+            thinking: None,
+            message_id: None,
+        });
+        app.handle_server_msg(raw());
+
+        assert_eq!(app.messages.len(), 2, "duplicate raw error must not append");
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::Assistant { content, .. }) if content == "still latest"
+        ));
     }
 
     #[test]
