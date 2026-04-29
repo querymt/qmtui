@@ -1838,17 +1838,17 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
                 ToolDetail::None
             }
         }
+        "index" => {
+            let path = str_field("path");
+            ToolDetail::Summary(short(&path).to_string())
+        }
         _ => ToolDetail::None,
     }
 }
 
 fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, result: &str) {
     let Some(id) = tool_call_id else { return };
-    // parse result JSON
-    let obj: serde_json::Value = match serde_json::from_str(result) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let parsed_result = serde_json::from_str::<serde_json::Value>(result).ok();
 
     // walk backwards to find matching ToolCall
     for entry in messages.iter_mut().rev() {
@@ -1863,15 +1863,20 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
                 continue;
             }
             // edit tool: update start_line
-            if let ToolDetail::Edit { start_line: sl, .. } = detail {
-                *sl = obj
-                    .get("startLineOld")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
+            if let Some(obj) = &parsed_result {
+                if let ToolDetail::Edit { start_line: sl, .. } = detail {
+                    *sl = obj
+                        .get("startLineOld")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize);
+                }
             }
             // shell tool: show last 3 lines of stdout below command
             if name.starts_with("shell")
-                && let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str())
+                && let Some(stdout) = parsed_result
+                    .as_ref()
+                    .and_then(|obj| obj.get("stdout"))
+                    .and_then(|v| v.as_str())
             {
                 let tail: Vec<&str> = stdout
                     .lines()
@@ -1889,14 +1894,80 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
                     }
                 }
             }
+            // index tool: enrich with language and section counts
+            if name == "index" {
+                let text = parsed_result
+                    .as_ref()
+                    .map(content_to_string)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| result.to_string());
+                if let Some(summary_parts) = index_outline_summary_parts(&text) {
+                    if let ToolDetail::Summary(path) = detail {
+                        let suffix = format!(" ({})", summary_parts.join(", "));
+                        if !path.ends_with(&suffix) {
+                            path.push_str(&suffix);
+                        }
+                    }
+                }
+            }
             break;
         }
     }
 }
 
+fn index_outline_summary_parts(text: &str) -> Option<Vec<String>> {
+    let lang = text
+        .lines()
+        .find(|l| l.starts_with("language:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty());
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut current_section: Option<String> = None;
+    let mut current_count = 0usize;
+    for line in text.lines() {
+        if line.ends_with(':') && !line.starts_with(' ') && !line.starts_with('\t') {
+            if let Some(ref section) = current_section {
+                if current_count > 0 {
+                    counts.push((section.clone(), current_count));
+                }
+            }
+            let section = line.trim_end_matches(':');
+            current_section =
+                (!matches!(section, "path" | "language")).then(|| section.to_string());
+            current_count = 0;
+        } else if line.starts_with("  - ") && current_section.is_some() {
+            current_count += 1;
+        }
+    }
+    if let Some(ref section) = current_section {
+        if current_count > 0 {
+            counts.push((section.clone(), current_count));
+        }
+    }
+    let mut summary_parts: Vec<String> = Vec::new();
+    if let Some(l) = lang {
+        summary_parts.push(l.to_string());
+    }
+    for (sec, n) in counts {
+        summary_parts.push(format!("{n} {sec}"));
+    }
+    (!summary_parts.is_empty()).then_some(summary_parts)
+}
+
 fn content_to_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(obj) => {
+            if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                obj.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
         serde_json::Value::Array(arr) => arr
             .iter()
             .filter_map(|block| {
@@ -1916,8 +1987,8 @@ fn content_to_string(v: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tool_detail_tests {
-    use super::parse_tool_detail;
-    use crate::app::ToolDetail;
+    use super::{parse_tool_detail, update_tool_detail};
+    use crate::app::{ChatEntry, ToolDetail};
 
     #[test]
     fn delegate_tool_shows_agent_and_objective() {
@@ -1949,6 +2020,119 @@ mod tool_detail_tests {
                 assert!(
                     s.contains("Do something"),
                     "must contain objective, got: {s}"
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_tool_shows_short_path_from_arguments() {
+        let args = serde_json::json!({"path": "/home/user/project/src/main.rs"});
+        let detail = parse_tool_detail("index", Some(&args));
+        match detail {
+            ToolDetail::Summary(s) => {
+                assert_eq!(s, "src/main.rs");
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_tool_enriched_with_language_and_counts() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("tc-1".into()),
+            name: "index".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("src/main.rs".into()),
+        }];
+        let result = "path: /home/user/project/src/main.rs\nlanguage: rust\n\nimports:\n  - use std::io [1]\n  - use std::fs [2]\ntypes:\n  - struct Foo [10-20]\n    - field: i32 [11]\nfunctions:\n  - fn main [30-40]\n  - fn helper [50-60]\n";
+        update_tool_detail(&mut messages, Some("tc-1"), result);
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Summary(s),
+                ..
+            } => {
+                assert_eq!(
+                    s, "src/main.rs (rust, 2 imports, 1 types, 2 functions)",
+                    "must summarize raw outline result"
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_tool_enrichment_is_idempotent() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("tc-dup".into()),
+            name: "index".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("src/main.rs".into()),
+        }];
+        let result = "path: /home/user/project/src/main.rs\nlanguage: rust\n\nimports:\n  - use std::io [1]\ntypes:\n  - struct Foo [10-20]\nfunctions:\n  - fn main [30-40]\n";
+        update_tool_detail(&mut messages, Some("tc-dup"), result);
+        update_tool_detail(&mut messages, Some("tc-dup"), result);
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Summary(s),
+                ..
+            } => {
+                assert_eq!(
+                    s, "src/main.rs (rust, 1 imports, 1 types, 1 functions)",
+                    "must not append duplicate index summary suffixes"
+                );
+                assert_eq!(
+                    s.matches("(rust, 1 imports, 1 types, 1 functions)").count(),
+                    1
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_tool_handles_json_text_blocks_and_skips_empty_sections() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("tc-2".into()),
+            name: "index".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("src/lib.rs".into()),
+        }];
+        let result = r#"[{"type":"text","text":"path: /home/user/project/src/lib.rs\nlanguage: python\n\nimports:\n  - os [1]\ntypes:\nfunctions:\n  - fn foo [10-20]\n"}]"#;
+        update_tool_detail(&mut messages, Some("tc-2"), result);
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Summary(s),
+                ..
+            } => {
+                assert_eq!(
+                    s, "src/lib.rs (python, 1 imports, 1 functions)",
+                    "must summarize JSON text blocks and skip empty sections"
+                );
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_tool_graceful_on_malformed_result() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("tc-3".into()),
+            name: "index".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("src/lib.rs".into()),
+        }];
+        let result = "totally wrong";
+        update_tool_detail(&mut messages, Some("tc-3"), result);
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Summary(s),
+                ..
+            } => {
+                assert_eq!(
+                    s, "src/lib.rs",
+                    "must preserve original path on malformed result"
                 );
             }
             other => panic!("expected Summary, got: {other:?}"),

@@ -443,6 +443,19 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                                     Theme::diff_file(),
                                 )));
                             }
+                        } else if name == "index" && info.ends_with(')') {
+                            if let Some((path, metadata)) = info.rsplit_once(" (") {
+                                pending_tools.push(Line::from(vec![
+                                    Span::styled(format!("{sym} {name} "), style),
+                                    Span::styled(path.to_string(), Theme::diff_file()),
+                                    Span::styled(format!(" ({metadata}"), Theme::status_accent()),
+                                ]));
+                            } else {
+                                pending_tools.push(Line::from(vec![
+                                    Span::styled(format!("{sym} {name} "), style),
+                                    Span::styled(info.clone(), Theme::diff_file()),
+                                ]));
+                            }
                         } else {
                             pending_tools.push(Line::from(vec![
                                 Span::styled(format!("{sym} {name} "), style),

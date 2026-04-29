@@ -1236,6 +1236,34 @@ mod tests {
     }
 
     #[test]
+    fn index_tool_call_metadata_suffix_uses_accent_color() {
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "index".into(),
+            is_error: false,
+            detail: ToolDetail::Summary(
+                "src/(generated)/main.rs (rust, 2 imports, 1 functions)".into(),
+            ),
+        });
+
+        let cards = build_message_cards(&mut app);
+        let line = cards
+            .iter()
+            .flat_map(|card| card.lines_for(120).iter().cloned().collect::<Vec<_>>())
+            .find(|line| line.spans.iter().any(|span| span.content == "> index "))
+            .expect("missing index tool line");
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content, "src/(generated)/main.rs");
+        assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(line.spans[2].content, " (rust, 2 imports, 1 functions)");
+        assert_eq!(line.spans[2].style.fg, Theme::status_accent().fg);
+    }
+
+    #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         use crate::app::{
             ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail,
