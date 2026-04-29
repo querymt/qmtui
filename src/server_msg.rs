@@ -1910,9 +1910,72 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
                     }
                 }
             }
+            // search_text tool: append backend result counts from the compact footer.
+            if name == "search_text" {
+                let text = parsed_result
+                    .as_ref()
+                    .map(content_to_string)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| result.to_string());
+                if let Some(footer) = search_text_footer(&text) {
+                    if let ToolDetail::Summary(summary) = detail {
+                        let suffix = format!(" {footer}");
+                        if !summary.ends_with(&suffix) {
+                            summary.push_str(&suffix);
+                        }
+                    }
+                }
+            }
             break;
         }
     }
+}
+
+fn search_text_footer(text: &str) -> Option<&str> {
+    let footer = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if !footer.starts_with('(') || !footer.ends_with(')') {
+        return None;
+    }
+
+    let inner = &footer[1..footer.len() - 1];
+    let parts: Vec<&str> = inner.split(", ").collect();
+    if !(parts.len() == 2 || parts.len() == 3) {
+        return None;
+    }
+    if parts.len() == 3 && parts[2] != "truncated" {
+        return None;
+    }
+
+    let file_label = if parse_counted_label(parts[0], "file")? == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let match_label = if parse_counted_label(parts[1], "match")? == 1 {
+        "match"
+    } else {
+        "matches"
+    };
+    if !parts[0].ends_with(file_label) || !parts[1].ends_with(match_label) {
+        return None;
+    }
+
+    Some(footer)
+}
+
+fn parse_counted_label(text: &str, singular: &str) -> Option<usize> {
+    let (count, label) = text.split_once(' ')?;
+    let count = count.parse::<usize>().ok()?;
+    let plural = if singular.ends_with("ch") {
+        format!("{singular}es")
+    } else {
+        format!("{singular}s")
+    };
+    (label == singular || label == plural).then_some(count)
 }
 
 fn index_outline_summary_parts(text: &str) -> Option<Vec<String>> {
@@ -1989,6 +2052,16 @@ fn content_to_string(v: &serde_json::Value) -> String {
 mod tool_detail_tests {
     use super::{parse_tool_detail, update_tool_detail};
     use crate::app::{ChatEntry, ToolDetail};
+
+    fn summary_text(entry: &ChatEntry) -> &str {
+        match entry {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Summary(s),
+                ..
+            } => s,
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
 
     #[test]
     fn delegate_tool_shows_agent_and_objective() {
@@ -2137,6 +2210,75 @@ mod tool_detail_tests {
             }
             other => panic!("expected Summary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_text_tool_enriched_with_raw_backend_footer() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("search-1".into()),
+            name: "search_text".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("\"needle\" *.rs".into()),
+        }];
+        let result = "config.rs\n13:needle\n\nmain.rs\n7:needle\n(5 files, 28 matches)";
+
+        update_tool_detail(&mut messages, Some("search-1"), result);
+
+        assert_eq!(
+            summary_text(&messages[0]),
+            "\"needle\" *.rs (5 files, 28 matches)"
+        );
+    }
+
+    #[test]
+    fn search_text_tool_enriched_with_truncated_footer() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("search-truncated".into()),
+            name: "search_text".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("\"needle\" src".into()),
+        }];
+        let result = "main.rs\n7:needle\n(1 file, 100 matches, truncated)";
+
+        update_tool_detail(&mut messages, Some("search-truncated"), result);
+
+        assert_eq!(
+            summary_text(&messages[0]),
+            "\"needle\" src (1 file, 100 matches, truncated)"
+        );
+    }
+
+    #[test]
+    fn search_text_tool_enrichment_is_idempotent() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("search-dup".into()),
+            name: "search_text".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("\"needle\" .".into()),
+        }];
+        let result = "(0 files, 0 matches)";
+
+        update_tool_detail(&mut messages, Some("search-dup"), result);
+        update_tool_detail(&mut messages, Some("search-dup"), result);
+
+        let summary = summary_text(&messages[0]);
+        assert_eq!(summary, "\"needle\" . (0 files, 0 matches)");
+        assert_eq!(summary.matches("(0 files, 0 matches)").count(), 1);
+    }
+
+    #[test]
+    fn search_text_tool_enriched_from_json_text_block_footer() {
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("search-json".into()),
+            name: "search_text".into(),
+            is_error: false,
+            detail: ToolDetail::Summary("\"needle\" .".into()),
+        }];
+        let result = r#"[{"type":"text","text":"main.rs\n7:needle\n(1 file, 1 match)"}]"#;
+
+        update_tool_detail(&mut messages, Some("search-json"), result);
+
+        assert_eq!(summary_text(&messages[0]), "\"needle\" . (1 file, 1 match)");
     }
 }
 
