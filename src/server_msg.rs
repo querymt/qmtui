@@ -1093,6 +1093,15 @@ impl App {
                         self.invalidate_delegate_render_cache();
                     }
                     let detail = parse_tool_detail(tool_name, arguments.as_ref());
+                    if reconcile_tool_call_start(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        tool_name,
+                        detail.clone(),
+                    ) {
+                        self.card_cache.invalidate();
+                        return;
+                    }
                     self.messages.push(ChatEntry::ToolCall {
                         tool_call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
@@ -1112,16 +1121,36 @@ impl App {
                         backfill_elicitation_outcomes(&mut self.messages, result_str);
                     }
                 } else {
+                    let mut updated_existing_tool = false;
                     if let Some(result_str) = result {
-                        update_tool_detail(&mut self.messages, tool_call_id.as_deref(), result_str);
+                        updated_existing_tool = update_tool_detail(
+                            &mut self.messages,
+                            tool_call_id.as_deref(),
+                            result_str,
+                        );
                     }
                     if is_error.unwrap_or(false) {
-                        self.messages.push(ChatEntry::ToolCall {
-                            tool_call_id: tool_call_id.clone(),
-                            name: format!("{tool_name} (failed)"),
-                            is_error: true,
-                            detail: ToolDetail::None,
-                        });
+                        if mark_tool_call_failed(
+                            &mut self.messages,
+                            tool_call_id.as_deref(),
+                            tool_name,
+                        ) {
+                            updated_existing_tool = true;
+                        } else if !failed_tool_call_exists(
+                            &self.messages,
+                            tool_call_id.as_deref(),
+                            tool_name,
+                        ) {
+                            self.messages.push(ChatEntry::ToolCall {
+                                tool_call_id: tool_call_id.clone(),
+                                name: format!("{tool_name} (failed)"),
+                                is_error: true,
+                                detail: ToolDetail::None,
+                            });
+                        }
+                    }
+                    if updated_existing_tool {
+                        self.card_cache.invalidate();
                     }
                 }
             }
@@ -1846,8 +1875,94 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
     }
 }
 
-fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, result: &str) {
-    let Some(id) = tool_call_id else { return };
+fn fallback_failed_tool_name(tool_name: &str) -> String {
+    format!("{tool_name} (failed)")
+}
+
+fn is_same_tool_call(existing_id: &Option<String>, tool_call_id: Option<&str>) -> bool {
+    existing_id.as_deref() == tool_call_id
+}
+
+fn failed_tool_call_exists(
+    messages: &[ChatEntry],
+    tool_call_id: Option<&str>,
+    tool_name: &str,
+) -> bool {
+    let fallback_name = fallback_failed_tool_name(tool_name);
+    messages.iter().any(|entry| {
+        matches!(
+            entry,
+            ChatEntry::ToolCall {
+                tool_call_id: existing_id,
+                name,
+                is_error: true,
+                ..
+            } if is_same_tool_call(existing_id, tool_call_id)
+                && (name == tool_name || name == &fallback_name)
+        )
+    })
+}
+
+fn reconcile_tool_call_start(
+    messages: &mut [ChatEntry],
+    tool_call_id: Option<&str>,
+    tool_name: &str,
+    start_detail: ToolDetail,
+) -> bool {
+    let Some(id) = tool_call_id else { return false };
+    let fallback_name = fallback_failed_tool_name(tool_name);
+    for entry in messages.iter_mut().rev() {
+        if let ChatEntry::ToolCall {
+            tool_call_id: Some(tid),
+            name,
+            detail,
+            ..
+        } = entry
+        {
+            if tid != id {
+                continue;
+            }
+            if name == &fallback_name {
+                *name = tool_name.to_string();
+            }
+            if matches!(detail, ToolDetail::None) && !matches!(start_detail, ToolDetail::None) {
+                *detail = start_detail;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn mark_tool_call_failed(
+    messages: &mut [ChatEntry],
+    tool_call_id: Option<&str>,
+    tool_name: &str,
+) -> bool {
+    let Some(id) = tool_call_id else { return false };
+    for entry in messages.iter_mut().rev() {
+        if let ChatEntry::ToolCall {
+            tool_call_id: Some(tid),
+            name,
+            is_error,
+            ..
+        } = entry
+        {
+            if tid == id && name == tool_name && !*is_error {
+                *is_error = true;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn update_tool_detail(
+    messages: &mut [ChatEntry],
+    tool_call_id: Option<&str>,
+    result: &str,
+) -> bool {
+    let Some(id) = tool_call_id else { return false };
     let parsed_result = serde_json::from_str::<serde_json::Value>(result).ok();
 
     // walk backwards to find matching ToolCall
@@ -1926,9 +2041,10 @@ fn update_tool_detail(messages: &mut [ChatEntry], tool_call_id: Option<&str>, re
                     }
                 }
             }
-            break;
+            return true;
         }
     }
+    false
 }
 
 fn search_text_footer(text: &str) -> Option<&str> {
@@ -2050,7 +2166,10 @@ fn content_to_string(v: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tool_detail_tests {
-    use super::{parse_tool_detail, update_tool_detail};
+    use super::{
+        failed_tool_call_exists, mark_tool_call_failed, parse_tool_detail,
+        reconcile_tool_call_start, update_tool_detail,
+    };
     use crate::app::{ChatEntry, ToolDetail};
 
     fn summary_text(entry: &ChatEntry) -> &str {
@@ -2109,6 +2228,115 @@ mod tool_detail_tests {
             }
             other => panic!("expected Summary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_tool_end_marks_existing_tool_in_place() {
+        let mut messages = vec![
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                detail: ToolDetail::Summary("echo ok".into()),
+            },
+            ChatEntry::Assistant {
+                content: "done".into(),
+                thinking: None,
+                message_id: None,
+            },
+        ];
+
+        assert!(mark_tool_call_failed(
+            &mut messages,
+            Some("tool-1"),
+            "shell"
+        ));
+
+        assert_eq!(messages.len(), 2, "must not append a stale failed badge");
+        match &messages[0] {
+            ChatEntry::ToolCall { name, is_error, .. } => {
+                assert_eq!(name, "shell");
+                assert!(*is_error);
+            }
+            other => panic!("expected ToolCall, got: {other:?}"),
+        }
+        assert!(matches!(messages[1], ChatEntry::Assistant { .. }));
+    }
+
+    #[test]
+    fn failed_tool_fallback_duplicate_check_is_idempotent() {
+        let messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("missing-start".into()),
+            name: "ls (failed)".into(),
+            is_error: true,
+            detail: ToolDetail::None,
+        }];
+
+        assert!(!mark_tool_call_failed(
+            &mut messages.clone(),
+            Some("missing-start"),
+            "ls"
+        ));
+        assert!(failed_tool_call_exists(
+            &messages,
+            Some("missing-start"),
+            "ls"
+        ));
+    }
+
+    #[test]
+    fn tool_start_reconciles_failed_fallback_in_place() {
+        let mut messages = vec![
+            ChatEntry::Assistant {
+                content: "before".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("missing-start".into()),
+                name: "shell (failed)".into(),
+                is_error: true,
+                detail: ToolDetail::None,
+            },
+        ];
+        let detail = parse_tool_detail(
+            "shell",
+            Some(&serde_json::json!({
+                "command": "cargo test tool_detail_tests"
+            })),
+        );
+
+        assert!(reconcile_tool_call_start(
+            &mut messages,
+            Some("missing-start"),
+            "shell",
+            detail
+        ));
+        assert_eq!(
+            messages.len(),
+            2,
+            "start must not append a second tool entry"
+        );
+        match &messages[1] {
+            ChatEntry::ToolCall {
+                name,
+                is_error,
+                detail,
+                ..
+            } => {
+                assert_eq!(name, "shell");
+                assert!(*is_error);
+                assert!(
+                    matches!(detail, ToolDetail::Summary(cmd) if cmd == "cargo test tool_detail_tests")
+                );
+            }
+            other => panic!("expected ToolCall, got: {other:?}"),
+        }
+        assert!(failed_tool_call_exists(
+            &messages,
+            Some("missing-start"),
+            "shell"
+        ));
     }
 
     #[test]

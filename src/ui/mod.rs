@@ -495,10 +495,55 @@ mod tests {
         })
     }
 
+    fn tool_call_start_event(tool_call_id: &str, tool_name: &str) -> serde_json::Value {
+        tool_call_start_event_with_args(tool_call_id, tool_name, serde_json::json!({}))
+    }
+
+    fn tool_call_start_event_with_args(
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "tool_call_start",
+                "data": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "arguments": arguments,
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
+    fn failed_tool_call_end_event(tool_call_id: &str, tool_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {
+                "type": "tool_call_end",
+                "data": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "is_error": true,
+                    "result": "failed",
+                }
+            },
+            "timestamp": null,
+        })
+    }
+
     fn envelope_event(event: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "type": "durable",
             "data": event,
+        })
+    }
+
+    fn server_event_data(event: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "test-session",
+            "agent_id": "test-agent",
+            "event": envelope_event(event),
         })
     }
 
@@ -2334,6 +2379,130 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
+    }
+
+    #[test]
+    fn late_failed_tool_end_updates_cached_tool_card_without_appending_badge() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+        for event in [
+            tool_call_start_event("tool-1", "shell"),
+            assistant_event("latest assistant", "assistant-1"),
+        ] {
+            app.handle_server_msg(RawServerMsg {
+                msg_type: "event".into(),
+                data: Some(server_event_data(event)),
+            });
+        }
+
+        build_message_cards(&mut app);
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(server_event_data(failed_tool_call_end_event(
+                "tool-1", "shell",
+            ))),
+        });
+
+        assert_eq!(
+            app.messages.len(),
+            2,
+            "failed end should update original entry"
+        );
+        match &app.messages[0] {
+            ChatEntry::ToolCall { name, is_error, .. } => {
+                assert_eq!(name, "shell");
+                assert!(*is_error);
+            }
+            other => panic!("expected ToolCall, got: {other:?}"),
+        }
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "cache must invalidate"
+        );
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(lines.iter().any(|line| line.contains("x shell")));
+        assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
+        assert!(matches!(app.messages[1], ChatEntry::Assistant { .. }));
+    }
+
+    #[test]
+    fn failed_tool_end_before_start_reconciles_badge_without_stale_bottom_entry() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+
+        for event in [
+            assistant_event("older assistant", "assistant-old"),
+            failed_tool_call_end_event("tool-out-of-order", "shell"),
+            assistant_event("latest assistant", "assistant-latest"),
+        ] {
+            app.handle_server_msg(RawServerMsg {
+                msg_type: "event".into(),
+                data: Some(server_event_data(event)),
+            });
+        }
+
+        build_message_cards(&mut app);
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(server_event_data(tool_call_start_event_with_args(
+                "tool-out-of-order",
+                "shell",
+                serde_json::json!({ "command": "echo replay" }),
+            ))),
+        });
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(server_event_data(failed_tool_call_end_event(
+                "tool-out-of-order",
+                "shell",
+            ))),
+        });
+
+        let matching_tools: Vec<_> = app
+            .messages
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::ToolCall {
+                    tool_call_id,
+                    name,
+                    is_error,
+                    detail,
+                } if tool_call_id.as_deref() == Some("tool-out-of-order") => {
+                    Some((name, is_error, detail))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            matching_tools.len(),
+            1,
+            "must keep one reconciled tool entry"
+        );
+        assert_eq!(matching_tools[0].0, "shell");
+        assert!(*matching_tools[0].1);
+        assert!(matches!(matching_tools[0].2, ToolDetail::Summary(cmd) if cmd == "echo replay"));
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "reconciliation must invalidate rendered cards"
+        );
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("x shell echo replay"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("latest assistant"),
+            "stale fallback badge must not render at the bottom"
+        );
     }
 
     #[test]
