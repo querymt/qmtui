@@ -2732,8 +2732,10 @@ mod tests {
                 updated_at: None,
                 parent_session_id: Some("parent".into()),
                 has_children: false,
+                ..Default::default()
             }],
             latest_activity: None,
+            ..Default::default()
         }];
 
         app.handle_server_msg(session_loaded_msg(
@@ -3422,9 +3424,19 @@ mod tests {
                     updated_at: None,
                     parent_session_id: None,
                     has_children: false,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
+    }
+
+    fn row_text(row: &super::start::StartPageRow) -> String {
+        row.line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     /// `build_start_page_rows` returns one `StartPageRow` per visible item.
@@ -3549,6 +3561,17 @@ mod tests {
             text.contains('\u{25BE}'),
             "expanded header must contain ▾, got: {text}"
         );
+    }
+
+    #[test]
+    fn start_page_show_more_row_uses_show_all_label_not_load_more() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
+        let rows = build_start_page_rows(&app, 80);
+        let text = row_text(rows.last().expect("missing show more row"));
+
+        assert!(text.contains("show all"), "row text: {text}");
+        assert!(!text.contains("load more"), "row text: {text}");
     }
 
     /// No sessions → empty-state row is produced.

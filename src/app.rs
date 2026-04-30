@@ -760,16 +760,23 @@ pub enum StartPageItem {
         /// Index into `App::session_groups[group_idx].sessions`.
         session_idx: usize,
     },
-    /// A "… show all (N total)" row shown when a group has more sessions than
-    /// `MAX_RECENT_SESSIONS`. Pressing Enter opens the session popup.
+    /// A "... show all" row shown when a group has more sessions than are
+    /// currently visible on the start page.
     ShowMore {
-        /// Number of sessions hidden beyond the first `MAX_RECENT_SESSIONS`.
+        /// Index into `App::session_groups`.
+        group_idx: usize,
+        /// Number of loaded sessions hidden beyond the first `MAX_RECENT_SESSIONS`.
         remaining: usize,
+        /// Whether the backend has another page for this group.
+        has_more: bool,
     },
 }
 
-/// Maximum number of recent sessions shown per group before a ShowMore row.
+/// Maximum number of recent sessions shown per group on the start page.
 pub const MAX_RECENT_SESSIONS: usize = 3;
+/// Target visible sessions per group when auto-filling the sessions popup.
+pub const POPUP_SESSION_PAGE_TARGET: usize = 10;
+pub const SESSION_GROUP_PAGE_LIMIT: u32 = 10;
 
 /// Maximum number of workspace groups shown on the start page.
 /// Groups beyond this cap are hidden from the start page but remain accessible
@@ -806,6 +813,11 @@ pub enum PopupItem {
         group_idx: usize,
         /// Index into `App::session_groups[group_idx].sessions`.
         session_idx: usize,
+    },
+    /// A "... load more..." row that fetches the next page for one group.
+    LoadMore {
+        /// Index into `App::session_groups`.
+        group_idx: usize,
     },
 }
 
@@ -849,6 +861,8 @@ pub struct App {
     /// Groups whose header has been collapsed by the user in the session popup.
     /// Separate from `collapsed_groups` so start-page and popup states are independent.
     pub popup_collapsed_groups: HashSet<String>,
+    /// CWDs with an outstanding group-page session request.
+    pub pending_session_group_loads: HashSet<Option<String>>,
     /// Scroll offset for the start-page session list (in visible rows).
     pub start_page_scroll: usize,
     /// Last rendered visible row count for the sessions tab in the popup.
@@ -1032,6 +1046,18 @@ pub fn validate_reasoning_effort(s: Option<&str>) -> Option<Option<String>> {
 }
 
 impl App {
+    pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<ClientMsg> {
+        let group = self.session_groups.get(group_idx)?;
+        let cursor = group.next_cursor.clone()?;
+        let cwd = group.cwd.clone();
+        self.pending_session_group_loads.insert(cwd.clone());
+        Some(ClientMsg::list_sessions_group(
+            cwd,
+            cursor,
+            SESSION_GROUP_PAGE_LIMIT,
+        ))
+    }
+
     pub fn new() -> Self {
         Self {
             screen: Screen::Sessions,
@@ -1043,6 +1069,7 @@ impl App {
             session_popup_tab: 0,
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
+            pending_session_group_loads: HashSet::new(),
             start_page_scroll: 0,
             session_popup_visible_rows: 0,
             delegate_popup_visible_rows: 0,
@@ -2434,7 +2461,9 @@ mod reasoning_effort_tests {
                 updated_at: None,
                 parent_session_id: None,
                 has_children: false,
+                ..Default::default()
             }],
+            ..Default::default()
         }];
         assert_eq!(
             app.resolve_new_session_default_cwd().as_deref(),
@@ -4201,8 +4230,10 @@ mod delegate_entry_tests {
                 updated_at: None,
                 parent_session_id: Some("parent".into()),
                 has_children: false,
+                ..Default::default()
             }],
             latest_activity: None,
+            ..Default::default()
         }];
 
         app.handle_server_msg(RawServerMsg {
@@ -7957,8 +7988,10 @@ mod start_page_tests {
                     updated_at: updated_at.map(String::from),
                     parent_session_id: None,
                     has_children: false,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -8158,6 +8191,119 @@ mod start_page_tests {
         assert_eq!(app.session_groups[0].sessions[0].session_id, "s1");
     }
 
+    #[test]
+    fn backend_shaped_session_list_deserializes_with_new_fields() {
+        let list: SessionListData = serde_json::from_value(serde_json::json!({
+            "groups": [
+                {
+                    "cwd": "/workspace/project",
+                    "latest_activity": "2024-02-01T00:00:00Z",
+                    "total_count": 1,
+                    "next_cursor": "group-next",
+                    "sessions": [
+                        {
+                            "session_id": "s1",
+                            "name": "Session One",
+                            "cwd": "/workspace/project",
+                            "title": "T1",
+                            "created_at": "2024-01-01T00:00:00Z",
+                            "updated_at": "2024-02-01T00:00:00Z",
+                            "parent_session_id": null,
+                            "fork_origin": null,
+                            "session_kind": "interactive",
+                            "has_children": true,
+                            "node": "local",
+                            "node_id": "node-1",
+                            "attached": true,
+                            "runtime_state": "running"
+                        }
+                    ]
+                }
+            ],
+            "next_cursor": "list-next",
+            "total_count": 1
+        }))
+        .expect("backend session_list shape should parse");
+
+        assert_eq!(list.next_cursor.as_deref(), Some("list-next"));
+        assert_eq!(list.total_count, Some(1));
+        assert_eq!(list.groups[0].total_count, Some(1));
+        assert_eq!(list.groups[0].next_cursor.as_deref(), Some("group-next"));
+        let session = &list.groups[0].sessions[0];
+        assert_eq!(session.name.as_deref(), Some("Session One"));
+        assert_eq!(session.session_kind.as_deref(), Some("interactive"));
+        assert_eq!(session.node.as_deref(), Some("local"));
+        assert_eq!(session.node_id.as_deref(), Some("node-1"));
+        assert_eq!(session.attached, Some(true));
+        assert_eq!(session.runtime_state.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn session_list_hides_only_delegation_children_and_preserves_delegate_entries() {
+        let mut app = App::new();
+        app.delegate_entries.push(DelegateEntry {
+            delegation_id: "del-existing".into(),
+            child_session_id: Some("delegate-child".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("agent".into()),
+            objective: "Existing delegate".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::default(),
+        });
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_list".into(),
+            data: Some(serde_json::json!({
+                "groups": [
+                    {
+                        "cwd": "/workspace/project",
+                        "sessions": [
+                            { "session_id": "root", "title": "Root", "updated_at": "2024-01-04T00:00:00Z" },
+                            { "session_id": "delegate-child", "title": "Delegation", "updated_at": "2024-01-03T00:00:00Z", "parent_session_id": "root", "fork_origin": "delegation" },
+                            { "session_id": "user-child", "title": "User Fork", "updated_at": "2024-01-02T00:00:00Z", "parent_session_id": "root", "fork_origin": "user" },
+                            { "session_id": "unknown-child", "title": "Unknown Fork", "updated_at": "2024-01-01T00:00:00Z", "parent_session_id": "root" }
+                        ]
+                    },
+                    {
+                        "cwd": "/workspace/project/empty-after-filter",
+                        "sessions": [
+                            { "session_id": "delegate-only", "title": "Delegate Only", "updated_at": "2024-01-05T00:00:00Z", "parent_session_id": "root", "fork_origin": "delegation" }
+                        ]
+                    }
+                ],
+                "total_count": 5
+            })),
+        });
+
+        let visible_ids: Vec<&str> = app.session_groups[0]
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(app.session_groups.len(), 1);
+        assert_eq!(visible_ids, vec!["root", "user-child", "unknown-child"]);
+        assert!(!visible_ids.contains(&"delegate-child"));
+        assert_eq!(app.status, "3 session(s)");
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert_eq!(app.delegate_entries[0].delegation_id, "del-existing");
+
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "session"
+                && entry.message
+                    == "session list: kept 2 non-delegation child session(s) (fork_origin=unknown: 1, user: 1)"
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "session"
+                && entry.message
+                    == "session list: hid 2 delegation child session(s); visible=3, backend_total=5"
+        }));
+    }
+
     // ── filtered_sessions still works (for popup compat) ─────────────────────
 
     #[test]
@@ -8248,7 +8394,7 @@ mod start_page_tests {
     }
 
     #[test]
-    fn visible_items_group_with_four_sessions_caps_at_three_plus_show_more() {
+    fn visible_items_group_with_four_sessions_shows_show_more() {
         let mut app = App::new();
         app.session_groups = vec![make_group(
             Some("/a"),
@@ -8258,15 +8404,14 @@ mod start_page_tests {
         // header + 3 sessions + ShowMore
         assert_eq!(items.len(), 5);
         assert!(matches!(
-            items[4],
-            StartPageItem::ShowMore { remaining: 1, .. }
+            items.last(),
+            Some(StartPageItem::ShowMore { remaining: 1, .. })
         ));
     }
 
     #[test]
     fn visible_items_show_more_remaining_is_total_minus_three() {
         let mut app = App::new();
-        // 7 sessions → show 3 + ShowMore(remaining=4)
         app.session_groups = vec![make_group(
             Some("/a"),
             &[
@@ -8277,12 +8422,20 @@ mod start_page_tests {
                 ("s5", None),
                 ("s6", None),
                 ("s7", None),
+                ("s8", None),
+                ("s9", None),
+                ("s10", None),
+                ("s11", None),
             ],
         )];
         let items = app.visible_start_items();
         assert!(matches!(
             items.last(),
-            Some(StartPageItem::ShowMore { remaining: 4, .. })
+            Some(StartPageItem::ShowMore {
+                remaining: 8,
+                has_more: false,
+                ..
+            })
         ));
     }
 
@@ -8296,15 +8449,21 @@ mod start_page_tests {
                 ("aaa2", None),
                 ("aaa3", None),
                 ("aaa4", None),
+                ("aaa5", None),
+                ("aaa6", None),
+                ("aaa7", None),
+                ("aaa8", None),
+                ("aaa9", None),
+                ("aaa10", None),
+                ("aaa11", None),
             ],
         )];
         app.session_filter = "aaa".to_string();
         let items = app.visible_start_items();
-        // All 4 match the filter but cap still applies → header + 3 sessions + ShowMore(1)
         assert_eq!(items.len(), 5);
         assert!(matches!(
             items.last(),
-            Some(StartPageItem::ShowMore { remaining: 1 })
+            Some(StartPageItem::ShowMore { remaining: 8, .. })
         ));
     }
 
@@ -8413,8 +8572,10 @@ mod popup_item_tests {
                     updated_at: None,
                     parent_session_id: None,
                     has_children: false,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -8451,12 +8612,26 @@ mod popup_item_tests {
         let items = app.visible_popup_items();
         // 1 header + 10 sessions = 11
         assert_eq!(items.len(), 11);
-        // No ShowMore items
         assert!(
             !items
                 .iter()
-                .any(|i| matches!(i, PopupItem::GroupHeader { .. } if false))
+                .any(|i| matches!(i, PopupItem::LoadMore { .. }))
         );
+    }
+
+    #[test]
+    fn popup_items_include_load_more_when_group_has_next_cursor() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/workspace/project"), &["s1"]);
+        group.next_cursor = Some("cursor-1".to_string());
+        app.session_groups = vec![group];
+
+        let items = app.visible_popup_items();
+
+        assert!(matches!(
+            items.last(),
+            Some(PopupItem::LoadMore { group_idx: 0 })
+        ));
     }
 
     // ── no MAX_VISIBLE_GROUPS cap ─────────────────────────────────────────────

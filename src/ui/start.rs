@@ -102,10 +102,11 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 ])
             }
 
-            // Per-group session overflow: show all N additional sessions in this group.
+            // Per-group overflow row. The start page always opens the popup;
+            // only the popup performs paginated load-more requests.
             crate::app::StartPageItem::ShowMore { remaining, .. } => {
                 let total = remaining + crate::app::MAX_RECENT_SESSIONS;
-                let label = format!("   \u{2026}  show all ({total} total)");
+                let label = format!("   {ELLIPSIS} show all ({total} total)");
                 Line::from(vec![Span::styled(label, dim_style)])
             }
         };

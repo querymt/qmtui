@@ -97,8 +97,12 @@ impl App {
                     });
                 }
 
-                if hidden > 0 {
-                    items.push(StartPageItem::ShowMore { remaining: hidden });
+                if hidden > 0 || group.next_cursor.is_some() {
+                    items.push(StartPageItem::ShowMore {
+                        group_idx,
+                        remaining: hidden,
+                        has_more: group.next_cursor.is_some(),
+                    });
                 }
             }
         }
@@ -130,11 +134,8 @@ impl App {
 
     /// Build the flat list of visible rows for the session popup.
     ///
-    /// Mirrors [`visible_start_items`] but with two key differences:
-    /// - Uses `popup_collapsed_groups` instead of `collapsed_groups`.
-    /// - No `MAX_RECENT_SESSIONS` or `MAX_VISIBLE_GROUPS` caps — the popup
-    ///   always shows every group and every session (its purpose is to browse
-    ///   the full list).
+    /// Mirrors [`visible_start_items`] but uses popup-local collapse state and
+    /// appends a per-group load-more row when the backend has another page.
     pub fn visible_popup_items(&self) -> Vec<PopupItem> {
         let q = self.session_filter.to_lowercase();
         let mut items = Vec::new();
@@ -162,6 +163,9 @@ impl App {
                         group_idx,
                         session_idx,
                     });
+                }
+                if group.next_cursor.is_some() {
+                    items.push(PopupItem::LoadMore { group_idx });
                 }
             }
         }

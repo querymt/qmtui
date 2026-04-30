@@ -41,6 +41,31 @@ enum ConnectionManagerEvent {
     State(app::ConnectionEvent),
 }
 
+#[derive(Debug)]
+enum ServerChannelMsg {
+    Parsed(RawServerMsg),
+    Invalid { error: String, raw: String },
+}
+
+fn parse_server_text_for_channel(text: &str) -> ServerChannelMsg {
+    match serde_json::from_str::<RawServerMsg>(text) {
+        Ok(raw) => ServerChannelMsg::Parsed(raw),
+        Err(err) => ServerChannelMsg::Invalid {
+            error: err.to_string(),
+            raw: text.to_string(),
+        },
+    }
+}
+
+fn log_invalid_server_message(app: &mut App, error: String, raw: String) {
+    app.status = format!("invalid server message: {error}");
+    app.push_log(
+        app::LogLevel::Error,
+        "protocol",
+        format!("invalid server message: {error}; raw: {raw}"),
+    );
+}
+
 fn reconnect_delay_ms(attempt: u32) -> u64 {
     let capped = attempt.min(5);
     250 * (1u64 << capped)
@@ -152,6 +177,39 @@ mod tests {
         assert_eq!(tick_at_0ms / 2, tick_at_150ms / 2);
         // Different spinner frame after 160ms
         assert_ne!(tick_at_0ms / 2, tick_at_160ms / 2);
+    }
+
+    #[test]
+    fn raw_server_msg_missing_data_parses_as_none() {
+        let raw = serde_json::from_str::<RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
+
+        assert_eq!(raw.msg_type, "heartbeat");
+        assert!(raw.data.is_none());
+    }
+
+    #[test]
+    fn invalid_server_message_log_includes_full_raw_payload() {
+        let raw = r#"{"data":"missing type","nested":{"value":"do not truncate"}}"#;
+        let ServerChannelMsg::Invalid {
+            error,
+            raw: parsed_raw,
+        } = parse_server_text_for_channel(raw)
+        else {
+            panic!("expected invalid server message");
+        };
+        let mut app = App::new();
+
+        log_invalid_server_message(&mut app, error.clone(), parsed_raw);
+
+        assert!(error.contains("missing field `type`"));
+        assert_eq!(app.status, format!("invalid server message: {error}"));
+        let log = app.logs.last().unwrap();
+        assert_eq!(log.level, app::LogLevel::Error);
+        assert_eq!(log.target, "protocol");
+        assert_eq!(
+            log.message,
+            format!("invalid server message: {error}; raw: {raw}")
+        );
     }
 
     // ── Elicitation key handling ──────────────────────────────────────────────
@@ -1430,7 +1488,7 @@ async fn main() -> anyhow::Result<()> {
     let url = format!("{scheme}://{addr}/ui/ws");
 
     // channels for the event loop
-    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<RawServerMsg>();
+    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerChannelMsg>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnectionManagerEvent>();
 
@@ -1536,7 +1594,7 @@ fn restore_hint(session_id: &str) -> String {
 
 async fn connection_manager(
     url: String,
-    srv_tx: mpsc::UnboundedSender<RawServerMsg>,
+    srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
     conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
 ) {
@@ -1572,9 +1630,7 @@ async fn connection_manager(
                         maybe_msg = ws_rx.next() => {
                             match maybe_msg {
                                 Some(Ok(Message::Text(text))) => {
-                                    if let Ok(raw) = serde_json::from_str::<RawServerMsg>(&text) {
-                                        let _ = srv_tx.send(raw);
-                                    }
+                                    let _ = srv_tx.send(parse_server_text_for_channel(&text));
                                 }
                                 Some(Ok(_)) => {}
                                 Some(Err(err)) => {
@@ -1610,7 +1666,7 @@ async fn connection_manager(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-    srv_rx: &mut mpsc::UnboundedReceiver<RawServerMsg>,
+    srv_rx: &mut mpsc::UnboundedReceiver<ServerChannelMsg>,
     conn_rx: &mut mpsc::UnboundedReceiver<ConnectionManagerEvent>,
     sup_rx: &mut mpsc::UnboundedReceiver<server_manager::ServerEvent>,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
@@ -1656,23 +1712,30 @@ async fn run_loop(
             }
             // server messages
             Some(msg) = srv_rx.recv() => {
-                // Save config when the server authoritatively updates effort.
-                let is_effort_push = msg.msg_type == "reasoning_effort";
-                for reply in app.handle_server_msg(msg) {
-                    // if reloading session, also re-subscribe
-                    if let ClientMsg::LoadSession { ref session_id } = reply {
-                        let sid = session_id.clone();
-                        cmd_tx.send(reply)?;
-                        cmd_tx.send(ClientMsg::SubscribeSession {
-                            session_id: sid,
-                            agent_id: app.agent_id.clone(),
-                        })?;
-                    } else {
-                        cmd_tx.send(reply)?;
+                match msg {
+                    ServerChannelMsg::Parsed(msg) => {
+                        // Save config when the server authoritatively updates effort.
+                        let is_effort_push = msg.msg_type == "reasoning_effort";
+                        for reply in app.handle_server_msg(msg) {
+                            // if reloading session, also re-subscribe
+                            if let ClientMsg::LoadSession { ref session_id } = reply {
+                                let sid = session_id.clone();
+                                cmd_tx.send(reply)?;
+                                cmd_tx.send(ClientMsg::SubscribeSession {
+                                    session_id: sid,
+                                    agent_id: app.agent_id.clone(),
+                                })?;
+                            } else {
+                                cmd_tx.send(reply)?;
+                            }
+                        }
+                        if is_effort_push {
+                            save_cache(app);
+                        }
                     }
-                }
-                if is_effort_push {
-                    save_cache(app);
+                    ServerChannelMsg::Invalid { error, raw } => {
+                        log_invalid_server_message(app, error, raw);
+                    }
                 }
             }
             // server supervisor events
@@ -1810,9 +1873,17 @@ mod sessions_key_tests {
                     updated_at: None,
                     parent_session_id: None,
                     has_children: false,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
+    }
+
+    fn make_group_with_cursor(cwd: Option<&str>, ids: &[&str], next_cursor: &str) -> SessionGroup {
+        let mut group = make_group(cwd, ids);
+        group.next_cursor = Some(next_cursor.to_string());
+        group
     }
 
     // ── Down / Up navigation ──────────────────────────────────────────────────
@@ -1994,7 +2065,7 @@ mod sessions_key_tests {
     #[test]
     fn enter_on_show_more_opens_session_popup() {
         let mut app = App::new();
-        // 4 sessions → header(0) + s1(1) + s2(2) + s3(3) + ShowMore(4)
+        // 4 sessions -> header(0) + 3 sessions + ShowMore(4)
         app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
         app.session_cursor = 4; // ShowMore row
         let action = apply_sessions_key(&mut app, KeyCode::Enter);
@@ -2002,6 +2073,24 @@ mod sessions_key_tests {
         assert_eq!(app.popup, crate::app::Popup::SessionSelect);
         assert_eq!(app.session_cursor, 0);
         assert!(app.session_filter.is_empty());
+    }
+
+    #[test]
+    fn enter_on_show_more_with_backend_cursor_still_only_opens_popup() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group_with_cursor(
+            Some("/workspace/project"),
+            &["s1", "s2", "s3"],
+            "cursor-1",
+        )];
+        app.session_cursor = 4; // ShowMore row created by next_cursor
+
+        let action = apply_sessions_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(app.popup, crate::app::Popup::SessionSelect);
+        assert_eq!(app.session_popup_tab, 0);
+        assert_eq!(app.session_cursor, 0);
     }
 
     // ── New Session button slot ───────────────────────────────────────────────
@@ -2092,9 +2181,17 @@ mod session_popup_key_tests {
                     updated_at: None,
                     parent_session_id: None,
                     has_children: false,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
+    }
+
+    fn make_group_with_cursor(cwd: Option<&str>, ids: &[&str], next_cursor: &str) -> SessionGroup {
+        let mut group = make_group(cwd, ids);
+        group.next_cursor = Some(next_cursor.to_string());
+        group
     }
 
     // ── Down / Up navigation ──────────────────────────────────────────────────
@@ -2269,6 +2366,23 @@ mod session_popup_key_tests {
                 agent_id: None,
             }
         );
+    }
+
+    #[test]
+    fn popup_enter_on_load_more_returns_action_and_keeps_popup_open() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group_with_cursor(
+            Some("/workspace/project"),
+            &["s1"],
+            "cursor-1",
+        )];
+        app.session_cursor = 2; // LoadMore row
+
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, SessionKeyAction::LoadMoreSessions { group_idx: 0 });
+        assert_eq!(app.popup, Popup::SessionSelect);
     }
 
     // ── Delete on Session removes it ─────────────────────────────────────────

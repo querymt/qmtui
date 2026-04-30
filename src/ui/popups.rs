@@ -546,6 +546,17 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
 
                     ListItem::new(Line::from(spans))
                 }
+                PopupItem::LoadMore { .. } => {
+                    let style = if selected {
+                        Theme::selected()
+                    } else {
+                        Theme::status()
+                    };
+                    ListItem::new(Line::from(vec![Span::styled(
+                        format!("     {ELLIPSIS} load more"),
+                        style,
+                    )]))
+                }
             }
         })
         .collect();

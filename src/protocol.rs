@@ -6,7 +6,18 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ClientMsg {
     Init,
-    ListSessions,
+    ListSessions {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
     SetReasoningEffort {
         reasoning_effort: String,
     },
@@ -77,6 +88,68 @@ pub enum ClientMsg {
     },
 }
 
+impl ClientMsg {
+    pub fn list_sessions_browse() -> Self {
+        Self::ListSessions {
+            mode: None,
+            cursor: None,
+            limit: None,
+            cwd: None,
+            query: None,
+        }
+    }
+
+    pub fn list_sessions_group(cwd: Option<String>, cursor: String, limit: u32) -> Self {
+        Self::ListSessions {
+            mode: Some("group".to_string()),
+            cursor: Some(cursor),
+            limit: Some(limit),
+            cwd: Some(cwd.unwrap_or_else(|| "__none__".to_string())),
+            query: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod client_msg_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn list_sessions_browse_serializes_default_data_object() {
+        let value = serde_json::to_value(ClientMsg::list_sessions_browse()).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "list_sessions",
+                "data": {}
+            })
+        );
+    }
+
+    #[test]
+    fn list_sessions_group_serializes_backend_pagination_fields() {
+        let value = serde_json::to_value(ClientMsg::list_sessions_group(
+            Some("/workspace/project".to_string()),
+            "cursor-1".to_string(),
+            10,
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "list_sessions",
+                "data": {
+                    "mode": "group",
+                    "cursor": "cursor-1",
+                    "limit": 10,
+                    "cwd": "/workspace/project"
+                }
+            })
+        );
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum PromptBlock {
@@ -91,6 +164,7 @@ pub enum PromptBlock {
 pub struct RawServerMsg {
     #[serde(rename = "type")]
     pub msg_type: String,
+    #[serde(default)]
     pub data: Option<serde_json::Value>,
 }
 
@@ -150,36 +224,62 @@ pub struct SessionCreatedData {
     pub request_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SessionListData {
+    #[serde(default)]
     pub groups: Vec<SessionGroup>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,
+    #[serde(default)]
     pub sessions: Vec<SessionSummary>,
     /// ISO 8601 timestamp of the most recent activity in this group.
     #[serde(default)]
     pub latest_activity: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<u64>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SessionSummary {
     pub session_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
     /// Working directory for this session (may differ from group cwd for remote sessions).
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
     pub updated_at: Option<String>,
     /// Parent session ID if this is a forked session.
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub fork_origin: Option<String>,
+    #[serde(default)]
+    pub session_kind: Option<String>,
     /// Whether this session has child (forked) sessions.
     #[serde(default)]
     pub has_children: bool,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub attached: Option<bool>,
+    #[serde(default)]
+    pub runtime_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

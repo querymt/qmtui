@@ -429,7 +429,7 @@ pub(crate) fn handle_chord(
             app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
-            cmd_tx.send(ClientMsg::ListSessions)?;
+            cmd_tx.send(ClientMsg::list_sessions_browse())?;
         }
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
@@ -561,6 +561,11 @@ pub(crate) fn handle_sessions_key(
         SessionKeyAction::NewSession => {
             app.open_new_session_popup();
         }
+        SessionKeyAction::LoadMoreSessions { group_idx } => {
+            if let Some(request) = app.session_group_page_request(group_idx) {
+                cmd_tx.send(request)?;
+            }
+        }
         SessionKeyAction::None => {}
     }
     Ok(())
@@ -613,6 +618,11 @@ pub(crate) fn handle_session_popup_key(
         }
         SessionKeyAction::DeleteSession { session_id } => {
             cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+        }
+        SessionKeyAction::LoadMoreSessions { group_idx } => {
+            if let Some(request) = app.session_group_page_request(group_idx) {
+                cmd_tx.send(request)?;
+            }
         }
         SessionKeyAction::NewSession | SessionKeyAction::None => {}
     }
@@ -675,6 +685,9 @@ pub(crate) fn apply_popup_session_key(
                             session_id: sid,
                             agent_id: None,
                         };
+                    }
+                    PopupItem::LoadMore { group_idx } => {
+                        return SessionKeyAction::LoadMoreSessions { group_idx };
                     }
                 }
             }
@@ -786,6 +799,7 @@ pub(crate) fn handle_delegate_popup_key(
         }
         SessionKeyAction::NewSession
         | SessionKeyAction::DeleteSession { .. }
+        | SessionKeyAction::LoadMoreSessions { .. }
         | SessionKeyAction::None => {}
     }
     Ok(())
@@ -1412,7 +1426,7 @@ fn try_execute_slash_command(
             app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
-            cmd_tx.send(ClientMsg::ListSessions)?;
+            cmd_tx.send(ClientMsg::list_sessions_browse())?;
         }
         "delegates" => {
             app.take_input();
@@ -1936,6 +1950,8 @@ pub(crate) enum SessionKeyAction {
     DeleteSession { session_id: String },
     /// Create a new session.
     NewSession,
+    /// Load the next session page for a cwd group.
+    LoadMoreSessions { group_idx: usize },
 }
 
 /// Apply a key event on the sessions screen, mutate `app`, and return the
