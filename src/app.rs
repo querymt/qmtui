@@ -6805,14 +6805,17 @@ mod tests {
         );
         app.handle_event_kind(
             &EventKind::ToolsAvailable {
-                tools: vec![ToolInfo {
-                    tool_type: "function".into(),
-                    function: Some(FunctionToolInfo {
-                        name: "search_text".into(),
-                        description: Some("Search file contents".into()),
-                        parameters: Some(serde_json::json!({ "type": "object" })),
-                    }),
-                }],
+                tools: ["delegate", "ls", "question", "glob", "shell", "read_tool"]
+                    .into_iter()
+                    .map(|name| ToolInfo {
+                        tool_type: "function".into(),
+                        function: Some(FunctionToolInfo {
+                            name: name.into(),
+                            description: Some(format!("{name} tool")),
+                            parameters: Some(serde_json::json!({ "type": "object" })),
+                        }),
+                    })
+                    .collect(),
                 tools_hash: Some(serde_json::json!("123456789")),
             },
             false,
@@ -6835,8 +6838,14 @@ mod tests {
         assert!(app.logs.iter().any(|entry| {
             entry.level == LogLevel::Debug
                 && entry.target == "tools"
-                && entry.message == "tools available: 1 tool(s) (search_text)"
+                && entry.message
+                    == "tools available: 6 tool(s) (delegate, ls, question, glob, shell, read_tool)"
         }));
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| !entry.message.contains("+2 more"))
+        );
     }
 
     #[test]

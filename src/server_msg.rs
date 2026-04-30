@@ -1771,17 +1771,11 @@ fn tool_names_suffix(tools: &[ToolInfo]) -> String {
         .filter_map(|tool| tool.function.as_ref())
         .map(|function| function.name.as_str())
         .filter(|name| !name.is_empty())
-        .take(4)
         .collect();
     if names.is_empty() {
         return String::new();
     }
-    let remaining = tools.len().saturating_sub(names.len());
-    if remaining == 0 {
-        format!(" ({})", names.join(", "))
-    } else {
-        format!(" ({} +{} more)", names.join(", "), remaining)
-    }
+    format!(" ({})", names.join(", "))
 }
 
 /// Update per-delegation stats from a single event arriving on a child session.
