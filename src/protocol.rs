@@ -355,6 +355,9 @@ pub enum EventKind {
     ProgressRecorded {
         progress_entry: ProgressEntry,
     },
+    ArtifactRecorded {
+        artifact: ArtifactInfo,
+    },
     SessionQueued {
         reason: String,
     },
@@ -431,6 +434,15 @@ pub struct ProgressEntry {
     pub kind: ProgressKind,
     pub content: String,
     pub metadata: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactInfo {
+    pub kind: String,
+    pub uri: Option<String>,
+    pub path: Option<String>,
+    pub summary: Option<String>,
     pub created_at: String,
 }
 

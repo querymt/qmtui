@@ -1246,6 +1246,15 @@ impl App {
                     }
                 }
             }
+            EventKind::ArtifactRecorded { artifact } => {
+                if !is_replay {
+                    self.push_log(
+                        LogLevel::Debug,
+                        "artifact",
+                        format!("artifact recorded: {}", format_artifact_info(artifact)),
+                    );
+                }
+            }
             EventKind::SessionQueued { reason } => {
                 if !is_replay {
                     self.set_status(
@@ -1739,6 +1748,23 @@ fn format_session_limits(limits: Option<&SessionLimits>) -> String {
     )
 }
 
+fn format_artifact_info(artifact: &ArtifactInfo) -> String {
+    let location = artifact
+        .path
+        .as_deref()
+        .or(artifact.uri.as_deref())
+        .unwrap_or("artifact");
+
+    match artifact
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
+        Some(summary) => format!("{} {} ({summary})", artifact.kind, location),
+        None => format!("{} {}", artifact.kind, location),
+    }
+}
+
 fn tool_names_suffix(tools: &[ToolInfo]) -> String {
     let names: Vec<&str> = tools
         .iter()
@@ -1789,6 +1815,7 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
         | EventKind::SnapshotStart { .. }
         | EventKind::SnapshotEnd { .. }
         | EventKind::ProgressRecorded { .. }
+        | EventKind::ArtifactRecorded { .. }
         | EventKind::SessionQueued { .. }
         | EventKind::SessionConfigured { .. }
         | EventKind::ToolsAvailable { .. }
@@ -1834,6 +1861,7 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
         | EventKind::SnapshotStart { .. }
         | EventKind::SnapshotEnd { .. }
         | EventKind::ProgressRecorded { .. }
+        | EventKind::ArtifactRecorded { .. }
         | EventKind::SessionQueued { .. }
         | EventKind::ProviderChanged { .. }
         | EventKind::Error { .. }

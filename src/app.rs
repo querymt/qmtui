@@ -5329,6 +5329,21 @@ mod tests {
             },
             "timestamp": null
         });
+        let artifact_recorded = serde_json::json!({
+            "kind": {
+                "type": "artifact_recorded",
+                "data": {
+                    "artifact": {
+                        "kind": "file",
+                        "uri": null,
+                        "path": "src/generated.txt",
+                        "summary": "Produced by write_file",
+                        "created_at": "2026-04-29T14:25:09Z"
+                    }
+                }
+            },
+            "timestamp": null
+        });
 
         let queued: AgentEvent = serde_json::from_value(session_queued).unwrap();
         assert!(
@@ -5343,6 +5358,11 @@ mod tests {
         let available: AgentEvent = serde_json::from_value(tools_available).unwrap();
         assert!(
             matches!(available.kind, EventKind::ToolsAvailable { tools, tools_hash } if tools.first().and_then(|tool| tool.function.as_ref()).map(|function| function.name.as_str()) == Some("search_text") && tools_hash.is_some())
+        );
+
+        let artifact: AgentEvent = serde_json::from_value(artifact_recorded).unwrap();
+        assert!(
+            matches!(artifact.kind, EventKind::ArtifactRecorded { artifact } if artifact.kind == "file" && artifact.path.as_deref() == Some("src/generated.txt") && artifact.summary.as_deref() == Some("Produced by write_file"))
         );
     }
 
@@ -5483,6 +5503,98 @@ mod tests {
         assert_eq!(last.level, LogLevel::Warn);
         assert_eq!(last.target, "protocol");
         assert!(last.message.contains("brand_new_unknown_event_2099"));
+    }
+
+    #[test]
+    fn artifact_recorded_session_event_replay_skips_log_without_unknown_warning() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+
+        app.handle_server_msg(session_events_msg(vec![durable_event(
+            "artifact_recorded",
+            serde_json::json!({
+                "artifact": {
+                    "kind": "file",
+                    "uri": null,
+                    "path": "src/generated.txt",
+                    "summary": "Produced by write_file",
+                    "created_at": "2026-04-29T14:25:09Z"
+                }
+            }),
+        )]));
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.iter().all(|entry| entry.target != "artifact"));
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| !entry.message.contains("unknown session_events kind"))
+        );
+    }
+
+    #[test]
+    fn artifact_recorded_live_event_logs_only() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "event": durable_event(
+                    "artifact_recorded",
+                    serde_json::json!({
+                        "artifact": {
+                            "kind": "file",
+                            "uri": null,
+                            "path": "src/generated.txt",
+                            "summary": "Produced by write_file",
+                            "created_at": "2026-04-29T14:25:09Z"
+                        }
+                    })
+                )
+            })),
+        });
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "artifact"
+                && entry.message
+                    == "artifact recorded: file src/generated.txt (Produced by write_file)"
+        }));
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| !entry.message.contains("unknown event kind"))
+        );
+    }
+
+    #[test]
+    fn artifact_recorded_replay_skips_log_and_chat() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+
+        app.handle_server_msg(make_session_loaded(serde_json::json!({
+            "events": [audit_event(
+                "artifact_recorded",
+                serde_json::json!({
+                    "artifact": {
+                        "kind": "file",
+                        "uri": null,
+                        "path": "src/generated.txt",
+                        "summary": "Produced by write_file",
+                        "created_at": "2026-04-29T14:25:09Z"
+                    }
+                })
+            )]
+        })));
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.iter().all(
+            |entry| entry.target != "artifact" && !entry.message.contains("artifact recorded")
+        ));
     }
 
     #[test]
