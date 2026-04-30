@@ -355,6 +355,21 @@ pub enum EventKind {
     ProgressRecorded {
         progress_entry: ProgressEntry,
     },
+    SessionQueued {
+        reason: String,
+    },
+    SessionConfigured {
+        cwd: Option<String>,
+        #[serde(default)]
+        mcp_servers: Vec<serde_json::Value>,
+        limits: Option<SessionLimits>,
+    },
+    ToolsAvailable {
+        #[serde(default)]
+        tools: Vec<ToolInfo>,
+        #[serde(default)]
+        tools_hash: Option<serde_json::Value>,
+    },
     ProviderChanged {
         provider: String,
         model: String,
@@ -428,6 +443,31 @@ pub enum ProgressKind {
     Checkpoint,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionLimits {
+    pub max_steps: Option<u32>,
+    pub max_turns: Option<u32>,
+    pub max_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolInfo {
+    #[serde(rename = "type", default)]
+    pub tool_type: String,
+    #[serde(default)]
+    pub function: Option<FunctionToolInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionToolInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
 /// Subset of the server-side `Delegation` struct that we care about.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DelegationData {
@@ -441,6 +481,32 @@ pub struct DelegationData {
 #[derive(Debug, Deserialize)]
 pub struct AllModelsData {
     pub models: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AudioCapabilitiesData {
+    #[serde(default)]
+    pub stt_models: Vec<AudioModelInfo>,
+    #[serde(default)]
+    pub tts_models: Vec<AudioModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AudioModelInfo {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderCapabilitiesData {
+    #[serde(default)]
+    pub providers: Vec<ProviderCapabilityEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderCapabilityEntry {
+    pub provider: String,
+    pub supports_custom_models: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

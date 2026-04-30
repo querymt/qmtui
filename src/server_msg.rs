@@ -593,6 +593,8 @@ impl App {
             "session_events" => {
                 if let Some(data) = raw.data {
                     if let Ok(parsed) = serde_json::from_value::<SessionEventsData>(data.clone()) {
+                        let unknown_kinds =
+                            unknown_event_kind_types_from_session_events_data(&data);
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
                             self.note_session_activity(&parsed.session_id);
                             for envelope in parsed.events {
@@ -610,6 +612,9 @@ impl App {
                             if !routed {
                                 self.note_session_activity(&parsed.session_id);
                             }
+                        }
+                        for kind_type in unknown_kinds {
+                            self.warn_unknown_event_kind(&kind_type, true);
                         }
                     } else {
                         match serde_json::from_value::<SessionEventsDataRaw>(data) {
@@ -709,6 +714,51 @@ impl App {
                     && let Ok(ml) = serde_json::from_value::<AllModelsData>(data)
                 {
                     self.models = ml.models;
+                }
+                vec![]
+            }
+            "audio_capabilities" => {
+                if let Some(data) = raw.data
+                    && let Ok(capabilities) = serde_json::from_value::<AudioCapabilitiesData>(data)
+                {
+                    let providers = audio_provider_summary(&capabilities);
+                    let suffix = if providers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({providers})")
+                    };
+                    self.push_log(
+                        LogLevel::Debug,
+                        "audio",
+                        format!(
+                            "audio: {} STT, {} TTS{}",
+                            capabilities.stt_models.len(),
+                            capabilities.tts_models.len(),
+                            suffix
+                        ),
+                    );
+                }
+                vec![]
+            }
+            "provider_capabilities" => {
+                if let Some(data) = raw.data
+                    && let Ok(capabilities) =
+                        serde_json::from_value::<ProviderCapabilitiesData>(data)
+                {
+                    let custom_count = capabilities
+                        .providers
+                        .iter()
+                        .filter(|provider| provider.supports_custom_models)
+                        .count();
+                    self.push_log(
+                        LogLevel::Debug,
+                        "models",
+                        format!(
+                            "models: {} provider capability entrie(s), {} support custom models",
+                            capabilities.providers.len(),
+                            custom_count
+                        ),
+                    );
                 }
                 vec![]
             }
@@ -1196,6 +1246,46 @@ impl App {
                     }
                 }
             }
+            EventKind::SessionQueued { reason } => {
+                if !is_replay {
+                    self.set_status(
+                        LogLevel::Warn,
+                        "session",
+                        format!("session queued: {reason}"),
+                    );
+                }
+            }
+            EventKind::SessionConfigured {
+                cwd,
+                mcp_servers,
+                limits,
+            } => {
+                if !is_replay {
+                    self.push_log(
+                        LogLevel::Debug,
+                        "session",
+                        format!(
+                            "session configured: cwd {}, {} MCP server(s), {}",
+                            cwd.as_deref().unwrap_or("none"),
+                            mcp_servers.len(),
+                            format_session_limits(limits.as_ref())
+                        ),
+                    );
+                }
+            }
+            EventKind::ToolsAvailable { tools, .. } => {
+                if !is_replay {
+                    self.push_log(
+                        LogLevel::Debug,
+                        "tools",
+                        format!(
+                            "tools available: {} tool(s){}",
+                            tools.len(),
+                            tool_names_suffix(tools)
+                        ),
+                    );
+                }
+            }
             EventKind::ProviderChanged {
                 provider,
                 model,
@@ -1592,10 +1682,80 @@ fn is_answer_result(result: &str) -> bool {
 
 fn extract_event_kind_type(value: &serde_json::Value) -> Option<&str> {
     value
-        .get("data")
-        .and_then(|data| data.get("kind"))
+        .get("kind")
+        .or_else(|| value.get("data").and_then(|data| data.get("kind")))
         .and_then(|kind| kind.get("type"))
         .and_then(|kind_type| kind_type.as_str())
+}
+
+fn unknown_event_kind_types_from_session_events_data(data: &serde_json::Value) -> Vec<String> {
+    data.get("events")
+        .and_then(|events| events.as_array())
+        .map(|events| {
+            events
+                .iter()
+                .filter_map(|event| {
+                    let kind_type = extract_event_kind_type(event)?;
+                    let parsed = serde_json::from_value::<EventEnvelope>(event.clone()).ok()?;
+                    matches!(parsed.kind(), EventKind::Unknown).then(|| kind_type.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn audio_provider_summary(capabilities: &AudioCapabilitiesData) -> String {
+    let mut providers: Vec<&str> = capabilities
+        .stt_models
+        .iter()
+        .chain(capabilities.tts_models.iter())
+        .map(|model| model.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    providers.join(", ")
+}
+
+fn format_session_limits(limits: Option<&SessionLimits>) -> String {
+    let Some(limits) = limits else {
+        return "limits none".into();
+    };
+    let cost = limits
+        .max_cost_usd
+        .map(|cost| cost.to_string())
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "limits steps={} turns={} cost={}",
+        limits
+            .max_steps
+            .map(|steps| steps.to_string())
+            .unwrap_or_else(|| "none".into()),
+        limits
+            .max_turns
+            .map(|turns| turns.to_string())
+            .unwrap_or_else(|| "none".into()),
+        cost
+    )
+}
+
+fn tool_names_suffix(tools: &[ToolInfo]) -> String {
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool.function.as_ref())
+        .map(|function| function.name.as_str())
+        .filter(|name| !name.is_empty())
+        .take(4)
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    let remaining = tools.len().saturating_sub(names.len());
+    if remaining == 0 {
+        format!(" ({})", names.join(", "))
+    } else {
+        format!(" ({} +{} more)", names.join(", "), remaining)
+    }
 }
 
 /// Update per-delegation stats from a single event arriving on a child session.
@@ -1629,6 +1789,9 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
         | EventKind::SnapshotStart { .. }
         | EventKind::SnapshotEnd { .. }
         | EventKind::ProgressRecorded { .. }
+        | EventKind::SessionQueued { .. }
+        | EventKind::SessionConfigured { .. }
+        | EventKind::ToolsAvailable { .. }
         | EventKind::SessionCreated
         | EventKind::Unknown => {}
         _ => {}
@@ -1671,6 +1834,7 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
         | EventKind::SnapshotStart { .. }
         | EventKind::SnapshotEnd { .. }
         | EventKind::ProgressRecorded { .. }
+        | EventKind::SessionQueued { .. }
         | EventKind::ProviderChanged { .. }
         | EventKind::Error { .. }
         | EventKind::Cancelled => {
@@ -1678,6 +1842,8 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
         }
         EventKind::TurnStarted
         | EventKind::SessionModeChanged { .. }
+        | EventKind::SessionConfigured { .. }
+        | EventKind::ToolsAvailable { .. }
         | EventKind::SessionCreated
         | EventKind::DelegationRequested { .. }
         | EventKind::DelegationCompleted { .. }

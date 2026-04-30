@@ -5289,6 +5289,64 @@ mod tests {
     }
 
     #[test]
+    fn backend_next_protocol_events_deserialize() {
+        let session_queued = serde_json::json!({
+            "kind": {
+                "type": "session_queued",
+                "data": { "reason": "waiting for previous operation to complete" }
+            },
+            "timestamp": null
+        });
+        let session_configured = serde_json::json!({
+            "kind": {
+                "type": "session_configured",
+                "data": {
+                    "cwd": "/workspace/project",
+                    "mcp_servers": [],
+                    "limits": {
+                        "max_steps": 200,
+                        "max_turns": 50,
+                        "max_cost_usd": null
+                    }
+                }
+            },
+            "timestamp": null
+        });
+        let tools_available = serde_json::json!({
+            "kind": {
+                "type": "tools_available",
+                "data": {
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "search_text",
+                            "description": "Search file contents",
+                            "parameters": { "type": "object" }
+                        }
+                    }],
+                    "tools_hash": "123456789"
+                }
+            },
+            "timestamp": null
+        });
+
+        let queued: AgentEvent = serde_json::from_value(session_queued).unwrap();
+        assert!(
+            matches!(queued.kind, EventKind::SessionQueued { reason } if reason == "waiting for previous operation to complete")
+        );
+
+        let configured: AgentEvent = serde_json::from_value(session_configured).unwrap();
+        assert!(
+            matches!(configured.kind, EventKind::SessionConfigured { cwd, mcp_servers, limits } if cwd.as_deref() == Some("/workspace/project") && mcp_servers.is_empty() && limits.as_ref().and_then(|l| l.max_steps) == Some(200))
+        );
+
+        let available: AgentEvent = serde_json::from_value(tools_available).unwrap();
+        assert!(
+            matches!(available.kind, EventKind::ToolsAvailable { tools, tools_hash } if tools.first().and_then(|tool| tool.function.as_ref()).map(|function| function.name.as_str()) == Some("search_text") && tools_hash.is_some())
+        );
+    }
+
+    #[test]
     fn backend_snapshot_and_progress_events_deserialize() {
         let snapshot_start = serde_json::json!({
             "kind": {
@@ -5331,6 +5389,52 @@ mod tests {
         assert!(
             matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
         );
+    }
+
+    #[test]
+    fn raw_capability_messages_log_without_unknown_warning_or_chat() {
+        let mut app = App::new();
+
+        let audio_cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "audio_capabilities".into(),
+            data: Some(serde_json::json!({
+                "stt_models": [
+                    { "provider": "izwi", "model": "stt-small" },
+                    { "provider": "mistralrs", "model": "stt-local" }
+                ],
+                "tts_models": [
+                    { "provider": "izwi", "model": "tts-small" }
+                ]
+            })),
+        });
+        let provider_cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "provider_capabilities".into(),
+            data: Some(serde_json::json!({
+                "providers": [
+                    { "provider": "openai", "supports_custom_models": true },
+                    { "provider": "anthropic", "supports_custom_models": false }
+                ]
+            })),
+        });
+
+        assert!(audio_cmds.is_empty());
+        assert!(provider_cmds.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "audio"
+                && entry.message == "audio: 2 STT, 1 TTS (izwi, mistralrs)"
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "models"
+                && entry.message
+                    == "models: 2 provider capability entrie(s), 1 support custom models"
+        }));
+        assert!(app.logs.iter().all(|entry| {
+            !entry.message.contains("audio_capabilities")
+                && !entry.message.contains("provider_capabilities")
+        }));
     }
 
     #[test]
@@ -6564,6 +6668,66 @@ mod tests {
     }
 
     #[test]
+    fn live_next_protocol_events_log_without_chat_messages() {
+        let mut app = App::new();
+
+        app.handle_event_kind(
+            &EventKind::SessionQueued {
+                reason: "waiting for previous operation to complete".into(),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::SessionConfigured {
+                cwd: Some("/workspace/project".into()),
+                mcp_servers: vec![],
+                limits: Some(SessionLimits {
+                    max_steps: Some(200),
+                    max_turns: Some(50),
+                    max_cost_usd: None,
+                }),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolsAvailable {
+                tools: vec![ToolInfo {
+                    tool_type: "function".into(),
+                    function: Some(FunctionToolInfo {
+                        name: "search_text".into(),
+                        description: Some("Search file contents".into()),
+                        parameters: Some(serde_json::json!({ "type": "object" })),
+                    }),
+                }],
+                tools_hash: Some(serde_json::json!("123456789")),
+            },
+            false,
+            None,
+        );
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Warn
+                && entry.target == "session"
+                && entry.message == "session queued: waiting for previous operation to complete"
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "session"
+                && entry
+                    .message
+                    .contains("session configured: cwd /workspace/project")
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "tools"
+                && entry.message == "tools available: 1 tool(s) (search_text)"
+        }));
+    }
+
+    #[test]
     fn live_snapshot_and_progress_events_log_without_chat_messages() {
         let mut app = App::new();
         let initial_messages = app.messages.len();
@@ -6614,6 +6778,39 @@ mod tests {
     }
 
     #[test]
+    fn replay_next_protocol_events_skip_logs_and_chat_messages() {
+        let mut app = App::new();
+
+        app.handle_event_kind(
+            &EventKind::SessionQueued {
+                reason: "waiting".into(),
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::SessionConfigured {
+                cwd: None,
+                mcp_servers: vec![],
+                limits: None,
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolsAvailable {
+                tools: vec![],
+                tools_hash: None,
+            },
+            true,
+            None,
+        );
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
     fn replay_snapshot_and_progress_events_skip_logs_and_chat_messages() {
         let mut app = App::new();
 
@@ -6639,6 +6836,43 @@ mod tests {
 
         assert!(app.messages.is_empty());
         assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn parent_session_next_protocol_events_do_not_warn_or_add_chat() {
+        let mut app = App::new();
+        app.session_id = Some("s1".into());
+        app.agent_id = Some("a1".into());
+        app.messages.push(ChatEntry::User {
+            text: "existing".into(),
+            message_id: Some("existing-msg".into()),
+        });
+
+        app.handle_server_msg(session_events_msg(vec![
+            durable_prompt("hello", "msg-1"),
+            durable_event(
+                "session_configured",
+                serde_json::json!({
+                    "cwd": "/workspace/project",
+                    "mcp_servers": [],
+                    "limits": { "max_steps": 200, "max_turns": 50, "max_cost_usd": null }
+                }),
+            ),
+            durable_event(
+                "tools_available",
+                serde_json::json!({
+                    "tools": [],
+                    "tools_hash": "123456789"
+                }),
+            ),
+            durable_assistant("reply", "a-1"),
+        ]));
+
+        assert_eq!(app.messages.len(), 3);
+        assert!(app.logs.iter().all(|entry| {
+            !entry.message.contains("session_configured")
+                && !entry.message.contains("tools_available")
+        }));
     }
 
     #[test]
