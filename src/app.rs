@@ -5289,6 +5289,51 @@ mod tests {
     }
 
     #[test]
+    fn backend_snapshot_and_progress_events_deserialize() {
+        let snapshot_start = serde_json::json!({
+            "kind": {
+                "type": "snapshot_start",
+                "data": { "policy": "diff" }
+            },
+            "timestamp": null
+        });
+        let snapshot_end = serde_json::json!({
+            "kind": {
+                "type": "snapshot_end",
+                "data": { "summary": "1 modified" }
+            },
+            "timestamp": null
+        });
+        let progress_recorded = serde_json::json!({
+            "kind": {
+                "type": "progress_recorded",
+                "data": {
+                    "progress_entry": {
+                        "kind": "tool_call",
+                        "content": "Calling tool: shell",
+                        "metadata": "{\"tool\":\"shell\"}",
+                        "created_at": "2026-04-13T00:00:00Z"
+                    }
+                }
+            },
+            "timestamp": null
+        });
+
+        let start: AgentEvent = serde_json::from_value(snapshot_start).unwrap();
+        assert!(matches!(start.kind, EventKind::SnapshotStart { policy } if policy == "diff"));
+
+        let end: AgentEvent = serde_json::from_value(snapshot_end).unwrap();
+        assert!(
+            matches!(end.kind, EventKind::SnapshotEnd { summary } if summary.as_deref() == Some("1 modified"))
+        );
+
+        let progress: AgentEvent = serde_json::from_value(progress_recorded).unwrap();
+        assert!(
+            matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
+        );
+    }
+
+    #[test]
     fn unknown_server_message_type_logs_warning() {
         let mut app = App::new();
 
@@ -6519,7 +6564,85 @@ mod tests {
     }
 
     #[test]
-    fn parent_session_events_with_unknown_kind_warns_and_keeps_known_events() {
+    fn live_snapshot_and_progress_events_log_without_chat_messages() {
+        let mut app = App::new();
+        let initial_messages = app.messages.len();
+
+        app.handle_event_kind(
+            &EventKind::SnapshotStart {
+                policy: "diff".into(),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::SnapshotEnd {
+                summary: Some("1 modified".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ProgressRecorded {
+                progress_entry: ProgressEntry {
+                    kind: ProgressKind::Note,
+                    content: "Received response from LLM".into(),
+                    metadata: None,
+                    created_at: "2026-04-13T00:00:00Z".into(),
+                },
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.messages.len(), initial_messages);
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "snapshot"
+                && entry.message == "starting diff snapshot"
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Info
+                && entry.target == "snapshot"
+                && entry.message == "snapshot: 1 modified"
+        }));
+        assert!(app.logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "progress"
+                && entry.message == "progress: Received response from LLM"
+        }));
+    }
+
+    #[test]
+    fn replay_snapshot_and_progress_events_skip_logs_and_chat_messages() {
+        let mut app = App::new();
+
+        app.handle_event_kind(
+            &EventKind::SnapshotEnd {
+                summary: Some("No changes".into()),
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ProgressRecorded {
+                progress_entry: ProgressEntry {
+                    kind: ProgressKind::Note,
+                    content: "Received response from LLM".into(),
+                    metadata: None,
+                    created_at: "2026-04-13T00:00:00Z".into(),
+                },
+            },
+            true,
+            None,
+        );
+
+        assert!(app.messages.is_empty());
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn parent_session_progress_recorded_does_not_warn_or_add_chat() {
         let mut app = App::new();
         app.session_id = Some("s1".into());
         app.agent_id = Some("a1".into());
@@ -6550,10 +6673,11 @@ mod tests {
             ChatEntry::Assistant { content, message_id: Some(message_id), .. }
                 if content == "reply" && message_id == "a-1"
         ));
-        let last = app.logs.last().expect("missing warning log entry");
-        assert_eq!(last.level, LogLevel::Warn);
-        assert_eq!(last.target, "protocol");
-        assert!(last.message.contains("progress_recorded"));
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| !entry.message.contains("progress_recorded"))
+        );
     }
 
     #[test]

@@ -1154,6 +1154,48 @@ impl App {
                     }
                 }
             }
+            EventKind::SnapshotStart { policy } => {
+                if !is_replay {
+                    self.set_status(
+                        LogLevel::Debug,
+                        "snapshot",
+                        format!("starting {policy} snapshot"),
+                    );
+                }
+            }
+            EventKind::SnapshotEnd { summary } => {
+                if !is_replay {
+                    let summary = summary.as_deref().unwrap_or("completed");
+                    let level = if summary.eq_ignore_ascii_case("no changes") {
+                        LogLevel::Debug
+                    } else {
+                        LogLevel::Info
+                    };
+                    self.set_status(level, "snapshot", format!("snapshot: {summary}"));
+                }
+            }
+            EventKind::ProgressRecorded { progress_entry } => {
+                if !is_replay {
+                    match &progress_entry.kind {
+                        ProgressKind::ToolCall => {}
+                        ProgressKind::Artifact => self.push_log(
+                            LogLevel::Debug,
+                            "progress",
+                            format!("artifact: {}", progress_entry.content),
+                        ),
+                        ProgressKind::Note => self.push_log(
+                            LogLevel::Debug,
+                            "progress",
+                            format!("progress: {}", progress_entry.content),
+                        ),
+                        ProgressKind::Checkpoint => self.push_log(
+                            LogLevel::Debug,
+                            "progress",
+                            format!("checkpoint: {}", progress_entry.content),
+                        ),
+                    }
+                }
+            }
             EventKind::ProviderChanged {
                 provider,
                 model,
@@ -1583,7 +1625,12 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
         } => {
             stats.context_limit = *limit;
         }
-        EventKind::LlmRequestStart { .. } | EventKind::SessionCreated | EventKind::Unknown => {}
+        EventKind::LlmRequestStart { .. }
+        | EventKind::SnapshotStart { .. }
+        | EventKind::SnapshotEnd { .. }
+        | EventKind::ProgressRecorded { .. }
+        | EventKind::SessionCreated
+        | EventKind::Unknown => {}
         _ => {}
     }
 }
@@ -1621,6 +1668,9 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
         | EventKind::LlmRequestEnd { .. }
         | EventKind::CompactionStart { .. }
         | EventKind::CompactionEnd { .. }
+        | EventKind::SnapshotStart { .. }
+        | EventKind::SnapshotEnd { .. }
+        | EventKind::ProgressRecorded { .. }
         | EventKind::ProviderChanged { .. }
         | EventKind::Error { .. }
         | EventKind::Cancelled => {

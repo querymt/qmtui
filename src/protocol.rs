@@ -346,6 +346,15 @@ pub enum EventKind {
         is_error: Option<bool>,
         result: Option<String>,
     },
+    SnapshotStart {
+        policy: String,
+    },
+    SnapshotEnd {
+        summary: Option<String>,
+    },
+    ProgressRecorded {
+        progress_entry: ProgressEntry,
+    },
     ProviderChanged {
         provider: String,
         model: String,
@@ -400,6 +409,23 @@ pub enum EventKind {
     },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProgressEntry {
+    pub kind: ProgressKind,
+    pub content: String,
+    pub metadata: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    ToolCall,
+    Artifact,
+    Note,
+    Checkpoint,
 }
 
 /// Subset of the server-side `Delegation` struct that we care about.
