@@ -4,7 +4,7 @@
 //! helper functions for parsing tool details, updating tool results, and
 //! building diff/write content lines.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::app::*;
 use crate::protocol::*;
@@ -400,13 +400,9 @@ impl App {
                 vec![]
             }
             "session_list" => {
-                let mut replies = Vec::new();
                 if let Some(data) = raw.data
                     && let Ok(list) = serde_json::from_value::<SessionListData>(data)
                 {
-                    let backend_total = list.total_count;
-                    let mut hidden_delegation_children = 0usize;
-                    let mut kept_child_origins: BTreeMap<String, usize> = BTreeMap::new();
                     let response_cwd = if list.groups.len() == 1 {
                         list.groups.first().and_then(|group| group.cwd.clone())
                     } else {
@@ -420,34 +416,7 @@ impl App {
                     let mut groups: Vec<SessionGroup> = list
                         .groups
                         .into_iter()
-                        .filter_map(|mut group| {
-                            group.sessions.retain(|session| {
-                                if session.parent_session_id.is_none() {
-                                    return true;
-                                }
-
-                                match session.fork_origin.as_deref() {
-                                    Some("delegation") => {
-                                        hidden_delegation_children += 1;
-                                        false
-                                    }
-                                    Some(origin) => {
-                                        *kept_child_origins
-                                            .entry(origin.to_string())
-                                            .or_default() += 1;
-                                        true
-                                    }
-                                    None => {
-                                        *kept_child_origins
-                                            .entry("unknown".to_string())
-                                            .or_default() += 1;
-                                        true
-                                    }
-                                }
-                            });
-
-                            (is_group_page || !group.sessions.is_empty()).then_some(group)
-                        })
+                        .filter(|group| is_group_page || !group.sessions.is_empty())
                         .collect();
 
                     // Sort sessions within each group by updated_at descending.
@@ -506,56 +475,14 @@ impl App {
                     });
 
                     let total: usize = self.session_groups.iter().map(|g| g.sessions.len()).sum();
-
-                    if !kept_child_origins.is_empty() {
-                        let origin_counts = kept_child_origins
-                            .iter()
-                            .map(|(origin, count)| format!("{origin}: {count}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let kept_count: usize = kept_child_origins.values().sum();
+                    if !is_group_page && let Some(root_total) = list.total_count {
                         self.push_log(
-                            LogLevel::Debug,
+                            LogLevel::Info,
                             "session",
                             format!(
-                                "session list: kept {kept_count} non-delegation child session(s) (fork_origin={origin_counts})"
+                                "session list: total root sessions={root_total}, loaded={total}"
                             ),
                         );
-                    }
-                    if hidden_delegation_children > 0 {
-                        self.push_log(
-                            LogLevel::Debug,
-                            "session",
-                            format!(
-                                "session list: hid {hidden_delegation_children} delegation child session(s); visible={total}, backend_total={}",
-                                backend_total
-                                    .map(|count| count.to_string())
-                                    .unwrap_or_else(|| "unknown".to_string())
-                            ),
-                        );
-                    }
-
-                    let fill_target =
-                        if self.popup == Popup::SessionSelect && self.session_popup_tab == 0 {
-                            POPUP_SESSION_PAGE_TARGET
-                        } else {
-                            MAX_RECENT_SESSIONS
-                        };
-                    let underfilled: Vec<usize> = self
-                        .session_groups
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(group_idx, group)| {
-                            (group.sessions.len() < fill_target
-                                && group.next_cursor.is_some()
-                                && !self.pending_session_group_loads.contains(&group.cwd))
-                            .then_some(group_idx)
-                        })
-                        .collect();
-                    for group_idx in underfilled {
-                        if let Some(request) = self.session_group_page_request(group_idx) {
-                            replies.push(request);
-                        }
                     }
 
                     // Clamp cursor to the new visible item count.
@@ -563,9 +490,8 @@ impl App {
                     if self.session_cursor >= visible_len && visible_len > 0 {
                         self.session_cursor = visible_len - 1;
                     }
-                    self.set_status(LogLevel::Info, "session", format!("{} session(s)", total));
                 }
-                replies
+                vec![]
             }
             "session_created" => {
                 if let Some(data) = raw.data
@@ -3017,18 +2943,6 @@ mod session_list_pagination_tests {
         })
     }
 
-    fn delegation_child(id: &str, updated_at: &str) -> serde_json::Value {
-        json!({
-            "session_id": id,
-            "title": id,
-            "cwd": "/workspace/project",
-            "updated_at": updated_at,
-            "parent_session_id": "parent",
-            "fork_origin": "delegation",
-            "has_children": false
-        })
-    }
-
     fn list_msg(sessions: Vec<serde_json::Value>, next_cursor: Option<&str>) -> RawServerMsg {
         RawServerMsg {
             msg_type: "session_list".to_string(),
@@ -3047,37 +2961,45 @@ mod session_list_pagination_tests {
     }
 
     #[test]
-    fn underfilled_initial_list_requests_group_page_after_filtering_delegates() {
-        let mut app = App::new();
-        let mut sessions = vec![session("root-1", "2025-01-01T00:00:00Z")];
-        sessions.extend(
-            (0..9).map(|i| delegation_child(&format!("child-{i}"), "2025-01-01T00:00:00Z")),
-        );
-
-        let replies = app.handle_server_msg(list_msg(sessions, Some("cursor-1")));
-
-        assert_eq!(app.session_groups[0].sessions.len(), 1);
-        assert_eq!(replies.len(), 1);
-        assert!(matches!(
-            &replies[0],
-            ClientMsg::ListSessions {
-                mode: Some(mode),
-                cursor: Some(cursor),
-                limit: Some(10),
-                cwd: Some(cwd),
-                ..
-            } if mode == "group" && cursor == "cursor-1" && cwd == "/workspace/project"
-        ));
-    }
-
-    #[test]
-    fn group_page_merges_and_stops_when_main_target_reaches_three() {
+    fn initial_list_does_not_autofill_when_backend_returns_root_page() {
         let mut app = App::new();
         let replies = app.handle_server_msg(list_msg(
             vec![session("root-1", "2025-01-01T00:00:00Z")],
             Some("cursor-1"),
         ));
-        assert_eq!(replies.len(), 1);
+
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+        assert_eq!(
+            app.session_groups[0].next_cursor.as_deref(),
+            Some("cursor-1")
+        );
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn group_page_merges_sessions_without_autofill() {
+        let mut app = App::new();
+        app.handle_server_msg(list_msg(
+            vec![session("root-1", "2025-01-01T00:00:00Z")],
+            Some("cursor-1"),
+        ));
+        let initial_total_logs = app
+            .logs
+            .iter()
+            .filter(|entry| {
+                entry
+                    .message
+                    .starts_with("session list: total root sessions=")
+            })
+            .count();
+        let request = app.session_group_page_request(0).unwrap();
+        assert!(matches!(
+            request,
+            ClientMsg::ListSessions {
+                session_scope: SessionScope::Root,
+                ..
+            }
+        ));
 
         let replies = app.handle_server_msg(list_msg(
             vec![
@@ -3093,58 +3015,17 @@ mod session_list_pagination_tests {
             app.session_groups[0].next_cursor.as_deref(),
             Some("cursor-2")
         );
+        let total_logs = app
+            .logs
+            .iter()
+            .filter(|entry| {
+                entry
+                    .message
+                    .starts_with("session list: total root sessions=")
+            })
+            .count();
+        assert_eq!(total_logs, initial_total_logs);
         assert!(replies.is_empty());
-    }
-
-    #[test]
-    fn popup_open_uses_ten_session_autofill_target() {
-        let mut app = App::new();
-        app.popup = Popup::SessionSelect;
-        app.session_popup_tab = 0;
-
-        let replies = app.handle_server_msg(list_msg(
-            vec![
-                session("root-1", "2025-01-01T00:00:00Z"),
-                session("root-2", "2025-01-02T00:00:00Z"),
-                session("root-3", "2025-01-03T00:00:00Z"),
-            ],
-            Some("cursor-1"),
-        ));
-
-        assert_eq!(app.session_groups[0].sessions.len(), 3);
-        assert_eq!(replies.len(), 1);
-        assert!(matches!(
-            &replies[0],
-            ClientMsg::ListSessions {
-                mode: Some(mode),
-                cursor: Some(cursor),
-                limit: Some(10),
-                cwd: Some(cwd),
-                ..
-            } if mode == "group" && cursor == "cursor-1" && cwd == "/workspace/project"
-        ));
-    }
-
-    #[test]
-    fn delegation_only_group_page_updates_cursor_and_requests_next_page() {
-        let mut app = App::new();
-        let replies = app.handle_server_msg(list_msg(
-            vec![session("root-1", "2025-01-01T00:00:00Z")],
-            Some("cursor-1"),
-        ));
-        assert_eq!(replies.len(), 1);
-
-        let replies = app.handle_server_msg(list_msg(
-            vec![delegation_child("child-1", "2025-01-02T00:00:00Z")],
-            Some("cursor-2"),
-        ));
-
-        assert_eq!(app.session_groups[0].sessions.len(), 1);
-        assert_eq!(
-            app.session_groups[0].next_cursor.as_deref(),
-            Some("cursor-2")
-        );
-        assert_eq!(replies.len(), 1);
     }
 }
 

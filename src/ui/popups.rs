@@ -7,7 +7,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, AuthPanel, LogLevel};
+use crate::app::{App, AuthPanel, LogLevel, session_group_count_text};
 use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
@@ -459,6 +459,7 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                 PopupItem::GroupHeader {
                     cwd,
                     session_count,
+                    session_total,
                     collapsed,
                 } => {
                     let indicator = if *collapsed {
@@ -473,10 +474,11 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     } else {
                         (Theme::status_accent(), Theme::status())
                     };
+                    let count_text = session_group_count_text(*session_count, *session_total);
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" {indicator} "), header_style),
                         Span::styled(cwd_short, header_style),
-                        Span::styled(format!("  ({session_count}) "), dim_style),
+                        Span::styled(format!("  ({count_text}) "), dim_style),
                     ]))
                 }
                 PopupItem::Session {
@@ -502,10 +504,16 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                         "   "
                     };
                     let id_part = format!(" {id_short} ");
+                    let fork_marker = if s.fork_count > 0 {
+                        format!(" ↳ {}", s.fork_count)
+                    } else {
+                        String::new()
+                    };
                     let time_part = format!(" {time_str:>7} ");
                     let avail = list_w.saturating_sub(
                         marker_part.chars().count()
                             + id_part.chars().count()
+                            + fork_marker.chars().count()
                             + time_part.chars().count(),
                     );
                     let title_display = if title.chars().count() > avail {
@@ -535,11 +543,13 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     let highlight = is_active || is_parent;
                     let marker_style = if highlight { active_style } else { dim_style };
                     let id_style = if highlight { active_style } else { dim_style };
+                    let fork_style = Theme::fork_count().bg(row_bg);
 
                     let mut spans = vec![
                         Span::styled(marker_part, marker_style),
                         Span::styled(id_part, id_style),
                         Span::styled(title_display, main_style),
+                        Span::styled(fork_marker, fork_style),
                         Span::styled(" ".repeat(title_gap), dim_style),
                     ];
                     spans.push(Span::styled(time_part, time_style));

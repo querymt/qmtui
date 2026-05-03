@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use crate::app::App;
+use crate::app::{App, session_group_count_text};
 use crate::theme::Theme;
 
 use super::{ELLIPSIS, draw_header, relative_time};
@@ -53,6 +53,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
             crate::app::StartPageItem::GroupHeader {
                 cwd,
                 session_count,
+                session_total,
                 collapsed,
             } => {
                 let indicator = if *collapsed {
@@ -63,10 +64,11 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 let cwd_display = cwd.as_deref().unwrap_or("(no workspace)");
                 // Shorten very long paths: keep last 3 components
                 let cwd_short = short_cwd(cwd_display, area_width.saturating_sub(16));
+                let count_text = session_group_count_text(*session_count, *session_total);
                 Line::from(vec![
                     Span::styled(format!(" {indicator} "), header_style),
                     Span::styled(cwd_short, header_style),
-                    Span::styled(format!("  ({session_count}) "), dim_style),
+                    Span::styled(format!("  ({count_text}) "), dim_style),
                 ])
             }
 
@@ -83,8 +85,17 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                     .map(relative_time)
                     .unwrap_or_default();
 
-                // Budget: "   {id_short}  " + time_str = fixed overhead ~20 chars
-                let overhead = 3 + 8 + 2 + time_str.len() + 2;
+                let fork_marker = if session.fork_count > 0 {
+                    format!(" ↳ {}", session.fork_count)
+                } else {
+                    String::new()
+                };
+
+                let id_part = format!("   {id_short}  ");
+                let time_part = format!("  {time_str} ");
+                let overhead = id_part.chars().count()
+                    + fork_marker.chars().count()
+                    + time_part.chars().count();
                 let avail = area_width.saturating_sub(overhead);
                 let title_display: String = if title.chars().count() > avail && avail > 1 {
                     let t: String = title.chars().take(avail.saturating_sub(1)).collect();
@@ -95,18 +106,21 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 let gap = avail.saturating_sub(title_display.chars().count());
 
                 Line::from(vec![
-                    Span::styled(format!("   {id_short}  "), dim_style),
+                    Span::styled(id_part, dim_style),
                     Span::styled(title_display, session_style),
+                    Span::styled(
+                        fork_marker,
+                        Theme::fork_count().bg(session_style.bg.unwrap_or(Theme::bg())),
+                    ),
                     Span::styled(" ".repeat(gap), session_style),
-                    Span::styled(format!("  {time_str} "), dim_style),
+                    Span::styled(time_part, dim_style),
                 ])
             }
 
             // Per-group overflow row. The start page always opens the popup;
             // only the popup performs paginated load-more requests.
-            crate::app::StartPageItem::ShowMore { remaining, .. } => {
-                let total = remaining + crate::app::MAX_RECENT_SESSIONS;
-                let label = format!("   {ELLIPSIS} show all ({total} total)");
+            crate::app::StartPageItem::ShowMore { .. } => {
+                let label = format!("   {ELLIPSIS} show all");
                 Line::from(vec![Span::styled(label, dim_style)])
             }
         };

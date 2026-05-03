@@ -81,6 +81,7 @@ impl App {
             items.push(StartPageItem::GroupHeader {
                 cwd: group.cwd.clone(),
                 session_count: group.sessions.len(),
+                session_total: group.total_count,
                 collapsed,
             });
 
@@ -154,6 +155,7 @@ impl App {
             items.push(PopupItem::GroupHeader {
                 cwd: group.cwd.clone(),
                 session_count: group.sessions.len(),
+                session_total: group.total_count,
                 collapsed,
             });
 

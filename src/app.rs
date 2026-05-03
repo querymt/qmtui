@@ -748,8 +748,10 @@ pub enum StartPageItem {
     GroupHeader {
         /// The cwd key used to look up collapse state (mirrors `SessionGroup::cwd`).
         cwd: Option<String>,
-        /// Total sessions in this group (unfiltered).
+        /// Loaded sessions in this group (unfiltered).
         session_count: usize,
+        /// Total sessions in this group from the backend, when known.
+        session_total: Option<u64>,
         /// Whether the group is currently collapsed.
         collapsed: bool,
     },
@@ -802,8 +804,10 @@ pub enum PopupItem {
     GroupHeader {
         /// The cwd key used to look up collapse state (mirrors `SessionGroup::cwd`).
         cwd: Option<String>,
-        /// Total sessions in this group (unfiltered).
+        /// Loaded sessions in this group (unfiltered).
         session_count: usize,
+        /// Total sessions in this group from the backend, when known.
+        session_total: Option<u64>,
         /// Whether the group is currently collapsed in the popup.
         collapsed: bool,
     },
@@ -819,6 +823,12 @@ pub enum PopupItem {
         /// Index into `App::session_groups`.
         group_idx: usize,
     },
+}
+
+pub fn session_group_count_text(session_count: usize, session_total: Option<u64>) -> String {
+    session_total
+        .map(|total| format!("{session_count}/{total}"))
+        .unwrap_or_else(|| session_count.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8192,6 +8202,17 @@ mod start_page_tests {
     }
 
     #[test]
+    fn session_summary_defaults_missing_fork_count_to_zero() {
+        let session: SessionSummary = serde_json::from_value(serde_json::json!({
+            "session_id": "s1",
+            "title": "Session One"
+        }))
+        .expect("session summary without fork_count should parse");
+
+        assert_eq!(session.fork_count, 0);
+    }
+
+    #[test]
     fn backend_shaped_session_list_deserializes_with_new_fields() {
         let list: SessionListData = serde_json::from_value(serde_json::json!({
             "groups": [
@@ -8212,6 +8233,7 @@ mod start_page_tests {
                             "fork_origin": null,
                             "session_kind": "interactive",
                             "has_children": true,
+                            "fork_count": 3,
                             "node": "local",
                             "node_id": "node-1",
                             "attached": true,
@@ -8232,6 +8254,7 @@ mod start_page_tests {
         let session = &list.groups[0].sessions[0];
         assert_eq!(session.name.as_deref(), Some("Session One"));
         assert_eq!(session.session_kind.as_deref(), Some("interactive"));
+        assert_eq!(session.fork_count, 3);
         assert_eq!(session.node.as_deref(), Some("local"));
         assert_eq!(session.node_id.as_deref(), Some("node-1"));
         assert_eq!(session.attached, Some(true));
@@ -8239,21 +8262,8 @@ mod start_page_tests {
     }
 
     #[test]
-    fn session_list_hides_only_delegation_children_and_preserves_delegate_entries() {
+    fn session_list_uses_server_root_scope_without_client_child_filtering() {
         let mut app = App::new();
-        app.delegate_entries.push(DelegateEntry {
-            delegation_id: "del-existing".into(),
-            child_session_id: Some("delegate-child".into()),
-            delegate_tool_call_id: None,
-            target_agent_id: Some("agent".into()),
-            objective: "Existing delegate".into(),
-            status: DelegateStatus::InProgress,
-            stats: DelegateStats::default(),
-            started_at: None,
-            ended_at: None,
-            child_state: DelegateChildState::default(),
-        });
-
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_list".into(),
             data: Some(serde_json::json!({
@@ -8262,19 +8272,11 @@ mod start_page_tests {
                         "cwd": "/workspace/project",
                         "sessions": [
                             { "session_id": "root", "title": "Root", "updated_at": "2024-01-04T00:00:00Z" },
-                            { "session_id": "delegate-child", "title": "Delegation", "updated_at": "2024-01-03T00:00:00Z", "parent_session_id": "root", "fork_origin": "delegation" },
-                            { "session_id": "user-child", "title": "User Fork", "updated_at": "2024-01-02T00:00:00Z", "parent_session_id": "root", "fork_origin": "user" },
-                            { "session_id": "unknown-child", "title": "Unknown Fork", "updated_at": "2024-01-01T00:00:00Z", "parent_session_id": "root" }
-                        ]
-                    },
-                    {
-                        "cwd": "/workspace/project/empty-after-filter",
-                        "sessions": [
-                            { "session_id": "delegate-only", "title": "Delegate Only", "updated_at": "2024-01-05T00:00:00Z", "parent_session_id": "root", "fork_origin": "delegation" }
+                            { "session_id": "unexpected-child", "title": "Child", "updated_at": "2024-01-03T00:00:00Z", "parent_session_id": "root", "fork_origin": "delegation" }
                         ]
                     }
                 ],
-                "total_count": 5
+                "total_count": 2
             })),
         });
 
@@ -8283,24 +8285,19 @@ mod start_page_tests {
             .iter()
             .map(|session| session.session_id.as_str())
             .collect();
-        assert_eq!(app.session_groups.len(), 1);
-        assert_eq!(visible_ids, vec!["root", "user-child", "unknown-child"]);
-        assert!(!visible_ids.contains(&"delegate-child"));
-        assert_eq!(app.status, "3 session(s)");
-        assert_eq!(app.delegate_entries.len(), 1);
-        assert_eq!(app.delegate_entries[0].delegation_id, "del-existing");
-
+        assert_eq!(visible_ids, vec!["root", "unexpected-child"]);
         assert!(app.logs.iter().any(|entry| {
-            entry.level == LogLevel::Debug
-                && entry.target == "session"
-                && entry.message
-                    == "session list: kept 2 non-delegation child session(s) (fork_origin=unknown: 1, user: 1)"
+            entry.target == "session"
+                && entry.message == "session list: total root sessions=2, loaded=2"
         }));
-        assert!(app.logs.iter().any(|entry| {
-            entry.level == LogLevel::Debug
-                && entry.target == "session"
-                && entry.message
-                    == "session list: hid 2 delegation child session(s); visible=3, backend_total=5"
+        assert!(
+            !app.logs
+                .iter()
+                .any(|entry| { entry.target == "session" && entry.message == "2 session(s)" })
+        );
+        assert!(!app.logs.iter().any(|entry| {
+            entry.target == "session"
+                && (entry.message.contains("hid") || entry.message.contains("kept"))
         }));
     }
 
@@ -8338,12 +8335,30 @@ mod start_page_tests {
             Some("/a"),
             &[("s1", None), ("s2", None), ("s3", None)],
         )];
+        app.session_groups[0].total_count = Some(8);
 
         let items = app.visible_start_items();
         assert!(matches!(
             &items[0],
             StartPageItem::GroupHeader {
                 session_count: 3,
+                session_total: Some(8),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn group_header_session_total_falls_back_to_unknown() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &[("s1", None)])];
+
+        let items = app.visible_start_items();
+        assert!(matches!(
+            &items[0],
+            StartPageItem::GroupHeader {
+                session_count: 1,
+                session_total: None,
                 ..
             }
         ));
@@ -8817,11 +8832,13 @@ mod popup_item_tests {
     fn popup_group_header_session_count_reflects_total() {
         let mut app = App::new();
         app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
+        app.session_groups[0].total_count = Some(8);
         let items = app.visible_popup_items();
         assert!(matches!(
             &items[0],
             PopupItem::GroupHeader {
                 session_count: 3,
+                session_total: Some(8),
                 ..
             }
         ));

@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 // --- Client → Server messages ---
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    Root,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ClientMsg {
     Init,
@@ -17,6 +23,7 @@ pub enum ClientMsg {
         cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
+        session_scope: SessionScope,
     },
     SetReasoningEffort {
         reasoning_effort: String,
@@ -96,6 +103,7 @@ impl ClientMsg {
             limit: None,
             cwd: None,
             query: None,
+            session_scope: SessionScope::Root,
         }
     }
 
@@ -106,6 +114,7 @@ impl ClientMsg {
             limit: Some(limit),
             cwd: Some(cwd.unwrap_or_else(|| "__none__".to_string())),
             query: None,
+            session_scope: SessionScope::Root,
         }
     }
 }
@@ -116,13 +125,15 @@ mod client_msg_tests {
     use serde_json::json;
 
     #[test]
-    fn list_sessions_browse_serializes_default_data_object() {
+    fn list_sessions_browse_serializes_root_session_scope() {
         let value = serde_json::to_value(ClientMsg::list_sessions_browse()).unwrap();
         assert_eq!(
             value,
             json!({
                 "type": "list_sessions",
-                "data": {}
+                "data": {
+                    "session_scope": "root"
+                }
             })
         );
     }
@@ -143,7 +154,8 @@ mod client_msg_tests {
                     "mode": "group",
                     "cursor": "cursor-1",
                     "limit": 10,
-                    "cwd": "/workspace/project"
+                    "cwd": "/workspace/project",
+                    "session_scope": "root"
                 }
             })
         );
@@ -272,6 +284,9 @@ pub struct SessionSummary {
     /// Whether this session has child (forked) sessions.
     #[serde(default)]
     pub has_children: bool,
+    /// Number of direct forked child sessions.
+    #[serde(default)]
+    pub fork_count: u64,
     #[serde(default)]
     pub node: Option<String>,
     #[serde(default)]

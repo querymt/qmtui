@@ -138,6 +138,9 @@ impl Theme {
     pub fn status_accent() -> Style {
         Style::default().fg(Self::magenta()).bg(Self::bg_dim())
     }
+    pub fn fork_count() -> Style {
+        Style::default().fg(Self::magenta())
+    }
     pub fn input() -> Style {
         Style::default().fg(Self::fg()).bg(Self::bg_card())
     }

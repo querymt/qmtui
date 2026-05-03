@@ -1561,6 +1561,34 @@ mod tests {
     }
 
     #[test]
+    fn draw_session_popup_shows_fork_count_marker() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.session_groups[0].sessions[0].fork_count = 3;
+        app.session_cursor = 1;
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered = buffer_text(&buffer);
+
+        assert!(
+            rendered.contains(" ↳ 3"),
+            "popup row should show fork marker, got: {rendered}"
+        );
+
+        let (fork_x, fork_y) = find_buffer_text(&buffer, "↳ 3").expect("fork marker missing");
+        assert_eq!(buffer[(fork_x, fork_y)].style().fg, Theme::fork_count().fg);
+        assert_eq!(
+            buffer[(fork_x, fork_y)].style().bg,
+            Some(Theme::bg_hl()),
+            "selected popup fork marker should keep selected row background"
+        );
+    }
+
+    #[test]
     fn draw_session_popup_truncates_long_titles_with_unicode_ellipsis() {
         let mut app = App::new();
         app.popup = Popup::SessionSelect;
@@ -3414,6 +3442,7 @@ mod tests {
         SessionGroup {
             cwd: cwd.map(String::from),
             latest_activity: None,
+            total_count: Some(ids.len() as u64),
             sessions: ids
                 .iter()
                 .map(|id| SessionSummary {
@@ -3507,6 +3536,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_page_rows_header_uses_loaded_total_count() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
+        app.session_groups[0].total_count = Some(5);
+        let rows = build_start_page_rows(&app, 80);
+        let header_text = row_text(&rows[0]);
+
+        assert!(header_text.contains("(2/5)"), "header text: {header_text}");
+    }
+
+    #[test]
+    fn start_page_rows_header_uses_loaded_count_when_total_unknown() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
+        app.session_groups[0].total_count = None;
+        let rows = build_start_page_rows(&app, 80);
+        let header_text = row_text(&rows[0]);
+
+        assert!(header_text.contains("(2)"), "header text: {header_text}");
+        assert!(!header_text.contains("(2/"), "header text: {header_text}");
+    }
+
     /// Session row text contains the session id prefix.
     #[test]
     fn start_page_rows_session_contains_id() {
@@ -3522,6 +3574,51 @@ mod tests {
         assert!(
             session_text.contains("abcdef12") || session_text.contains("abcdef"),
             "session row '{session_text}' should contain id prefix"
+        );
+    }
+
+    #[test]
+    fn start_page_rows_session_shows_fork_count_marker() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
+        app.session_groups[0].sessions[0].fork_count = 3;
+
+        let rows = build_start_page_rows(&app, 80);
+        let session_text = row_text(&rows[1]);
+
+        assert!(
+            session_text.contains(" ↳ 3"),
+            "session row should show fork marker, got: {session_text}"
+        );
+        assert!(
+            rows[1]
+                .line
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == " ↳ 3"),
+            "session row should not add trailing marker space, got: {session_text}"
+        );
+
+        let fork_span = rows[1]
+            .line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == " ↳ 3")
+            .expect("fork marker span missing");
+        assert_eq!(fork_span.style.fg, Theme::fork_count().fg);
+    }
+
+    #[test]
+    fn start_page_rows_session_hides_zero_fork_count_marker() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
+
+        let rows = build_start_page_rows(&app, 80);
+        let session_text = row_text(&rows[1]);
+
+        assert!(
+            !session_text.contains("↳"),
+            "session row should not show fork marker, got: {session_text}"
         );
     }
 
@@ -3571,6 +3668,7 @@ mod tests {
         let text = row_text(rows.last().expect("missing show more row"));
 
         assert!(text.contains("show all"), "row text: {text}");
+        assert!(!text.contains("total)"), "row text: {text}");
         assert!(!text.contains("load more"), "row text: {text}");
     }
 
