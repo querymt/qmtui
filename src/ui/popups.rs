@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
 };
@@ -1123,6 +1123,128 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
         Span::styled("start  ", Theme::status()),
         Span::styled("esc ", Theme::status_accent()),
         Span::styled("cancel", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+// ── Fork popup ────────────────────────────────────────────────────────────────
+
+pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup_width = area.width.saturating_sub(4).clamp(36, 84);
+    let popup_height = area.height.saturating_sub(4).min(12).max(6);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled("Fork Session", Theme::popup_title())).style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (filter_display, filter_cur) = scroll_input(&app.fork_filter, app.fork_filter.len(), avail);
+    let input_line = Line::from(vec![
+        Span::styled("/ ", Theme::popup_title()),
+        Span::styled(filter_display, Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(input_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+
+    let turns = app.visible_fork_turns();
+    if turns.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("No forkable turns", Theme::status()))
+                .style(Theme::popup_bg()),
+            chunks[2],
+        );
+    } else {
+        let row_width = chunks[2].width as usize;
+        let preview_budget = row_width.saturating_sub(8) / 2;
+        let selected = Some(app.fork_cursor.min(turns.len().saturating_sub(1)));
+        let selected_idx = selected.unwrap_or(0);
+        let dim_style = Theme::status().add_modifier(Modifier::DIM);
+        let selected_style = Theme::selected();
+        let selected_bg = selected_style.bg.unwrap_or_else(Theme::bg_hl);
+        let selected_dim_style = Style::default()
+            .fg(dim_style.fg.unwrap_or_else(Theme::dim))
+            .bg(selected_bg)
+            .add_modifier(Modifier::DIM);
+        let rows: Vec<Row> = turns
+            .iter()
+            .enumerate()
+            .map(|(idx, turn)| {
+                let user_text = turn.user_preview.replace('\n', " ");
+                let assistant_text = turn.assistant_preview.replace('\n', " ");
+                let user = truncate_with_ellipsis(&user_text, preview_budget);
+                let assistant = truncate_with_ellipsis(&assistant_text, preview_budget);
+                let boundary_style = if idx == selected_idx {
+                    selected_dim_style
+                } else {
+                    dim_style
+                };
+                let message_style = if idx == selected_idx {
+                    Theme::selected()
+                } else {
+                    Theme::popup_bg()
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(turn.turn_index.to_string(), boundary_style)),
+                    Cell::from(Span::styled(user, message_style)),
+                    Cell::from(Span::styled(ELLIPSIS, boundary_style)),
+                    Cell::from(Span::styled(assistant, message_style)),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Percentage(50),
+            ],
+        )
+        .block(Block::default().style(Theme::popup_bg()))
+        .style(Theme::popup_bg())
+        .row_highlight_style(Theme::selected());
+        let mut state = TableState::default().with_selected(selected);
+        f.render_stateful_widget(table, chunks[2], &mut state);
+    }
+
+    let hint = Line::from(vec![
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("fork  ", Theme::status()),
+        Span::styled("esc ", Theme::status_accent()),
+        Span::styled("cancel  ", Theme::status()),
+        Span::styled("type ", Theme::status_accent()),
+        Span::styled("filter", Theme::status()),
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }

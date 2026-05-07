@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, ActivityState, App, Popup, Screen};
+use crate::app::{self, ActivityState, App, LogLevel, Popup, Screen};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -325,6 +325,10 @@ pub(crate) fn handle_key(
             handle_auth_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
         }
+        Popup::ForkTurnSelect => {
+            handle_fork_turn_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
 
         Popup::None => {}
     }
@@ -466,6 +470,17 @@ pub(crate) fn handle_chord(
         KeyCode::Char('?') => {
             app.popup = Popup::Help;
             app.help_scroll = 0;
+        }
+        KeyCode::Char('f') => {
+            if app.screen != Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "fork",
+                    "fork selector is only available in chat",
+                );
+                return Ok(());
+            }
+            app.open_fork_turn_popup();
         }
         KeyCode::Char('u') => {
             if !can_send_server_commands(app) {
@@ -981,6 +996,59 @@ pub(crate) fn apply_delegate_popup_key(
         _ => {}
     }
     SessionKeyAction::None
+}
+
+fn begin_fork_session(
+    app: &mut App,
+    message_id: String,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    if app.pending_fork_message_id.is_some() {
+        app.set_status(LogLevel::Warn, "fork", "fork already pending");
+        return Ok(());
+    }
+    if app.is_turn_active() {
+        app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
+        return Ok(());
+    }
+    if app.has_pending_session_op() {
+        app.set_status(LogLevel::Warn, "fork", "session operation already pending");
+        return Ok(());
+    }
+    if message_id.is_empty() {
+        app.set_status(LogLevel::Warn, "fork", "selected turn has no message id");
+        return Ok(());
+    }
+
+    app.pending_fork_message_id = Some(message_id.clone());
+    app.set_status(LogLevel::Info, "fork", "forking session...");
+    cmd_tx.send(ClientMsg::ForkSession { message_id })?;
+    Ok(())
+}
+
+pub(crate) fn handle_fork_turn_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Up => app.move_fork_cursor(-1),
+        KeyCode::Down => app.move_fork_cursor(1),
+        KeyCode::Backspace => app.fork_filter_backspace(),
+        KeyCode::Enter => {
+            if let Some(turn) = app.selected_fork_turn() {
+                begin_fork_session(app, turn.message_id, cmd_tx)?;
+            } else {
+                app.set_status(LogLevel::Warn, "fork", "no forkable turns");
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.fork_filter_insert(c);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
@@ -1573,6 +1641,39 @@ fn try_execute_slash_command(
             }
             app.open_auth_popup();
             cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+        "fork" => {
+            app.take_input();
+            if app.screen != crate::app::Screen::Chat {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "fork",
+                    "forking is only available in chat",
+                );
+                return Ok(SlashResult::Handled);
+            }
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if app.pending_fork_message_id.is_some() {
+                app.set_status(app::LogLevel::Warn, "fork", "fork already pending");
+            } else if app.has_pending_session_op() {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "fork",
+                    "session operation already pending",
+                );
+            } else if app.is_turn_active() {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "fork",
+                    "cannot fork while agent is active",
+                );
+            } else if let Some(turn) = app.latest_fork_boundary() {
+                begin_fork_session(app, turn.message_id, cmd_tx)?;
+            } else {
+                app.set_status(app::LogLevel::Warn, "fork", "no forkable turns");
+            }
         }
         "undo" => {
             // Clear '/undo' first so the undo logic can optionally restore

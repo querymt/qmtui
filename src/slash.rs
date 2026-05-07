@@ -60,6 +60,11 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         chat_only: false,
     },
     SlashCommandDef {
+        name: "fork",
+        description: "fork latest turn",
+        chat_only: true,
+    },
+    SlashCommandDef {
         name: "undo",
         description: "undo last turn",
         chat_only: true,

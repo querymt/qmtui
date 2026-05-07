@@ -67,6 +67,7 @@ pub enum Popup {
     Help,
     Log,
     ProviderAuth,
+    ForkTurnSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -249,6 +250,21 @@ pub struct UndoableTurn {
     pub turn_id: String,
     pub message_id: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkBoundaryKind {
+    Assistant,
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkTurnItem {
+    pub turn_index: usize,
+    pub message_id: String,
+    pub boundary_kind: ForkBoundaryKind,
+    pub user_preview: String,
+    pub assistant_preview: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -909,6 +925,9 @@ pub struct App {
     pub input_scroll: u16,
     pub input_line_width: usize,
     pub input_preferred_col: Option<usize>,
+    pub fork_filter: String,
+    pub fork_cursor: usize,
+    pub pending_fork_message_id: Option<String>,
     pub scroll_offset: u16,
     /// Total content height (in rows) from the last render frame.
     /// Used to compensate `scroll_offset` when content grows while the user
@@ -1128,6 +1147,9 @@ impl App {
             input_scroll: 0,
             input_line_width: 1,
             input_preferred_col: None,
+            fork_filter: String::new(),
+            fork_cursor: 0,
+            pending_fork_message_id: None,
             scroll_offset: 0,
             prev_total_height: 0,
             activity: ActivityState::Idle,
@@ -1605,6 +1627,133 @@ impl App {
 
     pub fn has_pending_session_op(&self) -> bool {
         matches!(self.activity, ActivityState::SessionOp(_))
+    }
+
+    pub fn forkable_turns(&self) -> Vec<ForkTurnItem> {
+        let mut turns = Vec::new();
+        let mut current_user: Option<(Option<String>, String)> = None;
+        let mut current_assistant: Option<(String, String)> = None;
+
+        for entry in &self.messages {
+            match entry {
+                ChatEntry::User { text, message_id } => {
+                    if let Some((user_id, user_text)) = current_user.take() {
+                        if let Some(item) = Self::fork_turn_item(
+                            turns.len() + 1,
+                            user_id,
+                            user_text,
+                            current_assistant.take(),
+                        ) {
+                            turns.push(item);
+                        }
+                    }
+                    current_user = Some((message_id.clone(), text.clone()));
+                    current_assistant = None;
+                }
+                ChatEntry::Assistant {
+                    content,
+                    message_id,
+                    ..
+                } => {
+                    if let Some(id) = message_id.clone() {
+                        current_assistant = Some((id, content.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((user_id, user_text)) = current_user.take()
+            && let Some(item) = Self::fork_turn_item(
+                turns.len() + 1,
+                user_id,
+                user_text,
+                current_assistant.take(),
+            )
+        {
+            turns.push(item);
+        }
+
+        turns
+    }
+
+    fn fork_turn_item(
+        turn_index: usize,
+        user_id: Option<String>,
+        user_text: String,
+        assistant: Option<(String, String)>,
+    ) -> Option<ForkTurnItem> {
+        let (message_id, boundary_kind, assistant_preview) = match assistant {
+            Some((assistant_id, assistant_text)) => (
+                Some(assistant_id),
+                ForkBoundaryKind::Assistant,
+                assistant_text,
+            ),
+            None => (user_id, ForkBoundaryKind::User, String::new()),
+        };
+
+        let message_id = message_id.filter(|message_id| !message_id.is_empty())?;
+
+        Some(ForkTurnItem {
+            turn_index,
+            message_id,
+            boundary_kind,
+            user_preview: user_text,
+            assistant_preview,
+        })
+    }
+
+    pub fn filtered_fork_turns(&self) -> Vec<ForkTurnItem> {
+        let query = self.fork_filter.trim().to_lowercase();
+        self.forkable_turns()
+            .into_iter()
+            .filter(|turn| {
+                query.is_empty()
+                    || turn.user_preview.to_lowercase().contains(&query)
+                    || turn.assistant_preview.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn visible_fork_turns(&self) -> Vec<ForkTurnItem> {
+        self.filtered_fork_turns().into_iter().rev().collect()
+    }
+
+    pub fn latest_fork_boundary(&self) -> Option<ForkTurnItem> {
+        if self.is_turn_active() {
+            None
+        } else {
+            self.forkable_turns().into_iter().last()
+        }
+    }
+
+    pub fn open_fork_turn_popup(&mut self) {
+        self.popup = Popup::ForkTurnSelect;
+        self.fork_filter.clear();
+        self.fork_cursor = 0;
+    }
+
+    pub fn move_fork_cursor(&mut self, delta: isize) {
+        let len = self.visible_fork_turns().len();
+        if len == 0 {
+            self.fork_cursor = 0;
+            return;
+        }
+        self.fork_cursor = (self.fork_cursor as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    pub fn fork_filter_insert(&mut self, c: char) {
+        self.fork_filter.push(c);
+        self.fork_cursor = 0;
+    }
+
+    pub fn fork_filter_backspace(&mut self) {
+        self.fork_filter.pop();
+        self.fork_cursor = 0;
+    }
+
+    pub fn selected_fork_turn(&self) -> Option<ForkTurnItem> {
+        self.visible_fork_turns().get(self.fork_cursor).cloned()
     }
 
     pub fn input_blocked_by_activity(&self) -> bool {
@@ -5574,6 +5723,119 @@ mod tests {
         assert_eq!(last.level, LogLevel::Warn);
         assert_eq!(last.target, "protocol");
         assert!(last.message.contains("brand_new_unknown_event_2099"));
+    }
+
+    #[test]
+    fn fork_boundary_derivation_uses_last_assistant_then_user_fallback() {
+        let mut app = App::new();
+        app.messages = vec![
+            ChatEntry::User {
+                text: "first prompt".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "first reply".into(),
+                thinking: None,
+                message_id: Some("asst-1a".into()),
+            },
+            ChatEntry::Assistant {
+                content: "final reply".into(),
+                thinking: None,
+                message_id: Some("asst-1b".into()),
+            },
+            ChatEntry::User {
+                text: "second prompt".into(),
+                message_id: Some("user-2".into()),
+            },
+        ];
+
+        let turns = app.forkable_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].message_id, "asst-1b");
+        assert_eq!(turns[0].boundary_kind, ForkBoundaryKind::Assistant);
+        assert_eq!(turns[1].message_id, "user-2");
+        assert_eq!(turns[1].boundary_kind, ForkBoundaryKind::User);
+    }
+
+    #[test]
+    fn fork_boundary_derivation_includes_turn_when_only_assistant_has_message_id() {
+        let mut app = App::new();
+        app.messages = vec![
+            ChatEntry::User {
+                text: "first prompt".into(),
+                message_id: None,
+            },
+            ChatEntry::Assistant {
+                content: "first reply".into(),
+                thinking: None,
+                message_id: Some("asst-1".into()),
+            },
+            ChatEntry::User {
+                text: "second prompt".into(),
+                message_id: Some("user-2".into()),
+            },
+            ChatEntry::Assistant {
+                content: "second reply".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::User {
+                text: "third prompt".into(),
+                message_id: None,
+            },
+            ChatEntry::Assistant {
+                content: "third reply".into(),
+                thinking: None,
+                message_id: None,
+            },
+        ];
+
+        let turns = app.forkable_turns();
+        assert_eq!(turns.len(), 2);
+
+        assert_eq!(turns[0].turn_index, 1);
+        assert_eq!(turns[0].message_id, "asst-1");
+        assert_eq!(turns[0].boundary_kind, ForkBoundaryKind::Assistant);
+        assert_eq!(turns[0].user_preview, "first prompt");
+        assert_eq!(turns[0].assistant_preview, "first reply");
+
+        assert_eq!(turns[1].turn_index, 2);
+        assert_eq!(turns[1].message_id, "user-2");
+        assert_eq!(turns[1].boundary_kind, ForkBoundaryKind::User);
+        assert_eq!(turns[1].user_preview, "second prompt");
+        assert_eq!(turns[1].assistant_preview, "");
+    }
+
+    #[test]
+    fn latest_fork_boundary_selects_latest_eligible_turn() {
+        let mut app = App::new();
+        app.messages = vec![
+            ChatEntry::User {
+                text: "old".into(),
+                message_id: Some("user-old".into()),
+            },
+            ChatEntry::Assistant {
+                content: "old reply".into(),
+                thinking: None,
+                message_id: Some("asst-old".into()),
+            },
+            ChatEntry::User {
+                text: "new".into(),
+                message_id: None,
+            },
+            ChatEntry::Assistant {
+                content: "new reply".into(),
+                thinking: None,
+                message_id: Some("asst-new".into()),
+            },
+        ];
+
+        let latest = app.latest_fork_boundary().expect("latest fork boundary");
+        assert_eq!(latest.message_id, "asst-new");
+        assert_eq!(latest.boundary_kind, ForkBoundaryKind::Assistant);
+
+        app.activity = ActivityState::Streaming;
+        assert!(app.latest_fork_boundary().is_none());
     }
 
     #[test]

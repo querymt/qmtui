@@ -515,7 +515,7 @@ mod external_editor_tests {
     use super::*;
     use crate::config::{ServerConfig, TestPersistenceGuard, TuiConfig};
     use crate::handlers::*;
-    use app::ActivityState;
+    use app::{ActivityState, App};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use protocol::PromptBlock;
     use serial_test::serial;
@@ -1126,6 +1126,160 @@ mod external_editor_tests {
         // state must not change when disconnected
         assert_eq!(app.reasoning_effort, Some("high".into()));
         assert!(app.status.contains("not connected"));
+    }
+
+    fn app_with_forkable_messages() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.messages = vec![
+            app::ChatEntry::User {
+                text: "alpha prompt".into(),
+                message_id: Some("user-1".into()),
+            },
+            app::ChatEntry::Assistant {
+                content: "alpha reply".into(),
+                thinking: None,
+                message_id: Some("asst-1".into()),
+            },
+            app::ChatEntry::User {
+                text: "beta prompt".into(),
+                message_id: Some("user-2".into()),
+            },
+        ];
+        app
+    }
+
+    #[test]
+    fn slash_fork_sends_latest_boundary() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+        app.input = "/fork".into();
+        app.input_cursor = "/fork".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("ForkSession sent"),
+            ClientMsg::ForkSession { message_id } if message_id == "user-2"
+        ));
+        assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn ctrl_x_f_opens_fork_popup_and_filter_captures_text() {
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+
+        handle_key(&mut app, ctrl_x(), &tx).unwrap();
+        handle_key(&mut app, plain_key('f'), &tx).unwrap();
+        handle_key(&mut app, plain_key('b'), &tx).unwrap();
+
+        assert_eq!(app.popup, app::Popup::ForkTurnSelect);
+        assert_eq!(app.fork_filter, "b");
+        assert!(app.input.is_empty());
+        assert_eq!(app.filtered_fork_turns().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_x_f_in_delegate_view_does_not_open_fork_popup() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+        app.screen = Screen::Delegate;
+
+        handle_key(&mut app, ctrl_x(), &tx).unwrap();
+        handle_key(&mut app, plain_key('f'), &tx).unwrap();
+
+        assert_ne!(app.popup, app::Popup::ForkTurnSelect);
+        assert!(rx.try_recv().is_err());
+        assert!(app.status.contains("only available in chat"));
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "fork"));
+    }
+
+    #[test]
+    fn slash_fork_in_delegate_view_sends_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+        app.screen = Screen::Delegate;
+        app.input = "/fork".into();
+        app.input_cursor = "/fork".len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.pending_fork_message_id.is_none());
+        assert!(app.status.contains("only available in chat"));
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "fork"));
+    }
+
+    #[test]
+    fn fork_popup_enter_sends_selected_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+        app.open_fork_turn_popup();
+        app.fork_filter = "alpha".into();
+
+        handle_fork_turn_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("ForkSession sent"),
+            ClientMsg::ForkSession { message_id } if message_id == "asst-1"
+        ));
+        assert_eq!(app.pending_fork_message_id.as_deref(), Some("asst-1"));
+    }
+
+    #[test]
+    fn fork_popup_enter_with_default_cursor_sends_latest_visible_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = app_with_forkable_messages();
+        app.open_fork_turn_popup();
+
+        handle_fork_turn_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("ForkSession sent"),
+            ClientMsg::ForkSession { message_id } if message_id == "user-2"
+        ));
+        assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
+    }
+
+    #[test]
+    fn fork_popup_enter_with_no_eligible_turns_sends_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.open_fork_turn_popup();
+
+        handle_fork_turn_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.status.contains("no forkable turns"));
     }
 
     #[test]

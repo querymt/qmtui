@@ -5,8 +5,8 @@ mod start;
 pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
-    draw_auth_popup, draw_help_popup, draw_log_popup, draw_model_popup, draw_new_session_popup,
-    draw_session_popup, draw_theme_popup,
+    draw_auth_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup, draw_model_popup,
+    draw_new_session_popup, draw_session_popup, draw_theme_popup,
 };
 use start::draw_start;
 
@@ -313,6 +313,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::Help => draw_help_popup(f, app),
         Popup::Log => draw_log_popup(f, app),
         Popup::ProviderAuth => draw_auth_popup(f, app),
+        Popup::ForkTurnSelect => draw_fork_turn_popup(f, app),
         Popup::None => {}
     }
 }
@@ -607,6 +608,102 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn fork_popup_table_styles_dim_boundary_cells() {
+        let selected_bg = Theme::selected().bg.expect("selected style must define bg");
+        let dim_style = Theme::status().add_modifier(ratatui::style::Modifier::DIM);
+        let selected_dim_style = ratatui::style::Style::default()
+            .fg(dim_style.fg.unwrap_or_else(Theme::dim))
+            .bg(selected_bg)
+            .add_modifier(ratatui::style::Modifier::DIM);
+
+        assert_eq!(dim_style.fg, Theme::status().fg);
+        assert!(
+            dim_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert_eq!(selected_dim_style.fg, Theme::status().fg);
+        assert_eq!(selected_dim_style.bg, Some(selected_bg));
+        assert!(
+            selected_dim_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn draw_fork_popup_renders_turns_as_table() {
+        use crate::app::Popup;
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.popup = Popup::ForkTurnSelect;
+        app.messages = vec![
+            ChatEntry::User {
+                text: "alpha prompt".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "alpha reply".into(),
+                thinking: None,
+                message_id: Some("asst-1".into()),
+            },
+            ChatEntry::User {
+                text: "beta prompt".into(),
+                message_id: Some("user-2".into()),
+            },
+        ];
+
+        let backend = ratatui::backend::TestBackend::new(120, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_fork_turn_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(
+            !rendered.contains("#")
+                && !rendered.contains("user message")
+                && !rendered.contains("agent message"),
+            "table headers should not render: {rendered}"
+        );
+        assert!(
+            rendered.contains(ELLIPSIS),
+            "missing ellipsis column: {rendered}"
+        );
+        assert!(
+            rendered.contains("alpha prompt"),
+            "missing user text: {rendered}"
+        );
+        assert!(
+            rendered.contains("alpha reply"),
+            "missing agent text: {rendered}"
+        );
+        assert!(
+            rendered.contains("beta prompt"),
+            "missing user-only text: {rendered}"
+        );
+        let (_, beta_row) = find_buffer_text(&buffer, "beta prompt").expect("missing beta row");
+        let (_, alpha_row) = find_buffer_text(&buffer, "alpha prompt").expect("missing alpha row");
+        assert!(
+            beta_row < alpha_row,
+            "latest forkable turn should render before older turn: {rendered}"
+        );
+        let (_, hint_row) = find_buffer_text(&buffer, "enter fork").expect("missing hint row");
+        assert!(
+            hint_row > alpha_row + 1,
+            "expected a blank row between the last table row and hint: {rendered}"
+        );
+        assert!(
+            buffer_line(&buffer, hint_row - 1).trim().is_empty(),
+            "row before hint should be empty: {rendered}"
+        );
+        assert!(
+            !rendered.contains("asst") && !rendered.contains("user beta prompt"),
+            "old boundary labels should not render: {rendered}"
+        );
     }
 
     #[test]

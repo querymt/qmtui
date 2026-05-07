@@ -399,6 +399,41 @@ impl App {
                 }
                 vec![]
             }
+            "fork_result" => {
+                self.pending_fork_message_id = None;
+                if let Some(data) = raw.data
+                    && let Ok(fr) = serde_json::from_value::<ForkResultData>(data)
+                {
+                    if fr.success {
+                        if let Some(forked_session_id) = fr.forked_session_id {
+                            self.popup = Popup::None;
+                            self.set_status(LogLevel::Info, "fork", "forked - loading session");
+                            return vec![
+                                ClientMsg::LoadSession {
+                                    session_id: forked_session_id.clone(),
+                                },
+                                ClientMsg::SubscribeSession {
+                                    session_id: forked_session_id,
+                                    agent_id: self.agent_id.clone(),
+                                },
+                            ];
+                        }
+                        self.set_status(
+                            LogLevel::Warn,
+                            "fork",
+                            fr.message
+                                .unwrap_or_else(|| "fork succeeded without session id".into()),
+                        );
+                    } else {
+                        self.set_status(
+                            LogLevel::Warn,
+                            "fork",
+                            fr.message.unwrap_or_else(|| "fork failed".into()),
+                        );
+                    }
+                }
+                vec![]
+            }
             "session_list" => {
                 if let Some(data) = raw.data
                     && let Ok(list) = serde_json::from_value::<SessionListData>(data)
@@ -2491,6 +2526,59 @@ fn content_to_string(v: &serde_json::Value) -> String {
 }
 
 // ── scroll_tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod fork_result_tests {
+    use super::*;
+
+    #[test]
+    fn fork_success_loads_and_subscribes_to_child_session() {
+        let mut app = App::new();
+        app.agent_id = Some("agent-1".into());
+        app.popup = Popup::ForkTurnSelect;
+        app.pending_fork_message_id = Some("msg-1".into());
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "fork_result".into(),
+            data: Some(serde_json::json!({
+                "success": true,
+                "source_session_id": "source-1",
+                "forked_session_id": "fork-1",
+                "message": "forked"
+            })),
+        });
+
+        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.popup, Popup::None);
+        assert_eq!(cmds.len(), 2);
+        assert!(
+            matches!(&cmds[0], ClientMsg::LoadSession { session_id } if session_id == "fork-1")
+        );
+        assert!(
+            matches!(&cmds[1], ClientMsg::SubscribeSession { session_id, agent_id } if session_id == "fork-1" && agent_id.as_deref() == Some("agent-1"))
+        );
+    }
+
+    #[test]
+    fn fork_failure_clears_pending_without_switching() {
+        let mut app = App::new();
+        app.popup = Popup::ForkTurnSelect;
+        app.pending_fork_message_id = Some("msg-1".into());
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "fork_result".into(),
+            data: Some(serde_json::json!({
+                "success": false,
+                "message": "nope"
+            })),
+        });
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.popup, Popup::ForkTurnSelect);
+        assert!(app.status.contains("nope"));
+    }
+}
 
 #[cfg(test)]
 mod tool_detail_tests {

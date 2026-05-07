@@ -63,6 +63,9 @@ pub enum ClientMsg {
     DeleteSession {
         session_id: String,
     },
+    ForkSession {
+        message_id: String,
+    },
     Undo {
         message_id: String,
     },
@@ -200,6 +203,23 @@ mod client_msg_tests {
                     "cursor": "child-cursor",
                     "limit": 10,
                     "session_scope": "forks"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn fork_session_serializes_message_id() {
+        let value = serde_json::to_value(ClientMsg::ForkSession {
+            message_id: "msg-123".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "fork_session",
+                "data": {
+                    "message_id": "msg-123"
                 }
             })
         );
@@ -401,6 +421,39 @@ pub struct RedoResultData {
     pub message: Option<String>,
     #[serde(default)]
     pub undo_stack: Vec<UndoStackFrame>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForkResultData {
+    pub success: bool,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    #[serde(default)]
+    pub forked_session_id: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod fork_result_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn fork_result_deserializes_optional_fields() {
+        let result: ForkResultData = serde_json::from_value(json!({
+            "success": true,
+            "source_session_id": "source-1",
+            "forked_session_id": "fork-1",
+            "message": "forked"
+        }))
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.source_session_id.as_deref(), Some("source-1"));
+        assert_eq!(result.forked_session_id.as_deref(), Some("fork-1"));
+        assert_eq!(result.message.as_deref(), Some("forked"));
+    }
 }
 
 #[derive(Debug, Deserialize)]
