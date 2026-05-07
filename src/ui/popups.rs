@@ -1132,7 +1132,7 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
 pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
     let area = f.area();
     let popup_width = area.width.saturating_sub(4).clamp(36, 84);
-    let popup_height = area.height.saturating_sub(4).min(12).max(6);
+    let popup_height = area.height.saturating_sub(4).clamp(6, 12);
     let popup_area = Rect {
         x: area.x + area.width.saturating_sub(popup_width) / 2,
         y: area.y + area.height.saturating_sub(popup_height) / 2,
@@ -1187,8 +1187,8 @@ pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
     } else {
         let row_width = chunks[2].width as usize;
         let preview_budget = row_width.saturating_sub(8) / 2;
-        let selected = Some(app.fork_cursor.min(turns.len().saturating_sub(1)));
-        let selected_idx = selected.unwrap_or(0);
+        let selected_idx = app.fork_cursor.min(turns.len().saturating_sub(1));
+        let selected = Some(selected_idx);
         let dim_style = Theme::status().add_modifier(Modifier::DIM);
         let selected_style = Theme::selected();
         let selected_bg = selected_style.bg.unwrap_or_else(Theme::bg_hl);

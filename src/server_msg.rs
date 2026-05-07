@@ -83,11 +83,11 @@ impl App {
         let Some(state) = self.pending_delegate_child_states.remove(session_id) else {
             return;
         };
-        if let Some(idx) = self.child_delegate_entry_index(session_id) {
-            if self.delegate_entries[idx].child_state != state {
-                self.delegate_entries[idx].child_state = state;
-                self.invalidate_delegate_render_cache();
-            }
+        if let Some(idx) = self.child_delegate_entry_index(session_id)
+            && self.delegate_entries[idx].child_state != state
+        {
+            self.delegate_entries[idx].child_state = state;
+            self.invalidate_delegate_render_cache();
         }
     }
 
@@ -2310,11 +2310,12 @@ fn mark_tool_call_failed(
             is_error,
             ..
         } = entry
+            && tid == id
+            && name == tool_name
+            && !*is_error
         {
-            if tid == id && name == tool_name && !*is_error {
-                *is_error = true;
-                return true;
-            }
+            *is_error = true;
+            return true;
         }
     }
     false
@@ -2341,13 +2342,13 @@ fn update_tool_detail(
                 continue;
             }
             // edit tool: update start_line
-            if let Some(obj) = &parsed_result {
-                if let ToolDetail::Edit { start_line: sl, .. } = detail {
-                    *sl = obj
-                        .get("startLineOld")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize);
-                }
+            if let Some(obj) = &parsed_result
+                && let ToolDetail::Edit { start_line: sl, .. } = detail
+            {
+                *sl = obj
+                    .get("startLineOld")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
             }
             // shell tool: show last 3 lines of stdout below command
             if name.starts_with("shell")
@@ -2379,12 +2380,12 @@ fn update_tool_detail(
                     .map(content_to_string)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| result.to_string());
-                if let Some(summary_parts) = index_outline_summary_parts(&text) {
-                    if let ToolDetail::Summary(path) = detail {
-                        let suffix = format!(" ({})", summary_parts.join(", "));
-                        if !path.ends_with(&suffix) {
-                            path.push_str(&suffix);
-                        }
+                if let Some(summary_parts) = index_outline_summary_parts(&text)
+                    && let ToolDetail::Summary(path) = detail
+                {
+                    let suffix = format!(" ({})", summary_parts.join(", "));
+                    if !path.ends_with(&suffix) {
+                        path.push_str(&suffix);
                     }
                 }
             }
@@ -2395,12 +2396,12 @@ fn update_tool_detail(
                     .map(content_to_string)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| result.to_string());
-                if let Some(footer) = search_text_footer(&text) {
-                    if let ToolDetail::Summary(summary) = detail {
-                        let suffix = format!(" {footer}");
-                        if !summary.ends_with(&suffix) {
-                            summary.push_str(&suffix);
-                        }
+                if let Some(footer) = search_text_footer(&text)
+                    && let ToolDetail::Summary(summary) = detail
+                {
+                    let suffix = format!(" {footer}");
+                    if !summary.ends_with(&suffix) {
+                        summary.push_str(&suffix);
                     }
                 }
             }
@@ -2469,10 +2470,10 @@ fn index_outline_summary_parts(text: &str) -> Option<Vec<String>> {
     let mut current_count = 0usize;
     for line in text.lines() {
         if line.ends_with(':') && !line.starts_with(' ') && !line.starts_with('\t') {
-            if let Some(ref section) = current_section {
-                if current_count > 0 {
-                    counts.push((section.clone(), current_count));
-                }
+            if let Some(ref section) = current_section
+                && current_count > 0
+            {
+                counts.push((section.clone(), current_count));
             }
             let section = line.trim_end_matches(':');
             current_section =
@@ -2482,10 +2483,10 @@ fn index_outline_summary_parts(text: &str) -> Option<Vec<String>> {
             current_count += 1;
         }
     }
-    if let Some(ref section) = current_section {
-        if current_count > 0 {
-            counts.push((section.clone(), current_count));
-        }
+    if let Some(ref section) = current_section
+        && current_count > 0
+    {
+        counts.push((section.clone(), current_count));
     }
     let mut summary_parts: Vec<String> = Vec::new();
     if let Some(l) = lang {

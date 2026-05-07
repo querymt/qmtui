@@ -1637,15 +1637,15 @@ impl App {
         for entry in &self.messages {
             match entry {
                 ChatEntry::User { text, message_id } => {
-                    if let Some((user_id, user_text)) = current_user.take() {
-                        if let Some(item) = Self::fork_turn_item(
+                    if let Some((user_id, user_text)) = current_user.take()
+                        && let Some(item) = Self::fork_turn_item(
                             turns.len() + 1,
                             user_id,
                             user_text,
                             current_assistant.take(),
-                        ) {
-                            turns.push(item);
-                        }
+                        )
+                    {
+                        turns.push(item);
                     }
                     current_user = Some((message_id.clone(), text.clone()));
                     current_assistant = None;
@@ -6756,7 +6756,7 @@ mod tests {
         app.session_id = Some("s1".into());
         app.agent_id = Some("a1".into());
 
-        let history = vec![
+        let history = [
             durable_prompt("first", "msg-1"),
             durable_tool_call_start("tool-1", "read_tool"),
             durable_tool_call_end("tool-1", "read_tool", "first output"),
