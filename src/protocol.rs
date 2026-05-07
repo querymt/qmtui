@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum SessionScope {
     Root,
+    Forks,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +24,14 @@ pub enum ClientMsg {
         cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
+        session_scope: SessionScope,
+    },
+    ListSessionChildren {
+        parent_session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
         session_scope: SessionScope,
     },
     SetReasoningEffort {
@@ -117,6 +126,19 @@ impl ClientMsg {
             session_scope: SessionScope::Root,
         }
     }
+
+    pub fn list_session_children(
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Self {
+        Self::ListSessionChildren {
+            parent_session_id,
+            cursor,
+            limit: Some(limit),
+            session_scope: SessionScope::Forks,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +178,28 @@ mod client_msg_tests {
                     "limit": 10,
                     "cwd": "/workspace/project",
                     "session_scope": "root"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn list_session_children_serializes_forks_scope() {
+        let value = serde_json::to_value(ClientMsg::list_session_children(
+            "root-1".to_string(),
+            Some("child-cursor".to_string()),
+            10,
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "list_session_children",
+                "data": {
+                    "parent_session_id": "root-1",
+                    "cursor": "child-cursor",
+                    "limit": 10,
+                    "session_scope": "forks"
                 }
             })
         );
@@ -246,6 +290,17 @@ pub struct SessionListData {
     pub total_count: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionChildrenData {
+    pub parent_session_id: String,
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,
@@ -287,6 +342,12 @@ pub struct SessionSummary {
     /// Number of direct forked child sessions.
     #[serde(default)]
     pub fork_count: u64,
+    #[serde(default)]
+    pub children: Vec<SessionSummary>,
+    #[serde(default)]
+    pub children_next_cursor: Option<String>,
+    #[serde(default)]
+    pub children_total_count: Option<u64>,
     #[serde(default)]
     pub node: Option<String>,
     #[serde(default)]

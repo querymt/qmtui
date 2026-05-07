@@ -483,9 +483,12 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                 }
                 PopupItem::Session {
                     group_idx,
-                    session_idx,
+                    path,
+                    depth,
                 } => {
-                    let s = &app.session_groups[*group_idx].sessions[*session_idx];
+                    let Some(s) = app.session_by_path(*group_idx, path) else {
+                        return ListItem::new(Line::from(""));
+                    };
                     let id_short: String = s.session_id.chars().take(8).collect();
                     let time_str = s
                         .updated_at
@@ -503,8 +506,16 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     } else {
                         "   "
                     };
-                    let id_part = format!(" {id_short} ");
-                    let fork_marker = if s.fork_count > 0 {
+                    let indent = "  ".repeat(*depth);
+                    let id_part = format!(" {indent}{id_short} ");
+                    let fork_marker = if app.expandable_root_session(*group_idx, path) {
+                        let indicator = if app.expanded_session_children.contains(&s.session_id) {
+                            COLLAPSE_OPEN
+                        } else {
+                            COLLAPSE_CLOSED
+                        };
+                        format!(" {indicator} ↳ {}", s.fork_count)
+                    } else if s.fork_count > 0 && *depth == 0 {
                         format!(" ↳ {}", s.fork_count)
                     } else {
                         String::new()
@@ -556,16 +567,18 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
 
                     ListItem::new(Line::from(spans))
                 }
-                PopupItem::LoadMore { .. } => {
+                PopupItem::LoadMore { parent_path, .. } => {
                     let style = if selected {
                         Theme::selected()
                     } else {
                         Theme::status()
                     };
-                    ListItem::new(Line::from(vec![Span::styled(
-                        format!("     {ELLIPSIS} load more"),
-                        style,
-                    )]))
+                    let label = if parent_path.is_empty() {
+                        format!("     {ELLIPSIS} load more")
+                    } else {
+                        format!("       {ELLIPSIS} load more forks")
+                    };
+                    ListItem::new(Line::from(vec![Span::styled(label, style)]))
                 }
             }
         })

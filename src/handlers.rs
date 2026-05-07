@@ -535,6 +535,22 @@ pub(crate) fn handle_sessions_key(
         _ => {}
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        match apply_session_fork_toggle_key(app, false) {
+            SessionKeyAction::LoadMoreSessions {
+                group_idx,
+                parent_path,
+            } => {
+                if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
+                    cmd_tx.send(request)?;
+                }
+            }
+            SessionKeyAction::None => {}
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match apply_sessions_key(
         app,
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -561,8 +577,16 @@ pub(crate) fn handle_sessions_key(
         SessionKeyAction::NewSession => {
             app.open_new_session_popup();
         }
-        SessionKeyAction::LoadMoreSessions { group_idx } => {
-            if let Some(request) = app.session_group_page_request(group_idx) {
+        SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        } => {
+            let request = if parent_path.is_empty() {
+                app.session_group_page_request(group_idx)
+            } else {
+                app.session_child_page_request(group_idx, &parent_path)
+            };
+            if let Some(request) = request {
                 cmd_tx.send(request)?;
             }
         }
@@ -596,6 +620,22 @@ pub(crate) fn handle_session_popup_key(
         return Ok(());
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        match apply_session_fork_toggle_key(app, true) {
+            SessionKeyAction::LoadMoreSessions {
+                group_idx,
+                parent_path,
+            } => {
+                if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
+                    cmd_tx.send(request)?;
+                }
+            }
+            SessionKeyAction::None => {}
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match apply_popup_session_key(
         app,
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -619,8 +659,16 @@ pub(crate) fn handle_session_popup_key(
         SessionKeyAction::DeleteSession { session_id } => {
             cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
         }
-        SessionKeyAction::LoadMoreSessions { group_idx } => {
-            if let Some(request) = app.session_group_page_request(group_idx) {
+        SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        } => {
+            let request = if parent_path.is_empty() {
+                app.session_group_page_request(group_idx)
+            } else {
+                app.session_child_page_request(group_idx, &parent_path)
+            };
+            if let Some(request) = request {
                 cmd_tx.send(request)?;
             }
         }
@@ -674,20 +722,27 @@ pub(crate) fn apply_popup_session_key(
                         }
                     }
                     PopupItem::Session {
-                        group_idx,
-                        session_idx,
+                        group_idx, path, ..
                     } => {
-                        let sid = app.session_groups[group_idx].sessions[session_idx]
-                            .session_id
-                            .clone();
-                        app.popup = Popup::None;
-                        return SessionKeyAction::LoadSession {
-                            session_id: sid,
-                            agent_id: None,
-                        };
+                        let sid = app
+                            .session_by_path(group_idx, &path)
+                            .map(|session| session.session_id.clone());
+                        if let Some(sid) = sid {
+                            app.popup = Popup::None;
+                            return SessionKeyAction::LoadSession {
+                                session_id: sid,
+                                agent_id: None,
+                            };
+                        }
                     }
-                    PopupItem::LoadMore { group_idx } => {
-                        return SessionKeyAction::LoadMoreSessions { group_idx };
+                    PopupItem::LoadMore {
+                        group_idx,
+                        parent_path,
+                    } => {
+                        return SessionKeyAction::LoadMoreSessions {
+                            group_idx,
+                            parent_path,
+                        };
                     }
                 }
             }
@@ -695,15 +750,25 @@ pub(crate) fn apply_popup_session_key(
         KeyCode::Delete => {
             let items = app.visible_popup_items();
             if let Some(PopupItem::Session {
-                group_idx,
-                session_idx,
+                group_idx, path, ..
             }) = items.get(app.session_cursor).cloned()
             {
-                let sid = app.session_groups[group_idx].sessions[session_idx]
-                    .session_id
-                    .clone();
+                let Some(sid) = app
+                    .session_by_path(group_idx, &path)
+                    .map(|session| session.session_id.clone())
+                else {
+                    return SessionKeyAction::None;
+                };
                 // Optimistic remove
-                app.session_groups[group_idx].sessions.remove(session_idx);
+                if path.len() == 1 {
+                    app.session_groups[group_idx].sessions.remove(path[0]);
+                } else if let Some(parent_path) = path.get(..path.len() - 1).map(Vec::from)
+                    && let Some(parent) = app.session_by_path_mut(group_idx, &parent_path)
+                    && let Some(child_idx) = path.last()
+                    && *child_idx < parent.children.len()
+                {
+                    parent.children.remove(*child_idx);
+                }
                 app.session_groups.retain(|g| !g.sessions.is_empty());
                 let new_len = app.visible_popup_items().len();
                 if new_len > 0 && app.session_cursor >= new_len {
@@ -724,6 +789,46 @@ pub(crate) fn apply_popup_session_key(
         _ => {}
     }
     SessionKeyAction::None
+}
+
+pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
+    use crate::app::{PopupItem, StartPageItem};
+
+    let selected = if popup_items {
+        app.visible_popup_items()
+            .get(app.session_cursor)
+            .cloned()
+            .and_then(|item| match item {
+                PopupItem::Session {
+                    group_idx, path, ..
+                } => Some((group_idx, path)),
+                _ => None,
+            })
+    } else {
+        app.visible_start_items()
+            .get(app.session_cursor)
+            .cloned()
+            .and_then(|item| match item {
+                StartPageItem::Session {
+                    group_idx, path, ..
+                } => Some((group_idx, path)),
+                _ => None,
+            })
+    };
+
+    let Some((group_idx, path)) = selected else {
+        return SessionKeyAction::None;
+    };
+
+    let should_load = app.toggle_session_children(group_idx, &path);
+    if should_load {
+        SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path: path,
+        }
+    } else {
+        SessionKeyAction::None
+    }
 }
 
 // ── Delegate view key handler (read-only child session) ──────────────────────
@@ -1950,8 +2055,11 @@ pub(crate) enum SessionKeyAction {
     DeleteSession { session_id: String },
     /// Create a new session.
     NewSession,
-    /// Load the next session page for a cwd group.
-    LoadMoreSessions { group_idx: usize },
+    /// Load the next session page for a cwd group or fork children for a parent path.
+    LoadMoreSessions {
+        group_idx: usize,
+        parent_path: Vec<usize>,
+    },
 }
 
 /// Apply a key event on the sessions screen, mutate `app`, and return the
@@ -1995,16 +2103,17 @@ pub(crate) fn apply_sessions_key(
                         }
                     }
                     StartPageItem::Session {
-                        group_idx,
-                        session_idx,
+                        group_idx, path, ..
                     } => {
-                        let sid = app.session_groups[group_idx].sessions[session_idx]
-                            .session_id
-                            .clone();
-                        return SessionKeyAction::LoadSession {
-                            session_id: sid,
-                            agent_id: None,
-                        };
+                        if let Some(sid) = app
+                            .session_by_path(group_idx, &path)
+                            .map(|session| session.session_id.clone())
+                        {
+                            return SessionKeyAction::LoadSession {
+                                session_id: sid,
+                                agent_id: None,
+                            };
+                        }
                     }
                     StartPageItem::ShowMore { .. } => {
                         app.popup = Popup::SessionSelect;
@@ -2018,15 +2127,25 @@ pub(crate) fn apply_sessions_key(
         KeyCode::Delete => {
             let items = app.visible_start_items();
             if let Some(StartPageItem::Session {
-                group_idx,
-                session_idx,
+                group_idx, path, ..
             }) = items.get(app.session_cursor).cloned()
             {
-                let sid = app.session_groups[group_idx].sessions[session_idx]
-                    .session_id
-                    .clone();
+                let Some(sid) = app
+                    .session_by_path(group_idx, &path)
+                    .map(|session| session.session_id.clone())
+                else {
+                    return SessionKeyAction::None;
+                };
                 // Optimistic remove
-                app.session_groups[group_idx].sessions.remove(session_idx);
+                if path.len() == 1 {
+                    app.session_groups[group_idx].sessions.remove(path[0]);
+                } else if let Some(parent_path) = path.get(..path.len() - 1).map(Vec::from)
+                    && let Some(parent) = app.session_by_path_mut(group_idx, &parent_path)
+                    && let Some(child_idx) = path.last()
+                    && *child_idx < parent.children.len()
+                {
+                    parent.children.remove(*child_idx);
+                }
                 app.session_groups.retain(|g| !g.sessions.is_empty());
                 let new_len = app.visible_start_items().len();
                 if new_len > 0 && app.session_cursor >= new_len {

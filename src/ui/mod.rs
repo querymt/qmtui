@@ -1575,11 +1575,11 @@ mod tests {
         let rendered = buffer_text(&buffer);
 
         assert!(
-            rendered.contains(" ↳ 3"),
+            rendered.contains(" ▸ ↳ 3"),
             "popup row should show fork marker, got: {rendered}"
         );
 
-        let (fork_x, fork_y) = find_buffer_text(&buffer, "↳ 3").expect("fork marker missing");
+        let (fork_x, fork_y) = find_buffer_text(&buffer, "▸ ↳ 3").expect("fork marker missing");
         assert_eq!(buffer[(fork_x, fork_y)].style().fg, Theme::fork_count().fg);
         assert_eq!(
             buffer[(fork_x, fork_y)].style().bg,
@@ -3587,7 +3587,7 @@ mod tests {
         let session_text = row_text(&rows[1]);
 
         assert!(
-            session_text.contains(" ↳ 3"),
+            session_text.contains(" ▸ ↳ 3"),
             "session row should show fork marker, got: {session_text}"
         );
         assert!(
@@ -3595,7 +3595,7 @@ mod tests {
                 .line
                 .spans
                 .iter()
-                .any(|span| span.content.as_ref() == " ↳ 3"),
+                .any(|span| span.content.as_ref() == " ▸ ↳ 3"),
             "session row should not add trailing marker space, got: {session_text}"
         );
 
@@ -3603,7 +3603,7 @@ mod tests {
             .line
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == " ↳ 3")
+            .find(|span| span.content.as_ref() == " ▸ ↳ 3")
             .expect("fork marker span missing");
         assert_eq!(fork_span.style.fg, Theme::fork_count().fg);
     }

@@ -759,8 +759,10 @@ pub enum StartPageItem {
     Session {
         /// Index into `App::session_groups`.
         group_idx: usize,
-        /// Index into `App::session_groups[group_idx].sessions`.
-        session_idx: usize,
+        /// Index path from root session to this visible session.
+        path: Vec<usize>,
+        /// Visual nesting depth: 0 for roots, 1+ for fork children.
+        depth: usize,
     },
     /// A "... show all" row shown when a group has more sessions than are
     /// currently visible on the start page.
@@ -779,6 +781,7 @@ pub const MAX_RECENT_SESSIONS: usize = 3;
 /// Target visible sessions per group when auto-filling the sessions popup.
 pub const POPUP_SESSION_PAGE_TARGET: usize = 10;
 pub const SESSION_GROUP_PAGE_LIMIT: u32 = 10;
+pub const SESSION_CHILD_PAGE_LIMIT: u32 = 10;
 
 /// Maximum number of workspace groups shown on the start page.
 /// Groups beyond this cap are hidden from the start page but remain accessible
@@ -815,13 +818,17 @@ pub enum PopupItem {
     Session {
         /// Index into `App::session_groups`.
         group_idx: usize,
-        /// Index into `App::session_groups[group_idx].sessions`.
-        session_idx: usize,
+        /// Index path from root session to this visible session.
+        path: Vec<usize>,
+        /// Visual nesting depth: 0 for roots, 1+ for fork children.
+        depth: usize,
     },
-    /// A "... load more..." row that fetches the next page for one group.
+    /// A "... load more..." row that fetches the next page for one group or parent fork.
     LoadMore {
         /// Index into `App::session_groups`.
         group_idx: usize,
+        /// Parent session path when loading more fork children; empty for a cwd group page.
+        parent_path: Vec<usize>,
     },
 }
 
@@ -873,6 +880,10 @@ pub struct App {
     pub popup_collapsed_groups: HashSet<String>,
     /// CWDs with an outstanding group-page session request.
     pub pending_session_group_loads: HashSet<Option<String>>,
+    /// Root session IDs expanded to show fork children.
+    pub expanded_session_children: HashSet<String>,
+    /// Parent session IDs with an outstanding child-page request.
+    pub pending_session_child_loads: HashSet<String>,
     /// Scroll offset for the start-page session list (in visible rows).
     pub start_page_scroll: usize,
     /// Last rendered visible row count for the sessions tab in the popup.
@@ -1068,6 +1079,23 @@ impl App {
         ))
     }
 
+    pub fn session_child_page_request(
+        &mut self,
+        group_idx: usize,
+        parent_path: &[usize],
+    ) -> Option<ClientMsg> {
+        let parent = self.session_by_path(group_idx, parent_path)?;
+        let parent_session_id = parent.session_id.clone();
+        let cursor = parent.children_next_cursor.clone();
+        self.pending_session_child_loads
+            .insert(parent_session_id.clone());
+        Some(ClientMsg::list_session_children(
+            parent_session_id,
+            cursor,
+            SESSION_CHILD_PAGE_LIMIT,
+        ))
+    }
+
     pub fn new() -> Self {
         Self {
             screen: Screen::Sessions,
@@ -1080,6 +1108,8 @@ impl App {
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
             pending_session_group_loads: HashSet::new(),
+            expanded_session_children: HashSet::new(),
+            pending_session_child_loads: HashSet::new(),
             start_page_scroll: 0,
             session_popup_visible_rows: 0,
             delegate_popup_visible_rows: 0,
@@ -8154,22 +8184,25 @@ mod start_page_tests {
             &items[1],
             StartPageItem::Session {
                 group_idx: 0,
-                session_idx: 0
-            }
+                path,
+                depth: 0,
+            } if path == &vec![0]
         ));
         assert!(matches!(
             &items[2],
             StartPageItem::Session {
                 group_idx: 0,
-                session_idx: 1
-            }
+                path,
+                depth: 0,
+            } if path == &vec![1]
         ));
         assert!(matches!(
             &items[4],
             StartPageItem::Session {
                 group_idx: 1,
-                session_idx: 0
-            }
+                path,
+                depth: 0,
+            } if path == &vec![0]
         ));
     }
 
@@ -8259,6 +8292,219 @@ mod start_page_tests {
         assert_eq!(session.node_id.as_deref(), Some("node-1"));
         assert_eq!(session.attached, Some(true));
         assert_eq!(session.runtime_state.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn session_children_response_merges_under_parent_and_paginates() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("root", Some("2024-01-04T00:00:00Z"))]);
+        group.sessions[0].fork_count = 2;
+        app.session_groups = vec![group];
+        app.pending_session_child_loads.insert("root".to_string());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_children".into(),
+            data: Some(serde_json::json!({
+                "parent_session_id": "root",
+                "sessions": [
+                    { "session_id": "child-1", "title": "Child 1", "parent_session_id": "root" }
+                ],
+                "next_cursor": "next-child",
+                "total_count": 2
+            })),
+        });
+
+        let parent = &app.session_groups[0].sessions[0];
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(parent.children[0].session_id, "child-1");
+        assert_eq!(parent.children_next_cursor.as_deref(), Some("next-child"));
+        assert_eq!(parent.children_total_count, Some(2));
+        assert_eq!(parent.fork_count, 2);
+        assert!(!app.pending_session_child_loads.contains("root"));
+
+        app.pending_session_child_loads.insert("root".to_string());
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_children".into(),
+            data: Some(serde_json::json!({
+                "parent_session_id": "root",
+                "sessions": [
+                    { "session_id": "child-1", "title": "Duplicate", "parent_session_id": "root" },
+                    { "session_id": "child-2", "title": "Child 2", "parent_session_id": "root" }
+                ],
+                "next_cursor": null,
+                "total_count": 2
+            })),
+        });
+
+        let parent = &app.session_groups[0].sessions[0];
+        let child_ids: Vec<&str> = parent
+            .children
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(child_ids, vec!["child-1", "child-2"]);
+        assert_eq!(parent.children_next_cursor, None);
+    }
+
+    #[test]
+    fn first_page_refresh_replaces_existing_children() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("root", Some("2024-01-04T00:00:00Z"))]);
+        group.sessions[0].fork_count = 2;
+        group.sessions[0].children_next_cursor = Some("stale-next".to_string());
+        group.sessions[0].children = vec![SessionSummary {
+            session_id: "stale-child".to_string(),
+            title: Some("Stale".to_string()),
+            parent_session_id: Some("root".to_string()),
+            ..Default::default()
+        }];
+        app.session_groups = vec![group];
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_children".into(),
+            data: Some(serde_json::json!({
+                "parent_session_id": "root",
+                "sessions": [
+                    { "session_id": "fresh-child", "title": "Fresh", "parent_session_id": "root" }
+                ],
+                "next_cursor": null,
+                "total_count": 1
+            })),
+        });
+
+        let parent = &app.session_groups[0].sessions[0];
+        let child_ids: Vec<&str> = parent
+            .children
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(child_ids, vec!["fresh-child"]);
+        assert_eq!(parent.children_next_cursor, None);
+    }
+
+    #[test]
+    fn session_children_merge_finds_nested_parent_and_filters_delegations() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("root", Some("2024-01-04T00:00:00Z"))]);
+        group.sessions[0].children = vec![SessionSummary {
+            session_id: "nested-parent".to_string(),
+            title: Some("Nested".to_string()),
+            parent_session_id: Some("root".to_string()),
+            fork_count: 2,
+            ..Default::default()
+        }];
+        app.session_groups = vec![group];
+        app.pending_session_child_loads
+            .insert("nested-parent".to_string());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_children".into(),
+            data: Some(serde_json::json!({
+                "parent_session_id": "nested-parent",
+                "sessions": [
+                    { "session_id": "fork-child", "title": "Fork", "parent_session_id": "nested-parent" },
+                    { "session_id": "delegated-child", "title": "Delegate", "parent_session_id": "nested-parent", "fork_origin": "delegation" }
+                ],
+                "next_cursor": null,
+                "total_count": 2
+            })),
+        });
+
+        let nested = &app.session_groups[0].sessions[0].children[0];
+        let child_ids: Vec<&str> = nested
+            .children
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert_eq!(child_ids, vec!["fork-child"]);
+        assert!(!app.pending_session_child_loads.contains("nested-parent"));
+    }
+
+    #[test]
+    fn toggle_session_children_only_signals_load_without_marking_pending() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("root", Some("2024-01-04T00:00:00Z"))]);
+        group.sessions[0].fork_count = 1;
+        app.session_groups = vec![group];
+        app.session_cursor = 1;
+
+        let action = crate::handlers::apply_session_fork_toggle_key(&mut app, false);
+        assert_eq!(
+            action,
+            crate::handlers::SessionKeyAction::LoadMoreSessions {
+                group_idx: 0,
+                parent_path: vec![0],
+            }
+        );
+        assert!(app.expanded_session_children.contains("root"));
+        assert!(app.pending_session_child_loads.is_empty());
+
+        let action = crate::handlers::apply_session_fork_toggle_key(&mut app, false);
+        assert_eq!(action, crate::handlers::SessionKeyAction::None);
+        assert!(app.pending_session_child_loads.is_empty());
+    }
+
+    #[test]
+    fn remote_node_sessions_are_not_expandable() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("remote", Some("2024-01-04T00:00:00Z"))]);
+        group.sessions[0].fork_count = 1;
+        group.sessions[0].node = Some("remote-host".to_string());
+        app.session_groups = vec![group];
+
+        assert!(!app.expandable_root_session(0, &[0]));
+        assert!(!app.toggle_session_children(0, &[0]));
+        assert!(app.expanded_session_children.is_empty());
+        assert!(app.pending_session_child_loads.is_empty());
+    }
+
+    #[test]
+    fn session_children_error_clears_pending_loads() {
+        let mut app = App::new();
+        app.pending_session_child_loads.insert("root".to_string());
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "error".into(),
+            data: Some(serde_json::json!({
+                "message": "Failed to list session children: boom"
+            })),
+        });
+
+        assert!(app.pending_session_child_loads.is_empty());
+    }
+
+    #[test]
+    fn expanded_root_children_are_visible_with_load_more_row() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/a"), &[("root", None)]);
+        group.sessions[0].fork_count = 2;
+        group.sessions[0].children_next_cursor = Some("next".to_string());
+        group.sessions[0].children = vec![SessionSummary {
+            session_id: "child".to_string(),
+            title: Some("Child".to_string()),
+            parent_session_id: Some("root".to_string()),
+            ..Default::default()
+        }];
+        app.expanded_session_children.insert("root".to_string());
+        app.session_groups = vec![group];
+
+        let items = app.visible_popup_items();
+
+        assert!(matches!(
+            &items[2],
+            PopupItem::Session {
+                group_idx: 0,
+                path,
+                depth: 1,
+            } if path == &vec![0, 0]
+        ));
+        assert!(matches!(
+            &items[3],
+            PopupItem::LoadMore {
+                group_idx: 0,
+                parent_path,
+            } if parent_path == &vec![0]
+        ));
     }
 
     #[test]
@@ -8645,7 +8891,10 @@ mod popup_item_tests {
 
         assert!(matches!(
             items.last(),
-            Some(PopupItem::LoadMore { group_idx: 0 })
+            Some(PopupItem::LoadMore {
+                group_idx: 0,
+                parent_path,
+            }) if parent_path.is_empty()
         ));
     }
 
@@ -8807,22 +9056,25 @@ mod popup_item_tests {
             &items[1],
             PopupItem::Session {
                 group_idx: 0,
-                session_idx: 0
-            }
+                path,
+                depth: 0,
+            } if path == &vec![0]
         ));
         assert!(matches!(
             &items[2],
             PopupItem::Session {
                 group_idx: 0,
-                session_idx: 1
-            }
+                path,
+                depth: 0,
+            } if path == &vec![1]
         ));
         assert!(matches!(
             &items[4],
             PopupItem::Session {
                 group_idx: 1,
-                session_idx: 0
-            }
+                path,
+                depth: 0,
+            } if path == &vec![0]
         ));
     }
 

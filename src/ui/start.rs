@@ -74,9 +74,12 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
 
             crate::app::StartPageItem::Session {
                 group_idx,
-                session_idx,
+                path,
+                depth,
             } => {
-                let session = &app.session_groups[*group_idx].sessions[*session_idx];
+                let Some(session) = app.session_by_path(*group_idx, path) else {
+                    continue;
+                };
                 let id_short: String = session.session_id.chars().take(8).collect();
                 let title = session.title.as_deref().unwrap_or("(untitled)");
                 let time_str = session
@@ -85,13 +88,21 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                     .map(relative_time)
                     .unwrap_or_default();
 
-                let fork_marker = if session.fork_count > 0 {
+                let fork_marker = if app.expandable_root_session(*group_idx, path) {
+                    let indicator = if app.expanded_session_children.contains(&session.session_id) {
+                        COLLAPSE_OPEN
+                    } else {
+                        COLLAPSE_CLOSED
+                    };
+                    format!(" {indicator} ↳ {}", session.fork_count)
+                } else if session.fork_count > 0 && *depth == 0 {
                     format!(" ↳ {}", session.fork_count)
                 } else {
                     String::new()
                 };
 
-                let id_part = format!("   {id_short}  ");
+                let indent = "  ".repeat(*depth);
+                let id_part = format!("   {indent}{id_short}  ");
                 let time_part = format!("  {time_str} ");
                 let overhead = id_part.chars().count()
                     + fork_marker.chars().count()

@@ -493,6 +493,14 @@ impl App {
                 }
                 vec![]
             }
+            "session_children" => {
+                if let Some(data) = raw.data
+                    && let Ok(children) = serde_json::from_value::<SessionChildrenData>(data)
+                {
+                    self.merge_session_children(children);
+                }
+                vec![]
+            }
             "session_created" => {
                 if let Some(data) = raw.data
                     && let Ok(sc) = serde_json::from_value::<SessionCreatedData>(data)
@@ -900,6 +908,12 @@ impl App {
                 if let Some(data) = raw.data
                     && let Ok(e) = serde_json::from_value::<ErrorData>(data)
                 {
+                    if e.message.contains("Failed to list session children")
+                        || e.message
+                            .contains("Session children list only supports user forks")
+                    {
+                        self.pending_session_child_loads.clear();
+                    }
                     push_error_message(&mut self.messages, &e.message);
                     self.set_status(LogLevel::Error, "server", format!("error: {}", e.message));
                 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,17 @@ use crate::protocol::*;
 /// Returns indices of sessions in `group` whose title or ID matches `q`.
 /// When `q` is empty every session matches in original order.
 /// When `q` is non-empty, results are sorted by fuzzy match score (best first).
+fn session_matches(session: &SessionSummary, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let matcher = SkimMatcherV2::default();
+    matcher
+        .fuzzy_match(session.title.as_deref().unwrap_or(""), q)
+        .is_some()
+        || matcher.fuzzy_match(&session.session_id, q).is_some()
+}
+
 fn matching_session_indices(group: &SessionGroup, q: &str) -> Vec<usize> {
     if q.is_empty() {
         return (0..group.sessions.len()).collect();
@@ -34,7 +46,126 @@ fn matching_session_indices(group: &SessionGroup, q: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+fn session_by_id_mut<'a>(
+    sessions: &'a mut [SessionSummary],
+    session_id: &str,
+) -> Option<&'a mut SessionSummary> {
+    for session in sessions {
+        if session.session_id == session_id {
+            return Some(session);
+        }
+        if let Some(child) = session_by_id_mut(&mut session.children, session_id) {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn fork_browsing_child(session: &SessionSummary) -> bool {
+    session.fork_origin.as_deref() != Some("delegation")
+}
+
 impl App {
+    pub fn session_by_path(&self, group_idx: usize, path: &[usize]) -> Option<&SessionSummary> {
+        let (first, rest) = path.split_first()?;
+        let mut session = self.session_groups.get(group_idx)?.sessions.get(*first)?;
+        for idx in rest {
+            session = session.children.get(*idx)?;
+        }
+        Some(session)
+    }
+
+    pub fn session_by_path_mut(
+        &mut self,
+        group_idx: usize,
+        path: &[usize],
+    ) -> Option<&mut SessionSummary> {
+        fn descend<'a>(
+            sessions: &'a mut [SessionSummary],
+            path: &[usize],
+        ) -> Option<&'a mut SessionSummary> {
+            let (first, rest) = path.split_first()?;
+            let session = sessions.get_mut(*first)?;
+            if rest.is_empty() {
+                Some(session)
+            } else {
+                descend(&mut session.children, rest)
+            }
+        }
+        descend(&mut self.session_groups.get_mut(group_idx)?.sessions, path)
+    }
+
+    pub fn expandable_root_session(&self, group_idx: usize, path: &[usize]) -> bool {
+        let Some(session) = self.session_by_path(group_idx, path) else {
+            return false;
+        };
+        path.len() == 1
+            && session.parent_session_id.is_none()
+            && session.fork_count > 0
+            && session.node.is_none()
+            && session.node_id.is_none()
+    }
+
+    pub fn toggle_session_children(&mut self, group_idx: usize, path: &[usize]) -> bool {
+        if !self.expandable_root_session(group_idx, path) {
+            return false;
+        }
+        let Some(session) = self.session_by_path(group_idx, path) else {
+            return false;
+        };
+        let session_id = session.session_id.clone();
+        let should_load = session.children.is_empty()
+            && session.children_next_cursor.is_none()
+            && !self.pending_session_child_loads.contains(&session_id);
+        if !self.expanded_session_children.remove(&session_id) {
+            self.expanded_session_children.insert(session_id);
+            return should_load;
+        }
+        false
+    }
+
+    pub fn merge_session_children(&mut self, data: SessionChildrenData) {
+        let had_pending_request = self
+            .pending_session_child_loads
+            .remove(&data.parent_session_id);
+        if let Some(parent) = self
+            .session_groups
+            .iter_mut()
+            .find_map(|group| session_by_id_mut(&mut group.sessions, &data.parent_session_id))
+        {
+            let mut sessions: Vec<SessionSummary> = data
+                .sessions
+                .into_iter()
+                .filter(fork_browsing_child)
+                .collect();
+            let append = had_pending_request
+                && !parent.children.is_empty()
+                && parent.children_next_cursor.is_some();
+            if append {
+                let mut seen: HashSet<String> = parent
+                    .children
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect();
+                parent.children.extend(
+                    sessions
+                        .into_iter()
+                        .filter(|session| seen.insert(session.session_id.clone())),
+                );
+            } else {
+                let mut seen = HashSet::new();
+                sessions.retain(|session| seen.insert(session.session_id.clone()));
+                parent.children = sessions;
+            }
+            parent.children_next_cursor = data.next_cursor;
+            parent.children_total_count = data.total_count;
+            parent.has_children = !parent.children.is_empty() || parent.fork_count > 0;
+            if let Some(total) = parent.children_total_count {
+                parent.fork_count = total;
+            }
+        }
+    }
+
     /// Flat list of sessions that match the current filter, across all groups.
     ///
     /// Used by the session popup (which shows a flat list) for backward compatibility.
@@ -92,10 +223,24 @@ impl App {
                 let hidden = matching.len().saturating_sub(MAX_RECENT_SESSIONS);
 
                 for session_idx in visible {
+                    let path = vec![session_idx];
                     items.push(StartPageItem::Session {
                         group_idx,
-                        session_idx,
+                        path: path.clone(),
+                        depth: 0,
                     });
+                    let session = &group.sessions[session_idx];
+                    if self.expanded_session_children.contains(&session.session_id) {
+                        for (child_idx, child) in session.children.iter().enumerate() {
+                            if session_matches(child, &q) {
+                                items.push(StartPageItem::Session {
+                                    group_idx,
+                                    path: vec![session_idx, child_idx],
+                                    depth: 1,
+                                });
+                            }
+                        }
+                    }
                 }
 
                 if hidden > 0 || group.next_cursor.is_some() {
@@ -163,11 +308,33 @@ impl App {
                 for session_idx in matching {
                     items.push(PopupItem::Session {
                         group_idx,
-                        session_idx,
+                        path: vec![session_idx],
+                        depth: 0,
                     });
+                    let session = &group.sessions[session_idx];
+                    if self.expanded_session_children.contains(&session.session_id) {
+                        for (child_idx, child) in session.children.iter().enumerate() {
+                            if session_matches(child, &q) {
+                                items.push(PopupItem::Session {
+                                    group_idx,
+                                    path: vec![session_idx, child_idx],
+                                    depth: 1,
+                                });
+                            }
+                        }
+                        if session.children_next_cursor.is_some() {
+                            items.push(PopupItem::LoadMore {
+                                group_idx,
+                                parent_path: vec![session_idx],
+                            });
+                        }
+                    }
                 }
                 if group.next_cursor.is_some() {
-                    items.push(PopupItem::LoadMore { group_idx });
+                    items.push(PopupItem::LoadMore {
+                        group_idx,
+                        parent_path: Vec::new(),
+                    });
                 }
             }
         }

@@ -1857,8 +1857,9 @@ impl PersistenceGuard {
 mod sessions_key_tests {
     use super::*;
     use crate::handlers::*;
-    use crate::protocol::{SessionGroup, SessionSummary};
-    use crossterm::event::KeyCode;
+    use crate::protocol::{ClientMsg, SessionGroup, SessionSummary};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -1967,6 +1968,83 @@ mod sessions_key_tests {
                 agent_id: None,
             }
         );
+    }
+
+    #[test]
+    fn enter_on_expandable_root_returns_load_action() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+
+        let action = apply_sessions_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "root".to_string(),
+                agent_id: None,
+            }
+        );
+        assert!(!app.expanded_session_children.contains("root"));
+    }
+
+    #[test]
+    fn ctrl_o_on_expandable_root_requests_children() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        )
+        .unwrap();
+
+        assert!(app.expanded_session_children.contains("root"));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ClientMsg::ListSessionChildren {
+                parent_session_id,
+                ..
+            }) if parent_session_id == "root"
+        ));
+    }
+
+    #[test]
+    fn ctrl_o_on_expanded_root_collapses_without_loading_session() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.expanded_session_children.insert("root".to_string());
+        app.session_cursor = 1;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        )
+        .unwrap();
+
+        assert!(!app.expanded_session_children.contains("root"));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plain_o_still_filters_instead_of_toggling_forks() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+
+        apply_sessions_key(&mut app, KeyCode::Char('o'));
+
+        assert_eq!(app.session_filter, "o");
+        assert!(!app.expanded_session_children.contains("root"));
     }
 
     // ── Delete on Session removes it ─────────────────────────────────────────
@@ -2164,7 +2242,7 @@ mod sessions_key_tests {
 mod session_popup_key_tests {
     use super::*;
     use crate::handlers::*;
-    use crate::protocol::{SessionGroup, SessionSummary};
+    use crate::protocol::{ClientMsg, SessionGroup, SessionSummary};
     use app::Popup;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -2370,6 +2448,125 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn popup_enter_on_expandable_root_loads_session() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "root".to_string(),
+                agent_id: None,
+            }
+        );
+        assert!(!app.expanded_session_children.contains("root"));
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn popup_ctrl_o_on_expandable_root_requests_children() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        )
+        .unwrap();
+
+        assert!(app.expanded_session_children.contains("root"));
+        assert_eq!(app.popup, Popup::SessionSelect);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ClientMsg::ListSessionChildren {
+                parent_session_id,
+                ..
+            }) if parent_session_id == "root"
+        ));
+    }
+
+    #[test]
+    fn popup_ctrl_o_on_expanded_root_collapses_without_loading_session() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.expanded_session_children.insert("root".to_string());
+        app.session_cursor = 1;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &cmd_tx,
+        )
+        .unwrap();
+
+        assert!(!app.expanded_session_children.contains("root"));
+        assert_eq!(app.popup, Popup::SessionSelect);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn popup_plain_o_still_filters_instead_of_toggling_forks() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_cursor = 1;
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        handle_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &cmd_tx,
+        )
+        .unwrap();
+
+        assert_eq!(app.session_filter, "o");
+        assert!(!app.expanded_session_children.contains("root"));
+        assert_eq!(app.popup, Popup::SessionSelect);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn popup_enter_on_expanded_child_loads_session() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.session_groups[0].sessions[0].fork_count = 1;
+        app.session_groups[0].sessions[0].children = vec![SessionSummary {
+            session_id: "child".to_string(),
+            title: Some("child".to_string()),
+            parent_session_id: Some("root".to_string()),
+            ..Default::default()
+        }];
+        app.expanded_session_children.insert("root".to_string());
+        app.session_cursor = 2;
+
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadSession {
+                session_id: "child".to_string(),
+                agent_id: None,
+            }
+        );
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
     fn popup_enter_on_load_more_returns_action_and_keeps_popup_open() {
         let mut app = App::new();
         app.popup = Popup::SessionSelect;
@@ -2382,7 +2579,13 @@ mod session_popup_key_tests {
 
         let action = apply_popup_session_key(&mut app, KeyCode::Enter);
 
-        assert_eq!(action, SessionKeyAction::LoadMoreSessions { group_idx: 0 });
+        assert_eq!(
+            action,
+            SessionKeyAction::LoadMoreSessions {
+                group_idx: 0,
+                parent_path: Vec::new()
+            }
+        );
         assert_eq!(app.popup, Popup::SessionSelect);
     }
 
