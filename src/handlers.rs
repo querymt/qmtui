@@ -351,16 +351,12 @@ pub(crate) fn handle_key(
 }
 
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if matches!(app.screen, Screen::Chat | Screen::Delegate) && app.popup == Popup::None {
-                app.scroll_offset = app.scroll_offset.saturating_add(3);
-            }
+    match (mouse.kind, &app.screen, &app.popup) {
+        (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
         }
-        MouseEventKind::ScrollDown => {
-            if matches!(app.screen, Screen::Chat | Screen::Delegate) && app.popup == Popup::None {
-                app.scroll_offset = app.scroll_offset.saturating_sub(3);
-            }
+        (MouseEventKind::ScrollDown, Screen::Chat | Screen::Delegate, Popup::None) => {
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
         }
         _ => {}
     }
