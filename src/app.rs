@@ -220,6 +220,10 @@ pub enum ChatEntry {
         thinking: Option<String>,
         message_id: Option<String>,
     },
+    Thinking {
+        content: String,
+        message_id: Option<String>,
+    },
     ToolCall {
         tool_call_id: Option<String>,
         name: String,
@@ -937,6 +941,7 @@ pub struct App {
     pub streaming_content: String,
     pub streaming_cache: StreamingCache,
     pub streaming_thinking: String,
+    pub streaming_thinking_message_id: Option<String>,
     pub streaming_thinking_cache: StreamingCache,
     pub file_index: Vec<FileIndexEntryLite>,
     pub file_index_generated_at: Option<u64>,
@@ -1156,6 +1161,7 @@ impl App {
             streaming_content: String::new(),
             streaming_cache: StreamingCache::new(),
             streaming_thinking: String::new(),
+            streaming_thinking_message_id: None,
             streaming_thinking_cache: StreamingCache::new(),
             file_index: Vec::new(),
             file_index_generated_at: None,
@@ -1235,6 +1241,7 @@ impl App {
     pub fn invalidate_streaming_caches(&mut self) {
         self.streaming_cache.invalidate();
         self.streaming_thinking.clear();
+        self.streaming_thinking_message_id = None;
         self.streaming_thinking_cache.invalidate();
     }
 
@@ -6626,6 +6633,34 @@ mod tests {
     }
 
     #[test]
+    fn thinking_only_assistant_message_stored_with_same_message_id_is_not_duplicated() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("first thought".into()),
+                message_id: Some("msg-thinking".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("duplicate thought".into()),
+                message_id: Some("msg-thinking".into()),
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(
+            matches!(&app.messages[0], ChatEntry::Thinking { content, message_id: Some(message_id) } if content == "first thought" && message_id == "msg-thinking")
+        );
+    }
+
+    #[test]
     fn user_message_stored_only_backfills_when_prompt_received_missing() {
         let mut app = App::new();
         app.handle_event_kind(
@@ -8150,6 +8185,85 @@ mod thinking_content_tests {
     }
 
     #[test]
+    fn assistant_message_stored_with_only_thinking_creates_durable_thinking_entry() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("Thinking before tool.".into()),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatEntry::Thinking {
+                content,
+                message_id: Some(message_id),
+            } => {
+                assert_eq!(content, "Thinking before tool.");
+                assert_eq!(message_id, "think-1");
+            }
+            other => panic!("expected Thinking, got {:?}", other),
+        }
+        assert!(app.streaming_thinking.is_empty());
+    }
+
+    #[test]
+    fn assistant_message_stored_dedupes_existing_thinking_by_message_id() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Thinking before tool.".into(),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "glob".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("Thinking before tool.".into()),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-2".into()),
+                tool_name: "read_tool".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::Thinking { message_id: Some(id), .. } if id == "think-1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn assistant_message_stored_without_thinking_sets_none() {
         let mut app = App::new();
         app.handle_event_kind(&EventKind::TurnStarted, false, None);
@@ -8267,6 +8381,233 @@ mod thinking_content_tests {
         );
         // Should still be Thinking (not Streaming) during thinking phase
         assert_eq!(app.activity, ActivityState::Thinking);
+    }
+
+    #[test]
+    fn tool_call_start_flushes_streaming_thinking_to_durable_entry() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Need a file list first.".into(),
+                message_id: None,
+            },
+            false,
+            None,
+        );
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "glob".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.streaming_thinking, "");
+        assert_eq!(app.messages.len(), 2);
+        assert!(
+            matches!(&app.messages[0], ChatEntry::Thinking { content, message_id: None } if content == "Need a file list first.")
+        );
+        assert!(matches!(&app.messages[1], ChatEntry::ToolCall { name, .. } if name == "glob"));
+    }
+
+    #[test]
+    fn tool_call_start_preserves_streaming_thinking_message_id() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Need a file list first.".into(),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "glob".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.streaming_thinking_message_id, None);
+        assert!(
+            matches!(&app.messages[0], ChatEntry::Thinking { content, message_id: Some(message_id) } if content == "Need a file list first." && message_id == "think-1")
+        );
+    }
+
+    #[test]
+    fn replayed_duplicate_tool_start_discards_pending_thinking() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Need a file list first.".into(),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+        let tool_start = EventKind::ToolCallStart {
+            tool_call_id: Some("tool-1".into()),
+            tool_name: "glob".into(),
+            arguments: None,
+        };
+        app.handle_event_kind(&tool_start, false, None);
+
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Need a file list first.".into(),
+                message_id: Some("think-1".into()),
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(&tool_start, true, None);
+
+        assert!(app.streaming_thinking.is_empty());
+        assert_eq!(app.streaming_thinking_message_id, None);
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::Thinking { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::ToolCall { tool_call_id: Some(id), .. } if id == "tool-1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reconciled_tool_start_discards_pending_thinking() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell (failed)".into(),
+            is_error: true,
+            detail: ToolDetail::None,
+        });
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Replayed thinking.".into(),
+                message_id: Some("think-1".into()),
+            },
+            true,
+            None,
+        );
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "shell".into(),
+                arguments: None,
+            },
+            true,
+            None,
+        );
+
+        assert!(app.streaming_thinking.is_empty());
+        assert_eq!(app.streaming_thinking_message_id, None);
+        assert!(matches!(&app.messages[0], ChatEntry::ToolCall { name, .. } if name == "shell"));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn stale_thinking_flush_dedupes_existing_assistant_by_message_id() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::Assistant {
+            content: "Final answer.".into(),
+            thinking: None,
+            message_id: Some("msg-1".into()),
+        });
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Stale thinking.".into(),
+                message_id: Some("msg-1".into()),
+            },
+            true,
+            None,
+        );
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "glob".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::Thinking { message_id: Some(id), .. } if id == "msg-1"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::Assistant { message_id: Some(id), .. } if id == "msg-1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cancelled_with_only_thinking_preserves_durable_thinking_entry() {
+        let mut app = App::new();
+        app.handle_event_kind(&EventKind::TurnStarted, false, None);
+        app.handle_event_kind(
+            &EventKind::AssistantThinkingDelta {
+                content: "Deep thought.".into(),
+                message_id: Some("think-1".into()),
+            },
+            false,
+            None,
+        );
+
+        app.handle_event_kind(&EventKind::Cancelled, false, None);
+
+        assert!(app.streaming_content.is_empty());
+        assert!(app.streaming_thinking.is_empty());
+        assert_eq!(app.streaming_thinking_message_id, None);
+        assert_eq!(app.messages.len(), 1);
+        assert!(
+            matches!(&app.messages[0], ChatEntry::Thinking { content, message_id: Some(message_id) } if content == "Deep thought." && message_id == "think-1")
+        );
+    }
+
+    #[test]
+    fn question_tool_call_start_does_not_flush_streaming_thinking() {
+        let mut app = App::new();
+        app.streaming_thinking = "Need user input.".into();
+
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("question-1".into()),
+                tool_name: "question".into(),
+                arguments: None,
+            },
+            false,
+            None,
+        );
+
+        assert_eq!(app.streaming_thinking, "Need user input.");
+        assert!(app.messages.is_empty());
     }
 }
 
