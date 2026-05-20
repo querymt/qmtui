@@ -264,10 +264,15 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         Some(CardKind::Tool { .. })
     ) {
         app.card_cache.cards.pop();
-        // Scan backwards to find where the tool batch started
+        // Scan backwards to find where the tool batch started. Hidden thinking
+        // entries are transparent and should not split a tool batch.
         let mut idx = app.card_cache.processed_messages;
-        while idx > 0 && matches!(app.messages.get(idx - 1), Some(ChatEntry::ToolCall { .. })) {
-            idx -= 1;
+        while idx > 0 {
+            match app.messages.get(idx - 1) {
+                Some(ChatEntry::ToolCall { .. }) => idx -= 1,
+                Some(ChatEntry::Thinking { .. }) if !app.show_thinking => idx -= 1,
+                _ => break,
+            }
         }
         idx
     } else {
@@ -340,6 +345,19 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 app.card_cache
                     .cards
                     .push(Card::new(CardKind::Assistant, blocks));
+            }
+            ChatEntry::Thinking { content, .. } => {
+                if app.show_thinking {
+                    flush_tools(&mut pending_tools, &mut app.card_cache.cards);
+                    let mut blocks = markdown::render(content, Theme::thinking_text(), &app.hl);
+                    markdown::prepend_span_to_first_text(
+                        &mut blocks,
+                        Span::styled("\u{25CF} ", Theme::thinking()),
+                    );
+                    app.card_cache
+                        .cards
+                        .push(Card::new(CardKind::Thinking, blocks));
+                }
             }
             ChatEntry::ToolCall {
                 name,

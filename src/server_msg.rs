@@ -116,6 +116,12 @@ impl App {
         })
     }
 
+    fn discard_pending_thinking(&mut self) {
+        self.streaming_thinking.clear();
+        self.streaming_thinking_message_id = None;
+        self.streaming_thinking_cache.invalidate();
+    }
+
     fn current_delegate_pending_elicitation_snapshot(&self) -> Option<PendingElicitationSnapshot> {
         self.current_delegate_pending_elicitation().map(
             |(elicitation_id, message, requested_schema, source)| PendingElicitationSnapshot {
@@ -1125,7 +1131,15 @@ impl App {
                 self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
             EventKind::LlmRequestStart { .. } => {}
-            EventKind::AssistantThinkingDelta { content, .. } => {
+            EventKind::AssistantThinkingDelta {
+                content,
+                message_id,
+            } => {
+                if self.streaming_thinking.is_empty()
+                    || (self.streaming_thinking_message_id.is_none() && message_id.is_some())
+                {
+                    self.streaming_thinking_message_id = message_id.clone();
+                }
                 self.streaming_thinking.push_str(content);
             }
             EventKind::AssistantContentDelta { content, .. } => {
@@ -1171,35 +1185,47 @@ impl App {
                 thinking,
                 message_id,
             } => {
-                let thinking_text = thinking.clone().or_else(|| {
-                    if self.streaming_thinking.is_empty() {
-                        None
-                    } else {
-                        Some(std::mem::take(&mut self.streaming_thinking))
-                    }
-                });
+                let streaming_thinking_message_id = self.streaming_thinking_message_id.clone();
+                let thinking_text = thinking
+                    .as_ref()
+                    .filter(|text| !text.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        if self.streaming_thinking.is_empty() {
+                            None
+                        } else {
+                            Some(std::mem::take(&mut self.streaming_thinking))
+                        }
+                    });
+                let thinking_message_id = message_id.clone().or(streaming_thinking_message_id);
                 self.streaming_content.clear();
                 self.invalidate_streaming_caches();
                 if self.is_turn_active() {
                     self.activity = ActivityState::Thinking;
                 }
-                if !content.is_empty() {
+                if !content.is_empty() || thinking_text.is_some() {
                     self.recent_prompt_text = None;
                     if self.suppress_turn_output {
                         return;
                     }
                     if let Some(message_id) = message_id.as_deref()
                         && self.messages.iter().any(|entry| {
-                            matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } if mid == message_id)
+                            matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } | ChatEntry::Thinking { message_id: Some(mid), .. } if mid == message_id)
                         })
                     {
                         return;
                     }
-                    self.messages.push(ChatEntry::Assistant {
-                        content: content.clone(),
-                        thinking: thinking_text,
-                        message_id: message_id.clone(),
-                    });
+                    if content.is_empty() {
+                        if let Some(thinking) = thinking_text {
+                            push_thinking_entry(&mut self.messages, thinking, thinking_message_id);
+                        }
+                    } else {
+                        self.messages.push(ChatEntry::Assistant {
+                            content: content.clone(),
+                            thinking: thinking_text,
+                            message_id: message_id.clone(),
+                        });
+                    }
                 }
             }
             EventKind::ToolCallStart {
@@ -1230,7 +1256,25 @@ impl App {
                             )
                         })
                     {
+                        self.discard_pending_thinking();
                         return;
+                    }
+                    let detail = parse_tool_detail(tool_name, arguments.as_ref());
+                    if reconcile_tool_call_start(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        tool_name,
+                        detail.clone(),
+                    ) {
+                        self.discard_pending_thinking();
+                        self.card_cache.invalidate();
+                        return;
+                    }
+                    if !self.streaming_thinking.is_empty() {
+                        let thinking = std::mem::take(&mut self.streaming_thinking);
+                        let thinking_message_id = self.streaming_thinking_message_id.take();
+                        push_thinking_entry(&mut self.messages, thinking, thinking_message_id);
+                        self.streaming_thinking_cache.invalidate();
                     }
                     if tool_name == "delegate"
                         && let Some(pending) =
@@ -1254,16 +1298,6 @@ impl App {
                         });
                         self.pending_delegate_tool_calls.push(pending);
                         self.invalidate_delegate_render_cache();
-                    }
-                    let detail = parse_tool_detail(tool_name, arguments.as_ref());
-                    if reconcile_tool_call_start(
-                        &mut self.messages,
-                        tool_call_id.as_deref(),
-                        tool_name,
-                        detail.clone(),
-                    ) {
-                        self.card_cache.invalidate();
-                        return;
                     }
                     self.messages.push(ChatEntry::ToolCall {
                         tool_call_id: tool_call_id.clone(),
@@ -1500,7 +1534,6 @@ impl App {
                 self.clear_cancel_confirm();
                 if self.suppress_turn_output {
                     self.streaming_content.clear();
-                    self.streaming_thinking.clear();
                     self.invalidate_streaming_caches();
                     self.set_status(LogLevel::Warn, "activity", "cancelled");
                     return;
@@ -1511,6 +1544,8 @@ impl App {
                     let thinking = if self.streaming_thinking.is_empty() {
                         None
                     } else {
+                        self.streaming_thinking_message_id = None;
+                        self.streaming_thinking_cache.invalidate();
                         Some(std::mem::take(&mut self.streaming_thinking))
                     };
                     self.messages.push(ChatEntry::Assistant {
@@ -1518,6 +1553,11 @@ impl App {
                         thinking,
                         message_id: None,
                     });
+                } else if !self.streaming_thinking.is_empty() {
+                    let thinking = std::mem::take(&mut self.streaming_thinking);
+                    let thinking_message_id = self.streaming_thinking_message_id.take();
+                    push_thinking_entry(&mut self.messages, thinking, thinking_message_id);
+                    self.streaming_thinking_cache.invalidate();
                 }
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
@@ -2243,6 +2283,30 @@ fn push_error_message(messages: &mut Vec<ChatEntry>, message: &str) -> bool {
     }
 
     messages.push(ChatEntry::Error(message.to_string()));
+    true
+}
+
+fn message_entry_exists(messages: &[ChatEntry], message_id: Option<&str>) -> bool {
+    let Some(message_id) = message_id else {
+        return false;
+    };
+    messages.iter().any(|entry| {
+        matches!(entry, ChatEntry::Assistant { message_id: Some(existing_id), .. } | ChatEntry::Thinking { message_id: Some(existing_id), .. } if existing_id == message_id)
+    })
+}
+
+fn push_thinking_entry(
+    messages: &mut Vec<ChatEntry>,
+    content: String,
+    message_id: Option<String>,
+) -> bool {
+    if content.is_empty() || message_entry_exists(messages, message_id.as_deref()) {
+        return false;
+    }
+    messages.push(ChatEntry::Thinking {
+        content,
+        message_id,
+    });
     true
 }
 

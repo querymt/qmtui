@@ -367,7 +367,7 @@ fn draw_header(
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, Screen, ToolDetail};
-    use crate::protocol::RawServerMsg;
+    use crate::protocol::{EventKind, RawServerMsg};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -3844,6 +3844,95 @@ mod tests {
                 "thinking should be hidden, got: {text}"
             );
         }
+    }
+
+    #[test]
+    fn hidden_thinking_entry_between_tools_keeps_incremental_tool_batching() {
+        let mut app = App::new();
+        app.show_thinking = false;
+
+        app.messages.push(tool_call("glob"));
+        build_message_cards(&mut app);
+        app.messages.push(ChatEntry::Thinking {
+            content: "hidden reasoning".into(),
+            message_id: Some("think-1".into()),
+        });
+        build_message_cards(&mut app);
+        app.messages.push(tool_call("read_tool"));
+
+        let incremental_kinds: Vec<_> = {
+            let cards = build_message_cards(&mut app);
+            cards.iter().map(|card| card.kind.clone()).collect()
+        };
+        let incremental_tool_lines = app.card_cache.cards[0].lines_for(80).len();
+
+        app.card_cache.invalidate();
+        let full_kinds: Vec<_> = {
+            let cards = build_message_cards(&mut app);
+            cards.iter().map(|card| card.kind.clone()).collect()
+        };
+        let full_tool_lines = app.card_cache.cards[0].lines_for(80).len();
+
+        assert_eq!(incremental_kinds, full_kinds);
+        assert_eq!(incremental_kinds, vec![CardKind::Tool { compact: false }]);
+        assert_eq!(incremental_tool_lines, 2);
+        assert_eq!(full_tool_lines, 2);
+    }
+
+    #[test]
+    fn thinking_entry_between_tools_breaks_tool_card_batching() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("Thinking before first tool.".into()),
+                message_id: Some("think-1".into()),
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                tool_name: "glob".into(),
+                arguments: None,
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::AssistantMessageStored {
+                content: String::new(),
+                thinking: Some("Thinking before second tool.".into()),
+                message_id: Some("think-2".into()),
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("tool-2".into()),
+                tool_name: "read_tool".into(),
+                arguments: None,
+            },
+            true,
+            None,
+        );
+
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 4);
+        assert_eq!(cards[0].kind, CardKind::Thinking);
+        assert_eq!(cards[1].kind, CardKind::Tool { compact: false });
+        assert_eq!(cards[2].kind, CardKind::Thinking);
+        assert_eq!(cards[3].kind, CardKind::Tool { compact: false });
+
+        let thinking_text: String = cards[2]
+            .lines_for(80)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(thinking_text.contains('\u{25CF}'));
+        assert!(thinking_text.contains("Thinking before second tool."));
     }
 
     // ── scroll_input tests ────────────────────────────────────────────────────
