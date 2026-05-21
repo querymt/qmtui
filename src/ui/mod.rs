@@ -3922,9 +3922,9 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 4);
         assert_eq!(cards[0].kind, CardKind::Thinking);
-        assert_eq!(cards[1].kind, CardKind::Tool { compact: false });
+        assert_eq!(cards[1].kind, CardKind::Tool { compact: true });
         assert_eq!(cards[2].kind, CardKind::Thinking);
-        assert_eq!(cards[3].kind, CardKind::Tool { compact: false });
+        assert_eq!(cards[3].kind, CardKind::Tool { compact: true });
 
         let thinking_text: String = cards[2]
             .lines_for(80)

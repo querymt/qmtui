@@ -291,7 +291,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 .collect();
             let prev_is_assistant = matches!(
                 cards.last().map(|c| &c.kind),
-                Some(CardKind::Assistant | CardKind::Streaming)
+                Some(CardKind::Assistant | CardKind::Streaming | CardKind::Thinking)
             );
             cards.push(Card::new(
                 CardKind::Tool {
