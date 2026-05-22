@@ -2065,6 +2065,20 @@ pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_s
     }
 }
 
+fn truncate_summary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    format!("{}{ELLIPSIS}", &s[..end])
+}
+
 fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> ToolDetail {
     let Some(args) = arguments else {
         return ToolDetail::None;
@@ -2160,12 +2174,7 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
         }
         "shell" => {
             let cmd = str_field("command");
-            let display = if cmd.len() > 60 {
-                format!("{}{ELLIPSIS}", &cmd[..60])
-            } else {
-                cmd
-            };
-            ToolDetail::Summary(display)
+            ToolDetail::Summary(truncate_summary(&cmd, 60))
         }
         "search_text" => {
             let pattern = str_field("pattern");
@@ -2203,22 +2212,13 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
         }
         "browse" | "web_fetch" => {
             let url = str_field("url");
-            let display = if url.len() > 60 {
-                format!("{}{ELLIPSIS}", &url[..60])
-            } else {
-                url
-            };
-            ToolDetail::Summary(display)
+            ToolDetail::Summary(truncate_summary(&url, 60))
         }
         "apply_patch" => ToolDetail::Summary("patch".into()),
         "delegate" => {
             let agent = str_field("target_agent_id");
             let objective = str_field("objective");
-            let obj_display = if objective.len() > 50 {
-                format!("{}{ELLIPSIS}", &objective[..50])
-            } else {
-                objective
-            };
+            let obj_display = truncate_summary(&objective, 50);
             let display = if agent.is_empty() {
                 obj_display
             } else {
@@ -2800,6 +2800,76 @@ mod tool_detail_tests {
             }
             other => panic!("expected Summary, got: {other:?}"),
         }
+    }
+
+    fn assert_summary_truncates_with_ellipsis(tool_name: &str, args: serde_json::Value) {
+        let detail = parse_tool_detail(tool_name, Some(&args));
+
+        match detail {
+            ToolDetail::Summary(s) => {
+                assert!(s.ends_with(crate::ui::ELLIPSIS), "got: {s}");
+                assert!(s.is_char_boundary(s.len()), "got: {s}");
+            }
+            other => panic!("expected Summary, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_tool_truncates_utf8_command_on_char_boundary() {
+        let command =
+            "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
+        let args = serde_json::json!({ "command": command });
+
+        assert_summary_truncates_with_ellipsis("shell", args);
+    }
+
+    #[test]
+    fn session_loaded_replay_audit_truncates_utf8_shell_command_on_char_boundary() {
+        let command =
+            "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
+        assert!(!command.is_char_boundary(60));
+        let mut app = App::new();
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "sess-utf8",
+                "agent_id": "coder",
+                "audit": {
+                    "events": [{
+                        "kind": { "type": "tool_call_start", "data": {
+                            "tool_call_id": "tool-utf8",
+                            "tool_name": "shell",
+                            "arguments": { "command": command }
+                        }},
+                        "timestamp": null
+                    }]
+                },
+                "undo_stack": []
+            })),
+        });
+
+        assert_eq!(app.messages.len(), 1);
+        let summary = summary_text(&app.messages[0]);
+        assert!(summary.ends_with(crate::ui::ELLIPSIS), "got: {summary}");
+        assert!(summary.is_char_boundary(summary.len()), "got: {summary}");
+    }
+
+    #[test]
+    fn browse_tool_truncates_utf8_url_on_char_boundary() {
+        let url = "https://example.com/docs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa🔴/page";
+        let args = serde_json::json!({ "url": url });
+
+        assert_summary_truncates_with_ellipsis("browse", args);
+    }
+
+    #[test]
+    fn delegate_tool_truncates_utf8_objective_on_char_boundary() {
+        let objective = "Review this objective with multibyte marker aaaaa🔴 done";
+        assert!(!objective.is_char_boundary(50));
+        let args = serde_json::json!({ "objective": objective });
+
+        assert_summary_truncates_with_ellipsis("delegate", args);
     }
 
     #[test]
