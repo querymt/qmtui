@@ -68,6 +68,7 @@ pub enum Popup {
     Log,
     ProviderAuth,
     ForkTurnSelect,
+    ProfileSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -965,6 +966,13 @@ pub struct App {
     /// session.  Loaded from `~/.cache/qmt/tui-cache.toml` on startup.
     pub session_cache: HashMap<String, HashMap<String, CachedModeState>>,
 
+    // profile info
+    pub profiles: Vec<ProfileInfo>,
+    pub active_profile_id: Option<String>,
+    pub session_profiles: HashMap<String, String>,
+    pub profile_cursor: usize,
+    pub profile_filter: String,
+
     // model info
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
@@ -1090,6 +1098,14 @@ pub fn validate_reasoning_effort(s: Option<&str>) -> Option<Option<String>> {
     }
 }
 
+fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (cursor as isize + delta).rem_euclid(len as isize) as usize
+    }
+}
+
 impl App {
     pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<ClientMsg> {
         let group = self.session_groups.get(group_idx)?;
@@ -1174,6 +1190,11 @@ impl App {
             show_thinking: true,
             reasoning_effort: None,
             session_cache: HashMap::new(),
+            profiles: Vec::new(),
+            active_profile_id: None,
+            session_profiles: HashMap::new(),
+            profile_cursor: 0,
+            profile_filter: String::new(),
             current_model: None,
             current_provider: None,
             models: Vec::new(),
@@ -1452,6 +1473,116 @@ impl App {
         self.auth_oauth_response_cursor = 0;
         self.auth_result_message = None;
         self.auth_clipboard_fallback = None;
+    }
+
+    pub fn profile_by_id(&self, profile_id: &str) -> Option<&ProfileInfo> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+    }
+
+    pub fn active_profile(&self) -> Option<&ProfileInfo> {
+        self.active_profile_id
+            .as_deref()
+            .and_then(|profile_id| self.profile_by_id(profile_id))
+    }
+
+    pub fn current_session_profile_id(&self) -> Option<&str> {
+        self.session_id
+            .as_deref()
+            .and_then(|session_id| self.session_profiles.get(session_id).map(String::as_str))
+    }
+
+    pub fn current_session_profile(&self) -> Option<&ProfileInfo> {
+        self.current_session_profile_id()
+            .and_then(|profile_id| self.profile_by_id(profile_id))
+    }
+
+    pub fn profile_display_name(&self, profile_id: &str) -> String {
+        self.profile_by_id(profile_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| profile_id.to_string())
+    }
+
+    fn profile_label_or(
+        &self,
+        profile_id: Option<&str>,
+        fallback: impl FnOnce() -> String,
+    ) -> String {
+        profile_id
+            .map(|profile_id| self.profile_display_name(profile_id))
+            .unwrap_or_else(fallback)
+    }
+
+    pub fn active_profile_label(&self) -> String {
+        self.profile_label_or(self.active_profile_id.as_deref(), || "default".to_string())
+    }
+
+    pub fn current_profile_label(&self) -> String {
+        self.profile_label_or(self.current_session_profile_id(), || {
+            self.active_profile_label()
+        })
+    }
+
+    pub fn filtered_profiles(&self) -> Vec<&ProfileInfo> {
+        if self.profile_filter.is_empty() {
+            self.profiles.iter().collect()
+        } else {
+            let matcher = SkimMatcherV2::default();
+            let mut scored: Vec<(i64, &ProfileInfo)> = self
+                .profiles
+                .iter()
+                .filter_map(|profile| {
+                    let score = [
+                        matcher.fuzzy_match(&profile.name, &self.profile_filter),
+                        matcher.fuzzy_match(&profile.id, &self.profile_filter),
+                        profile.description.as_deref().and_then(|description| {
+                            matcher.fuzzy_match(description, &self.profile_filter)
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                    score.map(|s| (s, profile))
+                })
+                .collect();
+            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
+            scored.into_iter().map(|(_, profile)| profile).collect()
+        }
+    }
+
+    pub fn move_profile_cursor(&mut self, delta: isize) {
+        self.profile_cursor =
+            move_wrapping_cursor(self.profile_cursor, self.filtered_profiles().len(), delta);
+    }
+
+    pub fn selected_profile(&self) -> Option<&ProfileInfo> {
+        self.filtered_profiles().get(self.profile_cursor).copied()
+    }
+
+    pub fn open_profile_popup(&mut self) {
+        self.popup = Popup::ProfileSelect;
+        self.profile_filter.clear();
+        self.profile_cursor = self
+            .active_profile_id
+            .as_deref()
+            .and_then(|active_id| {
+                self.profiles
+                    .iter()
+                    .position(|profile| profile.id == active_id)
+            })
+            .unwrap_or(0);
+    }
+
+    pub fn find_profile_id(&self, query: &str) -> Option<String> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == needle || profile.name.eq_ignore_ascii_case(needle))
+            .map(|profile| profile.id.clone())
     }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
@@ -1741,12 +1872,8 @@ impl App {
     }
 
     pub fn move_fork_cursor(&mut self, delta: isize) {
-        let len = self.visible_fork_turns().len();
-        if len == 0 {
-            self.fork_cursor = 0;
-            return;
-        }
-        self.fork_cursor = (self.fork_cursor as isize + delta).rem_euclid(len as isize) as usize;
+        self.fork_cursor =
+            move_wrapping_cursor(self.fork_cursor, self.visible_fork_turns().len(), delta);
     }
 
     pub fn fork_filter_insert(&mut self, c: char) {
@@ -2382,6 +2509,52 @@ mod reasoning_effort_tests {
     }
 
     // ── state message populates reasoning_effort ──────────────────────────────
+
+    #[test]
+    fn state_msg_sets_profiles() {
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "state".into(),
+            data: Some(serde_json::json!({
+                "active_session_id": null,
+                "agents": [],
+                "profiles": [
+                    {"id": "fast", "name": "Fast", "tags": ["quick"], "config_kind": "single"}
+                ],
+                "active_profile_id": "fast"
+            })),
+        });
+
+        assert_eq!(app.profiles.len(), 1);
+        assert_eq!(app.profiles[0].id, "fast");
+        assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn session_messages_track_profile_binding() {
+        let mut app = App::new();
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "agent",
+                "request_id": null,
+                "profile_id": "fast"
+            })),
+        });
+        assert_eq!(app.current_session_profile_id(), Some("fast"));
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "event".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "agent",
+                "profile_id": "quorum",
+                "event": {"type": "durable", "data": {"kind": {"type": "turn_started"}}}
+            })),
+        });
+        assert_eq!(app.current_session_profile_id(), Some("quorum"));
+    }
 
     #[test]
     fn state_msg_sets_reasoning_effort() {

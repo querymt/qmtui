@@ -713,7 +713,22 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
     if app.parent_session_id.is_some() {
         left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
     }
-    left_spans.push(Span::styled(format!(" {}", app.status), Theme::status()));
+    let profile_label = app.current_profile_label();
+    let active_profile_id = app.active_profile_id.as_deref();
+    let current_profile_id = app.current_session_profile_id();
+    let profile_text = if current_profile_id.is_some()
+        && active_profile_id.is_some()
+        && current_profile_id != active_profile_id
+    {
+        format!(
+            " profile:{} (new:{}) ",
+            profile_label,
+            app.active_profile_label()
+        )
+    } else {
+        format!(" profile:{} ", profile_label)
+    };
+    left_spans.push(Span::styled(profile_text, Theme::status()));
 
     (left_spans, right_spans)
 }

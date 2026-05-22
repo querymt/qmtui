@@ -1844,6 +1844,7 @@ async fn run_loop(
                         if app.conn == app::ConnState::Connected {
                             cmd_tx.send(ClientMsg::Init)?;
                             cmd_tx.send(ClientMsg::list_sessions_browse())?;
+                            cmd_tx.send(ClientMsg::ListProfiles)?;
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
                             cmd_tx.send(ClientMsg::GetAgentMode)?;
                             if let Some(session_id) = app.session_id.clone() {
@@ -2979,7 +2980,8 @@ mod session_popup_key_tests {
             rx.try_recv(),
             Ok(ClientMsg::NewSession {
                 cwd: Some(ref cwd),
-                request_id: None
+                request_id: None,
+                profile_id: None
             }) if cwd == "/launch"
         ));
     }
@@ -3005,7 +3007,8 @@ mod session_popup_key_tests {
             rx.try_recv(),
             Ok(ClientMsg::NewSession {
                 cwd: Some(ref cwd),
-                request_id: None
+                request_id: None,
+                profile_id: None
             }) if cwd == "/launch/proj/subdir"
         ));
     }

@@ -30,6 +30,11 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         chat_only: false,
     },
     SlashCommandDef {
+        name: "profile",
+        description: "set profile [id or name]",
+        chat_only: false,
+    },
+    SlashCommandDef {
         name: "sessions",
         description: "open session switcher",
         chat_only: false,

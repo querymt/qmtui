@@ -278,6 +278,11 @@ impl App {
                 if let Some(data) = raw.data
                     && let Ok(state) = serde_json::from_value::<StateData>(data)
                 {
+                    self.profiles = state.profiles;
+                    self.active_profile_id = state.active_profile_id;
+                    if self.profile_cursor >= self.profiles.len() {
+                        self.profile_cursor = self.profiles.len().saturating_sub(1);
+                    }
                     self.agent_id = state.agents.first().map(|a| a.id.clone());
                     self.agents = state.agents;
                     if let Some(mode) = state.agent_mode {
@@ -547,6 +552,10 @@ impl App {
                     && let Ok(sc) = serde_json::from_value::<SessionCreatedData>(data)
                 {
                     self.session_id = Some(sc.session_id.clone());
+                    if let Some(profile_id) = sc.profile_id.clone() {
+                        self.session_profiles
+                            .insert(sc.session_id.clone(), profile_id);
+                    }
                     self.agent_id = Some(sc.agent_id);
                     self.messages.clear();
                     self.streaming_content.clear();
@@ -628,6 +637,10 @@ impl App {
                                         .find(|s| s.session_id == sl.session_id)
                                         .and_then(|s| s.parent_session_id.clone())
                                 });
+                            if let Some(profile_id) = sl.profile_id.clone() {
+                                self.session_profiles
+                                    .insert(sl.session_id.clone(), profile_id);
+                            }
                             self.session_id = Some(sl.session_id);
                             self.agent_id = Some(sl.agent_id);
                             self.messages.clear();
@@ -706,6 +719,10 @@ impl App {
             "session_events" => {
                 if let Some(data) = raw.data {
                     if let Ok(parsed) = serde_json::from_value::<SessionEventsData>(data.clone()) {
+                        if let Some(profile_id) = parsed.profile_id.clone() {
+                            self.session_profiles
+                                .insert(parsed.session_id.clone(), profile_id);
+                        }
                         let unknown_kinds =
                             unknown_event_kind_types_from_session_events_data(&data);
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
@@ -740,6 +757,10 @@ impl App {
                                 );
                             }
                             Ok(se) => {
+                                if let Some(profile_id) = se.profile_id.clone() {
+                                    self.session_profiles
+                                        .insert(se.session_id.clone(), profile_id);
+                                }
                                 let is_current =
                                     self.session_id.as_deref() == Some(se.session_id.as_str());
                                 if is_current {
@@ -784,6 +805,10 @@ impl App {
             "event" => {
                 if let Some(data) = raw.data {
                     if let Ok(parsed) = serde_json::from_value::<EventData>(data.clone()) {
+                        if let Some(profile_id) = parsed.profile_id.clone() {
+                            self.session_profiles
+                                .insert(parsed.session_id.clone(), profile_id);
+                        }
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
                             self.note_session_activity(&parsed.session_id);
                             self.handle_event(&parsed.event);
@@ -795,6 +820,10 @@ impl App {
                             self.note_session_activity(&parsed.session_id);
                         }
                     } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
+                        if let Some(profile_id) = ed.profile_id.clone() {
+                            self.session_profiles
+                                .insert(ed.session_id.clone(), profile_id);
+                        }
                         let is_current = self.session_id.as_deref() == Some(ed.session_id.as_str());
                         if is_current {
                             self.note_session_activity(&ed.session_id);

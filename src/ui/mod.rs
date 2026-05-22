@@ -6,7 +6,7 @@ pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup, draw_model_popup,
-    draw_new_session_popup, draw_session_popup, draw_theme_popup,
+    draw_new_session_popup, draw_profile_popup, draw_session_popup, draw_theme_popup,
 };
 use start::draw_start;
 
@@ -314,6 +314,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::Log => draw_log_popup(f, app),
         Popup::ProviderAuth => draw_auth_popup(f, app),
         Popup::ForkTurnSelect => draw_fork_turn_popup(f, app),
+        Popup::ProfileSelect => draw_profile_popup(f, app),
         Popup::None => {}
     }
 }
