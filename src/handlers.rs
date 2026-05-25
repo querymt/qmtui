@@ -329,6 +329,10 @@ pub(crate) fn handle_key(
             handle_fork_turn_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
         }
+        Popup::ProfileSelect => {
+            handle_profile_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
 
         Popup::None => {}
     }
@@ -440,6 +444,13 @@ pub(crate) fn handle_chord(
         }
 
         KeyCode::Char('p') => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_profile_popup();
+            cmd_tx.send(ClientMsg::ListProfiles)?;
+        }
+        KeyCode::Char('j') => {
             if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
                 app.set_status(
                     app::LogLevel::Warn,
@@ -1089,6 +1100,41 @@ pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Resu
     Ok(())
 }
 
+pub(crate) fn handle_profile_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.popup = Popup::None;
+        }
+        KeyCode::Up => app.move_profile_cursor(-1),
+        KeyCode::Down => app.move_profile_cursor(1),
+        KeyCode::Backspace => {
+            app.profile_filter.pop();
+            app.profile_cursor = 0;
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.profile_filter.push(c);
+            app.profile_cursor = 0;
+        }
+        KeyCode::Enter => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            if let Some(profile_id) = app.selected_profile().map(|profile| profile.id.clone()) {
+                cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
+                app.popup = Popup::None;
+            } else {
+                app.set_status(app::LogLevel::Warn, "profile", "no matching profile");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_new_session_popup_key(
     app: &mut App,
     key: KeyEvent,
@@ -1145,6 +1191,7 @@ pub(crate) fn handle_new_session_popup_key(
             cmd_tx.send(ClientMsg::NewSession {
                 cwd,
                 request_id: None,
+                profile_id: app.active_profile_id.clone(),
             })?;
         }
         _ => {}
@@ -1585,6 +1632,24 @@ fn try_execute_slash_command(
             app.popup = crate::app::Popup::ThemeSelect;
             app.theme_filter.clear();
             app.theme_cursor = crate::theme::Theme::current_index();
+        }
+        "profile" => {
+            app.take_input();
+            if !can_send_server_commands(app) {
+                return Ok(SlashResult::Handled);
+            }
+            if arg.is_empty() {
+                app.open_profile_popup();
+                cmd_tx.send(ClientMsg::ListProfiles)?;
+            } else if let Some(profile_id) = app.find_profile_id(&arg) {
+                cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
+            } else {
+                app.set_status(
+                    app::LogLevel::Warn,
+                    "profile",
+                    format!("unknown profile: {}", arg),
+                );
+            }
         }
         "sessions" => {
             app.take_input();
@@ -2274,7 +2339,7 @@ mod model_popup_tests {
     use super::*;
     use crate::app::{App, Popup};
     use crate::config::TestPersistenceGuard;
-    use crate::protocol::ModelEntry;
+    use crate::protocol::{ModelEntry, ProfileInfo};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -2292,6 +2357,68 @@ mod model_popup_tests {
             family: None,
             quant: None,
         }
+    }
+
+    fn make_profile(id: &str, name: &str) -> ProfileInfo {
+        ProfileInfo {
+            id: id.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slash_profile_without_arg_opens_selector_and_lists_profiles() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.screen = Screen::Chat;
+        app.input = "/profile".into();
+        app.input_cursor = app.input.len();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(action, AppAction::None));
+        assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListProfiles)));
+    }
+
+    #[test]
+    fn slash_profile_with_arg_sends_set_active_profile_without_optimistic_update() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.screen = Screen::Chat;
+        app.profiles = vec![make_profile("fast", "Fast")];
+        app.active_profile_id = Some("old".into());
+        app.input = "/profile Fast".into();
+        app.input_cursor = app.input.len();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetActiveProfile { profile_id }) if profile_id == "fast"
+        ));
+        assert_eq!(app.active_profile_id.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn profile_popup_enter_sends_selected_profile() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::ProfileSelect;
+        app.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
+        app.profile_cursor = 1;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::None));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetActiveProfile { profile_id }) if profile_id == "deep"
+        ));
     }
 
     #[test]

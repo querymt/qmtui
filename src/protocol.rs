@@ -37,9 +37,15 @@ pub enum ClientMsg {
     SetReasoningEffort {
         reasoning_effort: String,
     },
+    ListProfiles,
+    SetActiveProfile {
+        profile_id: String,
+    },
     NewSession {
         cwd: Option<String>,
         request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
     },
     LoadSession {
         session_id: String,
@@ -224,6 +230,55 @@ mod client_msg_tests {
             })
         );
     }
+
+    #[test]
+    fn profile_messages_serialize() {
+        let list = serde_json::to_value(ClientMsg::ListProfiles).unwrap();
+        assert_eq!(list, json!({ "type": "list_profiles" }));
+
+        let set = serde_json::to_value(ClientMsg::SetActiveProfile {
+            profile_id: "fast".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            set,
+            json!({
+                "type": "set_active_profile",
+                "data": { "profile_id": "fast" }
+            })
+        );
+    }
+
+    #[test]
+    fn new_session_serializes_optional_profile_id() {
+        let without_profile = serde_json::to_value(ClientMsg::NewSession {
+            cwd: None,
+            request_id: None,
+            profile_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            without_profile,
+            json!({
+                "type": "new_session",
+                "data": { "cwd": null, "request_id": null }
+            })
+        );
+
+        let with_profile = serde_json::to_value(ClientMsg::NewSession {
+            cwd: Some("/repo".to_string()),
+            request_id: None,
+            profile_id: Some("fast".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            with_profile,
+            json!({
+                "type": "new_session",
+                "data": { "cwd": "/repo", "request_id": null, "profile_id": "fast" }
+            })
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -249,6 +304,10 @@ pub struct RawServerMsg {
 #[derive(Debug, Deserialize)]
 pub struct StateData {
     pub active_session_id: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<ProfileInfo>,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
     pub agents: Vec<AgentInfo>,
     pub agent_mode: Option<String>,
     /// Current reasoning effort level. `None` means "auto". Absent key means
@@ -287,6 +346,20 @@ pub struct ReasoningEffortData {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub config_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
@@ -298,6 +371,8 @@ pub struct SessionCreatedData {
     pub agent_id: String,
     pub session_id: String,
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -385,6 +460,8 @@ pub struct SessionLoadedData {
     pub audit: serde_json::Value,
     #[serde(default)]
     pub undo_stack: Vec<UndoStackFrame>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -460,6 +537,8 @@ mod fork_result_tests {
 pub struct EventData {
     pub agent_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub event: EventEnvelope,
 }
 
@@ -469,6 +548,8 @@ pub struct EventData {
 pub struct EventDataRaw {
     pub agent_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub event: serde_json::Value,
 }
 
@@ -476,6 +557,8 @@ pub struct EventDataRaw {
 pub struct SessionEventsData {
     pub session_id: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -485,6 +568,8 @@ pub struct SessionEventsData {
 pub struct SessionEventsDataRaw {
     pub session_id: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub events: Vec<serde_json::Value>,
 }
 

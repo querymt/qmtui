@@ -191,7 +191,10 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         f,
         app,
         outer[0],
-        vec![Span::styled(format!(" {}", app.status), Theme::status())],
+        vec![Span::styled(
+            format!(" profile:{} ", app.active_profile_label()),
+            Theme::status(),
+        )],
         vec![],
     );
 
