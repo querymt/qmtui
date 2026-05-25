@@ -1195,11 +1195,11 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
                     Cell::from(Span::styled(source, Theme::status_accent())),
                     Cell::from(Span::styled(
                         truncate_with_ellipsis(&name, name_w),
-                        Theme::input(),
+                        Theme::popup_bg(),
                     )),
                     Cell::from(Span::styled(
                         truncate_with_ellipsis(&kind, kind_w),
-                        Theme::status(),
+                        Theme::profile_kind(&kind),
                     )),
                     Cell::from(Span::styled(
                         truncate_with_ellipsis(&description, desc_w),

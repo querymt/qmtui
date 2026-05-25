@@ -315,6 +315,14 @@ impl Theme {
     pub fn popup_bg() -> Style {
         Style::default().fg(Self::fg()).bg(Self::bg_dim())
     }
+    pub fn profile_kind(kind: &str) -> Style {
+        let fg = match kind {
+            "single" => Self::info(),
+            "quorum" => Self::accent(),
+            _ => Self::dim(),
+        };
+        Style::default().fg(fg).bg(Self::bg_dim())
+    }
     pub fn popup_title() -> Style {
         Style::default()
             .fg(Self::magenta())
@@ -486,5 +494,22 @@ mod tests {
         // Reset
         Theme::set_by_index(0);
         Theme::begin_frame();
+    }
+
+    #[test]
+    fn profile_kind_uses_popup_background_and_kind_colors() {
+        Theme::begin_frame();
+
+        let single = Theme::profile_kind("single");
+        assert_eq!(single.fg, Some(Theme::info()));
+        assert_eq!(single.bg, Some(Theme::bg_dim()));
+
+        let quorum = Theme::profile_kind("quorum");
+        assert_eq!(quorum.fg, Some(Theme::accent()));
+        assert_eq!(quorum.bg, Some(Theme::bg_dim()));
+
+        let other = Theme::profile_kind("other");
+        assert_eq!(other.fg, Some(Theme::dim()));
+        assert_eq!(other.bg, Some(Theme::bg_dim()));
     }
 }
