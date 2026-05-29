@@ -1848,13 +1848,26 @@ async fn run_loop(
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
                             cmd_tx.send(ClientMsg::GetAgentMode)?;
                             if let Some(session_id) = app.session_id.clone() {
-                                cmd_tx.send(ClientMsg::LoadSession {
-                                    session_id: session_id.clone(),
-                                })?;
-                                cmd_tx.send(ClientMsg::SubscribeSession {
-                                    session_id,
-                                    agent_id: app.agent_id.clone(),
-                                })?;
+                                if let Some(node_id) = app.session_remote_node_id(&session_id) {
+                                    cmd_tx.send(ClientMsg::AttachRemoteSession {
+                                        node_id: node_id.to_string(),
+                                        session_id,
+                                    })?;
+                                } else if app.is_remote_session_id(&session_id) {
+                                    app.set_status(
+                                        app::LogLevel::Warn,
+                                        "session",
+                                        "remote session is missing node id; reconnect attach skipped",
+                                    );
+                                } else {
+                                    cmd_tx.send(ClientMsg::LoadSession {
+                                        session_id: session_id.clone(),
+                                    })?;
+                                    cmd_tx.send(ClientMsg::SubscribeSession {
+                                        session_id,
+                                        agent_id: app.agent_id.clone(),
+                                    })?;
+                                }
                             }
                         } else if was_connected && app.conn == app::ConnState::Disconnected {
                             app.set_status(
@@ -2123,6 +2136,56 @@ mod sessions_key_tests {
                 agent_id: None,
             }
         );
+    }
+
+    #[test]
+    fn enter_on_remote_label_without_node_id_is_noop() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.session_groups[0].sessions[0].node = Some("remote node".into());
+        app.session_cursor = 1;
+
+        let action = apply_sessions_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, SessionKeyAction::None);
+    }
+
+    #[test]
+    fn enter_on_remote_session_remembers_node_id_for_reconnect() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.session_cursor = 1;
+
+        let action = apply_sessions_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::AttachRemoteSession {
+                node_id: "node-1".into(),
+                session_id: "remote-1".into(),
+            }
+        );
+        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
+    }
+
+    #[test]
+    fn delete_on_remote_session_returns_dismiss_action_and_removes() {
+        let mut app = App::new();
+        app.session_groups = vec![make_group(Some("/a"), &["remote-1", "s2"])];
+        app.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.session_cursor = 1;
+
+        let action = apply_sessions_key(&mut app, KeyCode::Delete);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::DismissRemoteSession {
+                session_id: "remote-1".into()
+            }
+        );
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+        assert_eq!(app.session_groups[0].sessions[0].session_id, "s2");
     }
 
     #[test]
@@ -2580,6 +2643,26 @@ mod session_popup_key_tests {
             }
         );
         assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn popup_delete_on_remote_session_returns_dismiss_and_removes() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![make_group(Some("/a"), &["remote-1", "s2"])];
+        app.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.session_cursor = 1;
+
+        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::DismissRemoteSession {
+                session_id: "remote-1".into()
+            }
+        );
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+        assert_eq!(app.session_groups[0].sessions[0].session_id, "s2");
     }
 
     // ── Enter with all groups shows all sessions (no cap) ─────────────────────

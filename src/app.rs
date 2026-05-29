@@ -922,6 +922,8 @@ pub struct App {
     pub new_session_cursor: usize,
     pub new_session_completion: Option<PathCompletionState>,
     pub session_activity: HashMap<String, SessionActivity>,
+    /// Remote sessions the user attached/dismissed before the refreshed list arrives.
+    pub remote_session_nodes: HashMap<String, String>,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -1162,6 +1164,7 @@ impl App {
             new_session_cursor: 0,
             new_session_completion: None,
             session_activity: HashMap::new(),
+            remote_session_nodes: HashMap::new(),
             messages: Vec::new(),
             input: String::new(),
             input_cursor: 0,
@@ -1520,7 +1523,11 @@ impl App {
 
     pub fn current_profile_label(&self) -> String {
         self.profile_label_or(self.current_session_profile_id(), || {
-            self.active_profile_label()
+            if self.current_session_is_remote() {
+                "remote".to_string()
+            } else {
+                self.active_profile_label()
+            }
         })
     }
 
@@ -2554,6 +2561,41 @@ mod reasoning_effort_tests {
             })),
         });
         assert_eq!(app.current_session_profile_id(), Some("quorum"));
+    }
+
+    #[test]
+    fn remote_session_profile_none_clears_stale_binding_and_label() {
+        let mut app = App::new();
+        app.profiles = vec![ProfileInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            ..Default::default()
+        }];
+        app.active_profile_id = Some("fast".into());
+        app.session_profiles
+            .insert("remote-1".into(), "fast".into());
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
+                session_id: "remote-1".into(),
+                node_id: Some("node-1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "remote-1",
+                "agent_id": "agent",
+                "audit": [],
+                "undo_stack": [],
+                "profile_id": null
+            })),
+        });
+
+        assert_eq!(app.current_session_profile_id(), None);
+        assert_eq!(app.current_profile_label(), "remote");
     }
 
     #[test]
@@ -5444,6 +5486,140 @@ mod session_mode_tests {
             "expected SetSessionModel in {cmds:?}"
         );
         assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
+    }
+
+    #[test]
+    fn remote_session_loaded_does_not_restore_model_from_session_cache() {
+        let mut app = App::new();
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
+                session_id: "s1".into(),
+                node_id: Some("node-1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.remember_remote_session_node("s1", "node-1");
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            CachedModeState {
+                model: "anthropic/claude-opus".into(),
+                effort: Some("max".into()),
+            },
+        );
+        app.models = vec![ModelEntry {
+            id: "anthropic/claude-opus".into(),
+            label: "claude-opus".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+
+        let audit = make_audit(&[
+            provider_changed_event("anthropic", "claude-sonnet"),
+            mode_changed_event("plan"),
+        ]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected no SetSessionModel for remote load: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "expected no SetReasoningEffort for remote load: {cmds:?}"
+        );
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn remembered_remote_session_loaded_skips_cache_before_list_refresh() {
+        let mut app = App::new();
+        app.remember_remote_session_node("s1", "node-1");
+        app.session_cache.entry("s1".into()).or_default().insert(
+            "plan".into(),
+            CachedModeState {
+                model: "anthropic/claude-opus".into(),
+                effort: Some("max".into()),
+            },
+        );
+        app.models = vec![ModelEntry {
+            id: "anthropic/claude-opus".into(),
+            label: "claude-opus".into(),
+            provider: "anthropic".into(),
+            model: "claude-opus".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+
+        let audit = make_audit(&[
+            provider_changed_event("anthropic", "claude-sonnet"),
+            mode_changed_event("plan"),
+        ]);
+        let cmds = app.handle_server_msg(make_session_loaded(audit));
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected no SetSessionModel for remembered remote load: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "expected no SetReasoningEffort for remembered remote load: {cmds:?}"
+        );
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn remote_session_created_does_not_apply_mode_model_preference() {
+        let mut app = App::new();
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
+                session_id: "s1".into(),
+                node_id: Some("node-1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.models = vec![crate::protocol::ModelEntry {
+            id: "anthropic/claude-sonnet".into(),
+            label: "claude-sonnet".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            node_id: None,
+            family: None,
+            quant: None,
+        }];
+        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
+
+        let cmds = app.handle_server_msg(RawServerMsg {
+            msg_type: "session_created".into(),
+            data: Some(serde_json::json!({
+                "session_id": "s1",
+                "agent_id": "a1",
+                "request_id": null,
+                "profile_id": null
+            })),
+        });
+
+        assert!(
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
+            "expected no SetSessionModel for remote create: {cmds:?}"
+        );
+        assert_eq!(app.current_provider, None);
+        assert_eq!(app.current_model, None);
     }
 
     #[test]

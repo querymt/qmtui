@@ -66,6 +66,66 @@ fn fork_browsing_child(session: &SessionSummary) -> bool {
 }
 
 impl App {
+    pub fn session_summary_by_id(&self, session_id: &str) -> Option<&SessionSummary> {
+        fn find<'a>(
+            sessions: &'a [SessionSummary],
+            session_id: &str,
+        ) -> Option<&'a SessionSummary> {
+            for session in sessions {
+                if session.session_id == session_id {
+                    return Some(session);
+                }
+                if let Some(child) = find(&session.children, session_id) {
+                    return Some(child);
+                }
+            }
+            None
+        }
+
+        self.session_groups
+            .iter()
+            .find_map(|group| find(&group.sessions, session_id))
+    }
+
+    pub fn remember_remote_session_node(&mut self, session_id: &str, node_id: &str) {
+        self.remote_session_nodes
+            .insert(session_id.to_string(), node_id.to_string());
+    }
+
+    pub fn session_remote_node_id(&self, session_id: &str) -> Option<&str> {
+        self.session_summary_by_id(session_id)
+            .and_then(|session| session.node_id.as_deref())
+            .or_else(|| {
+                self.remote_session_nodes
+                    .get(session_id)
+                    .map(String::as_str)
+            })
+    }
+
+    pub fn is_remote_session_id(&self, session_id: &str) -> bool {
+        self.session_remote_node_id(session_id).is_some()
+            || self
+                .session_summary_by_id(session_id)
+                .map(|session| session.node.is_some())
+                .unwrap_or(false)
+    }
+
+    pub fn current_session_is_remote(&self) -> bool {
+        self.session_id
+            .as_deref()
+            .map(|session_id| self.is_remote_session_id(session_id))
+            .unwrap_or(false)
+    }
+
+    pub fn apply_session_profile_binding(&mut self, session_id: &str, profile_id: Option<String>) {
+        if let Some(profile_id) = profile_id {
+            self.session_profiles
+                .insert(session_id.to_string(), profile_id);
+        } else if self.is_remote_session_id(session_id) {
+            self.session_profiles.remove(session_id);
+        }
+    }
+
     pub fn session_by_path(&self, group_idx: usize, path: &[usize]) -> Option<&SessionSummary> {
         let (first, rest) = path.split_first()?;
         let mut session = self.session_groups.get(group_idx)?.sessions.get(*first)?;
@@ -138,6 +198,18 @@ impl App {
                 .into_iter()
                 .filter(fork_browsing_child)
                 .collect();
+            let remote_nodes: Vec<(String, String)> = sessions
+                .iter()
+                .filter_map(|session| {
+                    Some((
+                        session.session_id.clone(),
+                        session.node_id.as_ref()?.clone(),
+                    ))
+                })
+                .collect();
+            for (session_id, node_id) in remote_nodes {
+                self.remote_session_nodes.insert(session_id, node_id);
+            }
             let append = had_pending_request
                 && !parent.children.is_empty()
                 && parent.children_next_cursor.is_some();

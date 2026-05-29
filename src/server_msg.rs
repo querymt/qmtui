@@ -467,6 +467,11 @@ impl App {
 
                     // Sort sessions within each group by updated_at descending.
                     for group in &mut groups {
+                        for session in &group.sessions {
+                            if let Some(node_id) = session.node_id.as_deref() {
+                                self.remember_remote_session_node(&session.session_id, node_id);
+                            }
+                        }
                         group
                             .sessions
                             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -552,10 +557,7 @@ impl App {
                     && let Ok(sc) = serde_json::from_value::<SessionCreatedData>(data)
                 {
                     self.session_id = Some(sc.session_id.clone());
-                    if let Some(profile_id) = sc.profile_id.clone() {
-                        self.session_profiles
-                            .insert(sc.session_id.clone(), profile_id);
-                    }
+                    self.apply_session_profile_binding(&sc.session_id, sc.profile_id.clone());
                     self.agent_id = Some(sc.agent_id);
                     self.messages.clear();
                     self.streaming_content.clear();
@@ -589,9 +591,10 @@ impl App {
                         session_id: sc.session_id,
                         agent_id: self.agent_id.clone(),
                     }];
-                    // Auto-apply mode model preference for the initial mode.
-                    if let Some((provider, model)) =
-                        self.get_mode_model_preference(&self.agent_mode)
+                    // Auto-apply mode model preference for local sessions only.
+                    if !self.current_session_is_remote()
+                        && let Some((provider, model)) =
+                            self.get_mode_model_preference(&self.agent_mode)
                     {
                         let provider = provider.to_string();
                         let model = model.to_string();
@@ -637,10 +640,10 @@ impl App {
                                         .find(|s| s.session_id == sl.session_id)
                                         .and_then(|s| s.parent_session_id.clone())
                                 });
-                            if let Some(profile_id) = sl.profile_id.clone() {
-                                self.session_profiles
-                                    .insert(sl.session_id.clone(), profile_id);
-                            }
+                            self.apply_session_profile_binding(
+                                &sl.session_id,
+                                sl.profile_id.clone(),
+                            );
                             self.session_id = Some(sl.session_id);
                             self.agent_id = Some(sl.agent_id);
                             self.messages.clear();
@@ -705,8 +708,10 @@ impl App {
                             let mut cmds = vec![ClientMsg::SetAgentMode {
                                 mode: self.agent_mode.clone(),
                             }];
-                            // Restore cached model + effort for this session + mode.
-                            cmds.extend(self.apply_cached_mode_state());
+                            // Restore cached model + effort for local sessions only.
+                            if !self.current_session_is_remote() {
+                                cmds.extend(self.apply_cached_mode_state());
+                            }
                             // Drain any subscribe commands queued during audit replay
                             // (e.g. SubscribeSession for delegation child sessions).
                             cmds.extend(self.drain_pending());
@@ -719,10 +724,10 @@ impl App {
             "session_events" => {
                 if let Some(data) = raw.data {
                     if let Ok(parsed) = serde_json::from_value::<SessionEventsData>(data.clone()) {
-                        if let Some(profile_id) = parsed.profile_id.clone() {
-                            self.session_profiles
-                                .insert(parsed.session_id.clone(), profile_id);
-                        }
+                        self.apply_session_profile_binding(
+                            &parsed.session_id,
+                            parsed.profile_id.clone(),
+                        );
                         let unknown_kinds =
                             unknown_event_kind_types_from_session_events_data(&data);
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
@@ -757,10 +762,10 @@ impl App {
                                 );
                             }
                             Ok(se) => {
-                                if let Some(profile_id) = se.profile_id.clone() {
-                                    self.session_profiles
-                                        .insert(se.session_id.clone(), profile_id);
-                                }
+                                self.apply_session_profile_binding(
+                                    &se.session_id,
+                                    se.profile_id.clone(),
+                                );
                                 let is_current =
                                     self.session_id.as_deref() == Some(se.session_id.as_str());
                                 if is_current {
@@ -805,10 +810,10 @@ impl App {
             "event" => {
                 if let Some(data) = raw.data {
                     if let Ok(parsed) = serde_json::from_value::<EventData>(data.clone()) {
-                        if let Some(profile_id) = parsed.profile_id.clone() {
-                            self.session_profiles
-                                .insert(parsed.session_id.clone(), profile_id);
-                        }
+                        self.apply_session_profile_binding(
+                            &parsed.session_id,
+                            parsed.profile_id.clone(),
+                        );
                         if self.session_id.as_deref() == Some(parsed.session_id.as_str()) {
                             self.note_session_activity(&parsed.session_id);
                             self.handle_event(&parsed.event);
@@ -820,10 +825,7 @@ impl App {
                             self.note_session_activity(&parsed.session_id);
                         }
                     } else if let Ok(ed) = serde_json::from_value::<EventDataRaw>(data) {
-                        if let Some(profile_id) = ed.profile_id.clone() {
-                            self.session_profiles
-                                .insert(ed.session_id.clone(), profile_id);
-                        }
+                        self.apply_session_profile_binding(&ed.session_id, ed.profile_id.clone());
                         let is_current = self.session_id.as_deref() == Some(ed.session_id.as_str());
                         if is_current {
                             self.note_session_activity(&ed.session_id);

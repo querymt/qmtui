@@ -24,7 +24,29 @@ pub enum ClientMsg {
         cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         query: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        include_remote: Option<bool>,
         session_scope: SessionScope,
+    },
+    ListRemoteNodes,
+    ListRemoteSessions {
+        node_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offset: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    CreateRemoteSession {
+        node_id: String,
+        cwd: Option<String>,
+        request_id: Option<String>,
+    },
+    AttachRemoteSession {
+        node_id: String,
+        session_id: String,
+    },
+    DismissRemoteSession {
+        session_id: String,
     },
     ListSessionChildren {
         parent_session_id: String,
@@ -121,6 +143,7 @@ impl ClientMsg {
             limit: None,
             cwd: None,
             query: None,
+            include_remote: Some(true),
             session_scope: SessionScope::Root,
         }
     }
@@ -132,6 +155,7 @@ impl ClientMsg {
             limit: Some(limit),
             cwd: Some(cwd.unwrap_or_else(|| "__none__".to_string())),
             query: None,
+            include_remote: None,
             session_scope: SessionScope::Root,
         }
     }
@@ -163,8 +187,73 @@ mod client_msg_tests {
             json!({
                 "type": "list_sessions",
                 "data": {
+                    "include_remote": true,
                     "session_scope": "root"
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn list_sessions_group_omits_include_remote_for_pagination() {
+        let value = serde_json::to_value(ClientMsg::list_sessions_group(
+            Some("/workspace/project".to_string()),
+            "cursor-1".to_string(),
+            10,
+        ))
+        .unwrap();
+        assert!(value["data"].get("include_remote").is_none());
+    }
+
+    #[test]
+    fn remote_session_messages_serialize() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::ListRemoteNodes).unwrap(),
+            json!({ "type": "list_remote_nodes" })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMsg::ListRemoteSessions {
+                node_id: "node-1".to_string(),
+                offset: Some(20),
+                limit: Some(10),
+            })
+            .unwrap(),
+            json!({
+                "type": "list_remote_sessions",
+                "data": { "node_id": "node-1", "offset": 20, "limit": 10 }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMsg::CreateRemoteSession {
+                node_id: "node-1".to_string(),
+                cwd: Some("/repo".to_string()),
+                request_id: Some("req-1".to_string()),
+            })
+            .unwrap(),
+            json!({
+                "type": "create_remote_session",
+                "data": { "node_id": "node-1", "cwd": "/repo", "request_id": "req-1" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMsg::AttachRemoteSession {
+                node_id: "node-1".to_string(),
+                session_id: "s1".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "attach_remote_session",
+                "data": { "node_id": "node-1", "session_id": "s1" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientMsg::DismissRemoteSession {
+                session_id: "s1".to_string(),
+            })
+            .unwrap(),
+            json!({
+                "type": "dismiss_remote_session",
+                "data": { "session_id": "s1" }
             })
         );
     }

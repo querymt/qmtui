@@ -158,6 +158,9 @@ pub(crate) fn apply_mode_model_if_preferred(
     let Some(sid) = app.session_id.clone() else {
         return Ok(());
     };
+    if app.current_session_is_remote() {
+        return Ok(());
+    }
     let Some((provider, model)) = app.get_mode_model_preference(&app.agent_mode) else {
         return Ok(());
     };
@@ -593,8 +596,20 @@ pub(crate) fn handle_sessions_key(
                 agent_id: agent_id.or_else(|| app.agent_id.clone()),
             })?;
         }
+        SessionKeyAction::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            cmd_tx.send(ClientMsg::AttachRemoteSession {
+                node_id,
+                session_id,
+            })?;
+        }
         SessionKeyAction::DeleteSession { session_id } => {
             cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+        }
+        SessionKeyAction::DismissRemoteSession { session_id } => {
+            cmd_tx.send(ClientMsg::DismissRemoteSession { session_id })?;
         }
         SessionKeyAction::NewSession => {
             app.open_new_session_popup();
@@ -678,8 +693,20 @@ pub(crate) fn handle_session_popup_key(
                 agent_id: agent_id.or_else(|| app.agent_id.clone()),
             })?;
         }
+        SessionKeyAction::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            cmd_tx.send(ClientMsg::AttachRemoteSession {
+                node_id,
+                session_id,
+            })?;
+        }
         SessionKeyAction::DeleteSession { session_id } => {
             cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+        }
+        SessionKeyAction::DismissRemoteSession { session_id } => {
+            cmd_tx.send(ClientMsg::DismissRemoteSession { session_id })?;
         }
         SessionKeyAction::LoadMoreSessions {
             group_idx,
@@ -746,13 +773,29 @@ pub(crate) fn apply_popup_session_key(
                     PopupItem::Session {
                         group_idx, path, ..
                     } => {
-                        let sid = app
-                            .session_by_path(group_idx, &path)
-                            .map(|session| session.session_id.clone());
-                        if let Some(sid) = sid {
+                        let session = app.session_by_path(group_idx, &path).cloned();
+                        if let Some(session) = session {
                             app.popup = Popup::None;
+                            let session_id = session.session_id;
+                            if let Some(node_id) =
+                                app.session_remote_node_id(&session_id).map(str::to_string)
+                            {
+                                app.remember_remote_session_node(&session_id, &node_id);
+                                return SessionKeyAction::AttachRemoteSession {
+                                    node_id,
+                                    session_id,
+                                };
+                            }
+                            if app.is_remote_session_id(&session_id) {
+                                app.set_status(
+                                    app::LogLevel::Warn,
+                                    "session",
+                                    "remote session is missing node id; refresh sessions and try again",
+                                );
+                                return SessionKeyAction::None;
+                            }
                             return SessionKeyAction::LoadSession {
-                                session_id: sid,
+                                session_id,
                                 agent_id: None,
                             };
                         }
@@ -775,12 +818,11 @@ pub(crate) fn apply_popup_session_key(
                 group_idx, path, ..
             }) = items.get(app.session_cursor).cloned()
             {
-                let Some(sid) = app
-                    .session_by_path(group_idx, &path)
-                    .map(|session| session.session_id.clone())
-                else {
+                let Some(session) = app.session_by_path(group_idx, &path).cloned() else {
                     return SessionKeyAction::None;
                 };
+                let sid = session.session_id;
+                let is_remote = app.is_remote_session_id(&sid);
                 // Optimistic remove
                 if path.len() == 1 {
                     app.session_groups[group_idx].sessions.remove(path[0]);
@@ -796,7 +838,11 @@ pub(crate) fn apply_popup_session_key(
                 if new_len > 0 && app.session_cursor >= new_len {
                     app.session_cursor = new_len - 1;
                 }
-                return SessionKeyAction::DeleteSession { session_id: sid };
+                return if is_remote {
+                    SessionKeyAction::DismissRemoteSession { session_id: sid }
+                } else {
+                    SessionKeyAction::DeleteSession { session_id: sid }
+                };
             }
             // Delete on a GroupHeader: no-op
         }
@@ -925,7 +971,9 @@ pub(crate) fn handle_delegate_popup_key(
             })?;
         }
         SessionKeyAction::NewSession
+        | SessionKeyAction::AttachRemoteSession { .. }
         | SessionKeyAction::DeleteSession { .. }
+        | SessionKeyAction::DismissRemoteSession { .. }
         | SessionKeyAction::LoadMoreSessions { .. }
         | SessionKeyAction::None => {}
     }
@@ -2134,25 +2182,28 @@ pub(crate) fn handle_model_popup_key(
                 if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
                     // Mode tab (plan / build / review): store preference for that mode
                     app.set_mode_model_preference(mode, &model.provider, &model.model);
+                    let current_is_remote = app.current_session_is_remote();
                     if app.agent_mode == mode {
-                        // If current mode matches, also apply to the live session
-                        if let Some(sid) = app.session_id.clone() {
-                            cmd_tx.send(ClientMsg::SetSessionModel {
-                                session_id: sid,
-                                model_id: model.id.clone(),
-                                node_id: model.node_id.clone(),
-                            })?;
+                        if !current_is_remote {
+                            // If current mode matches, also apply to the live session.
+                            if let Some(sid) = app.session_id.clone() {
+                                cmd_tx.send(ClientMsg::SetSessionModel {
+                                    session_id: sid,
+                                    model_id: model.id.clone(),
+                                    node_id: model.node_id.clone(),
+                                })?;
+                            }
+                            app.current_model = Some(model.model.clone());
+                            app.current_provider = Some(model.provider.clone());
+                            if app.reasoning_effort.is_some() {
+                                app.reasoning_effort = None;
+                                cmd_tx.send(ClientMsg::SetReasoningEffort {
+                                    reasoning_effort: "auto".into(),
+                                })?;
+                            }
+                            app.cache_session_mode_state();
                         }
-                        app.current_model = Some(model.model.clone());
-                        app.current_provider = Some(model.provider.clone());
-                        if app.reasoning_effort.is_some() {
-                            app.reasoning_effort = None;
-                            cmd_tx.send(ClientMsg::SetReasoningEffort {
-                                reasoning_effort: "auto".into(),
-                            })?;
-                        }
-                        app.cache_session_mode_state();
-                    } else {
+                    } else if !current_is_remote {
                         // Update the session cache for the target mode so that a later
                         // switch_mode does not restore a stale cached model.
                         app.update_cached_mode_model(mode, &model.provider, &model.model);
@@ -2208,13 +2259,17 @@ pub(crate) fn handle_model_popup_key(
 pub(crate) enum SessionKeyAction {
     /// Nothing to send to the server.
     None,
-    /// Load the session with the given id and subscribe to it.
+    /// Load the local session with the given id and subscribe to it.
     LoadSession {
         session_id: String,
         agent_id: Option<String>,
     },
-    /// Delete the session with the given id.
+    /// Attach a remote session through its node.
+    AttachRemoteSession { node_id: String, session_id: String },
+    /// Delete the local session with the given id.
     DeleteSession { session_id: String },
+    /// Dismiss the remote session from this TUI.
+    DismissRemoteSession { session_id: String },
     /// Create a new session.
     NewSession,
     /// Load the next session page for a cwd group or fork children for a parent path.
@@ -2267,12 +2322,27 @@ pub(crate) fn apply_sessions_key(
                     StartPageItem::Session {
                         group_idx, path, ..
                     } => {
-                        if let Some(sid) = app
-                            .session_by_path(group_idx, &path)
-                            .map(|session| session.session_id.clone())
-                        {
+                        if let Some(session) = app.session_by_path(group_idx, &path).cloned() {
+                            let session_id = session.session_id;
+                            if let Some(node_id) =
+                                app.session_remote_node_id(&session_id).map(str::to_string)
+                            {
+                                app.remember_remote_session_node(&session_id, &node_id);
+                                return SessionKeyAction::AttachRemoteSession {
+                                    node_id,
+                                    session_id,
+                                };
+                            }
+                            if app.is_remote_session_id(&session_id) {
+                                app.set_status(
+                                    app::LogLevel::Warn,
+                                    "session",
+                                    "remote session is missing node id; refresh sessions and try again",
+                                );
+                                return SessionKeyAction::None;
+                            }
                             return SessionKeyAction::LoadSession {
-                                session_id: sid,
+                                session_id,
                                 agent_id: None,
                             };
                         }
@@ -2292,12 +2362,11 @@ pub(crate) fn apply_sessions_key(
                 group_idx, path, ..
             }) = items.get(app.session_cursor).cloned()
             {
-                let Some(sid) = app
-                    .session_by_path(group_idx, &path)
-                    .map(|session| session.session_id.clone())
-                else {
+                let Some(session) = app.session_by_path(group_idx, &path).cloned() else {
                     return SessionKeyAction::None;
                 };
+                let sid = session.session_id;
+                let is_remote = app.is_remote_session_id(&sid);
                 // Optimistic remove
                 if path.len() == 1 {
                     app.session_groups[group_idx].sessions.remove(path[0]);
@@ -2313,7 +2382,11 @@ pub(crate) fn apply_sessions_key(
                 if new_len > 0 && app.session_cursor >= new_len {
                     app.session_cursor = new_len - 1;
                 }
-                return SessionKeyAction::DeleteSession { session_id: sid };
+                return if is_remote {
+                    SessionKeyAction::DismissRemoteSession { session_id: sid }
+                } else {
+                    SessionKeyAction::DeleteSession { session_id: sid }
+                };
             }
             // Delete on a GroupHeader: no-op
         }
@@ -2365,6 +2438,58 @@ mod model_popup_tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn start_page_enter_on_remote_session_attaches_instead_of_loading() {
+        let mut app = App::new();
+        app.session_groups = vec![protocol::SessionGroup {
+            sessions: vec![protocol::SessionSummary {
+                session_id: "remote-1".into(),
+                node_id: Some("node-1".into()),
+                attached: Some(false),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.session_cursor = 1;
+
+        let action = apply_sessions_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::AttachRemoteSession {
+                node_id: "node-1".into(),
+                session_id: "remote-1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn popup_enter_on_remote_session_attaches_instead_of_loading() {
+        let mut app = App::new();
+        app.popup = Popup::SessionSelect;
+        app.session_groups = vec![protocol::SessionGroup {
+            sessions: vec![protocol::SessionSummary {
+                session_id: "remote-1".into(),
+                node_id: Some("node-1".into()),
+                attached: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.session_cursor = 1;
+
+        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            SessionKeyAction::AttachRemoteSession {
+                node_id: "node-1".into(),
+                session_id: "remote-1".into(),
+            }
+        );
+        assert!(matches!(app.popup, Popup::None));
     }
 
     #[test]
@@ -2556,6 +2681,80 @@ mod model_popup_tests {
         let build_cache = &app.session_cache["s1"]["build"];
         assert_eq!(build_cache.model, "anthropic/claude-sonnet");
         assert_eq!(build_cache.effort, None);
+    }
+
+    #[test]
+    fn select_model_for_active_remote_mode_only_saves_preference() {
+        let _guard = TestPersistenceGuard::new("active-remote-mode");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("remote-1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.reasoning_effort = Some("high".into());
+        app.session_groups = vec![protocol::SessionGroup {
+            sessions: vec![protocol::SessionSummary {
+                session_id: "remote-1".into(),
+                node_id: Some("node-1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 1;
+        app.model_cursor = 3;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.current_provider.as_deref(), Some("openai"));
+        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+        assert!(!app.session_cache.contains_key("remote-1"));
+        assert_eq!(
+            app.get_mode_model_preference("build"),
+            Some(("anthropic", "claude-sonnet"))
+        );
+    }
+
+    #[test]
+    fn select_model_for_inactive_remote_mode_only_saves_preference() {
+        let _guard = TestPersistenceGuard::new("inactive-remote-mode");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("remote-1".into());
+        app.agent_mode = "plan".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.session_groups = vec![protocol::SessionGroup {
+            sessions: vec![protocol::SessionSummary {
+                session_id: "remote-1".into(),
+                node_id: Some("node-1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            make_model("anthropic", "claude-sonnet"),
+        ];
+        app.model_popup_agent_tab = 1;
+        app.model_cursor = 3;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(!app.session_cache.contains_key("remote-1"));
+        assert_eq!(
+            app.get_mode_model_preference("build"),
+            Some(("anthropic", "claude-sonnet"))
+        );
     }
 
     #[test]
