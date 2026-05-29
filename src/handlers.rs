@@ -1172,8 +1172,10 @@ pub(crate) fn handle_profile_popup_key(
                 return Ok(());
             }
             if let Some(profile_id) = app.selected_profile().map(|profile| profile.id.clone()) {
+                app.active_profile_id = Some(profile_id.clone());
                 cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
                 app.popup = Popup::None;
+                save_config(app);
             } else {
                 app.set_status(app::LogLevel::Warn, "profile", "no matching profile");
             }
@@ -1690,7 +1692,9 @@ fn try_execute_slash_command(
                 app.open_profile_popup();
                 cmd_tx.send(ClientMsg::ListProfiles)?;
             } else if let Some(profile_id) = app.find_profile_id(&arg) {
+                app.active_profile_id = Some(profile_id.clone());
                 cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
+                save_config(app);
             } else {
                 app.set_status(
                     app::LogLevel::Warn,
@@ -2509,7 +2513,8 @@ mod model_popup_tests {
     }
 
     #[test]
-    fn slash_profile_with_arg_sends_set_active_profile_without_optimistic_update() {
+    fn slash_profile_with_arg_sends_set_active_profile_with_optimistic_update() {
+        let _guard = TestPersistenceGuard::new("slash-profile");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.screen = Screen::Chat;
@@ -2525,7 +2530,7 @@ mod model_popup_tests {
             rx.try_recv(),
             Ok(ClientMsg::SetActiveProfile { profile_id }) if profile_id == "fast"
         ));
-        assert_eq!(app.active_profile_id.as_deref(), Some("old"));
+        assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
     }
 
     #[test]

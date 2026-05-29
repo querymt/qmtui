@@ -1648,6 +1648,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
+    app.active_profile_id = cfg.profile.id.clone();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
     for (agent_id, model_key) in &cfg.delegate_models {
         if let Some((provider, model)) = model_key.split_once('/') {

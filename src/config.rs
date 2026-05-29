@@ -103,6 +103,12 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ProfileConfig {
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TuiConfig {
     pub theme: Option<String>,
     pub show_thinking: Option<bool>,
@@ -114,6 +120,7 @@ pub struct TuiConfig {
     /// Applied as defaults when creating new sessions.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mode_models: HashMap<String, String>,
+    pub profile: ProfileConfig,
 }
 
 impl TuiConfig {
@@ -178,6 +185,7 @@ impl TuiConfig {
             .iter()
             .map(|(mode, (p, m))| (mode.clone(), format!("{p}/{m}")))
             .collect();
+        merged.profile.id = app.active_profile_id.clone();
         merged
     }
 }

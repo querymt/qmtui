@@ -279,7 +279,9 @@ impl App {
                     && let Ok(state) = serde_json::from_value::<StateData>(data)
                 {
                     self.profiles = state.profiles;
-                    self.active_profile_id = state.active_profile_id;
+                    if let Some(profile_id) = state.active_profile_id {
+                        self.active_profile_id = Some(profile_id);
+                    }
                     if self.profile_cursor >= self.profiles.len() {
                         self.profile_cursor = self.profiles.len().saturating_sub(1);
                     }
