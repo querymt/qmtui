@@ -400,6 +400,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                     (String::new(), false)
                 };
 
+                let tool_style = style;
                 match detail {
                     ToolDetail::Edit {
                         file, cached_lines, ..
@@ -434,10 +435,37 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         ]));
                         pending_tools.extend(cached_lines.iter().cloned());
                     }
-                    ToolDetail::Shell { cached_lines, .. } => {
-                        pending_tools
-                            .push(Line::from(Span::styled(format!("{sym} {name}"), style)));
+                    ToolDetail::Shell {
+                        workdir,
+                        cached_lines,
+                        ..
+                    } => {
+                        let mut spans = vec![Span::styled(format!("{sym} {name}"), style)];
+                        if let Some(workdir) = workdir.as_deref().filter(|s| !s.trim().is_empty()) {
+                            spans.push(Span::styled("@", tool_style));
+                            spans.push(Span::styled(workdir.to_string(), Theme::diff_file()));
+                        }
+                        pending_tools.push(Line::from(spans));
                         pending_tools.extend(cached_lines.iter().cloned());
+                    }
+                    ToolDetail::ReadTool {
+                        path,
+                        start_line,
+                        end_line,
+                    } => {
+                        let mut spans = vec![
+                            Span::styled(format!("{sym} {name} "), style),
+                            Span::styled(short_path(path).to_string(), Theme::diff_file()),
+                        ];
+                        if let Some(start) = start_line {
+                            spans.push(Span::styled(":", tool_style));
+                            let range = match end_line {
+                                Some(end) if end != start => format!("{start}-{end}"),
+                                _ => start.to_string(),
+                            };
+                            spans.push(Span::styled(range, Theme::status_accent()));
+                        }
+                        pending_tools.push(Line::from(spans));
                     }
                     ToolDetail::WriteFile {
                         path, cached_lines, ..
@@ -1430,24 +1458,18 @@ pub(crate) fn build_sectioned_diff_lines(
 
 pub(crate) fn build_shell_lines(
     command: &str,
-    workdir: Option<&str>,
+    _workdir: Option<&str>,
     output_tail: Option<&ShellOutputTail>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    if let Some(workdir) = workdir.filter(|s| !s.trim().is_empty()) {
-        lines.push(Line::from(Span::styled(
-            format!("  cwd: {workdir}"),
-            Theme::tool_output(),
-        )));
-    }
-
     let mut command_lines = command.lines();
     if let Some(first) = command_lines.next() {
-        lines.push(Line::from(Span::styled(
-            format!("  $ {first}"),
-            Theme::tool_output(),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Theme::tool_output()),
+            Span::styled("$", Theme::status_accent()),
+            Span::styled(format!(" {first}"), Theme::tool_output()),
+        ]));
         for line in command_lines {
             lines.push(Line::from(Span::styled(
                 format!("    {line}"),
@@ -1455,7 +1477,10 @@ pub(crate) fn build_shell_lines(
             )));
         }
     } else {
-        lines.push(Line::from(Span::styled("  $", Theme::tool_output())));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Theme::tool_output()),
+            Span::styled("$", Theme::status_accent()),
+        ]));
     }
 
     if let Some(tail) = output_tail
@@ -1464,7 +1489,7 @@ pub(crate) fn build_shell_lines(
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  output tail:",
-            Theme::tool_output(),
+            Theme::diff_file(),
         )));
         for line in &tail.lines {
             lines.push(Line::from(Span::styled(

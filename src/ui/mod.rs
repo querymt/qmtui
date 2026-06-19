@@ -1439,6 +1439,43 @@ mod tests {
     }
 
     #[test]
+    fn read_tool_call_range_uses_split_styles() {
+        use crate::theme::Theme;
+
+        let mut app = App::new();
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "read_tool".into(),
+            is_error: false,
+            detail: ToolDetail::ReadTool {
+                path: "src/server_msg.rs".into(),
+                start_line: Some(2135),
+                end_line: Some(2205),
+            },
+        });
+
+        let cards = build_message_cards(&mut app);
+        let line = cards
+            .iter()
+            .flat_map(|card| card.lines_for(120).iter().cloned().collect::<Vec<_>>())
+            .find(|line| line.spans.iter().any(|span| span.content == "> read_tool "))
+            .expect("missing read_tool line");
+
+        assert_eq!(
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "> read_tool src/server_msg.rs:2135-2205"
+        );
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(line.spans[2].content, ":");
+        assert_eq!(line.spans[2].style.fg, Theme::tool_text().fg);
+        assert_eq!(line.spans[3].style.fg, Theme::status_accent().fg);
+    }
+
+    #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         use crate::app::{
             ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail,
@@ -3252,8 +3289,23 @@ mod tests {
             },
         });
 
-        let lines = rendered_card_lines(&mut app);
-        assert!(lines.iter().any(|line| line == "> shell"));
+        let cards = build_message_cards(&mut app);
+        let card_lines: Vec<Line<'static>> = cards
+            .iter()
+            .flat_map(|card| card.lines_for(120).iter().cloned().collect::<Vec<_>>())
+            .collect();
+        let lines: Vec<String> = card_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(lines.iter().any(|line| line == "> shell@/repo"));
+        assert!(!lines.iter().any(|line| line.contains("cwd:")));
         assert!(lines.iter().any(|line| line.contains("$ cargo \\")));
         assert!(lines.iter().any(|line| line.contains("test \\")));
         assert!(lines.iter().any(|line| line.contains("output tail:")));
@@ -3263,6 +3315,27 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("12 earlier output lines hidden"))
         );
+
+        let command_line = card_lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "$"))
+            .expect("missing shell command line");
+        let dollar = command_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "$")
+            .expect("missing shell prompt");
+        assert_eq!(dollar.style.fg, Theme::status_accent().fg);
+
+        let output_tail = card_lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref().contains("output tail:"))
+            })
+            .expect("missing output tail label");
+        assert_eq!(output_tail.spans[0].style.fg, Theme::diff_file().fg);
     }
 
     // ── Card::height(width) wrapping tests ────────────────────────────────────

@@ -753,6 +753,11 @@ pub enum ToolDetail {
         /// Pre-computed command and output-tail lines.
         cached_lines: Vec<Line<'static>>,
     },
+    ReadTool {
+        path: String,
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+    },
     WriteFile {
         path: String,
         content: String,

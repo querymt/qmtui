@@ -2551,12 +2551,16 @@ fn parse_tool_detail(
             let path = str_field("path");
             let offset = obj.get("offset").and_then(|v| v.as_u64());
             let limit = obj.get("limit").and_then(|v| v.as_u64());
-            let range = match (offset, limit) {
-                (Some(o), Some(l)) => format!(":{}-{}", o, o + l),
-                (Some(o), None) => format!(":{}", o),
-                _ => String::new(),
+            let start_line = offset.map(|o| o + 1);
+            let end_line = match (start_line, limit) {
+                (Some(start), Some(limit)) => Some(start + limit.saturating_sub(1)),
+                _ => None,
             };
-            ToolDetail::Summary(format!("{}{range}", short(&path)))
+            ToolDetail::ReadTool {
+                path,
+                start_line,
+                end_line,
+            }
         }
         "shell" => {
             let command = shell_command_display(&obj);
@@ -3266,6 +3270,57 @@ mod tool_detail_tests {
         match detail {
             ToolDetail::Shell { command: got, .. } => assert_eq!(got, command),
             other => panic!("expected Shell, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_tool_uses_only_explicit_workdir() {
+        let explicit = parse_tool_detail(
+            "shell",
+            Some(&serde_json::json!({ "command": "pwd", "workdir": "/workspace/project" })),
+            Some("/session/cwd"),
+        );
+        match explicit {
+            ToolDetail::Shell { workdir, .. } => {
+                assert_eq!(workdir.as_deref(), Some("/workspace/project"))
+            }
+            other => panic!("expected Shell, got: {other:?}"),
+        }
+
+        let implicit = parse_tool_detail(
+            "shell",
+            Some(&serde_json::json!({ "command": "pwd" })),
+            Some("/session/cwd"),
+        );
+        match implicit {
+            ToolDetail::Shell { workdir, .. } => assert_eq!(workdir, None),
+            other => panic!("expected Shell, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tool_uses_one_based_inclusive_display_range() {
+        let detail = parse_tool_detail(
+            "read_tool",
+            Some(&serde_json::json!({
+                "path": "src/server_msg.rs",
+                "offset": 2134,
+                "limit": 71,
+            })),
+            None,
+        );
+
+        match detail {
+            ToolDetail::ReadTool {
+                path,
+                start_line,
+                end_line,
+            } => {
+                assert_eq!(path, "src/server_msg.rs");
+                assert_eq!(start_line, Some(2135));
+                assert_eq!(end_line, Some(2205));
+            }
+            other => panic!("expected ReadTool, got: {other:?}"),
         }
     }
 
