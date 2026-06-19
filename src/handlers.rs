@@ -1255,7 +1255,7 @@ pub(crate) fn handle_new_session_popup_key(
 /// Covers:
 /// - `card_cache` (finalized message cards)
 /// - `streaming_cache` / `streaming_thinking_cache`
-/// - `ToolDetail::Edit` / `ToolDetail::WriteFile` inline cached_lines
+/// - cached tool preview lines (`edit`, `multiedit`, `replace_symbol`, `shell`, `write_file`)
 pub(crate) fn invalidate_theme_caches(app: &mut App) {
     app.card_cache.invalidate();
     app.streaming_cache.invalidate();
@@ -1273,6 +1273,29 @@ pub(crate) fn invalidate_theme_caches(app: &mut App) {
                     ..
                 } => {
                     *cached_lines = ui::build_diff_lines(old, new, *start_line);
+                }
+                app::ToolDetail::MultiEdit {
+                    sections,
+                    cached_lines,
+                    ..
+                } => {
+                    *cached_lines = ui::build_sectioned_diff_lines(sections, 6);
+                }
+                app::ToolDetail::ReplaceSymbol {
+                    sections,
+                    cached_lines,
+                    ..
+                } => {
+                    *cached_lines = ui::build_sectioned_diff_lines(sections, 4);
+                }
+                app::ToolDetail::Shell {
+                    command,
+                    workdir,
+                    output_tail,
+                    cached_lines,
+                } => {
+                    *cached_lines =
+                        ui::build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
                 }
                 app::ToolDetail::WriteFile {
                     content,

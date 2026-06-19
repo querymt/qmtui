@@ -2,7 +2,9 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::{CardCache, build_diff_lines, build_write_lines};
+pub(crate) use chat::{
+    CardCache, build_diff_lines, build_sectioned_diff_lines, build_shell_lines, build_write_lines,
+};
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup, draw_model_popup,
@@ -367,7 +369,7 @@ fn draw_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ChatEntry, Screen, ToolDetail};
+    use crate::app::{App, ChatEntry, DiffPreviewSection, Screen, ShellOutputTail, ToolDetail};
     use crate::protocol::{EventKind, RawServerMsg};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -2611,18 +2613,17 @@ mod tests {
         );
         assert_eq!(matching_tools[0].0, "shell");
         assert!(*matching_tools[0].1);
-        assert!(matches!(matching_tools[0].2, ToolDetail::Summary(cmd) if cmd == "echo replay"));
+        assert!(
+            matches!(matching_tools[0].2, ToolDetail::Shell { command, .. } if command == "echo replay")
+        );
         assert_eq!(
             app.card_cache.processed_messages, 0,
             "reconciliation must invalidate rendered cards"
         );
 
         let lines = rendered_card_lines(&mut app);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("x shell echo replay"))
-        );
+        assert!(lines.iter().any(|line| line.contains("x shell")));
+        assert!(lines.iter().any(|line| line.contains("$ echo replay")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
         assert_eq!(
             lines.last().map(String::as_str),
@@ -3150,6 +3151,118 @@ mod tests {
         assert_eq!(cards.len(), 1);
         // header line + 1 content line
         assert_eq!(cards[0].lines_for(80).len(), 2);
+    }
+
+    #[test]
+    fn message_cards_multiedit_tool_includes_sectioned_diff_lines() {
+        let mut app = App::new();
+        let sections = vec![
+            DiffPreviewSection {
+                header: "edit 1".into(),
+                old: "aaa\n".into(),
+                new: "bbb\n".into(),
+                start_line: Some(10),
+            },
+            DiffPreviewSection {
+                header: "edit 2".into(),
+                old: "ccc\n".into(),
+                new: "ddd\n".into(),
+                start_line: Some(20),
+            },
+        ];
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "multiedit".into(),
+            is_error: false,
+            detail: ToolDetail::MultiEdit {
+                file: "src/lib.rs".into(),
+                edit_count: sections.len(),
+                cached_lines: build_sectioned_diff_lines(&sections, 6),
+                sections,
+            },
+        });
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("> multiedit src/lib.rs (2 edits)"))
+        );
+        assert!(lines.iter().any(|line| line.contains("@@ edit 1")));
+        assert!(lines.iter().any(|line| line.contains("- aaa")));
+        assert!(lines.iter().any(|line| line.contains("+ bbb")));
+    }
+
+    #[test]
+    fn message_cards_replace_symbol_tool_includes_symbol_diff_lines() {
+        let mut app = App::new();
+        let sections = vec![DiffPreviewSection {
+            header: "build_message_cards".into(),
+            old: "fn build_message_cards() {\n    old();\n}\n".into(),
+            new: "fn build_message_cards() {\n    new();\n}\n".into(),
+            start_line: Some(211),
+        }];
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "replace_symbol".into(),
+            is_error: false,
+            detail: ToolDetail::ReplaceSymbol {
+                title: "src/ui/chat.rs build_message_cards".into(),
+                cached_lines: build_sectioned_diff_lines(&sections, 4),
+                sections,
+            },
+        });
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("> replace_symbol src/ui/chat.rs build_message_cards"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("@@ build_message_cards"))
+        );
+        assert!(lines.iter().any(|line| line.contains("-     old();")));
+        assert!(lines.iter().any(|line| line.contains("+     new();")));
+    }
+
+    #[test]
+    fn message_cards_shell_tool_shows_command_and_last_output_lines() {
+        let mut app = App::new();
+        let command = "cargo \\\ntest \\\n--lib";
+        let output_tail = ShellOutputTail {
+            lines: vec![
+                "running 1 test".into(),
+                "test ui::tests::shell ... ok".into(),
+                "test result: ok".into(),
+            ],
+            hidden_line_count: 12,
+        };
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "shell".into(),
+            is_error: false,
+            detail: ToolDetail::Shell {
+                command: command.into(),
+                workdir: Some("/repo".into()),
+                output_tail: Some(output_tail.clone()),
+                cached_lines: build_shell_lines(command, Some("/repo"), Some(&output_tail)),
+            },
+        });
+
+        let lines = rendered_card_lines(&mut app);
+        assert!(lines.iter().any(|line| line == "> shell"));
+        assert!(lines.iter().any(|line| line.contains("$ cargo \\")));
+        assert!(lines.iter().any(|line| line.contains("test \\")));
+        assert!(lines.iter().any(|line| line.contains("output tail:")));
+        assert!(lines.iter().any(|line| line.contains("test result: ok")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("12 earlier output lines hidden"))
+        );
     }
 
     // ── Card::height(width) wrapping tests ────────────────────────────────────

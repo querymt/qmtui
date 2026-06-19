@@ -8,7 +8,10 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{ActivityState, App, ChatEntry, DelegateEntry, SessionOp, ToolDetail};
+use crate::app::{
+    ActivityState, App, ChatEntry, DelegateEntry, DiffPreviewSection, SessionOp, ShellOutputTail,
+    ToolDetail,
+};
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -405,6 +408,35 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(short_path(file).to_string(), Theme::diff_file()),
                         ]));
+                        pending_tools.extend(cached_lines.iter().cloned());
+                    }
+                    ToolDetail::MultiEdit {
+                        file,
+                        edit_count,
+                        cached_lines,
+                        ..
+                    } => {
+                        pending_tools.push(Line::from(vec![
+                            Span::styled(format!("{sym} {name} "), style),
+                            Span::styled(short_path(file).to_string(), Theme::diff_file()),
+                            Span::styled(format!(" ({edit_count} edits)"), Theme::status_accent()),
+                        ]));
+                        pending_tools.extend(cached_lines.iter().cloned());
+                    }
+                    ToolDetail::ReplaceSymbol {
+                        title,
+                        cached_lines,
+                        ..
+                    } => {
+                        pending_tools.push(Line::from(vec![
+                            Span::styled(format!("{sym} {name} "), style),
+                            Span::styled(title.clone(), Theme::diff_file()),
+                        ]));
+                        pending_tools.extend(cached_lines.iter().cloned());
+                    }
+                    ToolDetail::Shell { cached_lines, .. } => {
+                        pending_tools
+                            .push(Line::from(Span::styled(format!("{sym} {name}"), style)));
                         pending_tools.extend(cached_lines.iter().cloned());
                     }
                     ToolDetail::WriteFile {
@@ -1357,6 +1389,101 @@ fn short_path(path: &str) -> &str {
         }
     }
     path
+}
+
+pub(crate) fn build_sectioned_diff_lines(
+    sections: &[DiffPreviewSection],
+    max_sections: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let preview_count = sections.len().min(max_sections.max(1));
+
+    for (idx, section) in sections.iter().take(preview_count).enumerate() {
+        if !section.header.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  @@ {}", section.header),
+                Theme::diff_context(),
+            )));
+        }
+        lines.extend(build_diff_lines(
+            &section.old,
+            &section.new,
+            section.start_line,
+        ));
+        if idx + 1 < preview_count {
+            lines.push(Line::default());
+        }
+    }
+
+    if sections.len() > preview_count {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ... {} more sections collapsed",
+                sections.len() - preview_count
+            ),
+            Theme::diff_context(),
+        )));
+    }
+
+    lines
+}
+
+pub(crate) fn build_shell_lines(
+    command: &str,
+    workdir: Option<&str>,
+    output_tail: Option<&ShellOutputTail>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    if let Some(workdir) = workdir.filter(|s| !s.trim().is_empty()) {
+        lines.push(Line::from(Span::styled(
+            format!("  cwd: {workdir}"),
+            Theme::tool_output(),
+        )));
+    }
+
+    let mut command_lines = command.lines();
+    if let Some(first) = command_lines.next() {
+        lines.push(Line::from(Span::styled(
+            format!("  $ {first}"),
+            Theme::tool_output(),
+        )));
+        for line in command_lines {
+            lines.push(Line::from(Span::styled(
+                format!("    {line}"),
+                Theme::tool_output(),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled("  $", Theme::tool_output())));
+    }
+
+    if let Some(tail) = output_tail
+        && !tail.lines.is_empty()
+    {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "  output tail:",
+            Theme::tool_output(),
+        )));
+        for line in &tail.lines {
+            lines.push(Line::from(Span::styled(
+                format!("    {line}"),
+                Theme::tool_output(),
+            )));
+        }
+        if tail.hidden_line_count > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  ... {} earlier output lines hidden",
+                    tail.hidden_line_count
+                ),
+                Theme::diff_context(),
+            )));
+        }
+    }
+
+    lines
 }
 
 pub(crate) fn build_diff_lines(

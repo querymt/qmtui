@@ -702,6 +702,20 @@ pub struct SessionActivity {
 }
 
 #[derive(Debug, Clone)]
+pub struct DiffPreviewSection {
+    pub header: String,
+    pub old: String,
+    pub new: String,
+    pub start_line: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShellOutputTail {
+    pub lines: Vec<String>,
+    pub hidden_line_count: usize,
+}
+
+#[derive(Debug, Clone)]
 pub enum ToolDetail {
     None,
     /// Compact one-liner info for display after tool name
@@ -717,6 +731,26 @@ pub enum ToolDetail {
         new: String,
         start_line: Option<usize>,
         /// Pre-computed diff lines (avoids re-running TextDiff on every render).
+        cached_lines: Vec<Line<'static>>,
+    },
+    MultiEdit {
+        file: String,
+        edit_count: usize,
+        sections: Vec<DiffPreviewSection>,
+        /// Pre-computed sectioned diff lines for all requested edits.
+        cached_lines: Vec<Line<'static>>,
+    },
+    ReplaceSymbol {
+        title: String,
+        sections: Vec<DiffPreviewSection>,
+        /// Pre-computed best-effort symbol body diff lines.
+        cached_lines: Vec<Line<'static>>,
+    },
+    Shell {
+        command: String,
+        workdir: Option<String>,
+        output_tail: Option<ShellOutputTail>,
+        /// Pre-computed command and output-tail lines.
         cached_lines: Vec<Line<'static>>,
     },
     WriteFile {

@@ -5,10 +5,14 @@
 //! building diff/write content lines.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::app::*;
 use crate::protocol::*;
-use crate::ui::{ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_write_lines};
+use crate::ui::{
+    ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_sectioned_diff_lines, build_shell_lines,
+    build_write_lines,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingElicitationSnapshot {
@@ -1292,7 +1296,8 @@ impl App {
                         self.discard_pending_thinking();
                         return;
                     }
-                    let detail = parse_tool_detail(tool_name, arguments.as_ref());
+                    let cwd = self.current_session_cwd();
+                    let detail = parse_tool_detail(tool_name, arguments.as_ref(), cwd.as_deref());
                     if reconcile_tool_call_start(
                         &mut self.messages,
                         tool_call_id.as_deref(),
@@ -2112,7 +2117,304 @@ fn truncate_summary(s: &str, max_bytes: usize) -> String {
     format!("{}{ELLIPSIS}", &s[..end])
 }
 
-fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> ToolDetail {
+fn short_path_display(path: &str) -> String {
+    let mut count = 0;
+    for (i, c) in path.char_indices().rev() {
+        if c == '/' {
+            count += 1;
+            if count == 2 {
+                return path[i + 1..].to_string();
+            }
+        }
+    }
+    path.to_string()
+}
+
+fn scalar_string(obj: &serde_json::Value, key: &str) -> Option<String> {
+    obj.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn shell_command_display(obj: &serde_json::Value) -> String {
+    let command = scalar_string(obj, "command").unwrap_or_default();
+    let Some(args) = obj.get("args").and_then(|v| v.as_array()) else {
+        return command;
+    };
+
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote_arg(&command));
+    parts.extend(
+        args.iter()
+            .filter_map(|arg| arg.as_str())
+            .map(shell_quote_arg),
+    );
+
+    if parts.len() == 1 {
+        return command;
+    }
+
+    parts
+        .iter()
+        .enumerate()
+        .map(|(idx, part)| {
+            let continuation = if idx + 1 == parts.len() { "" } else { " \\" };
+            format!("{part}{continuation}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | ',' | '@' | '%')
+    }) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn resolve_preview_path(path: &str, root: Option<&str>, cwd: Option<&str>) -> PathBuf {
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_absolute() {
+        return path_buf;
+    }
+
+    let base = root
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
+    let base = if base.is_absolute() {
+        base
+    } else if let Some(cwd) = cwd {
+        Path::new(cwd).join(base)
+    } else {
+        base
+    };
+
+    base.join(path_buf)
+}
+
+fn replace_symbol_title(replacements: &[serde_json::Value]) -> String {
+    if replacements.len() == 1 {
+        let replacement = &replacements[0];
+        let path = replacement
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let symbol = replacement
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            return symbol.to_string();
+        }
+        if symbol.is_empty() {
+            return short_path_display(path);
+        }
+        return format!("{} {}", short_path_display(path), symbol);
+    }
+
+    let files = replacements
+        .iter()
+        .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
+    format!("{} symbols in {} files", replacements.len(), files)
+}
+
+fn build_replace_symbol_sections(
+    replacements: &[serde_json::Value],
+    root: Option<&str>,
+    cwd: Option<&str>,
+) -> Vec<DiffPreviewSection> {
+    replacements
+        .iter()
+        .filter_map(|replacement| {
+            let path = replacement.get("path").and_then(|v| v.as_str())?;
+            let symbol = replacement.get("symbol").and_then(|v| v.as_str())?;
+            let new_text = replacement.get("newText").and_then(|v| v.as_str())?;
+            let kind = replacement.get("kind").and_then(|v| v.as_str());
+            let occurrence = replacement
+                .get("occurrence")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let resolved_path = resolve_preview_path(path, root, cwd);
+            let (old, start_line) = extract_symbol_body(&resolved_path, symbol, kind, occurrence)
+                .unwrap_or_else(|| (String::new(), 1));
+            let header = if replacements.len() == 1 {
+                symbol.to_string()
+            } else {
+                format!("{} {}", short_path_display(path), symbol)
+            };
+            let header = if let Some(kind) = kind.filter(|kind| !kind.is_empty() && *kind != "any")
+            {
+                format!("{header} ({kind})")
+            } else {
+                header
+            };
+            Some(DiffPreviewSection {
+                header,
+                old,
+                new: new_text.to_string(),
+                start_line: Some(start_line),
+            })
+        })
+        .collect()
+}
+
+fn extract_symbol_body(
+    path: &Path,
+    symbol: &str,
+    kind: Option<&str>,
+    occurrence: usize,
+) -> Option<(String, usize)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let leaf = symbol
+        .rsplit("::")
+        .next()
+        .unwrap_or(symbol)
+        .rsplit('.')
+        .next()
+        .unwrap_or(symbol);
+
+    let starts = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| symbol_line_matches(line.trim_start(), leaf, kind).then_some(idx))
+        .collect::<Vec<_>>();
+    let start = *starts.get(occurrence)?;
+    let end = symbol_block_end(&lines, start);
+    Some((lines[start..=end].join("\n"), start + 1))
+}
+
+fn symbol_line_matches(line: &str, name: &str, kind: Option<&str>) -> bool {
+    let matches_function = || {
+        line.contains(&format!("fn {name}"))
+            || line.contains(&format!("function {name}"))
+            || line.starts_with(&format!("def {name}"))
+            || line.starts_with(&format!("async def {name}"))
+            || line.starts_with(&format!("{name}("))
+            || line.contains(&format!(" {name}("))
+    };
+    let matches_struct = || line.contains(&format!("struct {name}"));
+    let matches_enum = || line.contains(&format!("enum {name}"));
+    let matches_trait = || line.contains(&format!("trait {name}"));
+    let matches_class = || line.contains(&format!("class {name}"));
+    let matches_type = || line.contains(&format!("type {name}"));
+    let matches_const = || line.contains(&format!("const {name}"));
+
+    match kind.unwrap_or("any") {
+        "function" | "method" | "test" => matches_function(),
+        "struct" => matches_struct(),
+        "enum" => matches_enum(),
+        "trait" => matches_trait(),
+        "class" => matches_class(),
+        "type" => matches_type(),
+        "const" => matches_const(),
+        _ => {
+            matches_function()
+                || matches_struct()
+                || matches_enum()
+                || matches_trait()
+                || matches_class()
+                || matches_type()
+                || matches_const()
+        }
+    }
+}
+
+fn symbol_block_end(lines: &[&str], start: usize) -> usize {
+    let mut seen_brace = false;
+    let mut balance = 0isize;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    seen_brace = true;
+                    balance += 1;
+                }
+                '}' if seen_brace => {
+                    balance -= 1;
+                    if balance <= 0 {
+                        return idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if seen_brace {
+        return lines.len().saturating_sub(1);
+    }
+
+    let start_indent = line_indent(lines[start]);
+    let mut end = start;
+    for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim().is_empty() {
+            end = idx;
+            continue;
+        }
+        if line_indent(line) <= start_indent {
+            break;
+        }
+        end = idx;
+    }
+    end
+}
+
+fn line_indent(line: &str) -> usize {
+    line.chars().take_while(|c| c.is_whitespace()).count()
+}
+
+fn shell_output_tail_from_result(
+    parsed_result: Option<&serde_json::Value>,
+    raw_result: &str,
+) -> Option<ShellOutputTail> {
+    let (stdout, stderr) = parsed_result
+        .and_then(|obj| {
+            Some((
+                obj.get("stdout")?.as_str().unwrap_or_default().to_string(),
+                obj.get("stderr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .unwrap_or_else(|| (raw_result.to_string(), String::new()));
+
+    let lines = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let keep = 5;
+    let hidden_line_count = lines.len().saturating_sub(keep);
+    let visible = lines
+        .into_iter()
+        .skip(hidden_line_count)
+        .collect::<Vec<_>>();
+    Some(ShellOutputTail {
+        lines: visible,
+        hidden_line_count,
+    })
+}
+
+fn parse_tool_detail(
+    tool_name: &str,
+    arguments: Option<&serde_json::Value>,
+    cwd: Option<&str>,
+) -> ToolDetail {
     let Some(args) = arguments else {
         return ToolDetail::None;
     };
@@ -2176,13 +2478,64 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
                 .get("filePath")
                 .or_else(|| obj.get("file_path"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let count = obj
+                .unwrap_or("")
+                .to_string();
+            let sections = obj
                 .get("edits")
                 .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            ToolDetail::Summary(format!("{} ({} edits)", short(file), count))
+                .map(|edits| {
+                    edits
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, edit)| {
+                            let old = edit
+                                .get("oldString")
+                                .or_else(|| edit.get("old_string"))
+                                .and_then(|v| v.as_str())?;
+                            let new = edit
+                                .get("newString")
+                                .or_else(|| edit.get("new_string"))
+                                .and_then(|v| v.as_str())?;
+                            let replace_all = edit
+                                .get("replaceAll")
+                                .or_else(|| edit.get("replace_all"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let suffix = if replace_all { " (all)" } else { "" };
+                            Some(DiffPreviewSection {
+                                header: format!("edit {}{}", idx + 1, suffix),
+                                old: old.to_string(),
+                                new: new.to_string(),
+                                start_line: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let edit_count = sections.len();
+            let cached_lines = build_sectioned_diff_lines(&sections, 6);
+            ToolDetail::MultiEdit {
+                file,
+                edit_count,
+                sections,
+                cached_lines,
+            }
+        }
+        "replace_symbol" => {
+            let replacements = obj
+                .get("replacements")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let root = obj.get("root").and_then(|v| v.as_str());
+            let title = replace_symbol_title(&replacements);
+            let sections = build_replace_symbol_sections(&replacements, root, cwd);
+            let cached_lines = build_sectioned_diff_lines(&sections, 4);
+            ToolDetail::ReplaceSymbol {
+                title,
+                sections,
+                cached_lines,
+            }
         }
         "write_file" => {
             let path = str_field("path");
@@ -2206,8 +2559,18 @@ fn parse_tool_detail(tool_name: &str, arguments: Option<&serde_json::Value>) -> 
             ToolDetail::Summary(format!("{}{range}", short(&path)))
         }
         "shell" => {
-            let cmd = str_field("command");
-            ToolDetail::Summary(truncate_summary(&cmd, 60))
+            let command = shell_command_display(&obj);
+            let workdir = obj
+                .get("workdir")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let cached_lines = build_shell_lines(&command, workdir.as_deref(), None);
+            ToolDetail::Shell {
+                command,
+                workdir,
+                output_tail: None,
+                cached_lines,
+            }
         }
         "search_text" => {
             let pattern = str_field("pattern");
@@ -2438,37 +2801,56 @@ fn update_tool_detail(
             if tid != id {
                 continue;
             }
-            // edit tool: update start_line
-            if let Some(obj) = &parsed_result
-                && let ToolDetail::Edit { start_line: sl, .. } = detail
+            // edit tool: update line numbers from either legacy JSON or compact receipt output.
+            if let ToolDetail::Edit {
+                old,
+                new,
+                start_line,
+                cached_lines,
+                ..
+            } = detail
             {
-                *sl = obj
-                    .get("startLineOld")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-            }
-            // shell tool: show last 3 lines of stdout below command
-            if name.starts_with("shell")
-                && let Some(stdout) = parsed_result
-                    .as_ref()
-                    .and_then(|obj| obj.get("stdout"))
-                    .and_then(|v| v.as_str())
-            {
-                let tail: Vec<&str> = stdout
-                    .lines()
-                    .rev()
-                    .filter(|l| !l.trim().is_empty())
-                    .take(3)
-                    .collect();
-                if !tail.is_empty() {
-                    let tail_str = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                    if let ToolDetail::Summary(header) = detail {
-                        *detail = ToolDetail::SummaryWithOutput {
-                            header: std::mem::take(header),
-                            output: tail_str,
-                        };
-                    }
+                let compact_start =
+                    compact_receipt_old_starts(&tool_result_text(parsed_result.as_ref(), result))
+                        .into_iter()
+                        .next();
+                let json_start = parsed_result.as_ref().and_then(|obj| {
+                    obj.get("startLineOld")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize)
+                });
+                if let Some(start) = json_start.or(compact_start) {
+                    *start_line = Some(start);
+                    *cached_lines = build_diff_lines(old, new, Some(start));
                 }
+            }
+            if let ToolDetail::MultiEdit {
+                sections,
+                cached_lines,
+                ..
+            } = detail
+            {
+                let starts =
+                    compact_receipt_old_starts(&tool_result_text(parsed_result.as_ref(), result));
+                if !starts.is_empty() {
+                    for (section, start) in sections.iter_mut().zip(starts) {
+                        section.start_line = Some(start);
+                    }
+                    *cached_lines = build_sectioned_diff_lines(sections, 6);
+                }
+            }
+            if name.starts_with("shell")
+                && let ToolDetail::Shell {
+                    command,
+                    workdir,
+                    output_tail,
+                    cached_lines,
+                } = detail
+                && let Some(tail) = shell_output_tail_from_result(parsed_result.as_ref(), result)
+            {
+                *output_tail = Some(tail);
+                *cached_lines =
+                    build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
             }
             // index tool: enrich with language and section counts
             if name == "index" {
@@ -2506,6 +2888,33 @@ fn update_tool_detail(
         }
     }
     false
+}
+
+fn tool_result_text(parsed_result: Option<&serde_json::Value>, raw_result: &str) -> String {
+    parsed_result
+        .map(content_to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| raw_result.to_string())
+}
+
+fn compact_receipt_old_starts(text: &str) -> Vec<usize> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("H ") {
+                return None;
+            }
+            let old_part = line
+                .split_whitespace()
+                .find(|part| part.starts_with("old="))?;
+            old_part
+                .strip_prefix("old=")?
+                .split(',')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .collect()
 }
 
 fn search_text_footer(text: &str) -> Option<&str> {
@@ -2805,7 +3214,7 @@ mod tool_detail_tests {
             "target_agent_id": "coder",
             "objective": "List the contents of /tmp"
         });
-        let detail = parse_tool_detail("delegate", Some(&args));
+        let detail = parse_tool_detail("delegate", Some(&args), None);
         match detail {
             ToolDetail::Summary(s) => {
                 assert!(s.contains("coder"), "must contain agent name, got: {s}");
@@ -2823,7 +3232,7 @@ mod tool_detail_tests {
         let args = serde_json::json!({
             "objective": "Do something"
         });
-        let detail = parse_tool_detail("delegate", Some(&args));
+        let detail = parse_tool_detail("delegate", Some(&args), None);
         match detail {
             ToolDetail::Summary(s) => {
                 assert!(
@@ -2836,7 +3245,7 @@ mod tool_detail_tests {
     }
 
     fn assert_summary_truncates_with_ellipsis(tool_name: &str, args: serde_json::Value) {
-        let detail = parse_tool_detail(tool_name, Some(&args));
+        let detail = parse_tool_detail(tool_name, Some(&args), None);
 
         match detail {
             ToolDetail::Summary(s) => {
@@ -2848,19 +3257,22 @@ mod tool_detail_tests {
     }
 
     #[test]
-    fn shell_tool_truncates_utf8_command_on_char_boundary() {
+    fn shell_tool_preserves_full_utf8_command() {
         let command =
             "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
         let args = serde_json::json!({ "command": command });
+        let detail = parse_tool_detail("shell", Some(&args), None);
 
-        assert_summary_truncates_with_ellipsis("shell", args);
+        match detail {
+            ToolDetail::Shell { command: got, .. } => assert_eq!(got, command),
+            other => panic!("expected Shell, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn session_loaded_replay_audit_truncates_utf8_shell_command_on_char_boundary() {
+    fn session_loaded_replay_audit_preserves_full_utf8_shell_command() {
         let command =
             "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
-        assert!(!command.is_char_boundary(60));
         let mut app = App::new();
 
         app.handle_server_msg(RawServerMsg {
@@ -2883,9 +3295,99 @@ mod tool_detail_tests {
         });
 
         assert_eq!(app.messages.len(), 1);
-        let summary = summary_text(&app.messages[0]);
-        assert!(summary.ends_with(crate::ui::ELLIPSIS), "got: {summary}");
-        assert!(summary.is_char_boundary(summary.len()), "got: {summary}");
+        match &app.messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { command: got, .. },
+                ..
+            } => assert_eq!(got, command),
+            other => panic!("expected Shell tool call, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_tool_result_keeps_last_five_output_lines() {
+        let detail = parse_tool_detail(
+            "shell",
+            Some(&serde_json::json!({ "command": "cargo test" })),
+            None,
+        );
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("shell-tail".into()),
+            name: "shell".into(),
+            is_error: false,
+            detail,
+        }];
+        let result = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "out1\nout2\nout3\nout4\nout5\nout6\n",
+            "stderr": "err1\nerr2\n",
+        })
+        .to_string();
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("shell-tail"),
+            &result
+        ));
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail:
+                    ToolDetail::Shell {
+                        output_tail: Some(tail),
+                        cached_lines,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(tail.hidden_line_count, 3);
+                assert_eq!(tail.lines, ["out4", "out5", "out6", "err1", "err2"]);
+                let rendered = cached_lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+                    .collect::<String>();
+                assert!(rendered.contains("output tail:"));
+                assert!(rendered.contains("err2"));
+            }
+            other => panic!("expected shell tail, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiedit_tool_result_updates_preview_line_numbers() {
+        let detail = parse_tool_detail(
+            "multiedit",
+            Some(&serde_json::json!({
+                "filePath": "src/lib.rs",
+                "edits": [
+                    { "oldString": "aaa\n", "newString": "bbb\n" },
+                    { "oldString": "ccc\n", "newString": "ddd\n" }
+                ]
+            })),
+            None,
+        );
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("multi-lines".into()),
+            name: "multiedit".into(),
+            is_error: false,
+            detail,
+        }];
+        let result = "OK paths=1 edits=2 added=2 deleted=2\nP src/lib.rs\nH replace old=10,1 new=10,1 +1 -1\nH replace old=20,1 new=20,1 +1 -1";
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("multi-lines"),
+            result
+        ));
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail: ToolDetail::MultiEdit { sections, .. },
+                ..
+            } => {
+                assert_eq!(sections[0].start_line, Some(10));
+                assert_eq!(sections[1].start_line, Some(20));
+            }
+            other => panic!("expected multiedit detail, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -2908,7 +3410,7 @@ mod tool_detail_tests {
     #[test]
     fn index_tool_shows_short_path_from_arguments() {
         let args = serde_json::json!({"path": "/home/user/project/src/main.rs"});
-        let detail = parse_tool_detail("index", Some(&args));
+        let detail = parse_tool_detail("index", Some(&args), None);
         match detail {
             ToolDetail::Summary(s) => {
                 assert_eq!(s, "src/main.rs");
@@ -2991,6 +3493,7 @@ mod tool_detail_tests {
             Some(&serde_json::json!({
                 "command": "cargo test tool_detail_tests"
             })),
+            None,
         );
 
         assert!(reconcile_tool_call_start(
@@ -3014,7 +3517,7 @@ mod tool_detail_tests {
                 assert_eq!(name, "shell");
                 assert!(*is_error);
                 assert!(
-                    matches!(detail, ToolDetail::Summary(cmd) if cmd == "cargo test tool_detail_tests")
+                    matches!(detail, ToolDetail::Shell { command, .. } if command == "cargo test tool_detail_tests")
                 );
             }
             other => panic!("expected ToolCall, got: {other:?}"),
