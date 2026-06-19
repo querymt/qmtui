@@ -1428,10 +1428,13 @@ pub(crate) fn build_sectioned_diff_lines(
 
     for (idx, section) in sections.iter().take(preview_count).enumerate() {
         if !section.header.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  @@ {}", section.header),
-                Theme::diff_context(),
-            )));
+            let mut spans = vec![Span::styled("  @@ ", Theme::diff_context())];
+            if section.header.starts_with("edit ") {
+                spans.push(Span::styled(section.header.clone(), Theme::status_accent()));
+            } else {
+                spans.push(Span::styled(section.header.clone(), Theme::diff_file()));
+            }
+            lines.push(Line::from(spans));
         }
         lines.extend(build_diff_lines(
             &section.old,

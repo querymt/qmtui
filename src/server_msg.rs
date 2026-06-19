@@ -14,6 +14,8 @@ use crate::ui::{
     build_write_lines,
 };
 
+const DEFAULT_READ_TOOL_LIMIT: u64 = 2000;
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingElicitationSnapshot {
     elicitation_id: String,
@@ -2549,17 +2551,18 @@ fn parse_tool_detail(
         }
         "read_tool" => {
             let path = str_field("path");
-            let offset = obj.get("offset").and_then(|v| v.as_u64());
-            let limit = obj.get("limit").and_then(|v| v.as_u64());
-            let start_line = offset.map(|o| o + 1);
-            let end_line = match (start_line, limit) {
-                (Some(start), Some(limit)) => Some(start + limit.saturating_sub(1)),
-                _ => None,
-            };
+            let offset = obj.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit = obj
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .filter(|limit| *limit > 0)
+                .unwrap_or(DEFAULT_READ_TOOL_LIMIT);
+            let start_line = offset.saturating_add(1);
+            let end_line = offset.saturating_add(limit);
             ToolDetail::ReadTool {
                 path,
-                start_line,
-                end_line,
+                start_line: Some(start_line),
+                end_line: Some(end_line),
             }
         }
         "shell" => {
@@ -2856,6 +2859,18 @@ fn update_tool_detail(
                 *cached_lines =
                     build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
             }
+            if name == "read_tool"
+                && let ToolDetail::ReadTool {
+                    start_line,
+                    end_line,
+                    ..
+                } = detail
+                && let Some((first, last)) =
+                    read_tool_result_line_range(&tool_result_text(parsed_result.as_ref(), result))
+            {
+                *start_line = Some(first);
+                *end_line = Some(last);
+            }
             // index tool: enrich with language and section counts
             if name == "index" {
                 let text = parsed_result
@@ -2899,6 +2914,27 @@ fn tool_result_text(parsed_result: Option<&serde_json::Value>, raw_result: &str)
         .map(content_to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| raw_result.to_string())
+}
+
+fn read_tool_result_line_range(text: &str) -> Option<(u64, u64)> {
+    let mut first = None;
+    let mut last = None;
+
+    for line in text.lines() {
+        let Some((prefix, _)) = line.split_once('|') else {
+            continue;
+        };
+        if prefix.len() != 5 || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(line_number) = prefix.parse::<u64>() else {
+            continue;
+        };
+        first.get_or_insert(line_number);
+        last = Some(line_number);
+    }
+
+    first.zip(last)
 }
 
 fn compact_receipt_old_starts(text: &str) -> Vec<usize> {
@@ -3325,6 +3361,72 @@ mod tool_detail_tests {
     }
 
     #[test]
+    fn read_tool_defaults_missing_offset_and_limit_for_display_range() {
+        let detail = parse_tool_detail(
+            "read_tool",
+            Some(&serde_json::json!({
+                "path": "apps/portal/priv/static/assets/css/app.css",
+                "limit": 300,
+            })),
+            None,
+        );
+
+        match detail {
+            ToolDetail::ReadTool {
+                start_line,
+                end_line,
+                ..
+            } => {
+                assert_eq!(start_line, Some(1));
+                assert_eq!(end_line, Some(300));
+            }
+            other => panic!("expected ReadTool, got: {other:?}"),
+        }
+
+        let default_limit = parse_tool_detail(
+            "read_tool",
+            Some(&serde_json::json!({ "path": "README.md" })),
+            None,
+        );
+        match default_limit {
+            ToolDetail::ReadTool {
+                start_line,
+                end_line,
+                ..
+            } => {
+                assert_eq!(start_line, Some(1));
+                assert_eq!(end_line, Some(super::DEFAULT_READ_TOOL_LIMIT));
+            }
+            other => panic!("expected ReadTool, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tool_parses_json_string_arguments_for_display_range() {
+        let args = serde_json::Value::String(
+            r#"{"path":"apps/admin/lib/admin_web/components/layouts/root.html.heex","root":".","limit":220}"#
+                .into(),
+        );
+        let detail = parse_tool_detail("read_tool", Some(&args), None);
+
+        match detail {
+            ToolDetail::ReadTool {
+                path,
+                start_line,
+                end_line,
+            } => {
+                assert_eq!(
+                    path,
+                    "apps/admin/lib/admin_web/components/layouts/root.html.heex"
+                );
+                assert_eq!(start_line, Some(1));
+                assert_eq!(end_line, Some(220));
+            }
+            other => panic!("expected ReadTool, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn session_loaded_replay_audit_preserves_full_utf8_shell_command() {
         let command =
             "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
@@ -3404,6 +3506,91 @@ mod tool_detail_tests {
                 assert!(rendered.contains("err2"));
             }
             other => panic!("expected shell tail, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tool_result_refines_range_to_actual_line_numbers() {
+        let detail = parse_tool_detail(
+            "read_tool",
+            Some(&serde_json::json!({
+                "path": "apps/portal/lib/portal_web/components/layouts/root.html.heex",
+                "limit": 260,
+            })),
+            None,
+        );
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("read-lines".into()),
+            name: "read_tool".into(),
+            is_error: false,
+            detail,
+        }];
+        let result = "<path>/projects/querymt-org/service/apps/portal/lib/portal_web/components/layouts/root.html.heex</path>\n<type>file</type>\n<content>\n00001| <!DOCTYPE html>\n00002| <html lang=\"en\">\n00027| </html>\n\n(End of file - total 27 lines)\n</content>";
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("read-lines"),
+            result
+        ));
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail:
+                    ToolDetail::ReadTool {
+                        start_line,
+                        end_line,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(*start_line, Some(1));
+                assert_eq!(*end_line, Some(27));
+            }
+            other => panic!("expected read_tool detail, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tool_result_refines_range_from_json_text_content() {
+        let detail = parse_tool_detail(
+            "read_tool",
+            Some(&serde_json::json!({
+                "path": "apps/portal/lib/portal_web/components/core_components.ex",
+                "offset": 40,
+                "limit": 390,
+            })),
+            None,
+        );
+        let mut messages = vec![ChatEntry::ToolCall {
+            tool_call_id: Some("read-json-lines".into()),
+            name: "read_tool".into(),
+            is_error: false,
+            detail,
+        }];
+        let result = serde_json::json!([{
+            "type": "text",
+            "text": "<path>/repo/core_components.ex</path>\n<type>file</type>\n<content>\n00041|   attr :id, :string\n00042|   slot :inner_block\n00430| end\n\n(File has more lines. Use 'offset' parameter to read beyond line 430)\n</content>"
+        }])
+        .to_string();
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("read-json-lines"),
+            &result
+        ));
+        match &messages[0] {
+            ChatEntry::ToolCall {
+                detail:
+                    ToolDetail::ReadTool {
+                        start_line,
+                        end_line,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(*start_line, Some(41));
+                assert_eq!(*end_line, Some(430));
+            }
+            other => panic!("expected read_tool detail, got: {other:?}"),
         }
     }
 

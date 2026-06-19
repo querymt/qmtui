@@ -3219,7 +3219,21 @@ mod tests {
             },
         });
 
-        let lines = rendered_card_lines(&mut app);
+        let cards = build_message_cards(&mut app);
+        let card_lines: Vec<Line<'static>> = cards
+            .iter()
+            .flat_map(|card| card.lines_for(120).iter().cloned().collect::<Vec<_>>())
+            .collect();
+        let lines: Vec<String> = card_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
         assert!(
             lines
                 .iter()
@@ -3228,6 +3242,21 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("@@ edit 1")));
         assert!(lines.iter().any(|line| line.contains("- aaa")));
         assert!(lines.iter().any(|line| line.contains("+ bbb")));
+
+        let section_line = card_lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains("@@ edit 1")
+            })
+            .expect("missing multiedit section header");
+        assert_eq!(section_line.spans[0].content, "  @@ ");
+        assert_eq!(section_line.spans[0].style.fg, Theme::diff_context().fg);
+        assert_eq!(section_line.spans[1].content, "edit 1");
+        assert_eq!(section_line.spans[1].style.fg, Theme::status_accent().fg);
     }
 
     #[test]
@@ -3250,7 +3279,21 @@ mod tests {
             },
         });
 
-        let lines = rendered_card_lines(&mut app);
+        let cards = build_message_cards(&mut app);
+        let card_lines: Vec<Line<'static>> = cards
+            .iter()
+            .flat_map(|card| card.lines_for(120).iter().cloned().collect::<Vec<_>>())
+            .collect();
+        let lines: Vec<String> = card_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
         assert!(
             lines
                 .iter()
@@ -3263,6 +3306,21 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("-     old();")));
         assert!(lines.iter().any(|line| line.contains("+     new();")));
+
+        let section_line = card_lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains("@@ build_message_cards")
+            })
+            .expect("missing replace_symbol section header");
+        assert_eq!(section_line.spans[0].content, "  @@ ");
+        assert_eq!(section_line.spans[0].style.fg, Theme::diff_context().fg);
+        assert_eq!(section_line.spans[1].content, "build_message_cards");
+        assert_eq!(section_line.spans[1].style.fg, Theme::diff_file().fg);
     }
 
     #[test]
