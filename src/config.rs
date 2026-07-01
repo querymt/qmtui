@@ -1,8 +1,8 @@
 // src/config.rs — TUI persistent configuration and session cache
 //
 // Two files:
-//   ~/.qmt/tui.toml              — user config (theme, server defaults)
-//   ~/.cache/qmt/tui-cache.toml  — per-session mode→model+effort cache
+//   ~/.qmt/qmtui.toml            - user config (theme, ACP defaults)
+//   ~/.cache/qmt/tui-cache.toml  - per-session mode->model+effort cache
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ impl TestPersistenceGuard {
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("qmt-persistence-tests-{label}-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
-        test_set_config_path_override(Some(dir.join("tui.toml")));
+        test_set_config_path_override(Some(dir.join("qmtui.toml")));
         test_set_cache_path_override(Some(dir.join("tui-cache.toml")));
         Self { _lock: lock }
     }
@@ -72,33 +72,31 @@ impl Drop for TestPersistenceGuard {
     }
 }
 
-// ── TuiConfig — ~/.qmt/tui.toml ──────────────────────────────────────────────
+// -- TuiConfig - ~/.qmt/qmtui.toml -------------------------------------------
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ServerLaunchMode {
+pub enum AcpTransportMode {
     #[default]
-    Api,
-    Dashboard,
+    Stdio,
+    WebSocket,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ServerConfig {
-    pub addr: Option<String>,
-    pub tls: Option<bool>,
+pub struct AcpConfig {
+    /// ACP transport to use. Only stdio is wired today; WebSocket is reserved
+    /// because qmtcode can expose ACP at ws://host/ws once the CLI grows a flag.
+    pub transport: Option<AcpTransportMode>,
+    /// Reserved for future ACP WebSocket support.
+    pub websocket_url: Option<String>,
     /// Path to the `qmtcode` binary. Falls back to `$PATH` lookup when absent.
     pub binary_path: Option<String>,
-    /// Which built-in qmtcode server mode to launch when `binary_args` is absent.
-    /// Default: `api`.
-    pub launch_mode: Option<ServerLaunchMode>,
-    /// Extra CLI arguments passed to the spawned server.
-    /// Default (when absent): `["--api={addr}"]` or `["--dashboard={addr}"]`.
+    /// Extra CLI arguments passed to the spawned ACP agent.
+    /// Default (when absent): `["--acp"]`.
     pub binary_args: Option<Vec<String>>,
-    /// Automatically start a local server when none is found. Default: `true`.
+    /// Automatically start a local ACP stdio agent. Default: `true`.
     pub auto_start: Option<bool>,
-    /// Kill the spawned server when the TUI exits. Default: `true`.
-    pub shutdown_on_exit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -112,7 +110,7 @@ pub struct ProfileConfig {
 pub struct TuiConfig {
     pub theme: Option<String>,
     pub show_thinking: Option<bool>,
-    pub server: ServerConfig,
+    pub acp: AcpConfig,
     /// Per-agent-id model preferences: agent_id → "provider/model".
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub delegate_models: HashMap<String, String>,
@@ -131,10 +129,10 @@ impl TuiConfig {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".qmt")
-            .join("tui.toml")
+            .join("qmtui.toml")
     }
 
-    /// Load from the default path (`~/.qmt/tui.toml`).
+    /// Load from the default path (`~/.qmt/qmtui.toml`).
     pub fn load() -> Self {
         Self::load_from_path(&Self::config_path())
     }
@@ -147,13 +145,13 @@ impl TuiConfig {
             .unwrap_or_default()
     }
 
-    /// Save to the default path (`~/.qmt/tui.toml`).
+    /// Save to the default path (`~/.qmt/qmtui.toml`).
     pub fn save(&self) {
         #[cfg(test)]
         assert!(
             config_path_override().lock().unwrap().is_some(),
             "TuiConfig::save() called in test without config path override! \
-             Use TestPersistenceGuard to avoid writing to the real ~/.qmt/tui.toml."
+             Use TestPersistenceGuard to avoid writing to the real ~/.qmt/qmtui.toml."
         );
         self.save_to_path(&Self::config_path());
     }
@@ -170,7 +168,7 @@ impl TuiConfig {
     }
 
     /// Return a copy of this config with app-owned UI fields refreshed.
-    /// This intentionally preserves unrelated persisted settings like `server.*`.
+    /// This intentionally preserves unrelated persisted settings like `acp.*`.
     pub fn with_app_settings(&self, app: &crate::app::App) -> Self {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
@@ -187,6 +185,13 @@ impl TuiConfig {
             .collect();
         merged.profile.id = app.active_profile_id.clone();
         merged
+    }
+
+    pub fn acp_args(&self) -> Vec<String> {
+        self.acp
+            .binary_args
+            .clone()
+            .unwrap_or_else(|| vec!["--acp".to_string()])
     }
 }
 
@@ -340,9 +345,10 @@ mod tests {
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(false),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(false),
+            acp: AcpConfig {
+                binary_path: Some("/usr/local/bin/qmtcode".into()),
+                binary_args: Some(vec!["--acp".into()]),
+                auto_start: Some(true),
                 ..Default::default()
             },
             ..Default::default()
@@ -372,27 +378,31 @@ mod tests {
 
     #[test]
     fn config_show_thinking_absent_means_none() {
-        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
+        let cfg: TuiConfig = toml::from_str("[acp]\n").unwrap();
         assert_eq!(cfg.show_thinking, None);
     }
 
     #[test]
-    fn config_launch_mode_defaults_to_api_when_absent() {
-        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
-        assert_eq!(
-            cfg.server.launch_mode.unwrap_or_default(),
-            ServerLaunchMode::Api
-        );
+    fn config_acp_args_default_to_acp() {
+        let cfg: TuiConfig = toml::from_str("[acp]\n").unwrap();
+        assert_eq!(cfg.acp_args(), vec!["--acp"]);
     }
 
     #[test]
-    fn config_launch_mode_round_trips_dashboard() {
-        let cfg: TuiConfig = toml::from_str("[server]\nlaunch_mode = \"dashboard\"\n").unwrap();
-        assert_eq!(cfg.server.launch_mode, Some(ServerLaunchMode::Dashboard));
+    fn config_acp_transport_round_trips_websocket() {
+        let cfg: TuiConfig = toml::from_str(
+            "[acp]\ntransport = \"websocket\"\nwebsocket_url = \"ws://127.0.0.1:9123/ws\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.acp.transport, Some(AcpTransportMode::WebSocket));
+        assert_eq!(
+            cfg.acp.websocket_url.as_deref(),
+            Some("ws://127.0.0.1:9123/ws")
+        );
 
         let text = toml::to_string_pretty(&cfg).unwrap();
         let loaded: TuiConfig = toml::from_str(&text).unwrap();
-        assert_eq!(loaded.server.launch_mode, Some(ServerLaunchMode::Dashboard));
+        assert_eq!(loaded.acp.transport, Some(AcpTransportMode::WebSocket));
     }
 
     // ── TuiCache TOML ─────────────────────────────────────────────────────────
@@ -510,13 +520,12 @@ mod tests {
     #[test]
     fn config_save_to_path_and_load_round_trip() {
         let dir = unique_temp_dir("cfg-save");
-        let path = dir.join("nested").join("tui.toml");
+        let path = dir.join("nested").join("qmtui.toml");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(false),
+            acp: AcpConfig {
+                binary_path: Some("/usr/local/bin/qmtcode".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -533,7 +542,7 @@ mod tests {
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
-            server: ServerConfig::default(),
+            acp: AcpConfig::default(),
             ..Default::default()
         };
         cfg.save();
@@ -543,19 +552,17 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_save_load_round_trip_preserves_server_fields() {
-        let _guard = TestPathGuard::new("cfg-preserve-server");
+    fn config_save_load_round_trip_preserves_acp_fields() {
+        let _guard = TestPathGuard::new("cfg-preserve-acp");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(false),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(true),
+            acp: AcpConfig {
+                transport: Some(AcpTransportMode::Stdio),
+                websocket_url: Some("ws://127.0.0.1:9123/ws".into()),
                 binary_path: Some("/usr/local/bin/qmtcode".into()),
-                launch_mode: Some(ServerLaunchMode::Dashboard),
-                binary_args: Some(vec!["--dashboard=127.0.0.1:3030".into()]),
+                binary_args: Some(vec!["--acp".into()]),
                 auto_start: Some(false),
-                shutdown_on_exit: Some(false),
             },
             ..Default::default()
         };
@@ -567,28 +574,26 @@ mod tests {
     // ── from_app ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn with_app_settings_preserves_server_settings() {
+    fn with_app_settings_preserves_acp_settings() {
         let mut app = App::new();
         app.show_thinking = false;
 
         let existing = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(true),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(true),
+            acp: AcpConfig {
+                transport: Some(AcpTransportMode::Stdio),
+                websocket_url: Some("ws://127.0.0.1:9123/ws".into()),
                 binary_path: Some("/usr/local/bin/qmtcode".into()),
-                launch_mode: Some(ServerLaunchMode::Dashboard),
-                binary_args: Some(vec!["--dashboard=127.0.0.1:3030".into()]),
+                binary_args: Some(vec!["--acp".into()]),
                 auto_start: Some(false),
-                shutdown_on_exit: Some(false),
             },
             ..Default::default()
         };
 
         let merged = existing.with_app_settings(&app);
         assert_eq!(merged.show_thinking, Some(false));
-        assert_eq!(merged.server, existing.server);
+        assert_eq!(merged.acp, existing.acp);
     }
 
     #[test]

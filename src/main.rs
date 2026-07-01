@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod acp_client;
 mod app;
 mod config;
 mod handlers;
@@ -30,19 +31,18 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use protocol::{ClientMsg, RawServerMsg};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug)]
-enum ConnectionManagerEvent {
+pub(crate) enum ConnectionManagerEvent {
     State(app::ConnectionEvent),
 }
 
 #[derive(Debug)]
-enum ServerChannelMsg {
+pub(crate) enum ServerChannelMsg {
     Parsed(RawServerMsg),
     Invalid { error: String, raw: String },
 }
@@ -513,7 +513,7 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
-    use crate::config::{ServerConfig, TestPersistenceGuard, TuiConfig};
+    use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::handlers::*;
     use app::{ActivityState, App};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -687,9 +687,9 @@ mod external_editor_tests {
     fn log_server_binary_discovery_records_path_lookup_when_binary_path_unset() {
         let mut app = App::new();
         let cfg = TuiConfig {
-            server: ServerConfig {
+            acp: AcpConfig {
                 binary_path: None,
-                ..ServerConfig::default()
+                ..AcpConfig::default()
             },
             ..TuiConfig::default()
         };
@@ -705,10 +705,10 @@ mod external_editor_tests {
             },
         );
 
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
-            && entry.message == "server.binary_path not set; checking qmtcode on PATH"));
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+            && entry.message == "acp.binary_path not set; checking qmtcode on PATH"));
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
             && entry.message == "qmtcode not found on PATH"));
     }
@@ -1456,9 +1456,13 @@ mod external_editor_tests {
 #[command(version = env!("QMTUI_BUILD_VERSION"))]
 #[command(about = "querymt terminal interface")]
 struct Cli {
-    /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
+    /// Override the qmtcode binary used for ACP stdio for this run.
+    #[arg(short = 'b', long = "acp-binary")]
+    acp_binary: Option<String>,
+
+    /// Reserved for future ACP WebSocket transport support (ws://host/ws).
     #[arg(long)]
-    server: Option<String>,
+    acp_websocket: Option<String>,
 
     /// Restore a session by id.
     #[arg(short = 's', long)]
@@ -1584,18 +1588,18 @@ fn log_server_binary_discovery(
     if let Some(path) = discovery.configured_path.as_deref() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
+            "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
-    } else if cfg.server.binary_path.is_none() {
+    } else if cfg.acp.binary_path.is_none() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
-            "server.binary_path not set; checking qmtcode on PATH",
+            "acp",
+            "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(app::LogLevel::Info, "server", "qmtcode not found on PATH");
+        app.push_log(app::LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1628,18 +1632,9 @@ async fn main() -> anyhow::Result<()> {
     // Load persistent config; CLI args override config defaults.
     let cfg = config::TuiConfig::load();
 
-    let addr = cli
-        .server
-        .or_else(|| cfg.server.addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:42069".to_string());
-    let tls = cfg.server.tls.unwrap_or(false);
-
     // Apply saved theme (falls back to built-in default if absent or unknown).
     let theme_id = cfg.theme.as_deref().unwrap_or("base16-querymate");
     theme::Theme::init(theme_id);
-
-    let scheme = if tls { "wss" } else { "ws" };
-    let url = format!("{scheme}://{addr}/ui/ws");
 
     // channels for the event loop
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerChannelMsg>();
@@ -1667,42 +1662,59 @@ async fn main() -> anyhow::Result<()> {
     // Hydrate session effort cache from disk.
     config::TuiCache::load().hydrate_app(&mut app);
 
-    // ── Server auto-start ─────────────────────────────────────────────────────
-    let auto_start = cfg.server.auto_start.unwrap_or(true);
-    let shutdown_on_exit = cfg.server.shutdown_on_exit.unwrap_or(true);
-    let launch_mode = cfg.server.launch_mode.unwrap_or_default();
+    // -- ACP auto-start ---------------------------------------------------------
+    let auto_start = cfg.acp.auto_start.unwrap_or(true);
+    let transport = cfg.acp.transport.unwrap_or_default();
     let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
-    let (sup_shutdown_tx, sup_shutdown_rx) = mpsc::channel::<()>(1);
 
-    let initial_server_state = if auto_start {
-        let discovery = server_manager::find_binary_info(cfg.server.binary_path.as_deref());
+    let (endpoint, initial_server_state) = if let Some(url) = cli
+        .acp_websocket
+        .clone()
+        .or_else(|| cfg.acp.websocket_url.clone())
+    {
+        // Minimal prep only: the agent crate has ws:// ACP support, but qmtcode
+        // does not yet expose a stable CLI flag for it. Keep the config/CLI
+        // shape here so the transport can be wired without touching UI state.
+        (
+            Some(acp_client::AcpEndpoint::WebSocket { url }),
+            server_manager::ServerState::Starting,
+        )
+    } else if transport == config::AcpTransportMode::WebSocket {
+        (
+            Some(acp_client::AcpEndpoint::WebSocket {
+                url: "ws://127.0.0.1:0/ws".to_string(),
+            }),
+            server_manager::ServerState::Starting,
+        )
+    } else if auto_start {
+        let acp_binary = cli.acp_binary.as_deref().or(cfg.acp.binary_path.as_deref());
+        let discovery = server_manager::find_binary_info(acp_binary);
         log_server_binary_discovery(&mut app, &cfg, &discovery);
 
         if let Some(binary) = discovery.binary {
-            let sup_config = server_manager::ServerManagerConfig {
-                addr: addr.clone(),
-                launch_mode,
-                binary_args: cfg.server.binary_args.clone().unwrap_or_default(),
-                shutdown_on_exit,
-                lock_path: None,
-                ready_timeout: None,
-            };
-            tokio::spawn(server_manager::supervisor(
-                sup_config,
-                binary,
-                sup_event_tx,
-                sup_shutdown_rx,
-            ));
-            server_manager::ServerState::Starting
+            let argv = server_manager::build_acp_argv(binary, cfg.acp_args());
+            (
+                Some(acp_client::AcpEndpoint::Stdio { argv }),
+                server_manager::ServerState::Starting,
+            )
         } else {
             let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            server_manager::ServerState::BinaryNotFound
+            (None, server_manager::ServerState::BinaryNotFound)
         }
     } else {
-        server_manager::ServerState::Disabled
+        (None, server_manager::ServerState::Disabled)
     };
 
-    tokio::spawn(connection_manager(url, srv_tx, cmd_rx, conn_tx));
+    if let Some(endpoint) = endpoint {
+        tokio::spawn(connection_manager(
+            endpoint,
+            srv_tx,
+            cmd_rx,
+            conn_tx,
+            sup_event_tx.clone(),
+            app.launch_cwd.clone(),
+        ));
+    }
 
     // setup terminal
     enable_raw_mode()?;
@@ -1721,9 +1733,6 @@ async fn main() -> anyhow::Result<()> {
         &cmd_tx,
     )
     .await;
-
-    // Signal supervisor to stop (and kill the child if configured).
-    let _ = sup_shutdown_tx.send(()).await;
 
     // restore terminal
     disable_raw_mode()?;
@@ -1748,72 +1757,71 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 async fn connection_manager(
-    url: String,
+    endpoint: acp_client::AcpEndpoint,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
     conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
+    sup_event_tx: mpsc::UnboundedSender<server_manager::ServerEvent>,
+    launch_cwd: Option<String>,
 ) {
-    let mut attempt = 0u32;
+    match endpoint {
+        acp_client::AcpEndpoint::Stdio { argv } => {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
+            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
+                Ok(agent) => agent,
+                Err(err) => {
+                    let message = format!("invalid ACP stdio command: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: message.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason: message },
+                    ));
+                    return;
+                }
+            };
 
-    loop {
-        if attempt > 0 {
-            let delay_ms = reconnect_delay_ms(attempt - 1);
-            let _ = conn_tx.send(ConnectionManagerEvent::State(
-                app::ConnectionEvent::Connecting { attempt, delay_ms },
-            ));
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Started);
+            let result = acp_client::run_stdio_agent(
+                agent,
+                &mut cmd_rx,
+                srv_tx,
+                conn_tx.clone(),
+                launch_cwd,
+            )
+            .await;
+
+            match result {
+                Ok(()) => {
+                    let reason = "ACP stdio connection ended".to_string();
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
+                        reason: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
+                Err(err) => {
+                    let reason = format!("ACP stdio connection failed: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
+            }
         }
-
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((ws_stream, _)) => {
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Connected,
-                ));
-                let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-                let disconnected_reason = loop {
-                    tokio::select! {
-                        biased;
-                        maybe_cmd = cmd_rx.recv() => {
-                            let Some(cmd) = maybe_cmd else { return; };
-                            if let Ok(json) = serde_json::to_string(&cmd)
-                                && ws_tx.send(Message::Text(json.into())).await.is_err()
-                            {
-                                break String::from("send failed");
-                            }
-                        }
-                        maybe_msg = ws_rx.next() => {
-                            match maybe_msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    let _ = srv_tx.send(parse_server_text_for_channel(&text));
-                                }
-                                Some(Ok(_)) => {}
-                                Some(Err(err)) => {
-                                    break err.to_string();
-                                }
-                                None => {
-                                    break String::from("socket closed");
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: disconnected_reason,
-                    },
-                ));
-                attempt = 1;
-            }
-            Err(err) => {
-                attempt = attempt.saturating_add(1).max(1);
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: err.to_string(),
-                    },
-                ));
-            }
+        acp_client::AcpEndpoint::WebSocket { url } => {
+            // TODO(ACP websocket): agent crate support exists for ws://.../ws,
+            // but qmtcode does not expose a stable client-side endpoint here yet.
+            let reason = format!("ACP WebSocket transport is reserved but not wired yet: {url}");
+            let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                error: reason.clone(),
+            });
+            let _ = conn_tx.send(ConnectionManagerEvent::State(
+                app::ConnectionEvent::Disconnected { reason },
+            ));
         }
     }
 }
@@ -1845,9 +1853,7 @@ async fn run_loop(
                         if app.conn == app::ConnState::Connected {
                             cmd_tx.send(ClientMsg::Init)?;
                             cmd_tx.send(ClientMsg::list_sessions_browse())?;
-                            cmd_tx.send(ClientMsg::ListProfiles)?;
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
-                            cmd_tx.send(ClientMsg::GetAgentMode)?;
                             if let Some(session_id) = app.session_id.clone() {
                                 if let Some(node_id) = app.session_remote_node_id(&session_id) {
                                     cmd_tx.send(ClientMsg::AttachRemoteSession {
@@ -1915,17 +1921,13 @@ async fn run_loop(
                     ServerEvent::Starting => {
                         app.server_state = ServerState::Starting;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "server", "starting local server...");
+                            app.set_status(app::LogLevel::Info, "acp", "starting qmtcode ACP agent...");
                         }
                     }
                     ServerEvent::Started => {
                         app.server_state = ServerState::Running;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                app::LogLevel::Info,
-                                "server",
-                                "local server started — connecting...",
-                            );
+                            app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
                         }
                     }
                     ServerEvent::BinaryNotFound => {
@@ -1933,8 +1935,8 @@ async fn run_loop(
                         if app.conn != app::ConnState::Connected {
                             app.set_status(
                                 app::LogLevel::Warn,
-                                "server",
-                                "qmtcode not found — install it or set server.binary_path in ~/.qmt/tui.toml",
+                                "acp",
+                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
                             );
                         }
                     }
@@ -1942,24 +1944,16 @@ async fn run_loop(
                         app.server_state = ServerState::StartFailed { error: error.clone() };
                         app.set_status(
                             app::LogLevel::Error,
-                            "server",
-                            format!("server start failed: {error}"),
+                            "acp",
+                            format!("ACP start failed: {error}"),
                         );
                     }
                     ServerEvent::Stopped { reason } => {
                         app.server_state = ServerState::Restarting { reason: reason.clone() };
                         app.set_status(
                             app::LogLevel::Warn,
-                            "server",
-                            format!("server stopped ({reason}) — restarting..."),
-                        );
-                    }
-                    ServerEvent::FallingBackToDashboard => {
-                        app.server_state = ServerState::Starting;
-                        app.set_status(
-                            app::LogLevel::Info,
-                            "server",
-                            "--api unsupported, retrying with --dashboard...",
+                            "acp",
+                            format!("ACP agent stopped ({reason})"),
                         );
                     }
                 }
@@ -3836,6 +3830,21 @@ mod cli_tests {
         let b = bin();
         let cli = Cli::try_parse_from([b.as_str()]).unwrap();
         assert_eq!(cli.session, None);
+        assert_eq!(cli.acp_binary, None);
+    }
+
+    #[test]
+    fn cli_acp_binary_short_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn cli_acp_binary_long_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
     }
 
     #[test]

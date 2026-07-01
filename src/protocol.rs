@@ -894,11 +894,6 @@ pub struct DelegationData {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AllModelsData {
-    pub models: Vec<ModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AudioCapabilitiesData {
     #[serde(default)]
     pub stt_models: Vec<AudioModelInfo>,

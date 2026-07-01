@@ -369,7 +369,7 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// Persist current app state to `~/.qmt/tui.toml`.  Called at every
+/// Persist current app state to `~/.qmt/qmtui.toml`.  Called at every
 /// user-initiated change that should survive a restart.
 pub(crate) fn save_config(app: &App) {
     let merged = config::TuiConfig::load().with_app_settings(app);

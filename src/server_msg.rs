@@ -863,9 +863,12 @@ impl App {
             }
             "all_models_list" => {
                 if let Some(data) = raw.data
-                    && let Ok(ml) = serde_json::from_value::<AllModelsData>(data)
+                    && let Some(models) = data.get("models").and_then(serde_json::Value::as_array)
                 {
-                    self.models = ml.models;
+                    self.models = models
+                        .iter()
+                        .filter_map(|model| serde_json::from_value(model.clone()).ok())
+                        .collect();
                 }
                 vec![]
             }
