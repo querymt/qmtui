@@ -59,6 +59,7 @@ const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token 
 const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
 pub(crate) const ICON_DELEGATES: &str = "\u{2387}"; // ⎇  alt/fork       – delegation count
 pub(crate) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
+pub(crate) const ICON_MESH: &str = "\u{1F5A7}"; // mesh nodes (U+1F5A7)
 
 // ── General text symbols ──────────────────────────────────────────────────────
 const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
@@ -745,6 +746,10 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
             format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
             Theme::status(),
         ));
+    }
+
+    if let Some(span) = super::mesh_header_span(app) {
+        right_spans.push(span);
     }
 
     let effort_label = app.reasoning_effort_label().to_string();

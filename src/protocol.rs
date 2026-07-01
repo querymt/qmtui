@@ -926,6 +926,8 @@ pub struct ModelEntry {
     pub provider: String,
     pub model: String,
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub node_label: Option<String>,
     pub family: Option<String>,
     pub quant: Option<String>,
 }

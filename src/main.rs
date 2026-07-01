@@ -3499,6 +3499,7 @@ mod reasoning_effort_integration_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }

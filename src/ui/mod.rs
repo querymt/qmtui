@@ -335,6 +335,14 @@ fn conn_indicator(app: &App) -> Span<'static> {
     )
 }
 
+pub(crate) fn mesh_header_span(app: &App) -> Option<Span<'static>> {
+    let n = app.mesh_node_count.filter(|&n| n > 0)?;
+    Some(Span::styled(
+        format!(" {} {n} ", chat::ICON_MESH),
+        Theme::status(),
+    ))
+}
+
 fn draw_header(
     f: &mut Frame,
     app: &App,
@@ -1764,6 +1772,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1773,6 +1782,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1840,6 +1850,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1849,6 +1860,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1884,6 +1896,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1893,6 +1906,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1948,6 +1962,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: format!("model-{i}"),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             })

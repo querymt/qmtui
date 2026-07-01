@@ -861,6 +861,42 @@ impl App {
                 }
                 self.drain_pending()
             }
+            "control_capabilities" => {
+                if let Some(data) = raw.data {
+                    self.apply_control_capabilities_log(data);
+                }
+                vec![]
+            }
+            "control_capabilities_error" => {
+                if let Some(data) = raw.data {
+                    let message = data
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error");
+                    self.push_log(
+                        LogLevel::Warn,
+                        "capabilities",
+                        format!("capabilities unavailable: {message}"),
+                    );
+                }
+                vec![]
+            }
+            "mesh_nodes" => {
+                if let Some(data) = raw.data {
+                    let count = data
+                        .get("nodes")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|nodes| nodes.len() as u32)
+                        .unwrap_or(0);
+                    self.mesh_node_count = Some(count);
+                    self.push_log(
+                        LogLevel::Info,
+                        "mesh",
+                        format!("mesh nodes: {count}"),
+                    );
+                }
+                vec![]
+            }
             "all_models_list" => {
                 if let Some(data) = raw.data
                     && let Some(models) = data.get("models").and_then(serde_json::Value::as_array)
@@ -869,6 +905,31 @@ impl App {
                         .iter()
                         .filter_map(|model| serde_json::from_value(model.clone()).ok())
                         .collect();
+                    let remote_models = self
+                        .models
+                        .iter()
+                        .filter(|m| m.node_id.is_some())
+                        .count();
+                    let meta = data.get("meta");
+                    let remote_nodes = meta
+                        .and_then(|m| m.get("remote_node_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let timeouts = meta
+                        .and_then(|m| m.get("remote_timeout_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let mut line = format!(
+                        "models: {} total, {} remote",
+                        self.models.len(),
+                        remote_models
+                    );
+                    if remote_nodes > 0 || timeouts > 0 {
+                        line.push_str(&format!(
+                            " (inventory nodes={remote_nodes}, timeouts={timeouts})"
+                        ));
+                    }
+                    self.push_log(LogLevel::Info, "models", line);
                 }
                 vec![]
             }
@@ -1816,6 +1877,110 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    fn apply_control_capabilities_log(&mut self, data: serde_json::Value) {
+        let version = data
+            .get("querymt_control_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let agent = data.get("agent");
+        let kind = agent
+            .and_then(|a| a.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let display = agent
+            .and_then(|a| a.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let version_str = agent
+            .and_then(|a| a.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let transport = data.get("transport");
+        let mesh_on = transport
+            .and_then(|t| t.get("mesh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mesh_transport = transport
+            .and_then(|t| t.get("mesh_transport"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("none");
+        self.push_log(
+            LogLevel::Info,
+            "capabilities",
+            format!(
+                "querymt control v{version}: {display} ({kind} {version_str}), mesh={mesh_on} transport={mesh_transport}"
+            ),
+        );
+
+        if let Some(features) = data.get("features") {
+            let mesh = features
+                .get("mesh")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let remote_sessions = features
+                .get("remote_sessions")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let profiles = features
+                .get("profiles")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let auth = features
+                .get("auth")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let models = features
+                .get("models")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.push_log(
+                LogLevel::Debug,
+                "capabilities",
+                format!(
+                    "features: mesh={mesh}, remote_sessions={remote_sessions}, profiles={profiles}, auth={auth}, models={models}"
+                ),
+            );
+        }
+
+        let methods = data
+            .get("methods")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let querymt_methods: Vec<&str> = methods
+            .iter()
+            .map(String::as_str)
+            .filter(|m| m.starts_with("querymt/"))
+            .collect();
+        self.push_log(
+            LogLevel::Debug,
+            "capabilities",
+            format!(
+                "methods: {} total ({} querymt/*)",
+                methods.len(),
+                querymt_methods.len()
+            ),
+        );
+        if !querymt_methods.is_empty() {
+            let preview: Vec<&str> = querymt_methods.iter().copied().take(12).collect();
+            let suffix = if querymt_methods.len() > preview.len() {
+                format!(" …+{}", querymt_methods.len() - preview.len())
+            } else {
+                String::new()
+            };
+            self.push_log(
+                LogLevel::Debug,
+                "capabilities",
+                format!("querymt methods: {}{suffix}", preview.join(", ")),
+            );
         }
     }
 }

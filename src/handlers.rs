@@ -405,6 +405,9 @@ pub(crate) fn handle_chord(
                 _ => 1,
             };
             app.model_cursor = app.current_mode_model_cursor();
+            if can_send_server_commands(app) {
+                cmd_tx.send(ClientMsg::ListAllModels { refresh: true })?;
+            }
         }
         KeyCode::Char('n') => {
             if !can_send_server_commands(app) {
@@ -2454,6 +2457,7 @@ mod model_popup_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }

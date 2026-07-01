@@ -1066,6 +1066,10 @@ pub struct App {
     // status line
     pub status: String,
 
+    // mesh / remote (from ACP extensions)
+    /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch (connect-time).
+    pub mesh_node_count: Option<u32>,
+
     // connection
     pub conn: ConnState,
     pub reconnect_attempt: u32,
@@ -1261,6 +1265,7 @@ impl App {
             context_limit: 0,
             session_stats: SessionStatsLite::default(),
             pending_cancel_confirm_until: None,
+            mesh_node_count: None,
             conn: ConnState::Connecting,
             reconnect_attempt: 0,
             reconnect_delay_ms: None,
@@ -4243,6 +4248,7 @@ mod delegate_entry_tests {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -4968,6 +4974,7 @@ mod session_cache_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }
@@ -5507,6 +5514,7 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-opus".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -5552,6 +5560,7 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-opus".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -5594,6 +5603,7 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-opus".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -5636,6 +5646,7 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -5728,6 +5739,7 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -10278,6 +10290,7 @@ mod delegate_model_preference_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }

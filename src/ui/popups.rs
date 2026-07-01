@@ -304,11 +304,24 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 };
                 let marker_w = MODEL_MARKER_COL_W as usize;
                 let avail = list_w.saturating_sub(marker_w);
-                let label = if model.label.chars().count() > avail {
-                    let t: String = model.label.chars().take(avail.saturating_sub(1)).collect();
-                    format!("{t}{ELLIPSIS}")
+                let base_label = if model.node_id.is_some() {
+                    let node = model
+                        .node_label
+                        .as_deref()
+                        .or(model.node_id.as_deref())
+                        .unwrap_or("remote");
+                    format!("{} @ {node}", model.label)
                 } else {
                     model.label.clone()
+                };
+                let label = if base_label.chars().count() > avail {
+                    let t: String = base_label
+                        .chars()
+                        .take(avail.saturating_sub(1))
+                        .collect();
+                    format!("{t}{ELLIPSIS}")
+                } else {
+                    base_label
                 };
                 let gap = avail.saturating_sub(label.chars().count());
                 let main_style = if selected {

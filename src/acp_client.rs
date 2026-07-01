@@ -61,6 +61,7 @@ impl AcpModelEntry {
             provider: self.provider.clone(),
             model: self.model.clone(),
             node_id: self.node_id.clone(),
+            node_label: self.node_label.clone(),
             family: self.family.clone(),
             quant: self.quant.clone(),
         }
@@ -73,6 +74,10 @@ struct AcpModelsMeta {
     stale: bool,
     #[serde(default)]
     refresh_in_progress: bool,
+    #[serde(default)]
+    remote_node_count: u32,
+    #[serde(default)]
+    remote_timeout_count: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -281,6 +286,7 @@ async fn handle_client_msg(
                 Some("build"),
                 Some(None),
             );
+            post_connect_diagnostics(connection, srv_tx).await;
         }
         ClientMsg::ListSessions { cursor, cwd, .. } => {
             let mut req = acp::ListSessionsRequest::new().cursor(cursor);
@@ -323,7 +329,19 @@ async fn handle_client_msg(
         ClientMsg::LoadSession { session_id } => {
             state.set_current_session_id(session_id.clone()).await;
             state.begin_loading(&session_id).await;
+
+            let req = acp::LoadSessionRequest::new(session_id.clone(), state.default_cwd());
+            let result = connection.send_request(req).block_task().await;
+            state.end_loading(&session_id).await;
+            let response = result?;
+
             let identity = state.agent_identity().await;
+            let audit = session_load_audit_from_response(&response);
+            let profile_id = response
+                .config_options
+                .as_ref()
+                .and_then(|opts| profile_id_from_config_options(opts.as_slice()));
+
             send_raw(
                 srv_tx,
                 RawServerMsg {
@@ -331,17 +349,13 @@ async fn handle_client_msg(
                     data: Some(json!({
                         "session_id": session_id,
                         "agent_id": identity.id.clone(),
-                        "audit": { "events": [] },
+                        "audit": audit,
                         "undo_stack": [],
-                        "profile_id": null,
+                        "profile_id": profile_id,
                     })),
                 },
             );
 
-            let req = acp::LoadSessionRequest::new(session_id.clone(), state.default_cwd());
-            let result = connection.send_request(req).block_task().await;
-            state.end_loading(&session_id).await;
-            let response = result?;
             if let Some(config_options) = response.config_options {
                 send_config_updates(state, srv_tx, config_options).await;
             }
@@ -558,6 +572,58 @@ async fn call_querymt_ext(
         .await
 }
 
+fn ext_payload<'a>(response: &'a Value) -> &'a Value {
+    response.get("data").unwrap_or(response)
+}
+
+async fn post_connect_diagnostics(
+    connection: &ConnectionTo<Agent>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+) {
+    match call_querymt_ext(connection, "querymt/capabilities", json!({})).await {
+        Ok(response) => {
+            send_raw(
+                srv_tx,
+                RawServerMsg {
+                    msg_type: "control_capabilities".to_string(),
+                    data: Some(ext_payload(&response).clone()),
+                },
+            );
+            let methods = ext_payload(&response)
+                .get("methods")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if methods.iter().any(|m| m == "querymt/mesh/nodes") {
+                if let Ok(nodes_resp) =
+                    call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
+                {
+                    send_raw(
+                        srv_tx,
+                        RawServerMsg {
+                            msg_type: "mesh_nodes".to_string(),
+                            data: Some(ext_payload(&nodes_resp).clone()),
+                        },
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            send_raw(
+                srv_tx,
+                RawServerMsg {
+                    msg_type: "control_capabilities_error".to_string(),
+                    data: Some(json!({ "message": err.to_string() })),
+                },
+            );
+        }
+    }
+}
+
 fn client_capabilities() -> acp::ClientCapabilities {
     acp::ClientCapabilities::new()
         .fs(acp::FileSystemCapabilities::new())
@@ -585,6 +651,48 @@ fn profile_meta(profile_id: &str) -> serde_json::Map<String, Value> {
     let mut meta = serde_json::Map::new();
     meta.insert("querymt".to_string(), json!({ "profile_id": profile_id }));
     meta
+}
+
+const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
+
+fn session_load_audit_from_response(response: &acp::LoadSessionResponse) -> Value {
+    let value = serde_json::to_value(response).unwrap_or(Value::Null);
+    session_load_audit_from_load_value(&value)
+}
+
+fn session_load_audit_from_load_value(response: &Value) -> Value {
+    let meta = response.get("_meta").or_else(|| response.get("meta"));
+    let snapshot = meta.and_then(|m| m.get(SESSION_LOAD_SNAPSHOT_META_KEY));
+    match snapshot {
+        Some(snapshot) => snapshot
+            .get("audit")
+            .cloned()
+            .unwrap_or_else(|| json!({ "events": [] })),
+        None => json!({ "events": [] }),
+    }
+}
+
+fn profile_id_from_config_options(config_options: &[acp::SessionConfigOption]) -> Option<String> {
+    let options_json = serde_json::to_value(config_options).ok()?;
+    let options = options_json.as_array()?;
+    for option in options {
+        let id = option.get("id").and_then(Value::as_str).unwrap_or_default();
+        let category = option
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = option
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if normalize_config_key(id, category, name) == "profile" {
+            return option
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 async fn load_acp_models(
@@ -1417,6 +1525,46 @@ mod tests {
             "provider": provider,
             "model": model,
         })
+    }
+
+    #[test]
+    fn session_load_audit_reads_querymt_snapshot_from_meta() {
+        let response = json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "prompt_received",
+                                    "data": { "content": "hello", "message_id": "m1" }
+                                },
+                                "timestamp": 1
+                            }
+                        ]
+                    },
+                    "cursor": { "local_seq": 1, "remote_seq_by_source": {} }
+                }
+            }
+        });
+        let audit = session_load_audit_from_load_value(&response);
+        let events = audit
+            .get("events")
+            .and_then(Value::as_array)
+            .expect("events");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn session_load_audit_missing_snapshot_returns_empty_events() {
+        let audit = session_load_audit_from_load_value(&json!({}));
+        assert_eq!(
+            audit
+                .get("events")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]
