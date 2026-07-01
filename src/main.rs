@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod acp_client;
+mod acp_state;
 mod app;
 mod config;
 mod handlers;
@@ -9,6 +10,7 @@ mod input;
 mod markdown;
 mod protocol;
 mod server_manager;
+#[cfg(test)]
 mod server_msg;
 mod session;
 mod slash;
@@ -24,6 +26,7 @@ use std::{
     time::Duration,
 };
 
+use acp_state::AcpAppEvent;
 use app::{App, Screen};
 use clap::Parser;
 use crossterm::{
@@ -32,7 +35,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use protocol::{ClientMsg, RawServerMsg};
+use protocol::ClientMsg;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
@@ -43,27 +46,7 @@ pub(crate) enum ConnectionManagerEvent {
 
 #[derive(Debug)]
 pub(crate) enum ServerChannelMsg {
-    Parsed(RawServerMsg),
-    Invalid { error: String, raw: String },
-}
-
-fn parse_server_text_for_channel(text: &str) -> ServerChannelMsg {
-    match serde_json::from_str::<RawServerMsg>(text) {
-        Ok(raw) => ServerChannelMsg::Parsed(raw),
-        Err(err) => ServerChannelMsg::Invalid {
-            error: err.to_string(),
-            raw: text.to_string(),
-        },
-    }
-}
-
-fn log_invalid_server_message(app: &mut App, error: String, raw: String) {
-    app.status = format!("invalid server message: {error}");
-    app.push_log(
-        app::LogLevel::Error,
-        "protocol",
-        format!("invalid server message: {error}; raw: {raw}"),
-    );
+    Acp(AcpAppEvent),
 }
 
 fn reconnect_delay_ms(attempt: u32) -> u64 {
@@ -181,35 +164,10 @@ mod tests {
 
     #[test]
     fn raw_server_msg_missing_data_parses_as_none() {
-        let raw = serde_json::from_str::<RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
+        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
 
         assert_eq!(raw.msg_type, "heartbeat");
         assert!(raw.data.is_none());
-    }
-
-    #[test]
-    fn invalid_server_message_log_includes_full_raw_payload() {
-        let raw = r#"{"data":"missing type","nested":{"value":"do not truncate"}}"#;
-        let ServerChannelMsg::Invalid {
-            error,
-            raw: parsed_raw,
-        } = parse_server_text_for_channel(raw)
-        else {
-            panic!("expected invalid server message");
-        };
-        let mut app = App::new();
-
-        log_invalid_server_message(&mut app, error.clone(), parsed_raw);
-
-        assert!(error.contains("missing field `type`"));
-        assert_eq!(app.status, format!("invalid server message: {error}"));
-        let log = app.logs.last().unwrap();
-        assert_eq!(log.level, app::LogLevel::Error);
-        assert_eq!(log.target, "protocol");
-        assert_eq!(
-            log.message,
-            format!("invalid server message: {error}; raw: {raw}")
-        );
     }
 
     // ── Elicitation key handling ──────────────────────────────────────────────
@@ -1878,26 +1836,19 @@ async fn run_loop(
                     }
                 }
             }
-            // server messages
-            Some(msg) = srv_rx.recv() => {
-                match msg {
-                    ServerChannelMsg::Parsed(msg) => {
-                        for reply in app.handle_server_msg(msg) {
-                            // if reloading session, also re-subscribe
-                            if let ClientMsg::LoadSession { ref session_id } = reply {
-                                let sid = session_id.clone();
-                                cmd_tx.send(reply)?;
-                                cmd_tx.send(ClientMsg::SubscribeSession {
-                                    session_id: sid,
-                                    agent_id: app.agent_id.clone(),
-                                })?;
-                            } else {
-                                cmd_tx.send(reply)?;
-                            }
-                        }
-                    }
-                    ServerChannelMsg::Invalid { error, raw } => {
-                        log_invalid_server_message(app, error, raw);
+            // native ACP client events
+            Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
+                for reply in app.handle_acp_event(event) {
+                    // if reloading session, also re-subscribe
+                    if let ClientMsg::LoadSession { ref session_id } = reply {
+                        let sid = session_id.clone();
+                        cmd_tx.send(reply)?;
+                        cmd_tx.send(ClientMsg::SubscribeSession {
+                            session_id: sid,
+                            agent_id: app.agent_id.clone(),
+                        })?;
+                    } else {
+                        cmd_tx.send(reply)?;
                     }
                 }
             }

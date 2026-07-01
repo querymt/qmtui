@@ -1099,7 +1099,7 @@ pub struct App {
     /// UserMessageStored to suppress the noisy batch-result message.
     pub suppress_delegation_result: bool,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
-    /// Drained by handle_server_msg after each event/replay batch.
+    /// Drained by native ACP and legacy reducers after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
@@ -1541,9 +1541,9 @@ impl App {
     }
 
     fn model_index_for_entry(&self, entry: &ModelEntry) -> Option<usize> {
-        self.models.iter().position(|m| {
-            m.id == entry.id && m.node_id == entry.node_id
-        })
+        self.models
+            .iter()
+            .position(|m| m.id == entry.id && m.node_id == entry.node_id)
     }
 
     /// Match catalog row to a provider/model pair, disambiguating local vs mesh.
@@ -1575,12 +1575,7 @@ impl App {
         ) else {
             return false;
         };
-        Self::model_entry_matches_node(
-            entry,
-            cp,
-            cm,
-            self.current_model_node_id.as_deref(),
-        )
+        Self::model_entry_matches_node(entry, cp, cm, self.current_model_node_id.as_deref())
     }
 
     pub fn model_popup_open_cursor(&self) -> usize {
@@ -5182,7 +5177,8 @@ mod session_mode_tests {
         let cmds = app.handle_server_msg(make_session_loaded(audit));
 
         assert!(
-            !cmds.iter()
+            !cmds
+                .iter()
                 .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
             "model comes from session audit replay only: {cmds:?}"
         );

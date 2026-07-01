@@ -273,10 +273,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 let avail = list_w.saturating_sub(marker_w);
                 let base_label = model.label.clone();
                 let label = if base_label.chars().count() > avail {
-                    let t: String = base_label
-                        .chars()
-                        .take(avail.saturating_sub(1))
-                        .collect();
+                    let t: String = base_label.chars().take(avail.saturating_sub(1)).collect();
                     format!("{t}{ELLIPSIS}")
                 } else {
                     base_label

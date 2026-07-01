@@ -1,8 +1,10 @@
 //! Server message handling for the TUI application.
 //!
-//! Contains `handle_server_msg`, `handle_event_kind`, `replay_audit`, and
-//! helper functions for parsing tool details, updating tool results, and
-//! building diff/write content lines.
+//! Legacy QueryMT websocket/server-message reducers.
+//!
+//! The normal ACP runtime no longer routes through this module. It remains for
+//! compatibility tests and as a reference while old event-shaped behavior is
+//! ported to native ACP state.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -856,11 +858,7 @@ impl App {
                         .map(|nodes| nodes.len() as u32)
                         .unwrap_or(0);
                     self.mesh_node_count = Some(count);
-                    self.push_log(
-                        LogLevel::Info,
-                        "mesh",
-                        format!("mesh nodes: {count}"),
-                    );
+                    self.push_log(LogLevel::Info, "mesh", format!("mesh nodes: {count}"));
                 }
                 vec![]
             }
@@ -882,11 +880,7 @@ impl App {
                         .iter()
                         .filter_map(|model| serde_json::from_value(model.clone()).ok())
                         .collect();
-                    let remote_models = self
-                        .models
-                        .iter()
-                        .filter(|m| m.node_id.is_some())
-                        .count();
+                    let remote_models = self.models.iter().filter(|m| m.node_id.is_some()).count();
                     let meta = data.get("meta");
                     let remote_nodes = meta
                         .and_then(|m| m.get("remote_node_count"))

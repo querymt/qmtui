@@ -12,7 +12,11 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::ServerChannelMsg;
-use crate::protocol::{ClientMsg, RawServerMsg};
+use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
+use crate::protocol::{
+    AuthProvidersData, ClientMsg, OAuthFlowData, OAuthResultData, ProfileInfo, SessionGroup,
+    SessionSummary,
+};
 
 #[derive(Debug, Clone)]
 pub enum AcpEndpoint {
@@ -94,13 +98,6 @@ impl AcpModelsResponse {
                 .as_ref()
                 .is_some_and(|meta| meta.stale || meta.refresh_in_progress)
     }
-
-    fn to_wire_value(&self) -> Value {
-        json!({
-            "models": self.models,
-            "meta": self.meta,
-        })
-    }
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +112,7 @@ struct AcpRuntimeState {
     agent: Mutex<AgentIdentity>,
     current_session_id: Mutex<Option<String>>,
     loading_sessions: Mutex<HashSet<String>>,
+    replay_updates: Mutex<HashMap<String, Vec<AcpSessionUpdate>>>,
     assistant_buffers: Mutex<HashMap<String, AssistantBuffer>>,
     pending_elicitations:
         Mutex<HashMap<String, acp_sdk::Responder<acp::CreateElicitationResponse>>>,
@@ -154,12 +152,26 @@ impl AcpRuntimeState {
             .insert(session_id.to_string());
     }
 
-    async fn end_loading(&self, session_id: &str) {
+    async fn end_loading(&self, session_id: &str) -> Vec<AcpSessionUpdate> {
         self.loading_sessions.lock().await.remove(session_id);
+        self.replay_updates
+            .lock()
+            .await
+            .remove(session_id)
+            .unwrap_or_default()
     }
 
     async fn is_loading(&self, session_id: &str) -> bool {
         self.loading_sessions.lock().await.contains(session_id)
+    }
+
+    async fn queue_replay_update(&self, session_id: &str, update: AcpSessionUpdate) {
+        self.replay_updates
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .push(update);
     }
 
     async fn set_models(&self, models: Vec<AcpModelEntry>) {
@@ -310,16 +322,12 @@ async fn handle_client_msg(
             let session_id = response.session_id.to_string();
             state.set_current_session_id(session_id.clone()).await;
             let identity = state.agent_identity().await;
-            send_raw(
+            send_acp(
                 srv_tx,
-                RawServerMsg {
-                    msg_type: "session_created".to_string(),
-                    data: Some(json!({
-                        "agent_id": identity.id.clone(),
-                        "session_id": session_id,
-                        "request_id": null,
-                        "profile_id": profile_id,
-                    })),
+                AcpAppEvent::SessionCreated {
+                    agent_id: identity.id.clone(),
+                    session_id,
+                    profile_id,
                 },
             );
             if let Some(config_options) = response.config_options {
@@ -332,29 +340,43 @@ async fn handle_client_msg(
 
             let req = acp::LoadSessionRequest::new(session_id.clone(), state.default_cwd());
             let result = connection.send_request(req).block_task().await;
-            state.end_loading(&session_id).await;
+            let replay_updates = state.end_loading(&session_id).await;
             let response = result?;
+            let snapshot_updates = if replay_updates.is_empty() {
+                snapshot_updates_from_load_response(&response)
+            } else {
+                Vec::new()
+            };
 
             let identity = state.agent_identity().await;
-            let audit = session_load_audit_from_response(&response);
             let profile_id = response
                 .config_options
                 .as_ref()
                 .and_then(|opts| profile_id_from_config_options(opts.as_slice()));
 
-            send_raw(
+            send_acp(
                 srv_tx,
-                RawServerMsg {
-                    msg_type: "session_loaded".to_string(),
-                    data: Some(json!({
-                        "session_id": session_id,
-                        "agent_id": identity.id.clone(),
-                        "audit": audit,
-                        "undo_stack": [],
-                        "profile_id": profile_id,
-                    })),
+                AcpAppEvent::SessionLoaded {
+                    session_id: session_id.clone(),
+                    agent_id: identity.id.clone(),
+                    profile_id,
                 },
             );
+            let history_updates = if replay_updates.is_empty() {
+                snapshot_updates
+            } else {
+                replay_updates
+            };
+            for update in history_updates {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::SessionUpdate {
+                        session_id: session_id.clone(),
+                        update,
+                        is_replay: true,
+                    },
+                );
+            }
 
             if let Some(config_options) = response.config_options {
                 send_config_updates(state, srv_tx, config_options).await;
@@ -365,7 +387,7 @@ async fn handle_client_msg(
                 send_error(srv_tx, "cannot prompt before a session is loaded");
                 return Ok(());
             };
-            send_event_kind(srv_tx, &session_id, json!({ "type": "turn_started" }));
+            send_session_update(srv_tx, &session_id, AcpSessionUpdate::TurnStarted, false);
             let req = acp::PromptRequest::new(session_id.clone(), prompt_blocks(prompt));
             let response = connection.send_request(req).block_task().await?;
             finish_prompt(state, srv_tx, &session_id, response.stop_reason).await;
@@ -405,22 +427,18 @@ async fn handle_client_msg(
                 .model_by_id(&model_id)
                 .await
                 .unwrap_or_else(|| fallback_model_entry(&model_id));
-            let effective_node = node_id
-                .as_deref()
-                .or(model.node_id.as_deref());
+            let effective_node = node_id.as_deref().or(model.node_id.as_deref());
             let node_part = effective_node
                 .map(|n| format!(" node={n}"))
                 .unwrap_or_default();
-            send_raw(
+            send_acp(
                 srv_tx,
-                RawServerMsg {
-                    msg_type: "acp_set_session_model".to_string(),
-                    data: Some(json!({
-                        "message": format!(
-                            "ACP SetSessionModel: provider={} model={} id={}{node_part}",
-                            model.provider, model.model, model_id
-                        ),
-                    })),
+                AcpAppEvent::InfoLog {
+                    target: "acp",
+                    message: format!(
+                        "ACP SetSessionModel: provider={} model={} id={}{node_part}",
+                        model.provider, model.model, model_id
+                    ),
                 },
             );
             let meta = model_entry_meta(&model, node_id.as_deref());
@@ -438,13 +456,7 @@ async fn handle_client_msg(
         ClientMsg::ListAllModels { refresh } => {
             let response = load_acp_models(connection, refresh).await?;
             state.set_models(response.models.clone()).await;
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "all_models_list".to_string(),
-                    data: Some(response.to_wire_value()),
-                },
-            );
+            send_models(srv_tx, &response);
             if let Some(model) = state.selected_or_default_model().await {
                 state.select_model(model.id.clone()).await;
                 send_provider_changed(srv_tx, &model);
@@ -452,13 +464,11 @@ async fn handle_client_msg(
         }
         ClientMsg::ListAuthProviders => {
             let response = call_querymt_ext(connection, "querymt/auth/status", json!({})).await?;
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "auth_providers".to_string(),
-                    data: Some(response),
-                },
-            );
+            if let Ok(auth) =
+                serde_json::from_value::<AuthProvidersData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::AuthProviders(auth.providers));
+            }
         }
         ClientMsg::StartOAuthLogin { provider } => {
             let response = call_querymt_ext(
@@ -467,13 +477,11 @@ async fn handle_client_msg(
                 json!({ "provider": provider }),
             )
             .await?;
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "oauth_flow_started".to_string(),
-                    data: Some(response),
-                },
-            );
+            if let Ok(flow) =
+                serde_json::from_value::<OAuthFlowData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::OAuthFlowStarted(flow));
+            }
         }
         ClientMsg::CompleteOAuthLogin { flow_id, response } => {
             let response = call_querymt_ext(
@@ -482,13 +490,11 @@ async fn handle_client_msg(
                 json!({ "flow_id": flow_id, "response": response }),
             )
             .await?;
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "oauth_result".to_string(),
-                    data: Some(response),
-                },
-            );
+            if let Ok(result) =
+                serde_json::from_value::<OAuthResultData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::OAuthResult(result));
+            }
         }
         ClientMsg::DisconnectOAuth { provider } => {
             let response = call_querymt_ext(
@@ -497,13 +503,11 @@ async fn handle_client_msg(
                 json!({ "provider": provider }),
             )
             .await?;
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "oauth_result".to_string(),
-                    data: Some(response),
-                },
-            );
+            if let Ok(result) =
+                serde_json::from_value::<OAuthResultData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::OAuthResult(result));
+            }
         }
         ClientMsg::ElicitationResponse {
             elicitation_id,
@@ -600,14 +604,9 @@ async fn post_connect_diagnostics(
 ) {
     match call_querymt_ext(connection, "querymt/capabilities", json!({})).await {
         Ok(response) => {
-            send_raw(
-                srv_tx,
-                RawServerMsg {
-                    msg_type: "control_capabilities".to_string(),
-                    data: Some(ext_payload(&response).clone()),
-                },
-            );
-            let methods = ext_payload(&response)
+            let payload = ext_payload(&response).clone();
+            send_acp(srv_tx, AcpAppEvent::ControlCapabilities(payload.clone()));
+            let methods = payload
                 .get("methods")
                 .and_then(Value::as_array)
                 .map(|arr| {
@@ -620,23 +619,17 @@ async fn post_connect_diagnostics(
                 if let Ok(nodes_resp) =
                     call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
                 {
-                    send_raw(
+                    send_acp(
                         srv_tx,
-                        RawServerMsg {
-                            msg_type: "mesh_nodes".to_string(),
-                            data: Some(ext_payload(&nodes_resp).clone()),
-                        },
+                        AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
                     );
                 }
             }
         }
         Err(err) => {
-            send_raw(
+            send_acp(
                 srv_tx,
-                RawServerMsg {
-                    msg_type: "control_capabilities_error".to_string(),
-                    data: Some(json!({ "message": err.to_string() })),
-                },
+                AcpAppEvent::ControlCapabilitiesUnavailable(err.to_string()),
             );
         }
     }
@@ -673,11 +666,6 @@ fn profile_meta(profile_id: &str) -> serde_json::Map<String, Value> {
 
 const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 
-fn session_load_audit_from_response(response: &acp::LoadSessionResponse) -> Value {
-    let value = serde_json::to_value(response).unwrap_or(Value::Null);
-    session_load_audit_from_load_value(&value)
-}
-
 fn session_load_audit_from_load_value(response: &Value) -> Value {
     let meta = response.get("_meta").or_else(|| response.get("meta"));
     let snapshot = meta.and_then(|m| m.get(SESSION_LOAD_SNAPSHOT_META_KEY));
@@ -687,6 +675,83 @@ fn session_load_audit_from_load_value(response: &Value) -> Value {
             .cloned()
             .unwrap_or_else(|| json!({ "events": [] })),
         None => json!({ "events": [] }),
+    }
+}
+
+fn snapshot_updates_from_load_response(
+    response: &acp::LoadSessionResponse,
+) -> Vec<AcpSessionUpdate> {
+    serde_json::to_value(response)
+        .map(|value| snapshot_updates_from_load_value(&value))
+        .unwrap_or_default()
+}
+
+fn snapshot_updates_from_load_value(response: &Value) -> Vec<AcpSessionUpdate> {
+    let audit = session_load_audit_from_load_value(response);
+    let Some(events) = audit.get("events").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    events
+        .iter()
+        .filter_map(|event| {
+            let kind = event.get("kind")?;
+            let kind_type = kind.get("type").and_then(Value::as_str)?;
+            let data = kind.get("data").unwrap_or(&Value::Null);
+            snapshot_event_to_update(kind_type, data)
+        })
+        .collect()
+}
+
+fn snapshot_event_to_update(kind_type: &str, data: &Value) -> Option<AcpSessionUpdate> {
+    match kind_type {
+        "prompt_received" => Some(AcpSessionUpdate::UserMessage {
+            content: data.get("content").cloned().unwrap_or(Value::Null),
+            message_id: snapshot_string(data, "message_id"),
+        }),
+        "assistant_content_delta" => Some(AcpSessionUpdate::AssistantContentDelta {
+            content: snapshot_string(data, "content").unwrap_or_default(),
+            message_id: snapshot_string(data, "message_id"),
+        }),
+        "assistant_thinking_delta" => Some(AcpSessionUpdate::AssistantThinkingDelta {
+            content: snapshot_string(data, "content").unwrap_or_default(),
+            message_id: snapshot_string(data, "message_id"),
+        }),
+        "assistant_message_stored" => Some(AcpSessionUpdate::AssistantMessage {
+            content: snapshot_string(data, "content").unwrap_or_default(),
+            thinking: snapshot_string(data, "thinking").filter(|text| !text.is_empty()),
+            message_id: snapshot_string(data, "message_id"),
+        }),
+        "tool_call_start" => Some(AcpSessionUpdate::ToolCallStart {
+            tool_call_id: snapshot_string(data, "tool_call_id"),
+            name: snapshot_string(data, "tool_name").unwrap_or_else(|| "tool".to_string()),
+            arguments: data.get("arguments").or_else(|| data.get("input")).cloned(),
+        }),
+        "tool_call_end" => Some(AcpSessionUpdate::ToolCallEnd {
+            tool_call_id: snapshot_string(data, "tool_call_id"),
+            name: snapshot_string(data, "tool_name").unwrap_or_else(|| "tool".to_string()),
+            is_error: data
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            result: snapshot_string(data, "result")
+                .or_else(|| snapshot_string(data, "output"))
+                .or_else(|| snapshot_string(data, "content")),
+        }),
+        "cancelled" => Some(AcpSessionUpdate::Cancelled),
+        "llm_request_end" => Some(AcpSessionUpdate::Finished {
+            finish_reason: snapshot_string(data, "finish_reason")
+                .unwrap_or_else(|| "completed".to_string()),
+        }),
+        _ => None,
+    }
+}
+
+fn snapshot_string(data: &Value, key: &str) -> Option<String> {
+    match data.get(key)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        other => serde_json::to_string(other).ok(),
     }
 }
 
@@ -795,96 +860,100 @@ async fn handle_session_notification(
 
     match notification.update {
         acp::SessionUpdate::UserMessageChunk(chunk) => {
-            send_event_kind(
+            emit_or_queue_update(
+                state,
                 srv_tx,
                 &session_id,
-                json!({
-                    "type": "prompt_received",
-                    "data": {
-                        "content": content_block_to_json(&chunk.content),
-                        "message_id": chunk.message_id,
-                    }
-                }),
-            );
+                AcpSessionUpdate::UserMessage {
+                    content: content_block_to_json(&chunk.content),
+                    message_id: chunk.message_id.map(|id| id.to_string()),
+                },
+                loading,
+            )
+            .await;
         }
         acp::SessionUpdate::AgentMessageChunk(chunk) => {
             let text = content_block_text(&chunk.content);
+            let message_id = chunk.message_id.as_ref().map(ToString::to_string);
             if loading {
-                send_event_kind(
+                emit_or_queue_update(
+                    state,
                     srv_tx,
                     &session_id,
-                    json!({
-                        "type": "assistant_message_stored",
-                        "data": {
-                            "content": text,
-                            "thinking": null,
-                            "message_id": chunk.message_id,
-                        }
-                    }),
-                );
-            } else {
-                remember_assistant_chunk(
-                    state,
-                    &session_id,
-                    chunk.message_id.as_ref().map(ToString::to_string),
-                    &text,
-                    false,
+                    AcpSessionUpdate::AssistantMessage {
+                        content: text,
+                        thinking: None,
+                        message_id,
+                    },
+                    true,
                 )
                 .await;
-                send_event_kind(
+            } else {
+                remember_assistant_chunk(state, &session_id, message_id.clone(), &text, false)
+                    .await;
+                send_session_update(
                     srv_tx,
                     &session_id,
-                    json!({
-                        "type": "assistant_content_delta",
-                        "data": {
-                            "content": text,
-                            "message_id": chunk.message_id.as_ref().map(ToString::to_string),
-                        }
-                    }),
+                    AcpSessionUpdate::AssistantContentDelta {
+                        content: text,
+                        message_id,
+                    },
+                    false,
                 );
             }
         }
         acp::SessionUpdate::AgentThoughtChunk(chunk) => {
             let text = content_block_text(&chunk.content);
-            remember_assistant_chunk(
+            let message_id = chunk.message_id.as_ref().map(ToString::to_string);
+            if !loading {
+                remember_assistant_chunk(state, &session_id, message_id.clone(), &text, true).await;
+            }
+            emit_or_queue_update(
                 state,
+                srv_tx,
                 &session_id,
-                chunk.message_id.as_ref().map(ToString::to_string),
-                &text,
-                true,
+                AcpSessionUpdate::AssistantThinkingDelta {
+                    content: text,
+                    message_id,
+                },
+                loading,
             )
             .await;
-            send_event_kind(
-                srv_tx,
-                &session_id,
-                json!({
-                    "type": "assistant_thinking_delta",
-                        "data": {
-                            "content": text,
-                            "message_id": chunk.message_id.as_ref().map(ToString::to_string),
-                        }
-                }),
-            );
         }
         acp::SessionUpdate::ToolCall(tool_call) => {
-            send_tool_start(srv_tx, &session_id, &tool_call);
+            emit_or_queue_update(
+                state,
+                srv_tx,
+                &session_id,
+                tool_start_update(&tool_call),
+                loading,
+            )
+            .await;
         }
         acp::SessionUpdate::ToolCallUpdate(update) => {
-            send_tool_update(srv_tx, &session_id, update);
+            emit_or_queue_update(
+                state,
+                srv_tx,
+                &session_id,
+                tool_call_update(update),
+                loading,
+            )
+            .await;
         }
         acp::SessionUpdate::CurrentModeUpdate(update) => {
-            send_raw(
+            send_acp(
                 srv_tx,
-                RawServerMsg {
-                    msg_type: "agent_mode".to_string(),
-                    data: Some(json!({ "mode": update.current_mode_id.to_string() })),
+                AcpAppEvent::AgentMode {
+                    mode: update.current_mode_id.to_string(),
                 },
             );
         }
         acp::SessionUpdate::ConfigOptionUpdate(update) => {
             send_config_updates(state, srv_tx, update.config_options).await;
         }
+        // TODO(ACP parity): map these native ACP updates into status/sidebar state.
         acp::SessionUpdate::SessionInfoUpdate(_) | acp::SessionUpdate::UsageUpdate(_) => {}
+        // TODO(ACP parity): add native plan/available-command rendering once the TUI UX is defined.
         acp::SessionUpdate::Plan(_) | acp::SessionUpdate::AvailableCommandsUpdate(_) => {}
         _ => {}
     }
@@ -921,67 +990,42 @@ async fn finish_prompt(
     let buffer = state.assistant_buffers.lock().await.remove(session_id);
     if let Some(buffer) = buffer {
         if !buffer.content.is_empty() || !buffer.thinking.is_empty() {
-            send_event_kind(
+            send_session_update(
                 srv_tx,
                 session_id,
-                json!({
-                    "type": "assistant_message_stored",
-                    "data": {
-                        "content": buffer.content,
-                        "thinking": if buffer.thinking.is_empty() { Value::Null } else { Value::String(buffer.thinking) },
-                        "message_id": buffer.message_id,
-                    }
-                }),
+                AcpSessionUpdate::AssistantMessage {
+                    content: buffer.content,
+                    thinking: (!buffer.thinking.is_empty()).then_some(buffer.thinking),
+                    message_id: buffer.message_id,
+                },
+                false,
             );
         }
     }
 
     if matches!(stop_reason, acp::StopReason::Cancelled) {
-        send_event_kind(srv_tx, session_id, json!({ "type": "cancelled" }));
+        send_session_update(srv_tx, session_id, AcpSessionUpdate::Cancelled, false);
     } else {
-        send_event_kind(
+        send_session_update(
             srv_tx,
             session_id,
-            json!({
-                "type": "llm_request_end",
-                "data": {
-                    "finish_reason": format!("{stop_reason:?}"),
-                    "cost_usd": null,
-                    "cumulative_cost_usd": null,
-                    "context_tokens": null,
-                    "tool_calls": null,
-                    "metrics": null,
-                }
-            }),
+            AcpSessionUpdate::Finished {
+                finish_reason: format!("{stop_reason:?}"),
+            },
+            false,
         );
     }
 }
 
-fn send_tool_start(
-    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
-    session_id: &str,
-    tool_call: &acp::ToolCall,
-) {
-    let tool_name = tool_name_from_title(&tool_call.title);
-    send_event_kind(
-        srv_tx,
-        session_id,
-        json!({
-            "type": "tool_call_start",
-            "data": {
-                "tool_call_id": tool_call.tool_call_id.to_string(),
-                "tool_name": tool_name,
-                "arguments": tool_call.raw_input.clone(),
-            }
-        }),
-    );
+fn tool_start_update(tool_call: &acp::ToolCall) -> AcpSessionUpdate {
+    AcpSessionUpdate::ToolCallStart {
+        tool_call_id: Some(tool_call.tool_call_id.to_string()),
+        name: tool_name_from_title(&tool_call.title),
+        arguments: tool_call.raw_input.clone(),
+    }
 }
 
-fn send_tool_update(
-    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
-    session_id: &str,
-    update: acp::ToolCallUpdate,
-) {
+fn tool_call_update(update: acp::ToolCallUpdate) -> AcpSessionUpdate {
     let status = update.fields.status.clone();
     let tool_name = update
         .fields
@@ -994,32 +1038,18 @@ fn send_tool_update(
         status,
         Some(acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed)
     ) {
-        send_event_kind(
-            srv_tx,
-            session_id,
-            json!({
-                "type": "tool_call_end",
-                "data": {
-                    "tool_call_id": update.tool_call_id.to_string(),
-                    "tool_name": tool_name,
-                    "is_error": matches!(status, Some(acp::ToolCallStatus::Failed)),
-                    "result": tool_update_result(&update.fields),
-                }
-            }),
-        );
+        AcpSessionUpdate::ToolCallEnd {
+            tool_call_id: Some(update.tool_call_id.to_string()),
+            name: tool_name,
+            is_error: matches!(status, Some(acp::ToolCallStatus::Failed)),
+            result: tool_update_result(&update.fields),
+        }
     } else {
-        send_event_kind(
-            srv_tx,
-            session_id,
-            json!({
-                "type": "tool_call_start",
-                "data": {
-                    "tool_call_id": update.tool_call_id.to_string(),
-                    "tool_name": tool_name,
-                    "arguments": update.fields.raw_input.clone(),
-                }
-            }),
-        );
+        AcpSessionUpdate::ToolCallStart {
+            tool_call_id: Some(update.tool_call_id.to_string()),
+            name: tool_name,
+            arguments: update.fields.raw_input.clone(),
+        }
     }
 }
 
@@ -1083,11 +1113,10 @@ async fn send_config_updates(
             }
         } else if normalized == "mode" {
             if let Some(mode) = current {
-                send_raw(
+                send_acp(
                     srv_tx,
-                    RawServerMsg {
-                        msg_type: "agent_mode".to_string(),
-                        data: Some(json!({ "mode": mode })),
+                    AcpAppEvent::AgentMode {
+                        mode: mode.to_string(),
                     },
                 );
             }
@@ -1096,11 +1125,10 @@ async fn send_config_updates(
             "thought_level" | "reasoning" | "reasoning_effort" | "thought"
         ) {
             if let Some(effort) = current {
-                send_raw(
+                send_acp(
                     srv_tx,
-                    RawServerMsg {
-                        msg_type: "reasoning_effort".to_string(),
-                        data: Some(json!({ "reasoning_effort": effort })),
+                    AcpAppEvent::ReasoningEffort {
+                        reasoning_effort: Some(effort.to_string()),
                     },
                 );
             }
@@ -1111,8 +1139,13 @@ async fn send_config_updates(
     }
 
     if !profiles.is_empty() {
-        let identity = state.agent_identity().await;
-        send_state(srv_tx, &identity, profiles, active_profile_id, None, None);
+        send_acp(
+            srv_tx,
+            AcpAppEvent::Profiles {
+                profiles,
+                active_profile_id,
+            },
+        );
     }
 }
 
@@ -1178,19 +1211,14 @@ fn model_entry_from_config_option(option: &Value, model_id: &str) -> Option<AcpM
 }
 
 fn send_provider_changed(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, model: &AcpModelEntry) {
-    send_event_kind(
+    send_acp(
         srv_tx,
-        "models",
-        json!({
-            "type": "provider_changed",
-            "data": {
-                "provider": model.provider,
-                "model": model.model,
-                "config_id": null,
-                "context_limit": null,
-                "provider_node_id": model.node_id,
-            }
-        }),
+        AcpAppEvent::ProviderChanged {
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+            context_limit: None,
+            provider_node_id: model.node_id.clone(),
+        },
     );
 }
 
@@ -1210,20 +1238,23 @@ fn normalize_config_key(id: &str, category: &str, name: &str) -> String {
     String::new()
 }
 
-fn profile_infos_from_option(option: &Value) -> Vec<Value> {
+fn profile_infos_from_option(option: &Value) -> Vec<ProfileInfo> {
     flatten_select_entries(option)
         .into_iter()
         .filter_map(|entry| {
             let id = entry.get("value")?.as_str()?;
             let name = entry.get("name").and_then(Value::as_str).unwrap_or(id);
-            Some(json!({
-                "id": id,
-                "name": name,
-                "description": entry.get("description").and_then(Value::as_str),
-                "tags": [],
-                "source": null,
-                "config_kind": null,
-            }))
+            Some(ProfileInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                tags: Vec::new(),
+                source: None,
+                config_kind: None,
+            })
         })
         .collect()
 }
@@ -1248,56 +1279,52 @@ fn send_session_list(
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
     response: acp::ListSessionsResponse,
 ) {
-    let mut groups: BTreeMap<Option<String>, Vec<Value>> = BTreeMap::new();
+    let mut groups: BTreeMap<Option<String>, Vec<SessionSummary>> = BTreeMap::new();
     for session in response.sessions {
         let cwd = session.cwd.to_string_lossy().to_string();
         let group_key = (!cwd.is_empty()).then_some(cwd.clone());
-        groups.entry(group_key).or_default().push(json!({
-            "session_id": session.session_id.to_string(),
-            "name": session.title,
-            "title": session.title,
-            "cwd": if cwd.is_empty() { Value::Null } else { Value::String(cwd) },
-            "created_at": null,
-            "updated_at": session.updated_at,
-            "parent_session_id": null,
-            "fork_origin": null,
-            "session_kind": null,
-            "has_children": false,
-            "fork_count": 0,
-            "children": [],
-            "children_next_cursor": null,
-            "children_total_count": null,
-            "node": null,
-            "node_id": null,
-            "attached": null,
-            "runtime_state": null,
-        }));
+        groups.entry(group_key).or_default().push(SessionSummary {
+            session_id: session.session_id.to_string(),
+            name: session.title.clone(),
+            title: session.title,
+            cwd: (!cwd.is_empty()).then_some(cwd),
+            created_at: None,
+            updated_at: session.updated_at,
+            parent_session_id: None,
+            fork_origin: None,
+            session_kind: None,
+            has_children: false,
+            fork_count: 0,
+            children: Vec::new(),
+            children_next_cursor: None,
+            children_total_count: None,
+            node: None,
+            node_id: None,
+            attached: None,
+            runtime_state: None,
+        });
     }
 
     let total_count: usize = groups.values().map(Vec::len).sum();
     let groups = groups
         .into_iter()
-        .map(|(cwd, sessions)| {
-            let session_count = sessions.len();
-            json!({
-                "cwd": cwd,
-                "sessions": sessions,
-                "latest_activity": null,
-                "total_count": session_count,
-                "next_cursor": null,
-            })
+        .map(|(cwd, sessions)| SessionGroup {
+            cwd,
+            latest_activity: sessions
+                .first()
+                .and_then(|session| session.updated_at.clone()),
+            total_count: Some(sessions.len() as u64),
+            next_cursor: None,
+            sessions,
         })
         .collect::<Vec<_>>();
 
-    send_raw(
+    send_acp(
         srv_tx,
-        RawServerMsg {
-            msg_type: "session_list".to_string(),
-            data: Some(json!({
-                "groups": groups,
-                "next_cursor": response.next_cursor,
-                "total_count": total_count,
-            })),
+        AcpAppEvent::SessionList {
+            groups,
+            next_cursor: response.next_cursor.map(|cursor| cursor.to_string()),
+            total_count: Some(total_count as u64),
         },
     );
 }
@@ -1305,38 +1332,20 @@ fn send_session_list(
 fn send_state(
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
     identity: &AgentIdentity,
-    profiles: Vec<Value>,
+    profiles: Vec<ProfileInfo>,
     active_profile_id: Option<String>,
     agent_mode: Option<&str>,
     reasoning_effort: Option<Option<String>>,
 ) {
-    let mut data = serde_json::Map::new();
-    data.insert("active_session_id".to_string(), Value::Null);
-    data.insert("profiles".to_string(), Value::Array(profiles));
-    data.insert(
-        "active_profile_id".to_string(),
-        active_profile_id.map(Value::String).unwrap_or(Value::Null),
-    );
-    data.insert(
-        "agents".to_string(),
-        json!([{ "id": identity.id.clone(), "name": identity.name.clone() }]),
-    );
-    data.insert(
-        "agent_mode".to_string(),
-        agent_mode.map(Value::from).unwrap_or(Value::Null),
-    );
-    if let Some(effort) = reasoning_effort {
-        data.insert(
-            "reasoning_effort".to_string(),
-            effort.map(Value::String).unwrap_or(Value::Null),
-        );
-    }
-
-    send_raw(
+    send_acp(
         srv_tx,
-        RawServerMsg {
-            msg_type: "state".to_string(),
-            data: Some(Value::Object(data)),
+        AcpAppEvent::Initialized {
+            agent_id: identity.id.clone(),
+            agent_name: identity.name.clone(),
+            profiles,
+            active_profile_id,
+            agent_mode: agent_mode.map(str::to_string),
+            reasoning_effort,
         },
     );
 }
@@ -1372,19 +1381,16 @@ async fn handle_elicitation_request(
         .await
         .insert(elicitation_id.clone(), responder);
 
-    send_event_kind(
+    send_session_update(
         srv_tx,
         &session_id,
-        json!({
-            "type": "elicitation_requested",
-            "data": {
-                "elicitation_id": elicitation_id,
-                "session_id": session_id,
-                "message": request.message,
-                "requested_schema": requested_schema,
-                "source": source,
-            }
-        }),
+        AcpSessionUpdate::ElicitationRequested {
+            elicitation_id,
+            message: request.message,
+            requested_schema,
+            source,
+        },
+        false,
     );
 }
 
@@ -1471,43 +1477,64 @@ fn permission_response_for(
     }
 }
 
-fn send_event_kind(
+async fn emit_or_queue_update(
+    state: &Arc<AcpRuntimeState>,
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
     session_id: &str,
-    kind: Value,
+    update: AcpSessionUpdate,
+    queue: bool,
 ) {
-    send_raw(
+    if queue {
+        state.queue_replay_update(session_id, update).await;
+    } else {
+        send_session_update(srv_tx, session_id, update, false);
+    }
+}
+
+fn send_session_update(
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    session_id: &str,
+    update: AcpSessionUpdate,
+    is_replay: bool,
+) {
+    send_acp(
         srv_tx,
-        RawServerMsg {
-            msg_type: "event".to_string(),
-            data: Some(json!({
-                "agent_id": "querymt",
-                "session_id": session_id,
-                "profile_id": null,
-                "event": {
-                    "type": "ephemeral",
-                    "data": {
-                        "kind": kind,
-                        "timestamp": null,
-                    }
-                }
-            })),
+        AcpAppEvent::SessionUpdate {
+            session_id: session_id.to_string(),
+            update,
+            is_replay,
+        },
+    );
+}
+
+fn send_models(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, response: &AcpModelsResponse) {
+    send_acp(
+        srv_tx,
+        AcpAppEvent::Models {
+            models: response
+                .models
+                .iter()
+                .map(AcpModelEntry::to_app_model)
+                .collect(),
+            meta: response.meta.as_ref().map(|meta| AcpModelsMetaInfo {
+                remote_node_count: meta.remote_node_count,
+                remote_timeout_count: meta.remote_timeout_count,
+            }),
         },
     );
 }
 
 fn send_error(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, message: impl Into<String>) {
-    send_raw(
+    send_acp(
         srv_tx,
-        RawServerMsg {
-            msg_type: "error".to_string(),
-            data: Some(json!({ "message": message.into() })),
+        AcpAppEvent::Error {
+            message: message.into(),
         },
     );
 }
 
-fn send_raw(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, raw: RawServerMsg) {
-    let _ = srv_tx.send(ServerChannelMsg::Parsed(raw));
+fn send_acp(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, event: AcpAppEvent) {
+    let _ = srv_tx.send(ServerChannelMsg::Acp(event));
 }
 
 fn content_block_to_json(block: &acp::ContentBlock) -> Value {
@@ -1578,12 +1605,101 @@ mod tests {
     fn session_load_audit_missing_snapshot_returns_empty_events() {
         let audit = session_load_audit_from_load_value(&json!({}));
         assert_eq!(
-            audit
-                .get("events")
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            audit.get("events").and_then(Value::as_array).map(Vec::len),
             Some(0)
         );
+    }
+
+    #[test]
+    fn snapshot_updates_restore_basic_user_and_assistant_history() {
+        let updates = snapshot_updates_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "prompt_received",
+                                    "data": { "content": "hello", "message_id": "u1" }
+                                }
+                            },
+                            {
+                                "kind": {
+                                    "type": "assistant_message_stored",
+                                    "data": { "content": "world", "thinking": "notes", "message_id": "a1" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            &updates[0],
+            AcpSessionUpdate::UserMessage { content, message_id }
+                if content == "hello" && message_id.as_deref() == Some("u1")
+        ));
+        assert!(matches!(
+            &updates[1],
+            AcpSessionUpdate::AssistantMessage { content, thinking, message_id }
+                if content == "world"
+                    && thinking.as_deref() == Some("notes")
+                    && message_id.as_deref() == Some("a1")
+        ));
+    }
+
+    #[test]
+    fn snapshot_updates_restore_tool_history() {
+        let updates = snapshot_updates_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "tool_call_start",
+                                    "data": {
+                                        "tool_call_id": "tool-1",
+                                        "tool_name": "read_tool",
+                                        "arguments": { "path": "src/main.rs" }
+                                    }
+                                }
+                            },
+                            {
+                                "kind": {
+                                    "type": "tool_call_end",
+                                    "data": {
+                                        "tool_call_id": "tool-1",
+                                        "tool_name": "read_tool",
+                                        "is_error": false,
+                                        "result": "ok"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            &updates[0],
+            AcpSessionUpdate::ToolCallStart { tool_call_id, name, arguments }
+                if tool_call_id.as_deref() == Some("tool-1")
+                    && name == "read_tool"
+                    && arguments.as_ref().and_then(|v| v.get("path")).and_then(Value::as_str) == Some("src/main.rs")
+        ));
+        assert!(matches!(
+            &updates[1],
+            AcpSessionUpdate::ToolCallEnd { tool_call_id, name, is_error, result }
+                if tool_call_id.as_deref() == Some("tool-1")
+                    && name == "read_tool"
+                    && !is_error
+                    && result.as_deref() == Some("ok")
+        ));
     }
 
     #[test]

@@ -2500,10 +2500,7 @@ mod model_popup_tests {
         app.agent_mode = "plan".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
-        app.agents = vec![
-            make_agent("main", "Main"),
-            make_agent("coder", "Coder"),
-        ];
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
         app.models = vec![
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
@@ -2613,7 +2610,9 @@ mod model_popup_tests {
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         match rx.try_recv().expect("SetSessionModel") {
-            ClientMsg::SetSessionModel { node_id, model_id, .. } => {
+            ClientMsg::SetSessionModel {
+                node_id, model_id, ..
+            } => {
                 assert_eq!(node_id.as_deref(), Some("node-a"));
                 assert_eq!(model_id, "mesh/anthropic/claude");
             }
