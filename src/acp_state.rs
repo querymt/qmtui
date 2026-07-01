@@ -933,6 +933,24 @@ mod tests {
     }
 
     #[test]
+    fn native_thinking_delta_updates_streaming_thinking() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::AssistantThinkingDelta {
+                content: "thinking".into(),
+                message_id: Some("a1".into()),
+            },
+        });
+
+        assert_eq!(app.streaming_thinking, "thinking");
+        assert_eq!(app.streaming_thinking_message_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
     fn native_session_update_for_other_session_marks_activity_only() {
         let mut app = App::new();
         app.session_id = Some("active".into());
