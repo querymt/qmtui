@@ -164,7 +164,8 @@ mod tests {
 
     #[test]
     fn raw_server_msg_missing_data_parses_as_none() {
-        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
+        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#)
+            .unwrap();
 
         assert_eq!(raw.msg_type, "heartbeat");
         assert!(raw.data.is_none());
@@ -1311,6 +1312,10 @@ mod external_editor_tests {
             ClientMsg::CancelSession
         ));
         assert_eq!(app.status, "stopping...");
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry) if entry.target == "activity" && entry.message == "stopping..."
+        ));
     }
 
     #[test]

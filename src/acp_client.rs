@@ -388,15 +388,48 @@ async fn handle_client_msg(
                 return Ok(());
             };
             send_session_update(srv_tx, &session_id, AcpSessionUpdate::TurnStarted, false);
-            let req = acp::PromptRequest::new(session_id.clone(), prompt_blocks(prompt));
-            let response = connection.send_request(req).block_task().await?;
-            finish_prompt(state, srv_tx, &session_id, response.stop_reason).await;
+
+            let prompt_connection = connection.clone();
+            let prompt_state = state.clone();
+            let prompt_srv_tx = srv_tx.clone();
+            connection.spawn(async move {
+                let req = acp::PromptRequest::new(session_id.clone(), prompt_blocks(prompt));
+                match prompt_connection.send_request(req).block_task().await {
+                    Ok(response) => {
+                        finish_prompt(
+                            &prompt_state,
+                            &prompt_srv_tx,
+                            &session_id,
+                            response.stop_reason,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        send_error(&prompt_srv_tx, format!("ACP prompt failed: {err:?}"));
+                    }
+                }
+                Ok(())
+            })?;
         }
         ClientMsg::CancelSession => {
             let Some(session_id) = state.current_session_id().await else {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::InfoLog {
+                        target: "acp",
+                        message: "session/cancel skipped: no active session".to_string(),
+                    },
+                );
                 return Ok(());
             };
-            connection.send_notification(acp::CancelNotification::new(session_id))?;
+            connection.send_notification(acp::CancelNotification::new(session_id.clone()))?;
+            send_acp(
+                srv_tx,
+                AcpAppEvent::InfoLog {
+                    target: "acp",
+                    message: format!("sent session/cancel for {session_id}"),
+                },
+            );
         }
         ClientMsg::DeleteSession { session_id } => {
             connection
