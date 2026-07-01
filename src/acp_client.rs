@@ -405,6 +405,24 @@ async fn handle_client_msg(
                 .model_by_id(&model_id)
                 .await
                 .unwrap_or_else(|| fallback_model_entry(&model_id));
+            let effective_node = node_id
+                .as_deref()
+                .or(model.node_id.as_deref());
+            let node_part = effective_node
+                .map(|n| format!(" node={n}"))
+                .unwrap_or_default();
+            send_raw(
+                srv_tx,
+                RawServerMsg {
+                    msg_type: "acp_set_session_model".to_string(),
+                    data: Some(json!({
+                        "message": format!(
+                            "ACP SetSessionModel: provider={} model={} id={}{node_part}",
+                            model.provider, model.model, model_id
+                        ),
+                    })),
+                },
+            );
             let meta = model_entry_meta(&model, node_id.as_deref());
             let response = connection
                 .send_request(
@@ -1170,6 +1188,7 @@ fn send_provider_changed(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, model
                 "model": model.model,
                 "config_id": null,
                 "context_limit": null,
+                "provider_node_id": model.node_id,
             }
         }),
     );

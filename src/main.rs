@@ -1506,7 +1506,7 @@ fn system_editor_command() -> Option<EditorCommand> {
     editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
 }
 
-use handlers::{AppAction, handle_key, handle_mouse, save_cache};
+use handlers::{AppAction, handle_key, handle_mouse};
 
 fn temp_editor_file_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -1650,18 +1650,10 @@ async fn main() -> anyhow::Result<()> {
             app.set_delegate_model_preference(agent_id, provider, model);
         }
     }
-    for (mode, model_key) in &cfg.mode_models {
-        if let Some((provider, model)) = model_key.split_once('/') {
-            app.set_mode_model_preference(mode, provider, model);
-        }
-    }
     if let Some(session_id) = cli.session.clone() {
         app.session_id = Some(session_id);
         app.screen = Screen::Chat;
     }
-    // Hydrate session effort cache from disk.
-    config::TuiCache::load().hydrate_app(&mut app);
-
     // -- ACP auto-start ---------------------------------------------------------
     let auto_start = cfg.acp.auto_start.unwrap_or(true);
     let transport = cfg.acp.transport.unwrap_or_default();
@@ -1890,8 +1882,6 @@ async fn run_loop(
             Some(msg) = srv_rx.recv() => {
                 match msg {
                     ServerChannelMsg::Parsed(msg) => {
-                        // Save config when the server authoritatively updates effort.
-                        let is_effort_push = msg.msg_type == "reasoning_effort";
                         for reply in app.handle_server_msg(msg) {
                             // if reloading session, also re-subscribe
                             if let ClientMsg::LoadSession { ref session_id } = reply {
@@ -1904,9 +1894,6 @@ async fn run_loop(
                             } else {
                                 cmd_tx.send(reply)?;
                             }
-                        }
-                        if is_effort_push {
-                            save_cache(app);
                         }
                     }
                     ServerChannelMsg::Invalid { error, raw } => {
@@ -3513,18 +3500,12 @@ mod reasoning_effort_integration_tests {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
 
-    // ── Ctrl+x t caches mode state per session ──────────────────────────────
-
     #[test]
     #[serial]
-    fn ctrl_t_caches_mode_state_for_session() {
+    fn ctrl_t_cycles_reasoning_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
         app.conn = app::ConnState::Connected;
 
         handle_key(
@@ -3534,16 +3515,16 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("low".into()));
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
+        ));
     }
-
-    // ── Tab: saves outgoing, restores incoming ────────────────────────────────
 
     #[test]
     #[serial]
-    fn tab_saves_outgoing_and_restores_incoming_mode_state() {
+    fn tab_switches_mode_without_changing_model_or_effort() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
@@ -3553,47 +3534,24 @@ mod reasoning_effort_integration_tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
-        app.models = vec![
-            make_model("anthropic", "claude-sonnet"),
-            make_model("openai", "gpt-4o"),
-        ];
 
-        // Pre-cache plan mode state for this session
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            app::CachedModeState {
-                model: "openai/gpt-4o".into(),
-                effort: Some("low".into()),
-            },
-        );
-
-        // Tab → switch build → plan
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
-        // Outgoing build state saved
-        let build = &app.session_cache["s1"]["build"];
-        assert_eq!(build.model, "anthropic/claude-sonnet");
-        assert_eq!(build.effort, Some("high".into()));
-
-        // Incoming plan state restored
         assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.reasoning_effort, Some("high".into()));
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
-            "expected SetSessionModel: {msgs:?}"
+                .any(|m| matches!(m, ClientMsg::SetAgentMode { mode } if mode == "plan")),
+            "expected SetAgentMode(plan): {msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
-                if reasoning_effort == "low"
-            )),
-            "expected SetReasoningEffort(low): {msgs:?}"
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "no effort restore on mode switch: {msgs:?}"
         );
     }
 
@@ -3637,9 +3595,9 @@ mod reasoning_effort_integration_tests {
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.agent_mode = "plan".into();
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             make_model("anthropic", "claude-sonnet"),
             make_model("openai", "gpt-4o"),
@@ -3661,7 +3619,8 @@ mod reasoning_effort_integration_tests {
 
         assert_eq!(app.popup, app::Popup::ModelSelect);
         assert_eq!(app.model_filter, "");
-        assert_eq!(app.model_cursor, 3);
+        let expected = app.model_popup_open_cursor();
+        assert_eq!(app.model_cursor, expected);
     }
 
     #[test]
@@ -3674,12 +3633,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3688,7 +3651,6 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        // Effort dropped to auto
         assert_eq!(app.reasoning_effort, None);
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -3704,35 +3666,6 @@ mod reasoning_effort_integration_tests {
 
     #[test]
     #[serial]
-    fn model_select_caches_new_model_with_auto_effort() {
-        let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
-        let mut app = App::new();
-        app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
-        app.popup = app::Popup::ModelSelect;
-        app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
-
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-opus");
-        assert_eq!(cms.effort, None); // auto
-    }
-
-    #[test]
-    #[serial]
     fn model_select_no_effort_msg_when_already_auto() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -3741,12 +3674,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = None; // already auto
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3764,42 +3701,14 @@ mod reasoning_effort_integration_tests {
         );
     }
 
-    // ── reasoning_effort server push caches per session+mode ──────────────────
-
     #[test]
-    fn server_push_caches_effort_for_session_and_mode() {
+    fn server_push_updates_reasoning_effort() {
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-
         app.handle_server_msg(crate::protocol::RawServerMsg {
             msg_type: "reasoning_effort".into(),
             data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
         });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("medium".into()));
-    }
-
-    #[test]
-    fn server_push_auto_caches_none_effort() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-
-        app.handle_server_msg(crate::protocol::RawServerMsg {
-            msg_type: "reasoning_effort".into(),
-            data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
-        });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.effort, None);
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
     }
 }
 

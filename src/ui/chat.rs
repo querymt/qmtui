@@ -663,7 +663,19 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 /// Build left + right span vectors for the chat/delegate header bar.
 fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let model_str = match (&app.current_provider, &app.current_model) {
-        (Some(p), Some(m)) => format!("{p}/{m}"),
+        (Some(p), Some(m)) => {
+            if let Some(node_id) = app.current_model_node_id.as_deref() {
+                let label = app
+                    .models
+                    .iter()
+                    .find(|e| App::model_entry_matches_node(e, p, m, Some(node_id)))
+                    .and_then(|e| e.node_label.as_deref())
+                    .unwrap_or(node_id);
+                format!("{p}/{m}@{label}")
+            } else {
+                format!("{p}/{m}")
+            }
+        }
         _ => "no model".into(),
     };
     let sid = app

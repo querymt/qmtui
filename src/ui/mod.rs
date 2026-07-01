@@ -1762,9 +1762,9 @@ mod tests {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             crate::protocol::ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
@@ -1836,11 +1836,11 @@ mod tests {
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_marker_on_build_tab() {
+    fn draw_model_popup_live_marker_uses_status_accent_on_session_tab() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.models = vec![
@@ -1870,43 +1870,47 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let (build_x, build_y) =
-            find_buffer_text(&buffer, "Claude Sonnet").expect("build model missing");
-        let build_marker_x = (0..build_x)
-            .find(|x| buffer[(*x, build_y)].symbol() == "●")
-            .expect("build marker missing");
+        let (model_x, model_y) =
+            find_buffer_text(&buffer, "Claude Sonnet").expect("live model missing");
+        let marker_x = (0..model_x)
+            .find(|x| buffer[(*x, model_y)].symbol() == "●")
+            .expect("live marker missing");
 
         assert_eq!(
-            buffer[(build_marker_x, build_y)].fg,
-            crate::theme::Theme::mode_color("build")
+            buffer[(marker_x, model_y)].fg,
+            crate::theme::Theme::status_accent()
+                .fg
+                .expect("status_accent fg")
         );
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_marker_on_planner_tab() {
+    fn draw_model_popup_marks_only_remote_live_row_when_duplicates() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0; // Planner tab
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
+        app.model_popup_agent_tab = 0;
+        app.current_provider = Some("codex".into());
+        app.current_model = Some("gpt-5".into());
+        app.current_model_node_id = Some("node-1".into());
         app.models = vec![
             crate::protocol::ModelEntry {
-                id: "anthropic/claude-sonnet".into(),
-                label: "Claude Sonnet".into(),
-                provider: "anthropic".into(),
-                model: "claude-sonnet".into(),
+                id: "codex/gpt-5".into(),
+                label: "gpt-5".into(),
+                provider: "codex".into(),
+                model: "gpt-5".into(),
                 node_id: None,
                 node_label: None,
                 family: None,
                 quant: None,
             },
             crate::protocol::ModelEntry {
-                id: "openai/gpt-4o".into(),
-                label: "GPT-4o".into(),
-                provider: "openai".into(),
-                model: "gpt-4o".into(),
-                node_id: None,
-                node_label: None,
+                id: "codex@node-1/gpt-5".into(),
+                label: "gpt-5".into(),
+                provider: "codex".into(),
+                model: "gpt-5".into(),
+                node_id: Some("node-1".into()),
+                node_label: Some("framework".into()),
                 family: None,
                 quant: None,
             },
@@ -1916,15 +1920,19 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
-        let plan_marker_x = (0..plan_x)
-            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
-            .expect("plan marker missing");
+        let (_, local_y) = find_buffer_text(&buffer, "codex").expect("local header");
+        let (_, remote_y) = find_buffer_text(&buffer, "framework").expect("remote node label");
+        let local_row = local_y + 1;
+        let remote_row = if remote_y == local_y {
+            local_y + 3
+        } else {
+            remote_y + 1
+        };
+        let local_marker = (0..buffer.area.width).any(|x| buffer[(x, local_row)].symbol() == "●");
+        let remote_marker = (0..buffer.area.width).any(|x| buffer[(x, remote_row)].symbol() == "●");
 
-        assert_eq!(
-            buffer[(plan_marker_x, plan_y)].fg,
-            crate::theme::Theme::mode_color("plan")
-        );
+        assert!(!local_marker, "local duplicate must not show live marker");
+        assert!(remote_marker, "remote live row must show marker");
     }
 
     #[test]
@@ -1969,8 +1977,7 @@ mod tests {
             .collect();
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("model-8".into());
-        app.set_mode_model_preference("plan", "anthropic", "model-3");
-        app.model_cursor = 9;
+        app.model_cursor = app.model_popup_open_cursor();
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

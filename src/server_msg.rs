@@ -318,9 +318,6 @@ impl App {
                         validate_reasoning_effort(re.reasoning_effort.as_deref())
                 {
                     self.reasoning_effort = validated;
-                    // Server is authoritative — cache so this session + mode
-                    // remembers the level across restarts.
-                    self.cache_session_mode_state();
                 }
                 vec![]
             }
@@ -595,36 +592,10 @@ impl App {
                     self.session_stats = SessionStatsLite::default();
                     self.screen = Screen::Chat;
                     self.set_status(LogLevel::Info, "session", "session created");
-                    let mut cmds = vec![ClientMsg::SubscribeSession {
+                    let cmds = vec![ClientMsg::SubscribeSession {
                         session_id: sc.session_id,
                         agent_id: self.agent_id.clone(),
                     }];
-                    // Auto-apply mode model preference for local sessions only.
-                    if !self.current_session_is_remote()
-                        && let Some((provider, model)) =
-                            self.get_mode_model_preference(&self.agent_mode)
-                    {
-                        let provider = provider.to_string();
-                        let model = model.to_string();
-                        if let Some(entry) = self
-                            .models
-                            .iter()
-                            .find(|m| {
-                                m.provider == provider && m.model == model && m.node_id.is_none()
-                            })
-                            .cloned()
-                        {
-                            self.current_provider = Some(entry.provider.clone());
-                            self.current_model = Some(entry.model.clone());
-                            if let Some(sid) = self.session_id.clone() {
-                                cmds.push(ClientMsg::SetSessionModel {
-                                    session_id: sid,
-                                    model_id: entry.id,
-                                    node_id: entry.node_id,
-                                });
-                            }
-                        }
-                    }
                     return cmds;
                 }
                 vec![]
@@ -716,10 +687,6 @@ impl App {
                             let mut cmds = vec![ClientMsg::SetAgentMode {
                                 mode: self.agent_mode.clone(),
                             }];
-                            // Restore cached model + effort for local sessions only.
-                            if !self.current_session_is_remote() {
-                                cmds.extend(self.apply_cached_mode_state());
-                            }
                             // Drain any subscribe commands queued during audit replay
                             // (e.g. SubscribeSession for delegation child sessions).
                             cmds.extend(self.drain_pending());
@@ -894,6 +861,16 @@ impl App {
                         "mesh",
                         format!("mesh nodes: {count}"),
                     );
+                }
+                vec![]
+            }
+            "acp_set_session_model" => {
+                if let Some(data) = &raw.data {
+                    let message = data
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("ACP SetSessionModel");
+                    self.push_log(LogLevel::Info, "acp", message);
                 }
                 vec![]
             }
@@ -1550,16 +1527,20 @@ impl App {
                 provider,
                 model,
                 context_limit,
+                provider_node_id,
                 ..
             } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
+                if is_replay {
+                    if provider_node_id.is_some() {
+                        self.current_model_node_id = provider_node_id.clone();
+                    }
+                } else {
+                    self.current_model_node_id = provider_node_id.clone();
+                }
                 if let Some(limit) = context_limit {
                     self.context_limit = *limit;
-                }
-                // Keep the session cache in sync with live model changes.
-                if !is_replay {
-                    self.cache_session_mode_state();
                 }
             }
             EventKind::LlmRequestEnd {
@@ -1766,25 +1747,6 @@ impl App {
                         session_id: sid.clone(),
                         agent_id,
                     });
-                    // Auto-apply delegate model preference if configured.
-                    if let Some(target_id) = target_agent_id.as_deref()
-                        && let Some((prov, mdl)) = self.get_delegate_model_preference(target_id)
-                    {
-                        let prov = prov.to_string();
-                        let mdl = mdl.to_string();
-                        if let Some(entry) = self
-                            .models
-                            .iter()
-                            .find(|m| m.provider == prov && m.model == mdl && m.node_id.is_none())
-                            .cloned()
-                        {
-                            self.pending_commands.push(ClientMsg::SetSessionModel {
-                                session_id: sid.clone(),
-                                model_id: entry.id,
-                                node_id: entry.node_id,
-                            });
-                        }
-                    }
                 }
             }
             EventKind::DelegationCompleted { delegation_id, .. } => {

@@ -781,6 +781,9 @@ pub enum EventKind {
         model: String,
         config_id: Option<i64>,
         context_limit: Option<u64>,
+        /// Mesh node hosting the provider when the session routes LLM calls remotely.
+        #[serde(default)]
+        provider_node_id: Option<String>,
     },
     ElicitationRequested {
         elicitation_id: String,
