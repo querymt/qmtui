@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Screen, ToolDetail};
@@ -104,6 +106,10 @@ pub(crate) enum AcpAppEvent {
         session_id: String,
         update: AcpSessionUpdate,
         is_replay: bool,
+    },
+    SessionReplay {
+        session_id: String,
+        updates: Vec<AcpSessionUpdate>,
     },
     Models {
         models: Vec<ModelEntry>,
@@ -247,6 +253,16 @@ impl crate::app::App {
                 is_replay,
             } => {
                 self.apply_acp_session_update(&session_id, update, is_replay);
+                std::mem::take(&mut self.pending_commands)
+            }
+            AcpAppEvent::SessionReplay {
+                session_id,
+                updates,
+            } => {
+                let updates = normalize_replay_updates(updates);
+                for update in updates {
+                    self.apply_acp_session_update(&session_id, update, true);
+                }
                 std::mem::take(&mut self.pending_commands)
             }
             AcpAppEvent::UndoStack(undo_stack) => {
@@ -949,6 +965,316 @@ impl crate::app::App {
     }
 }
 
+fn normalize_replay_updates(updates: Vec<AcpSessionUpdate>) -> Vec<AcpSessionUpdate> {
+    let finalized_messages = finalized_assistant_messages(&updates);
+    let mut normalized = Vec::with_capacity(updates.len());
+    let mut pending_delta: Option<PendingReplayDelta> = None;
+    let mut pending_assistant: Option<PendingReplayAssistant> = None;
+    let mut emitted_assistant_ids = HashSet::new();
+
+    for update in updates {
+        match update {
+            AcpSessionUpdate::AssistantContentDelta {
+                content,
+                message_id,
+            } => {
+                flush_pending_replay_assistant(
+                    &mut normalized,
+                    &mut pending_assistant,
+                    &mut emitted_assistant_ids,
+                );
+                if message_id
+                    .as_ref()
+                    .is_some_and(|id| finalized_messages.contains(id))
+                {
+                    continue;
+                }
+                push_replay_delta(
+                    &mut normalized,
+                    &mut pending_delta,
+                    PendingReplayDelta::Content {
+                        content,
+                        message_id,
+                    },
+                );
+            }
+            AcpSessionUpdate::AssistantThinkingDelta {
+                content,
+                message_id,
+            } => {
+                flush_pending_replay_assistant(
+                    &mut normalized,
+                    &mut pending_assistant,
+                    &mut emitted_assistant_ids,
+                );
+                if message_id
+                    .as_ref()
+                    .is_some_and(|id| finalized_messages.contains(id))
+                {
+                    continue;
+                }
+                push_replay_delta(
+                    &mut normalized,
+                    &mut pending_delta,
+                    PendingReplayDelta::Thinking {
+                        content,
+                        message_id,
+                    },
+                );
+            }
+            AcpSessionUpdate::AssistantMessage {
+                content,
+                thinking,
+                message_id,
+            } => {
+                flush_pending_replay_delta(&mut normalized, &mut pending_delta);
+                push_replay_assistant(
+                    &mut normalized,
+                    &mut pending_assistant,
+                    &mut emitted_assistant_ids,
+                    PendingReplayAssistant {
+                        content,
+                        thinking,
+                        message_id,
+                    },
+                );
+            }
+            other => {
+                flush_pending_replay_delta(&mut normalized, &mut pending_delta);
+                flush_pending_replay_assistant(
+                    &mut normalized,
+                    &mut pending_assistant,
+                    &mut emitted_assistant_ids,
+                );
+                normalized.push(other);
+            }
+        }
+    }
+
+    flush_pending_replay_delta(&mut normalized, &mut pending_delta);
+    flush_pending_replay_assistant(
+        &mut normalized,
+        &mut pending_assistant,
+        &mut emitted_assistant_ids,
+    );
+    normalized
+}
+
+#[derive(Debug)]
+struct PendingReplayAssistant {
+    content: String,
+    thinking: Option<String>,
+    message_id: Option<String>,
+}
+
+impl PendingReplayAssistant {
+    fn can_merge(&self, other: &Self) -> bool {
+        message_id_matches(self.message_id.as_ref(), other.message_id.as_ref())
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.content.push_str(&other.content);
+        if let Some(thinking) = other.thinking {
+            match &mut self.thinking {
+                Some(existing) => existing.push_str(&thinking),
+                None => self.thinking = Some(thinking),
+            }
+        }
+        if self.message_id.is_none() && other.message_id.is_some() {
+            self.message_id = other.message_id;
+        }
+    }
+
+    fn into_update(self) -> AcpSessionUpdate {
+        AcpSessionUpdate::AssistantMessage {
+            content: self.content,
+            thinking: self.thinking,
+            message_id: self.message_id,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PendingReplayDelta {
+    Content {
+        content: String,
+        message_id: Option<String>,
+    },
+    Thinking {
+        content: String,
+        message_id: Option<String>,
+    },
+}
+
+impl PendingReplayDelta {
+    fn can_merge(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Content {
+                    message_id: left, ..
+                },
+                Self::Content {
+                    message_id: right, ..
+                },
+            )
+            | (
+                Self::Thinking {
+                    message_id: left, ..
+                },
+                Self::Thinking {
+                    message_id: right, ..
+                },
+            ) => message_id_matches(left.as_ref(), right.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (
+                Self::Content {
+                    content,
+                    message_id,
+                },
+                Self::Content {
+                    content: next,
+                    message_id: next_id,
+                },
+            )
+            | (
+                Self::Thinking {
+                    content,
+                    message_id,
+                },
+                Self::Thinking {
+                    content: next,
+                    message_id: next_id,
+                },
+            ) => {
+                content.push_str(&next);
+                if message_id.is_none() && next_id.is_some() {
+                    *message_id = next_id;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Content { content, .. } | Self::Thinking { content, .. } => content.is_empty(),
+        }
+    }
+
+    fn into_update(self) -> Option<AcpSessionUpdate> {
+        match self {
+            Self::Content { content, .. } => {
+                (!content.is_empty()).then_some(AcpSessionUpdate::AssistantMessage {
+                    content,
+                    thinking: None,
+                    // Synthesized historical chunks may be split by tools, so avoid
+                    // message-id dedupe from hiding later ordered segments.
+                    message_id: None,
+                })
+            }
+            Self::Thinking {
+                content,
+                message_id,
+            } => (!content.is_empty()).then_some(AcpSessionUpdate::AssistantThinkingDelta {
+                content,
+                message_id,
+            }),
+        }
+    }
+}
+
+fn finalized_assistant_messages(updates: &[AcpSessionUpdate]) -> HashSet<String> {
+    updates
+        .iter()
+        .filter_map(|update| match update {
+            AcpSessionUpdate::AssistantMessage {
+                message_id: Some(message_id),
+                ..
+            } => Some(message_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn push_replay_assistant(
+    normalized: &mut Vec<AcpSessionUpdate>,
+    pending: &mut Option<PendingReplayAssistant>,
+    emitted_ids: &mut HashSet<String>,
+    assistant: PendingReplayAssistant,
+) {
+    if assistant
+        .message_id
+        .as_ref()
+        .is_some_and(|id| emitted_ids.contains(id))
+    {
+        return;
+    }
+
+    match pending {
+        Some(existing) if existing.can_merge(&assistant) => existing.merge(assistant),
+        Some(_) => {
+            flush_pending_replay_assistant(normalized, pending, emitted_ids);
+            *pending = Some(assistant);
+        }
+        None => *pending = Some(assistant),
+    }
+}
+
+fn flush_pending_replay_assistant(
+    normalized: &mut Vec<AcpSessionUpdate>,
+    pending: &mut Option<PendingReplayAssistant>,
+    emitted_ids: &mut HashSet<String>,
+) {
+    if let Some(assistant) = pending.take() {
+        if let Some(message_id) = assistant.message_id.as_ref() {
+            emitted_ids.insert(message_id.clone());
+        }
+        normalized.push(assistant.into_update());
+    }
+}
+
+fn push_replay_delta(
+    normalized: &mut Vec<AcpSessionUpdate>,
+    pending: &mut Option<PendingReplayDelta>,
+    delta: PendingReplayDelta,
+) {
+    if delta.is_empty() {
+        return;
+    }
+
+    match pending {
+        Some(existing) if existing.can_merge(&delta) => existing.merge(delta),
+        Some(_) => {
+            flush_pending_replay_delta(normalized, pending);
+            *pending = Some(delta);
+        }
+        None => *pending = Some(delta),
+    }
+}
+
+fn flush_pending_replay_delta(
+    normalized: &mut Vec<AcpSessionUpdate>,
+    pending: &mut Option<PendingReplayDelta>,
+) {
+    if let Some(delta) = pending.take()
+        && let Some(update) = delta.into_update()
+    {
+        normalized.push(update);
+    }
+}
+
+fn message_id_matches(left: Option<&String>, right: Option<&String>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        (None, _) | (_, None) => true,
+    }
+}
+
 fn acp_content_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -1208,5 +1534,156 @@ mod tests {
 
         assert!(app.messages.is_empty());
         assert!(app.session_activity.contains_key("other"));
+    }
+
+    #[test]
+    fn native_session_replay_applies_history_as_one_event() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: "session-1".into(),
+            updates: vec![
+                AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "hello" }),
+                    message_id: Some("u1".into()),
+                },
+                AcpSessionUpdate::AssistantMessage {
+                    content: "world".into(),
+                    thinking: None,
+                    message_id: Some("a1".into()),
+                },
+            ],
+        });
+
+        assert!(replies.is_empty());
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::User { text, message_id: Some(user_id) },
+                ChatEntry::Assistant { content, message_id: Some(assistant_id), .. }
+            ] if text == "hello" && user_id == "u1" && content == "world" && assistant_id == "a1"
+        ));
+    }
+
+    #[test]
+    fn native_session_replay_coalesces_deltas_without_crossing_tool_order() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: "session-1".into(),
+            updates: vec![
+                AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "run it" }),
+                    message_id: Some("u1".into()),
+                },
+                AcpSessionUpdate::AssistantContentDelta {
+                    content: "before ".into(),
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::AssistantContentDelta {
+                    content: "tool".into(),
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::ToolCallStart {
+                    tool_call_id: Some("tool-1".into()),
+                    name: "shell".into(),
+                    arguments: Some(serde_json::json!({ "command": "echo ok" })),
+                },
+                AcpSessionUpdate::ToolCallEnd {
+                    tool_call_id: Some("tool-1".into()),
+                    name: "shell".into(),
+                    is_error: false,
+                    result: Some("ok".into()),
+                },
+                AcpSessionUpdate::AssistantContentDelta {
+                    content: "after".into(),
+                    message_id: Some("a2".into()),
+                },
+            ],
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::User { .. },
+                ChatEntry::Assistant { content: before, .. },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_id), .. },
+                ChatEntry::Assistant { content: after, .. },
+            ] if before == "before tool" && tool_id == "tool-1" && after == "after"
+        ));
+    }
+
+    #[test]
+    fn native_session_replay_prefers_final_assistant_message() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: "session-1".into(),
+            updates: vec![
+                AcpSessionUpdate::AssistantContentDelta {
+                    content: "partial".into(),
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::AssistantThinkingDelta {
+                    content: "draft".into(),
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::AssistantMessage {
+                    content: "final".into(),
+                    thinking: Some("final thinking".into()),
+                    message_id: Some("a1".into()),
+                },
+            ],
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) }]
+                if content == "final" && thinking == "final thinking" && message_id == "a1"
+        ));
+    }
+
+    #[test]
+    fn native_session_replay_merges_adjacent_assistant_chunks_from_loading_notifications() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: "session-1".into(),
+            updates: vec![
+                AcpSessionUpdate::AssistantMessage {
+                    content: "hel".into(),
+                    thinking: None,
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::AssistantMessage {
+                    content: "lo".into(),
+                    thinking: None,
+                    message_id: Some("a1".into()),
+                },
+                AcpSessionUpdate::ToolCallStart {
+                    tool_call_id: Some("tool-1".into()),
+                    name: "shell".into(),
+                    arguments: Some(serde_json::json!({ "command": "echo ok" })),
+                },
+                AcpSessionUpdate::AssistantMessage {
+                    content: "after".into(),
+                    thinking: None,
+                    message_id: Some("a2".into()),
+                },
+            ],
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content: first, message_id: Some(first_id), .. },
+                ChatEntry::ToolCall { .. },
+                ChatEntry::Assistant { content: second, message_id: Some(second_id), .. },
+            ] if first == "hello" && first_id == "a1" && second == "after" && second_id == "a2"
+        ));
     }
 }

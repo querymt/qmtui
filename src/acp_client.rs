@@ -368,13 +368,12 @@ async fn handle_client_msg(
             } else {
                 replay_updates
             };
-            for update in history_updates {
+            if !history_updates.is_empty() {
                 send_acp(
                     srv_tx,
-                    AcpAppEvent::SessionUpdate {
+                    AcpAppEvent::SessionReplay {
                         session_id: session_id.clone(),
-                        update,
-                        is_replay: true,
+                        updates: history_updates,
                     },
                 );
             }
