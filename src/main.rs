@@ -16,6 +16,7 @@ mod session;
 mod slash;
 mod theme;
 mod themes_gen;
+mod tool_detail;
 mod ui;
 
 use std::{

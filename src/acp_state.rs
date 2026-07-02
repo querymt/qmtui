@@ -5,6 +5,7 @@ use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ModelEntry, OAuthFlowData, OAuthResultData,
     ProfileInfo, RedoResultData, SessionGroup, UndoResultData, UndoStackFrame,
 };
+use crate::tool_detail;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AcpModelsMetaInfo {
@@ -584,7 +585,9 @@ impl crate::app::App {
                 message_id,
             } => self.push_acp_assistant_message(content, thinking, message_id),
             AcpSessionUpdate::ToolCallStart {
-                tool_call_id, name, ..
+                tool_call_id,
+                name,
+                arguments,
             } => {
                 if self.suppress_turn_output {
                     return;
@@ -592,6 +595,21 @@ impl crate::app::App {
                 self.activity = ActivityState::RunningTool { name: name.clone() };
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
                 if name != "question" {
+                    let cwd = self.current_session_cwd();
+                    let detail =
+                        tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
+                    if tool_detail::reconcile_tool_call_start(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        &name,
+                        detail.clone(),
+                    ) {
+                        self.streaming_thinking.clear();
+                        self.streaming_thinking_message_id = None;
+                        self.streaming_thinking_cache.invalidate();
+                        self.card_cache.invalidate();
+                        return;
+                    }
                     if !self.streaming_thinking.is_empty() {
                         let thinking = std::mem::take(&mut self.streaming_thinking);
                         let thinking_message_id = self.streaming_thinking_message_id.take();
@@ -605,7 +623,7 @@ impl crate::app::App {
                         tool_call_id,
                         name,
                         is_error: false,
-                        detail: ToolDetail::None,
+                        detail,
                     });
                 }
             }
@@ -615,28 +633,34 @@ impl crate::app::App {
                 is_error,
                 result,
             } => {
-                if let Some(entry) = self.messages.iter_mut().rev().find(|entry| {
-                    matches!(
-                        entry,
-                        ChatEntry::ToolCall {
-                            tool_call_id: existing,
-                            name: existing_name,
-                            ..
-                        } if existing.as_ref() == tool_call_id.as_ref() || existing_name == &name
-                    )
-                }) {
-                    if let ChatEntry::ToolCall { is_error: e, .. } = entry {
-                        *e = is_error;
-                    }
-                } else if is_error {
-                    self.messages.push(ChatEntry::ToolCall {
-                        tool_call_id,
-                        name: format!("{name} (failed)"),
-                        is_error: true,
-                        detail: result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
-                    });
+                let mut updated = false;
+                if let Some(result) = result.as_deref() {
+                    updated = tool_detail::update_tool_detail(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        result,
+                    );
                 }
-                self.card_cache.invalidate();
+                if is_error {
+                    if tool_detail::mark_tool_call_failed(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        &name,
+                    ) {
+                        updated = true;
+                    } else {
+                        self.messages.push(ChatEntry::ToolCall {
+                            tool_call_id,
+                            name: format!("{name} (failed)"),
+                            is_error: true,
+                            detail: result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
+                        });
+                        updated = true;
+                    }
+                }
+                if updated {
+                    self.card_cache.invalidate();
+                }
             }
             AcpSessionUpdate::ElicitationRequested {
                 elicitation_id,
@@ -1012,6 +1036,98 @@ mod tests {
 
         assert_eq!(app.streaming_thinking, "thinking");
         assert_eq!(app.streaming_thinking_message_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn native_tool_call_start_keeps_shell_details() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "cargo check --examples",
+                    "workdir": "/repo"
+                })),
+            },
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { command, workdir, .. },
+                ..
+            }] if command == "cargo check --examples" && workdir.as_deref() == Some("/repo")
+        ));
+    }
+
+    #[test]
+    fn native_tool_call_end_updates_shell_output_tail() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "cargo check",
+                    "workdir": "/repo"
+                })),
+            },
+        });
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some("Checking qmtui\nFinished dev profile".into()),
+            },
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output_tail: Some(tail), .. },
+                ..
+            }] if tail.lines.iter().any(|line| line.contains("Finished dev profile"))
+        ));
+    }
+
+    #[test]
+    fn native_tool_call_start_keeps_read_tool_range() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "read_tool".into(),
+                arguments: Some(serde_json::json!({
+                    "path": "src/main.rs",
+                    "offset": 9,
+                    "limit": 5
+                })),
+            },
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                detail: ToolDetail::ReadTool { path, start_line: Some(10), end_line: Some(14) },
+                ..
+            }] if path == "src/main.rs"
+        ));
     }
 
     #[test]
