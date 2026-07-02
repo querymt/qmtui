@@ -71,6 +71,8 @@ pub enum ClientMsg {
     },
     LoadSession {
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     Prompt {
         prompt: Vec<PromptBlock>,
@@ -570,7 +572,7 @@ pub struct UndoStackFrame {
     pub message_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UndoResultData {
     pub success: bool,
     pub message_id: Option<String>,
@@ -581,7 +583,7 @@ pub struct UndoResultData {
     pub undo_stack: Vec<UndoStackFrame>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RedoResultData {
     pub success: bool,
     pub message: Option<String>,

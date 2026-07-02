@@ -415,6 +415,7 @@ pub(crate) fn handle_chord(
             if let Some(parent_sid) = app.parent_session_id.clone() {
                 cmd_tx.send(ClientMsg::LoadSession {
                     session_id: parent_sid.clone(),
+                    cwd: app.current_session_cwd(),
                 })?;
                 cmd_tx.send(ClientMsg::SubscribeSession {
                     session_id: parent_sid,
@@ -534,9 +535,11 @@ pub(crate) fn handle_sessions_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -631,9 +634,11 @@ pub(crate) fn handle_session_popup_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -744,6 +749,9 @@ pub(crate) fn apply_popup_session_key(
                             return SessionKeyAction::LoadSession {
                                 session_id,
                                 agent_id: None,
+                                cwd: session
+                                    .cwd
+                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
@@ -878,6 +886,7 @@ fn handle_delegate_view_key(
             if let Some(parent_sid) = app.parent_session_id.clone() {
                 cmd_tx.send(ClientMsg::LoadSession {
                     session_id: parent_sid.clone(),
+                    cwd: app.current_session_cwd(),
                 })?;
                 cmd_tx.send(ClientMsg::SubscribeSession {
                     session_id: parent_sid,
@@ -908,9 +917,11 @@ pub(crate) fn handle_delegate_popup_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -977,6 +988,7 @@ pub(crate) fn apply_delegate_popup_key(
                     return SessionKeyAction::LoadSession {
                         session_id: sid,
                         agent_id: target_agent_id,
+                        cwd: app.current_session_cwd(),
                     };
                 } else {
                     app.set_status(
@@ -2198,6 +2210,7 @@ pub(crate) enum SessionKeyAction {
     LoadSession {
         session_id: String,
         agent_id: Option<String>,
+        cwd: Option<String>,
     },
     /// Attach a remote session through its node.
     AttachRemoteSession { node_id: String, session_id: String },
@@ -2279,6 +2292,9 @@ pub(crate) fn apply_sessions_key(
                             return SessionKeyAction::LoadSession {
                                 session_id,
                                 agent_id: None,
+                                cwd: session
+                                    .cwd
+                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
@@ -2746,7 +2762,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv().expect("expected LoadSession"),
-            ClientMsg::LoadSession { session_id } if session_id == "child-1"
+            ClientMsg::LoadSession { session_id, .. } if session_id == "child-1"
         ));
         assert!(matches!(
             rx.try_recv().expect("expected SubscribeSession"),

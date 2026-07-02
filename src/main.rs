@@ -1824,6 +1824,7 @@ async fn run_loop(
                                 } else {
                                     cmd_tx.send(ClientMsg::LoadSession {
                                         session_id: session_id.clone(),
+                                        cwd: app.current_session_cwd(),
                                     })?;
                                     cmd_tx.send(ClientMsg::SubscribeSession {
                                         session_id,
@@ -1845,7 +1846,7 @@ async fn run_loop(
             Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
                 for reply in app.handle_acp_event(event) {
                     // if reloading session, also re-subscribe
-                    if let ClientMsg::LoadSession { ref session_id } = reply {
+                    if let ClientMsg::LoadSession { ref session_id, .. } = reply {
                         let sid = session_id.clone();
                         cmd_tx.send(reply)?;
                         cmd_tx.send(ClientMsg::SubscribeSession {
@@ -2072,6 +2073,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2140,6 +2142,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2578,6 +2581,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -2619,6 +2623,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "s5".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2638,6 +2643,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2737,6 +2743,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3241,6 +3248,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-2".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3290,6 +3298,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-3".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
     }
@@ -3311,6 +3320,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-1".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);

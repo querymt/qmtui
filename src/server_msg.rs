@@ -381,6 +381,7 @@ impl App {
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
+                                cwd: self.current_session_cwd(),
                             }];
                         }
                     } else {
@@ -405,6 +406,7 @@ impl App {
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
+                                cwd: self.current_session_cwd(),
                             }];
                         }
                     } else {
@@ -429,6 +431,7 @@ impl App {
                             return vec![
                                 ClientMsg::LoadSession {
                                     session_id: forked_session_id.clone(),
+                                    cwd: self.current_session_cwd(),
                                 },
                                 ClientMsg::SubscribeSession {
                                     session_id: forked_session_id,
@@ -3223,7 +3226,7 @@ mod fork_result_tests {
         assert_eq!(app.popup, Popup::None);
         assert_eq!(cmds.len(), 2);
         assert!(
-            matches!(&cmds[0], ClientMsg::LoadSession { session_id } if session_id == "fork-1")
+            matches!(&cmds[0], ClientMsg::LoadSession { session_id, .. } if session_id == "fork-1")
         );
         assert!(
             matches!(&cmds[1], ClientMsg::SubscribeSession { session_id, agent_id } if session_id == "fork-1" && agent_id.as_deref() == Some("agent-1"))

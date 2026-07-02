@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::protocol::{
-    AuthProvidersData, ClientMsg, OAuthFlowData, OAuthResultData, ProfileInfo, SessionGroup,
-    SessionSummary,
+    AuthProvidersData, ClientMsg, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
+    SessionGroup, SessionSummary, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone)]
@@ -334,11 +334,12 @@ async fn handle_client_msg(
                 send_config_updates(state, srv_tx, config_options).await;
             }
         }
-        ClientMsg::LoadSession { session_id } => {
+        ClientMsg::LoadSession { session_id, cwd } => {
             state.set_current_session_id(session_id.clone()).await;
             state.begin_loading(&session_id).await;
+            let load_cwd = load_session_cwd(cwd.as_deref(), state.default_cwd());
+            let req = acp::LoadSessionRequest::new(session_id.clone(), load_cwd);
 
-            let req = acp::LoadSessionRequest::new(session_id.clone(), state.default_cwd());
             let result = connection.send_request(req).block_task().await;
             let replay_updates = state.end_loading(&session_id).await;
             let response = result?;
@@ -380,6 +381,9 @@ async fn handle_client_msg(
 
             if let Some(config_options) = response.config_options {
                 send_config_updates(state, srv_tx, config_options).await;
+            }
+            if let Ok(undo_stack) = fetch_undo_stack(connection, &session_id).await {
+                send_acp(srv_tx, AcpAppEvent::UndoStack(undo_stack));
             }
         }
         ClientMsg::Prompt { prompt } => {
@@ -559,9 +563,41 @@ async fn handle_client_msg(
                 "file mentions are not exposed in the ACP subset yet",
             );
         }
+        ClientMsg::Undo { message_id } => {
+            let Some(session_id) = state.current_session_id().await else {
+                send_error(srv_tx, "cannot undo before a session is loaded");
+                return Ok(());
+            };
+            let response = call_querymt_ext(
+                connection,
+                "querymt/session/undo",
+                json!({ "session_id": session_id, "message_id": message_id }),
+            )
+            .await?;
+            if let Ok(result) =
+                serde_json::from_value::<UndoResultData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::UndoResult(result));
+            }
+        }
+        ClientMsg::Redo => {
+            let Some(session_id) = state.current_session_id().await else {
+                send_error(srv_tx, "cannot redo before a session is loaded");
+                return Ok(());
+            };
+            let response = call_querymt_ext(
+                connection,
+                "querymt/session/redo",
+                json!({ "session_id": session_id }),
+            )
+            .await?;
+            if let Ok(result) =
+                serde_json::from_value::<RedoResultData>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::RedoResult(result));
+            }
+        }
         ClientMsg::ForkSession { .. }
-        | ClientMsg::Undo { .. }
-        | ClientMsg::Redo
         | ClientMsg::ListSessionChildren { .. }
         | ClientMsg::ListRemoteNodes
         | ClientMsg::ListRemoteSessions { .. }
@@ -629,6 +665,33 @@ async fn call_querymt_ext(
 
 fn ext_payload<'a>(response: &'a Value) -> &'a Value {
     response.get("data").unwrap_or(response)
+}
+
+fn load_session_cwd(cwd: Option<&str>, default_cwd: PathBuf) -> PathBuf {
+    cwd.and_then(|cwd| (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd)))
+        .unwrap_or(default_cwd)
+}
+
+async fn fetch_undo_stack(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+) -> Result<Vec<UndoStackFrame>, acp_sdk::Error> {
+    let response = call_querymt_ext(
+        connection,
+        "querymt/session/undoStack",
+        json!({ "session_id": session_id }),
+    )
+    .await?;
+    Ok(ext_payload(&response)
+        .get("undo_stack")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<UndoStackFrame>(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 async fn post_connect_diagnostics(

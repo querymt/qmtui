@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Screen, ToolDetail};
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ModelEntry, OAuthFlowData, OAuthResultData,
-    ProfileInfo, SessionGroup,
+    ProfileInfo, RedoResultData, SessionGroup, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +108,9 @@ pub(crate) enum AcpAppEvent {
         models: Vec<ModelEntry>,
         meta: Option<AcpModelsMetaInfo>,
     },
+    UndoStack(Vec<UndoStackFrame>),
+    UndoResult(UndoResultData),
+    RedoResult(RedoResultData),
     AuthProviders(Vec<AuthProviderEntry>),
     OAuthFlowStarted(OAuthFlowData),
     OAuthResult(OAuthResultData),
@@ -244,6 +247,67 @@ impl crate::app::App {
             } => {
                 self.apply_acp_session_update(&session_id, update, is_replay);
                 std::mem::take(&mut self.pending_commands)
+            }
+            AcpAppEvent::UndoStack(undo_stack) => {
+                self.undo_state = self.build_undo_state_from_server_stack(&undo_stack, None, None);
+                vec![]
+            }
+            AcpAppEvent::UndoResult(ur) => {
+                self.activity = ActivityState::Idle;
+                let message_id_for_files = ur
+                    .message_id
+                    .clone()
+                    .or_else(|| ur.undo_stack.last().map(|frame| frame.message_id.clone()));
+                self.undo_state = self.build_undo_state_from_server_stack(
+                    &ur.undo_stack,
+                    message_id_for_files.as_deref(),
+                    if ur.success {
+                        Some(ur.reverted_files.as_slice())
+                    } else {
+                        None
+                    },
+                );
+
+                if ur.success {
+                    self.recent_prompt_text = None;
+                    self.streaming_content.clear();
+                    self.streaming_cache.invalidate();
+                    self.set_status(LogLevel::Info, "session", "undone - reloading session");
+                    if let Some(ref sid) = self.session_id {
+                        return vec![ClientMsg::LoadSession {
+                            session_id: sid.clone(),
+                            cwd: self.current_session_cwd(),
+                        }];
+                    }
+                } else {
+                    self.set_status(
+                        LogLevel::Warn,
+                        "session",
+                        ur.message.unwrap_or_else(|| "undo failed".into()),
+                    );
+                }
+                vec![]
+            }
+            AcpAppEvent::RedoResult(rr) => {
+                self.activity = ActivityState::Idle;
+                self.undo_state =
+                    self.build_undo_state_from_server_stack(&rr.undo_stack, None, None);
+                if rr.success {
+                    self.set_status(LogLevel::Info, "session", "redone - reloading session");
+                    if let Some(ref sid) = self.session_id {
+                        return vec![ClientMsg::LoadSession {
+                            session_id: sid.clone(),
+                            cwd: self.current_session_cwd(),
+                        }];
+                    }
+                } else {
+                    self.set_status(
+                        LogLevel::Warn,
+                        "session",
+                        rr.message.unwrap_or_else(|| "redo failed".into()),
+                    );
+                }
+                vec![]
             }
             AcpAppEvent::Models { models, meta } => {
                 self.models = models;
@@ -948,6 +1012,67 @@ mod tests {
 
         assert_eq!(app.streaming_thinking, "thinking");
         assert_eq!(app.streaming_thinking_message_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn native_undo_result_success_updates_state_and_reloads_session() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+        app.activity = ActivityState::SessionOp(crate::app::SessionOp::Undo);
+        app.undoable_turns.push(crate::app::UndoableTurn {
+            turn_id: "u1".into(),
+            message_id: "u1".into(),
+            text: "change".into(),
+        });
+
+        let replies = app.handle_acp_event(AcpAppEvent::UndoResult(UndoResultData {
+            success: true,
+            message_id: Some("u1".into()),
+            reverted_files: vec!["src/main.rs".into()],
+            message: None,
+            undo_stack: vec![UndoStackFrame {
+                message_id: "u1".into(),
+            }],
+        }));
+
+        assert!(matches!(app.activity, ActivityState::Idle));
+        assert_eq!(app.status, "undone - reloading session");
+        assert!(app.can_redo());
+        assert!(matches!(
+            replies.as_slice(),
+            [ClientMsg::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
+        ));
+    }
+
+    #[test]
+    fn native_redo_result_failure_clears_pending_state_and_logs_warning() {
+        let mut app = App::new();
+        app.activity = ActivityState::SessionOp(crate::app::SessionOp::Redo);
+
+        let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResultData {
+            success: false,
+            message: Some("Nothing to redo".into()),
+            undo_stack: Vec::new(),
+        }));
+
+        assert!(matches!(app.activity, ActivityState::Idle));
+        assert_eq!(app.status, "Nothing to redo");
+        assert!(replies.is_empty());
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry) if entry.level == LogLevel::Warn && entry.target == "session"
+        ));
+    }
+
+    #[test]
+    fn native_undo_stack_hydrates_redo_state() {
+        let mut app = App::new();
+
+        app.handle_acp_event(AcpAppEvent::UndoStack(vec![UndoStackFrame {
+            message_id: "u1".into(),
+        }]));
+
+        assert!(app.can_redo());
     }
 
     #[test]

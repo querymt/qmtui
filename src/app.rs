@@ -6946,11 +6946,9 @@ mod tests {
                 "undo_stack": [{ "message_id": "msg-2" }]
             })),
         });
-        assert!(
-            cmds.iter().any(
-                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
-            )
-        );
+        assert!(cmds.iter().any(
+            |msg| matches!(msg, ClientMsg::LoadSession { session_id, .. } if session_id == "s1")
+        ));
 
         let loaded = RawServerMsg {
             msg_type: "session_loaded".into(),
@@ -7076,11 +7074,9 @@ mod tests {
                 "undo_stack": [{ "message_id": "msg-2" }]
             })),
         });
-        assert!(
-            cmds.iter().any(
-                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
-            )
-        );
+        assert!(cmds.iter().any(
+            |msg| matches!(msg, ClientMsg::LoadSession { session_id, .. } if session_id == "s1")
+        ));
 
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_loaded".into(),
