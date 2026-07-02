@@ -1,15 +1,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{
-    self as acp_sdk, AcpAgent, Agent, Client, ConnectionTo, UntypedMessage,
+    self as acp_sdk, AcpAgent, Agent, Client, ConnectionTo, JsonRpcMessage, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, UntypedMessage,
 };
+use futures_util::{SinkExt, StreamExt as FuturesStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
@@ -18,7 +24,7 @@ use crate::protocol::{
     RedoResultData, SessionGroup, SessionSummary, UndoResultData, UndoStackFrame,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpEndpoint {
     Stdio { argv: Vec<String> },
     WebSocket { url: String },
@@ -115,6 +121,15 @@ struct AssistantBuffer {
     message_id: Option<String>,
 }
 
+enum PendingElicitationResponse {
+    Sdk(acp_sdk::Responder<acp::CreateElicitationResponse>),
+    WsResultMethod(WsAcpConnection),
+    WsJsonRpcResponse {
+        connection: WsAcpConnection,
+        id: Value,
+    },
+}
+
 #[derive(Default)]
 struct AcpRuntimeState {
     agent: Mutex<AgentIdentity>,
@@ -122,8 +137,7 @@ struct AcpRuntimeState {
     loading_sessions: Mutex<HashSet<String>>,
     replay_updates: Mutex<HashMap<String, Vec<AcpSessionUpdate>>>,
     assistant_buffers: Mutex<HashMap<String, AssistantBuffer>>,
-    pending_elicitations:
-        Mutex<HashMap<String, acp_sdk::Responder<acp::CreateElicitationResponse>>>,
+    pending_elicitations: Mutex<HashMap<String, PendingElicitationResponse>>,
     models: Mutex<Vec<AcpModelEntry>>,
     selected_model_id: Mutex<Option<String>>,
     launch_cwd: Option<String>,
@@ -218,6 +232,466 @@ impl AcpRuntimeState {
     }
 }
 
+trait AcpConnection: Clone + Send + Sync + 'static {
+    fn request<R>(
+        &self,
+        request: R,
+    ) -> impl Future<Output = Result<R::Response, acp_sdk::Error>> + Send
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static;
+
+    fn notify<N>(&self, notification: N) -> Result<(), acp_sdk::Error>
+    where
+        N: JsonRpcNotification + Send + Sync + 'static;
+
+    fn spawn(
+        &self,
+        fut: impl Future<Output = Result<(), acp_sdk::Error>> + Send + 'static,
+    ) -> Result<(), acp_sdk::Error>;
+}
+
+fn acp_internal_error(message: impl ToString) -> acp_sdk::Error {
+    acp_sdk::Error::internal_error().data(message.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JsonRpcEnvelope {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+#[derive(Clone)]
+struct WsAcpConnection {
+    tx: mpsc::UnboundedSender<Message>,
+    pending: Arc<Mutex<HashMap<i64, PendingWsRequest>>>,
+    next_id: Arc<AtomicI64>,
+}
+
+struct PendingWsRequest {
+    method: String,
+    tx: oneshot::Sender<Result<Value, acp_sdk::Error>>,
+}
+
+impl WsAcpConnection {
+    fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicI64::new(1)),
+        }
+    }
+
+    async fn request_value(&self, method: &str, params: Value) -> Result<Value, acp_sdk::Error> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(
+            id,
+            PendingWsRequest {
+                method: method.to_string(),
+                tx,
+            },
+        );
+        let envelope = JsonRpcEnvelope {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(id)),
+            method: Some(method.to_string()),
+            params,
+            result: None,
+            error: None,
+        };
+        if let Err(err) = self.send_envelope(envelope) {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+        rx.await
+            .map_err(|_| acp_internal_error(format!("ACP WebSocket request dropped: {method}")))?
+    }
+
+    fn notify_value(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
+        self.send_envelope(JsonRpcEnvelope {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some(method.to_string()),
+            params,
+            result: None,
+            error: None,
+        })
+    }
+
+    fn respond_value(
+        &self,
+        id: Value,
+        result: Result<Value, acp_sdk::Error>,
+    ) -> Result<(), acp_sdk::Error> {
+        let (result, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(err) => (
+                None,
+                Some(serde_json::to_value(err).unwrap_or_else(|_| {
+                    json!({
+                        "code": -32603,
+                        "message": "internal error"
+                    })
+                })),
+            ),
+        };
+        self.send_envelope(JsonRpcEnvelope {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: None,
+            params: Value::Null,
+            result,
+            error,
+        })
+    }
+
+    fn send_envelope(&self, envelope: JsonRpcEnvelope) -> Result<(), acp_sdk::Error> {
+        let text = serde_json::to_string(&envelope).map_err(acp_sdk::Error::into_internal_error)?;
+        self.tx
+            .send(Message::Text(text.into()))
+            .map_err(|err| acp_internal_error(format!("ACP WebSocket send failed: {err}")))
+    }
+
+    async fn resolve_response(&self, envelope: JsonRpcEnvelope) -> Result<(), acp_sdk::Error> {
+        let Some(id) = envelope.id.and_then(|id| id.as_i64()) else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending.lock().await.remove(&id) else {
+            return Ok(());
+        };
+        let result = if let Some(error) = envelope.error {
+            Err(acp_internal_error(format!(
+                "ACP WebSocket {} failed: {error}",
+                pending.method
+            )))
+        } else {
+            Ok(envelope.result.unwrap_or(Value::Null))
+        };
+        let _ = pending.tx.send(result);
+        Ok(())
+    }
+
+    async fn fail_all(&self, message: &str) {
+        let pending = std::mem::take(&mut *self.pending.lock().await);
+        for (_, request) in pending {
+            let _ = request.tx.send(Err(acp_internal_error(format!(
+                "ACP WebSocket {} failed: {message}",
+                request.method
+            ))));
+        }
+    }
+}
+
+impl AcpConnection for ConnectionTo<Agent> {
+    async fn request<R>(&self, request: R) -> Result<R::Response, acp_sdk::Error>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
+        self.send_request(request).block_task().await
+    }
+
+    fn notify<N>(&self, notification: N) -> Result<(), acp_sdk::Error>
+    where
+        N: JsonRpcNotification + Send + Sync + 'static,
+    {
+        self.send_notification(notification)
+    }
+
+    fn spawn(
+        &self,
+        fut: impl Future<Output = Result<(), acp_sdk::Error>> + Send + 'static,
+    ) -> Result<(), acp_sdk::Error> {
+        self.spawn(fut)
+    }
+}
+
+impl AcpConnection for WsAcpConnection {
+    async fn request<R>(&self, request: R) -> Result<R::Response, acp_sdk::Error>
+    where
+        R: JsonRpcRequest + Send + Sync + 'static,
+        R::Response: Send + 'static,
+    {
+        let message = request.to_untyped_message()?;
+        let method = message.method.clone();
+        let result = self.request_value(&message.method, message.params).await?;
+        R::Response::from_value(&method, result)
+    }
+
+    fn notify<N>(&self, notification: N) -> Result<(), acp_sdk::Error>
+    where
+        N: JsonRpcNotification + Send + Sync + 'static,
+    {
+        let message = notification.to_untyped_message()?;
+        self.notify_value(&message.method, message.params)
+    }
+
+    fn spawn(
+        &self,
+        fut: impl Future<Output = Result<(), acp_sdk::Error>> + Send + 'static,
+    ) -> Result<(), acp_sdk::Error> {
+        tokio::spawn(async move {
+            let _ = fut.await;
+        });
+        Ok(())
+    }
+}
+
+pub async fn probe_websocket(url: &str, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, connect_async(url))
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+pub async fn run_websocket_agent(
+    url: String,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
+    srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
+    conn_tx: mpsc::UnboundedSender<crate::ConnectionManagerEvent>,
+    launch_cwd: Option<String>,
+) -> Result<(), acp_sdk::Error> {
+    let state = Arc::new(AcpRuntimeState::new(launch_cwd));
+    let (socket, _) = connect_async(&url)
+        .await
+        .map_err(acp_sdk::Error::into_internal_error)?;
+    let (mut ws_write, mut ws_read) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let connection = WsAcpConnection::new(tx);
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if ws_write.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let reader_connection = connection.clone();
+    let reader_state = state.clone();
+    let reader_srv_tx = srv_tx.clone();
+    let reader = tokio::spawn(async move {
+        let mut close_reason = "socket closed".to_string();
+        while let Some(message) = FuturesStreamExt::next(&mut ws_read).await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    if let Err(err) = handle_websocket_text(
+                        &reader_connection,
+                        &reader_state,
+                        &reader_srv_tx,
+                        text.as_ref(),
+                    )
+                    .await
+                    {
+                        send_error(
+                            &reader_srv_tx,
+                            format!("ACP WebSocket message failed: {err:?}"),
+                        );
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    close_reason = frame
+                        .map(|frame| format!("socket closed: {}", frame.reason))
+                        .unwrap_or_else(|| "socket closed".to_string());
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    close_reason = err.to_string();
+                    send_error(&reader_srv_tx, format!("ACP WebSocket read failed: {err}"));
+                    break;
+                }
+            }
+        }
+        reader_connection.fail_all(&close_reason).await;
+        close_reason
+    });
+
+    let _ = conn_tx.send(crate::ConnectionManagerEvent::State(
+        crate::app::ConnectionEvent::Connected,
+    ));
+
+    let mut reader = Box::pin(reader);
+    let result = loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    break Ok(());
+                };
+                if let Err(err) = handle_client_msg(&connection, &state, &srv_tx, cmd).await {
+                    send_error(&srv_tx, format!("ACP request failed: {err:?}"));
+                }
+            }
+            reader_result = &mut reader => {
+                let reason = reader_result.unwrap_or_else(|err| err.to_string());
+                break Err(acp_internal_error(format!("ACP WebSocket connection closed: {reason}")));
+            }
+        }
+    };
+
+    writer.abort();
+    result
+}
+
+async fn handle_websocket_text(
+    connection: &WsAcpConnection,
+    state: &Arc<AcpRuntimeState>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    text: &str,
+) -> Result<(), acp_sdk::Error> {
+    let envelope: JsonRpcEnvelope =
+        serde_json::from_str(text).map_err(acp_sdk::Error::into_internal_error)?;
+    if envelope.method.is_none() {
+        return connection.resolve_response(envelope).await;
+    }
+
+    let method = envelope.method.clone().unwrap_or_default();
+    match method.as_str() {
+        "session/update" => {
+            let notification = acp::SessionNotification::parse_message(&method, &envelope.params)?;
+            handle_session_notification(state, srv_tx, notification).await;
+        }
+        "session/request_permission" => {
+            let request = acp::RequestPermissionRequest::parse_message(&method, &envelope.params)?;
+            let response = permission_response_for(&request);
+            if let Some(id) = envelope.id {
+                connection.respond_value(
+                    id,
+                    serde_json::to_value(response).map_err(acp_sdk::Error::into_internal_error),
+                )?;
+            }
+        }
+        "elicitation/create" => {
+            let request = acp::CreateElicitationRequest::parse_message(&method, &envelope.params)?;
+            if let Some(id) = envelope.id {
+                handle_ws_elicitation_request(state, srv_tx, connection.clone(), id, request).await;
+            }
+        }
+        "elicitation/requested" => {
+            handle_ws_elicitation_requested(state, srv_tx, connection.clone(), envelope.params)
+                .await;
+        }
+        "querymt/models/changed" => {
+            if let Ok(response) = call_acp_models(connection, false).await {
+                send_models(srv_tx, &response);
+            }
+        }
+        "querymt/mesh/nodesChanged" | "querymt/mesh/joined" | "querymt/mesh/peerExpired" => {
+            if let Ok(nodes_resp) =
+                call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
+            {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_ws_elicitation_requested(
+    state: &Arc<AcpRuntimeState>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    connection: WsAcpConnection,
+    params: Value,
+) {
+    let elicitation_id = params
+        .get("elicitationId")
+        .or_else(|| params.get("elicitation_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("elicitation")
+        .to_string();
+    let session_id = params
+        .get("sessionId")
+        .or_else(|| params.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("request")
+        .to_string();
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Input requested")
+        .to_string();
+    let requested_schema = params
+        .get("requestedSchema")
+        .or_else(|| params.get("requested_schema"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let source = params
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("acp-ws")
+        .to_string();
+
+    state.pending_elicitations.lock().await.insert(
+        elicitation_id.clone(),
+        PendingElicitationResponse::WsResultMethod(connection),
+    );
+    send_session_update(
+        srv_tx,
+        &session_id,
+        AcpSessionUpdate::ElicitationRequested {
+            elicitation_id,
+            message,
+            requested_schema,
+            source,
+        },
+        false,
+    );
+}
+
+async fn handle_ws_elicitation_request(
+    state: &Arc<AcpRuntimeState>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    connection: WsAcpConnection,
+    id: Value,
+    request: acp::CreateElicitationRequest,
+) {
+    let elicitation_id = id
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| id.to_string());
+    let (session_id, requested_schema, source) = match &request.mode {
+        acp::ElicitationMode::Form(form) => (
+            elicitation_scope_session_id(&form.scope),
+            serde_json::to_value(&form.requested_schema).unwrap_or_else(|_| json!({})),
+            "acp-ws".to_string(),
+        ),
+        acp::ElicitationMode::Url(url) => (
+            elicitation_scope_session_id(&url.scope),
+            json!({}),
+            format!("acp-url:{}", url.url),
+        ),
+        _ => ("request".to_string(), json!({}), "acp-ws".to_string()),
+    };
+    state.pending_elicitations.lock().await.insert(
+        elicitation_id.clone(),
+        PendingElicitationResponse::WsJsonRpcResponse { connection, id },
+    );
+    send_session_update(
+        srv_tx,
+        &session_id,
+        AcpSessionUpdate::ElicitationRequested {
+            elicitation_id,
+            message: request.message,
+            requested_schema,
+            source,
+        },
+        false,
+    );
+}
+
 pub async fn run_stdio_agent(
     agent: AcpAgent,
     cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
@@ -274,8 +748,8 @@ pub async fn run_stdio_agent(
         .await
 }
 
-async fn handle_client_msg(
-    connection: &ConnectionTo<Agent>,
+async fn handle_client_msg<C: AcpConnection>(
+    connection: &C,
     state: &Arc<AcpRuntimeState>,
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
     cmd: ClientMsg,
@@ -283,12 +757,11 @@ async fn handle_client_msg(
     match cmd {
         ClientMsg::Init => {
             let response = connection
-                .send_request(
+                .request(
                     acp::InitializeRequest::new(ProtocolVersion::V1)
                         .client_capabilities(client_capabilities())
                         .client_info(acp::Implementation::new("qmtui", env!("CARGO_PKG_VERSION"))),
                 )
-                .block_task()
                 .await?;
             let identity = response
                 .agent_info
@@ -313,7 +786,7 @@ async fn handle_client_msg(
             if let Some(cwd) = cwd.and_then(|cwd| (cwd != "__none__").then_some(cwd)) {
                 req = req.cwd(PathBuf::from(cwd));
             }
-            let response = connection.send_request(req).block_task().await?;
+            let response = connection.request(req).await?;
             send_session_list(srv_tx, response);
         }
         ClientMsg::NewSession {
@@ -326,7 +799,7 @@ async fn handle_client_msg(
             if let Some(profile_id) = profile_id.as_deref() {
                 req = req.meta(profile_meta(profile_id));
             }
-            let response = connection.send_request(req).block_task().await?;
+            let response = connection.request(req).await?;
             let session_id = response.session_id.to_string();
             state.set_current_session_id(session_id.clone()).await;
             let identity = state.agent_identity().await;
@@ -348,7 +821,7 @@ async fn handle_client_msg(
             let load_cwd = load_session_cwd(cwd.as_deref(), state.default_cwd());
             let req = acp::LoadSessionRequest::new(session_id.clone(), load_cwd);
 
-            let result = connection.send_request(req).block_task().await;
+            let result = connection.request(req).await;
             let replay_updates = state.end_loading(&session_id).await;
             let response = result?;
             let response_value = serde_json::to_value(&response).unwrap_or(Value::Null);
@@ -404,7 +877,7 @@ async fn handle_client_msg(
             let prompt_srv_tx = srv_tx.clone();
             connection.spawn(async move {
                 let req = acp::PromptRequest::new(session_id.clone(), prompt_blocks(prompt));
-                match prompt_connection.send_request(req).block_task().await {
+                match prompt_connection.request(req).await {
                     Ok(response) => {
                         finish_prompt(
                             &prompt_state,
@@ -432,7 +905,7 @@ async fn handle_client_msg(
                 );
                 return Ok(());
             };
-            connection.send_notification(acp::CancelNotification::new(session_id.clone()))?;
+            connection.notify(acp::CancelNotification::new(session_id.clone()))?;
             send_acp(
                 srv_tx,
                 AcpAppEvent::InfoLog {
@@ -443,8 +916,7 @@ async fn handle_client_msg(
         }
         ClientMsg::DeleteSession { session_id } => {
             connection
-                .send_request(acp::DeleteSessionRequest::new(session_id))
-                .block_task()
+                .request(acp::DeleteSessionRequest::new(session_id))
                 .await?;
         }
         ClientMsg::SetAgentMode { mode } => {
@@ -486,11 +958,10 @@ async fn handle_client_msg(
             );
             let meta = model_entry_meta(&model, node_id.as_deref());
             let response = connection
-                .send_request(
+                .request(
                     acp::SetSessionConfigOptionRequest::new(session_id, "model", model_id.as_str())
                         .meta(meta),
                 )
-                .block_task()
                 .await?;
             state.select_model(model_id).await;
             send_provider_changed(srv_tx, &model);
@@ -574,7 +1045,7 @@ async fn handle_client_msg(
             };
             let req = acp::ForkSessionRequest::new(session_id.clone(), state.default_cwd())
                 .meta(fork_session_meta(&message_id));
-            match connection.send_request(req).block_task().await {
+            match connection.request(req).await {
                 Ok(response) => send_acp(
                     srv_tx,
                     AcpAppEvent::ForkResult(ForkResultData {
@@ -662,8 +1133,8 @@ async fn handle_client_msg(
     Ok(())
 }
 
-async fn set_config_option(
-    connection: &ConnectionTo<Agent>,
+async fn set_config_option<C: AcpConnection>(
+    connection: &C,
     state: &Arc<AcpRuntimeState>,
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
     config_id: &str,
@@ -678,7 +1149,7 @@ async fn set_config_option(
         return Ok(());
     };
     let response = connection
-        .send_request(
+        .request(
             acp::SetSessionConfigOptionRequest::new(
                 session_id,
                 config_id.to_string(),
@@ -686,21 +1157,19 @@ async fn set_config_option(
             )
             .meta(meta),
         )
-        .block_task()
         .await?;
     send_config_updates(state, srv_tx, response.config_options).await;
     Ok(())
 }
 
-async fn call_querymt_ext(
-    connection: &ConnectionTo<Agent>,
+async fn call_querymt_ext<C: AcpConnection>(
+    connection: &C,
     method: &str,
     params: Value,
 ) -> Result<Value, acp_sdk::Error> {
     let wire_method = format!("_{method}");
     connection
-        .send_request(UntypedMessage::new(&wire_method, params)?)
-        .block_task()
+        .request(UntypedMessage::new(&wire_method, params)?)
         .await
 }
 
@@ -713,8 +1182,8 @@ fn load_session_cwd(cwd: Option<&str>, default_cwd: PathBuf) -> PathBuf {
         .unwrap_or(default_cwd)
 }
 
-async fn fetch_undo_stack(
-    connection: &ConnectionTo<Agent>,
+async fn fetch_undo_stack<C: AcpConnection>(
+    connection: &C,
     session_id: &str,
 ) -> Result<Vec<UndoStackFrame>, acp_sdk::Error> {
     let response = call_querymt_ext(
@@ -735,8 +1204,8 @@ async fn fetch_undo_stack(
         .unwrap_or_default())
 }
 
-async fn post_connect_diagnostics(
-    connection: &ConnectionTo<Agent>,
+async fn post_connect_diagnostics<C: AcpConnection>(
+    connection: &C,
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
 ) {
     match call_querymt_ext(connection, "querymt/capabilities", json!({})).await {
@@ -1059,8 +1528,8 @@ fn profile_id_from_config_options(config_options: &[acp::SessionConfigOption]) -
     None
 }
 
-async fn load_acp_models(
-    connection: &ConnectionTo<Agent>,
+async fn load_acp_models<C: AcpConnection>(
+    connection: &C,
     refresh: bool,
 ) -> Result<AcpModelsResponse, acp_sdk::Error> {
     let mut response = if refresh {
@@ -1093,8 +1562,8 @@ async fn load_acp_models(
     Ok(response)
 }
 
-async fn call_acp_models(
-    connection: &ConnectionTo<Agent>,
+async fn call_acp_models<C: AcpConnection>(
+    connection: &C,
     refresh: bool,
 ) -> Result<AcpModelsResponse, acp_sdk::Error> {
     let method = if refresh {
@@ -1671,11 +2140,10 @@ async fn handle_elicitation_request(
         _ => ("request".to_string(), json!({}), "acp".to_string()),
     };
 
-    state
-        .pending_elicitations
-        .lock()
-        .await
-        .insert(elicitation_id.clone(), responder);
+    state.pending_elicitations.lock().await.insert(
+        elicitation_id.clone(),
+        PendingElicitationResponse::Sdk(responder),
+    );
 
     send_session_update(
         srv_tx,
@@ -1713,14 +2181,37 @@ async fn respond_to_elicitation(
         return;
     };
 
-    let response = match action {
-        "accept" => acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
-            acp::ElicitationAcceptAction::new().content(elicitation_content(content)),
-        )),
-        "decline" => acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
-        _ => acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel),
-    };
-    let _ = responder.respond(response);
+    match responder {
+        PendingElicitationResponse::Sdk(responder) => {
+            let response = match action {
+                "accept" => acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(elicitation_content(content)),
+                )),
+                "decline" => acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                _ => acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel),
+            };
+            let _ = responder.respond(response);
+        }
+        PendingElicitationResponse::WsResultMethod(connection) => {
+            let _ = connection
+                .request_value(
+                    "elicitation_result",
+                    json!({
+                        "elicitation_id": elicitation_id,
+                        "action": action,
+                        "content": content,
+                    }),
+                )
+                .await;
+        }
+        PendingElicitationResponse::WsJsonRpcResponse { connection, id } => {
+            let result = json!({
+                "action": action,
+                "content": content,
+            });
+            let _ = connection.respond_value(id, Ok(result));
+        }
+    }
 }
 
 fn elicitation_content(

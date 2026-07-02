@@ -40,6 +40,10 @@ use protocol::ClientMsg;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
+const DEFAULT_ACP_WS_HOST: &str = "127.0.0.1";
+const DEFAULT_ACP_WS_PORT: &str = "3030";
+const DEFAULT_ACP_WS_PATH: &str = "/ws";
+
 #[derive(Debug)]
 pub(crate) enum ConnectionManagerEvent {
     State(app::ConnectionEvent),
@@ -48,6 +52,18 @@ pub(crate) enum ConnectionManagerEvent {
 #[derive(Debug)]
 pub(crate) enum ServerChannelMsg {
     Acp(AcpAppEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndpointSelection {
+    Endpoint {
+        endpoint: acp_client::AcpEndpoint,
+        state: server_manager::ServerState,
+        discovered_ws: Option<String>,
+        missing_binary_fallback: bool,
+    },
+    BinaryNotFound,
+    Disabled,
 }
 
 fn reconnect_delay_ms(attempt: u32) -> u64 {
@@ -1424,13 +1440,142 @@ struct Cli {
     #[arg(short = 'b', long = "acp-binary")]
     acp_binary: Option<String>,
 
-    /// Reserved for future ACP WebSocket transport support (ws://host/ws).
-    #[arg(long)]
+    /// Connect to an ACP WebSocket server; defaults to 127.0.0.1:3030.
+    #[arg(short = 'w', long = "ws", value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_ACP_WS_HOST)]
+    ws: Option<String>,
+
+    /// Backcompat alias for --ws.
+    #[arg(long, hide = true)]
     acp_websocket: Option<String>,
 
     /// Restore a session by id.
     #[arg(short = 's', long)]
     session: Option<String>,
+}
+
+fn normalize_acp_ws_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default_acp_ws_url();
+    }
+
+    let mut url = if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed.to_string()
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    let scheme_end = url.find("://").map(|idx| idx + 3).unwrap_or(0);
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map(|idx| scheme_end + idx)
+        .unwrap_or(url.len());
+    if !url[scheme_end..authority_end].contains(':') {
+        url.insert_str(authority_end, &format!(":{DEFAULT_ACP_WS_PORT}"));
+    }
+
+    let path_start = url[scheme_end..].find('/').map(|idx| scheme_end + idx);
+    match path_start {
+        Some(path_start) if url[path_start..].trim_end_matches('/').is_empty() => {
+            url.truncate(path_start);
+            url.push_str(DEFAULT_ACP_WS_PATH);
+        }
+        Some(_) => {}
+        None => url.push_str(DEFAULT_ACP_WS_PATH),
+    }
+    url
+}
+
+fn default_acp_ws_url() -> String {
+    normalize_acp_ws_url(DEFAULT_ACP_WS_HOST)
+}
+
+fn select_acp_endpoint(
+    cli: &Cli,
+    cfg: &config::TuiConfig,
+    default_ws_available: bool,
+) -> EndpointSelection {
+    if let Some(url) = cli
+        .ws
+        .as_deref()
+        .or(cli.acp_websocket.as_deref())
+        .map(normalize_acp_ws_url)
+    {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket { url },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if let Some(binary_path) = cli.acp_binary.as_deref() {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::Stdio {
+                argv: server_manager::build_acp_argv(OsString::from(binary_path), cfg.acp_args()),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if let Some(url) = cfg.acp.websocket_url.as_deref().map(normalize_acp_ws_url) {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket { url },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    let transport = cfg.acp.transport.unwrap_or_default();
+    if transport == config::AcpTransportMode::WebSocket {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_acp_ws_url(),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if !cfg.acp.auto_start.unwrap_or(true) {
+        return EndpointSelection::Disabled;
+    }
+
+    let default_ws_url = default_acp_ws_url();
+    if default_ws_available {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_ws_url.clone(),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: Some(default_ws_url),
+            missing_binary_fallback: false,
+        };
+    }
+
+    let discovery = server_manager::find_binary_info(cfg.acp.binary_path.as_deref());
+    discovery.binary.map_or_else(
+        || EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_ws_url,
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: true,
+        },
+        |binary| EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::Stdio {
+                argv: server_manager::build_acp_argv(binary, cfg.acp_args()),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        },
+    )
 }
 
 fn detect_launch_cwd() -> Option<String> {
@@ -1619,46 +1764,69 @@ async fn main() -> anyhow::Result<()> {
         app.screen = Screen::Chat;
     }
     // -- ACP auto-start ---------------------------------------------------------
-    let auto_start = cfg.acp.auto_start.unwrap_or(true);
-    let transport = cfg.acp.transport.unwrap_or_default();
     let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
+    let default_ws_available = cli.ws.is_none()
+        && cli.acp_websocket.is_none()
+        && cli.acp_binary.is_none()
+        && cfg.acp.websocket_url.is_none()
+        && cfg.acp.transport.unwrap_or_default() != config::AcpTransportMode::WebSocket
+        && cfg.acp.auto_start.unwrap_or(true)
+        && acp_client::probe_websocket(&default_acp_ws_url(), Duration::from_millis(250)).await;
 
-    let (endpoint, initial_server_state) = if let Some(url) = cli
-        .acp_websocket
-        .clone()
-        .or_else(|| cfg.acp.websocket_url.clone())
+    let selection = select_acp_endpoint(&cli, &cfg, default_ws_available);
+    if let EndpointSelection::Endpoint {
+        discovered_ws: Some(url),
+        ..
+    } = &selection
     {
-        // Minimal prep only: the agent crate has ws:// ACP support, but qmtcode
-        // does not yet expose a stable CLI flag for it. Keep the config/CLI
-        // shape here so the transport can be wired without touching UI state.
-        (
-            Some(acp_client::AcpEndpoint::WebSocket { url }),
-            server_manager::ServerState::Starting,
-        )
-    } else if transport == config::AcpTransportMode::WebSocket {
-        (
-            Some(acp_client::AcpEndpoint::WebSocket {
-                url: "ws://127.0.0.1:0/ws".to_string(),
-            }),
-            server_manager::ServerState::Starting,
-        )
-    } else if auto_start {
-        let acp_binary = cli.acp_binary.as_deref().or(cfg.acp.binary_path.as_deref());
-        let discovery = server_manager::find_binary_info(acp_binary);
-        log_server_binary_discovery(&mut app, &cfg, &discovery);
+        app.push_log(
+            app::LogLevel::Info,
+            "acp",
+            format!("found ACP WebSocket server at {url}"),
+        );
+    }
+    if cli.acp_binary.is_none()
+        && cfg.acp.transport.unwrap_or_default() == config::AcpTransportMode::Stdio
+    {
+        let discovery = server_manager::find_binary_info(cfg.acp.binary_path.as_deref());
+        if matches!(
+            selection,
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::Stdio { .. },
+                ..
+            } | EndpointSelection::Endpoint {
+                missing_binary_fallback: true,
+                ..
+            } | EndpointSelection::BinaryNotFound
+        ) {
+            log_server_binary_discovery(&mut app, &cfg, &discovery);
+        }
+    }
+    if let EndpointSelection::Endpoint {
+        missing_binary_fallback: true,
+        endpoint: acp_client::AcpEndpoint::WebSocket { url },
+        ..
+    } = &selection
+    {
+        app.push_log(
+            app::LogLevel::Warn,
+            "acp",
+            format!("qmtcode unavailable; waiting for ACP WebSocket at {url}"),
+        );
+    }
 
-        if let Some(binary) = discovery.binary {
-            let argv = server_manager::build_acp_argv(binary, cfg.acp_args());
-            (
-                Some(acp_client::AcpEndpoint::Stdio { argv }),
-                server_manager::ServerState::Starting,
-            )
-        } else {
+    let (endpoint, initial_server_state) = match selection {
+        EndpointSelection::Endpoint {
+            endpoint,
+            state,
+            discovered_ws: _,
+            missing_binary_fallback: _,
+        } => (Some(endpoint), state),
+        EndpointSelection::BinaryNotFound => {
             let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
             (None, server_manager::ServerState::BinaryNotFound)
         }
-    } else {
-        (None, server_manager::ServerState::Disabled)
+        EndpointSelection::Disabled => (None, server_manager::ServerState::Disabled),
     };
 
     if let Some(endpoint) = endpoint {
@@ -1769,15 +1937,49 @@ async fn connection_manager(
             }
         }
         acp_client::AcpEndpoint::WebSocket { url } => {
-            // TODO(ACP websocket): agent crate support exists for ws://.../ws,
-            // but qmtcode does not expose a stable client-side endpoint here yet.
-            let reason = format!("ACP WebSocket transport is reserved but not wired yet: {url}");
-            let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
-                error: reason.clone(),
-            });
-            let _ = conn_tx.send(ConnectionManagerEvent::State(
-                app::ConnectionEvent::Disconnected { reason },
-            ));
+            let mut attempt = 0u32;
+            loop {
+                if attempt > 0 {
+                    let delay_ms = reconnect_delay_ms(attempt - 1);
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Connecting { attempt, delay_ms },
+                    ));
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
+                let result = acp_client::run_websocket_agent(
+                    url.clone(),
+                    &mut cmd_rx,
+                    srv_tx.clone(),
+                    conn_tx.clone(),
+                    launch_cwd.clone(),
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let reason = "ACP WebSocket connection ended".to_string();
+                        let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
+                            reason: reason.clone(),
+                        });
+                        let _ = conn_tx.send(ConnectionManagerEvent::State(
+                            app::ConnectionEvent::Disconnected { reason },
+                        ));
+                        return;
+                    }
+                    Err(err) => {
+                        let reason = format!("ACP WebSocket connection failed ({url}): {err:?}");
+                        let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                            error: reason.clone(),
+                        });
+                        let _ = conn_tx.send(ConnectionManagerEvent::State(
+                            app::ConnectionEvent::Disconnected { reason },
+                        ));
+                        attempt = attempt.saturating_add(1).max(1);
+                    }
+                }
+            }
         }
     }
 }
@@ -3708,6 +3910,52 @@ mod cli_tests {
         let cli = Cli::try_parse_from([b.as_str()]).unwrap();
         assert_eq!(cli.session, None);
         assert_eq!(cli.acp_binary, None);
+        assert_eq!(cli.ws, None);
+    }
+
+    #[test]
+    fn cli_ws_flag_defaults_to_localhost() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_flag_accepts_address() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws=0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_defaults_to_localhost() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-w"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_accepts_address() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-w", "0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn acp_ws_url_normalization_adds_defaults() {
+        assert_eq!(normalize_acp_ws_url("127.0.0.1"), "ws://127.0.0.1:3030/ws");
+        assert_eq!(
+            normalize_acp_ws_url("127.0.0.1:42069"),
+            "ws://127.0.0.1:42069/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999"),
+            "ws://localhost:9999/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999/custom"),
+            "ws://localhost:9999/custom"
+        );
     }
 
     #[test]
@@ -3722,6 +3970,104 @@ mod cli_tests {
         let b = bin();
         let cli = Cli::try_parse_from([b.as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
         assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn explicit_ws_selection_wins_over_default_stdio() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws=localhost:42069"]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_binary_selection_wins_over_default_ws_probe() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_args = Some(vec!["--acp".into()]);
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::Stdio {
+                    argv: vec!["/tmp/qmtcode".into(), "--acp".into()]
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn configured_websocket_selection_wins_over_default_ws_probe() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.websocket_url = Some("localhost:42069".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_default_ws_selection_records_discovery() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: Some("ws://127.0.0.1:3030/ws".into()),
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_binary_missing_retries_default_websocket_forever() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_path = Some("/definitely/missing/qmtcode".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: true,
+            }
+        );
     }
 
     #[test]
