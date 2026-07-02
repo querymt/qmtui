@@ -81,38 +81,10 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
     }
 }
 
-/// Single-mode marker: returns vec with the mode name if this model matches
-/// the preference for that specific mode, empty vec otherwise.
-fn popup_single_mode_marker(
-    app: &App,
-    model: &crate::protocol::ModelEntry,
-    mode: &'static str,
-) -> Vec<&'static str> {
-    let fallback_current = if app.agent_mode == mode {
-        match (
-            app.current_provider.as_deref(),
-            app.current_model.as_deref(),
-        ) {
-            (Some(provider), Some(model_name)) => Some((provider, model_name)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let target = app.get_mode_model_preference(mode).or(fallback_current);
-    if target.is_some_and(|(provider, model_name)| {
-        provider == model.provider && model_name == model.model
-    }) {
-        vec![mode]
-    } else {
-        vec![]
-    }
-}
-
 /// Whether the given model matches a delegate agent's preferred model.
 fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
     app.get_delegate_model_preference(agent_id)
-        .is_some_and(|(p, m)| p == model.provider && m == model.model)
+        .is_some_and(|(p, m)| App::model_entry_matches_node(model, p, m, None))
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -125,7 +97,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
 
-    let has_tabs = true;
+    let has_tabs = app.model_popup_has_tabs();
 
     let area = f.area();
     let popup_width = area
@@ -192,16 +164,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         for i in 0..app.model_popup_tab_count() {
             let label = app.model_popup_tab_label(i);
             let is_active = i == app.model_popup_agent_tab;
-            let style = if let Some(mode) = app.model_popup_tab_mode(i) {
-                let mut s = ratatui::style::Style::default()
-                    .fg(Theme::mode_color(mode))
-                    .bg(Theme::bg_dim())
-                    .add_modifier(Modifier::BOLD);
-                if is_active {
-                    s = s.add_modifier(Modifier::UNDERLINED);
-                }
-                s
-            } else if is_active {
+            let style = if is_active {
                 Theme::popup_title().add_modifier(Modifier::UNDERLINED)
             } else {
                 Theme::status()
@@ -232,8 +195,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
 
-    // Resolve current tab's mode (for mode tabs) or agent_id (for agent tabs).
-    let active_mode = app.model_popup_tab_mode(app.model_popup_agent_tab);
+    let on_session_tab = app.model_popup_is_session_tab(app.model_popup_agent_tab);
     let active_agent_id = app
         .model_popup_tab_agent_id(app.model_popup_agent_tab)
         .map(str::to_string);
@@ -249,18 +211,11 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
             ModelPopupItem::ProviderHeader {
                 provider,
                 model_count,
+                node_suffix,
             } => {
                 let selected = i == app.model_cursor;
                 let marker = COLLAPSE_CLOSED;
                 let count = format!(" {model_count}");
-                let avail = list_w.saturating_sub(4 + count.chars().count());
-                let label = if provider.chars().count() > avail {
-                    let t: String = provider.chars().take(avail.saturating_sub(1)).collect();
-                    format!("{t}{ELLIPSIS}")
-                } else {
-                    provider.clone()
-                };
-                let gap = avail.saturating_sub(label.chars().count());
                 let marker_style = if selected {
                     Theme::selected()
                 } else {
@@ -272,30 +227,42 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 } else {
                     Theme::status()
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {marker} "), marker_style),
-                    Span::styled(label, provider_style),
+                let suffix_style = Theme::status_accent();
+
+                let marker_w = 2usize;
+                let count_w = count.chars().count();
+                let suffix = node_suffix.as_ref().map(|n| format!("@ {n}"));
+                let suffix_w = suffix.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+                let avail = list_w.saturating_sub(marker_w + 1 + count_w + suffix_w + 1);
+
+                let provider_display = if provider.chars().count() > avail {
+                    let t: String = provider.chars().take(avail.saturating_sub(1)).collect();
+                    format!("{t}{ELLIPSIS}")
+                } else {
+                    provider.clone()
+                };
+                let gap = avail.saturating_sub(provider_display.chars().count());
+
+                let mut line_spans = vec![
+                    Span::styled(format!("{marker} "), marker_style),
+                    Span::styled(provider_display, provider_style),
                     Span::styled(" ".repeat(gap), dim_style),
-                    Span::styled(count, dim_style),
-                ]))
+                ];
+                if let Some(s) = suffix {
+                    line_spans.push(Span::styled(s, suffix_style));
+                }
+                line_spans.push(Span::styled(count, dim_style));
+                ListItem::new(Line::from(line_spans))
             }
             ModelPopupItem::Model { model_idx } => {
                 let selected = i == app.model_cursor;
                 let model = &app.models[*model_idx];
 
-                // On a mode tab show that mode's marker;
-                // on an agent tab show a delegate preference marker.
-                let marker_modes: Vec<&str> = match (active_mode, active_agent_id.as_deref()) {
-                    (Some(mode), _) => popup_single_mode_marker(app, model, mode),
-                    (_, Some(aid)) => {
-                        if popup_delegate_marker(app, model, aid) {
-                            vec!["delegate"]
-                        } else {
-                            vec![]
-                        }
-                    }
-                    _ => vec![],
-                };
+                let show_live = on_session_tab && app.live_model_selection_matches_entry(model);
+                let show_delegate = active_agent_id
+                    .as_deref()
+                    .is_some_and(|aid| popup_delegate_marker(app, model, aid));
+                let marker_count = usize::from(show_live) + usize::from(show_delegate);
 
                 let marker_bg = if selected {
                     Theme::bg_hl()
@@ -304,11 +271,12 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 };
                 let marker_w = MODEL_MARKER_COL_W as usize;
                 let avail = list_w.saturating_sub(marker_w);
-                let label = if model.label.chars().count() > avail {
-                    let t: String = model.label.chars().take(avail.saturating_sub(1)).collect();
+                let base_label = model.label.clone();
+                let label = if base_label.chars().count() > avail {
+                    let t: String = base_label.chars().take(avail.saturating_sub(1)).collect();
                     format!("{t}{ELLIPSIS}")
                 } else {
-                    model.label.clone()
+                    base_label
                 };
                 let gap = avail.saturating_sub(label.chars().count());
                 let main_style = if selected {
@@ -316,18 +284,24 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 } else {
                     Theme::popup_bg()
                 };
-                let mut spans = Vec::with_capacity(1 + marker_modes.len() * 2 + 2);
+                let mut spans = Vec::with_capacity(4);
                 spans.push(Span::styled(" ", main_style));
-                for mode in &marker_modes {
+                if show_live {
                     spans.push(Span::styled(
                         "\u{25cf}",
-                        ratatui::style::Style::default()
-                            .fg(Theme::mode_color(mode))
-                            .bg(marker_bg),
+                        Theme::status_accent().bg(marker_bg),
+                    ));
+                }
+                if show_delegate {
+                    spans.push(Span::styled(
+                        "\u{25cf}",
+                        Theme::status_accent()
+                            .bg(marker_bg)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
                 spans.push(Span::styled(
-                    " ".repeat(marker_w.saturating_sub(1 + marker_modes.len())),
+                    " ".repeat(marker_w.saturating_sub(1 + marker_count)),
                     main_style,
                 ));
                 spans.push(Span::styled(label, main_style));
@@ -353,8 +327,10 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         Span::styled("enter ", Theme::status_accent()),
         Span::styled("select", Theme::status()),
     ];
-    hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
-    hint_spans.push(Span::styled("switch", Theme::status()));
+    if has_tabs {
+        hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
+        hint_spans.push(Span::styled("agent", Theme::status()));
+    }
     f.render_widget(
         Paragraph::new(Line::from(hint_spans)).style(Theme::popup_bg()),
         chunks[hint_idx],

@@ -59,6 +59,7 @@ const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token 
 const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
 pub(crate) const ICON_DELEGATES: &str = "\u{2387}"; // ⎇  alt/fork       – delegation count
 pub(crate) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
+pub(crate) const ICON_MESH: &str = "\u{1F5A7}"; // mesh nodes (U+1F5A7)
 
 // ── General text symbols ──────────────────────────────────────────────────────
 const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
@@ -662,7 +663,19 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 /// Build left + right span vectors for the chat/delegate header bar.
 fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let model_str = match (&app.current_provider, &app.current_model) {
-        (Some(p), Some(m)) => format!("{p}/{m}"),
+        (Some(p), Some(m)) => {
+            if let Some(node_id) = app.current_model_node_id.as_deref() {
+                let label = app
+                    .models
+                    .iter()
+                    .find(|e| App::model_entry_matches_node(e, p, m, Some(node_id)))
+                    .and_then(|e| e.node_label.as_deref())
+                    .unwrap_or(node_id);
+                format!("{p}/{m}@{label}")
+            } else {
+                format!("{p}/{m}")
+            }
+        }
         _ => "no model".into(),
     };
     let sid = app
@@ -745,6 +758,10 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
             format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
             Theme::status(),
         ));
+    }
+
+    if let Some(span) = super::mesh_header_span(app) {
+        right_spans.push(span);
     }
 
     let effort_label = app.reasoning_effort_label().to_string();

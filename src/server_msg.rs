@@ -1,8 +1,10 @@
 //! Server message handling for the TUI application.
 //!
-//! Contains `handle_server_msg`, `handle_event_kind`, `replay_audit`, and
-//! helper functions for parsing tool details, updating tool results, and
-//! building diff/write content lines.
+//! Legacy QueryMT websocket/server-message reducers.
+//!
+//! The normal ACP runtime no longer routes through this module. It remains for
+//! compatibility tests and as a reference while old event-shaped behavior is
+//! ported to native ACP state.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -318,9 +320,6 @@ impl App {
                         validate_reasoning_effort(re.reasoning_effort.as_deref())
                 {
                     self.reasoning_effort = validated;
-                    // Server is authoritative — cache so this session + mode
-                    // remembers the level across restarts.
-                    self.cache_session_mode_state();
                 }
                 vec![]
             }
@@ -382,6 +381,7 @@ impl App {
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
+                                cwd: self.current_session_cwd(),
                             }];
                         }
                     } else {
@@ -406,6 +406,7 @@ impl App {
                         if let Some(ref sid) = self.session_id {
                             return vec![ClientMsg::LoadSession {
                                 session_id: sid.clone(),
+                                cwd: self.current_session_cwd(),
                             }];
                         }
                     } else {
@@ -430,6 +431,7 @@ impl App {
                             return vec![
                                 ClientMsg::LoadSession {
                                     session_id: forked_session_id.clone(),
+                                    cwd: self.current_session_cwd(),
                                 },
                                 ClientMsg::SubscribeSession {
                                     session_id: forked_session_id,
@@ -595,36 +597,10 @@ impl App {
                     self.session_stats = SessionStatsLite::default();
                     self.screen = Screen::Chat;
                     self.set_status(LogLevel::Info, "session", "session created");
-                    let mut cmds = vec![ClientMsg::SubscribeSession {
+                    let cmds = vec![ClientMsg::SubscribeSession {
                         session_id: sc.session_id,
                         agent_id: self.agent_id.clone(),
                     }];
-                    // Auto-apply mode model preference for local sessions only.
-                    if !self.current_session_is_remote()
-                        && let Some((provider, model)) =
-                            self.get_mode_model_preference(&self.agent_mode)
-                    {
-                        let provider = provider.to_string();
-                        let model = model.to_string();
-                        if let Some(entry) = self
-                            .models
-                            .iter()
-                            .find(|m| {
-                                m.provider == provider && m.model == model && m.node_id.is_none()
-                            })
-                            .cloned()
-                        {
-                            self.current_provider = Some(entry.provider.clone());
-                            self.current_model = Some(entry.model.clone());
-                            if let Some(sid) = self.session_id.clone() {
-                                cmds.push(ClientMsg::SetSessionModel {
-                                    session_id: sid,
-                                    model_id: entry.id,
-                                    node_id: entry.node_id,
-                                });
-                            }
-                        }
-                    }
                     return cmds;
                 }
                 vec![]
@@ -716,10 +692,6 @@ impl App {
                             let mut cmds = vec![ClientMsg::SetAgentMode {
                                 mode: self.agent_mode.clone(),
                             }];
-                            // Restore cached model + effort for local sessions only.
-                            if !self.current_session_is_remote() {
-                                cmds.extend(self.apply_cached_mode_state());
-                            }
                             // Drain any subscribe commands queued during audit replay
                             // (e.g. SubscribeSession for delegation child sessions).
                             cmds.extend(self.drain_pending());
@@ -861,11 +833,77 @@ impl App {
                 }
                 self.drain_pending()
             }
+            "control_capabilities" => {
+                if let Some(data) = raw.data {
+                    self.apply_control_capabilities_log(data);
+                }
+                vec![]
+            }
+            "control_capabilities_error" => {
+                if let Some(data) = raw.data {
+                    let message = data
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error");
+                    self.push_log(
+                        LogLevel::Warn,
+                        "capabilities",
+                        format!("capabilities unavailable: {message}"),
+                    );
+                }
+                vec![]
+            }
+            "mesh_nodes" => {
+                if let Some(data) = raw.data {
+                    let count = data
+                        .get("nodes")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|nodes| nodes.len() as u32)
+                        .unwrap_or(0);
+                    self.mesh_node_count = Some(count);
+                    self.push_log(LogLevel::Info, "mesh", format!("mesh nodes: {count}"));
+                }
+                vec![]
+            }
+            "acp_set_session_model" => {
+                if let Some(data) = &raw.data {
+                    let message = data
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("ACP SetSessionModel");
+                    self.push_log(LogLevel::Info, "acp", message);
+                }
+                vec![]
+            }
             "all_models_list" => {
                 if let Some(data) = raw.data
-                    && let Ok(ml) = serde_json::from_value::<AllModelsData>(data)
+                    && let Some(models) = data.get("models").and_then(serde_json::Value::as_array)
                 {
-                    self.models = ml.models;
+                    self.models = models
+                        .iter()
+                        .filter_map(|model| serde_json::from_value(model.clone()).ok())
+                        .collect();
+                    let remote_models = self.models.iter().filter(|m| m.node_id.is_some()).count();
+                    let meta = data.get("meta");
+                    let remote_nodes = meta
+                        .and_then(|m| m.get("remote_node_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let timeouts = meta
+                        .and_then(|m| m.get("remote_timeout_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let mut line = format!(
+                        "models: {} total, {} remote",
+                        self.models.len(),
+                        remote_models
+                    );
+                    if remote_nodes > 0 || timeouts > 0 {
+                        line.push_str(&format!(
+                            " (inventory nodes={remote_nodes}, timeouts={timeouts})"
+                        ));
+                    }
+                    self.push_log(LogLevel::Info, "models", line);
                 }
                 vec![]
             }
@@ -1486,16 +1524,20 @@ impl App {
                 provider,
                 model,
                 context_limit,
+                provider_node_id,
                 ..
             } => {
                 self.current_provider = Some(provider.clone());
                 self.current_model = Some(model.clone());
+                if is_replay {
+                    if provider_node_id.is_some() {
+                        self.current_model_node_id = provider_node_id.clone();
+                    }
+                } else {
+                    self.current_model_node_id = provider_node_id.clone();
+                }
                 if let Some(limit) = context_limit {
                     self.context_limit = *limit;
-                }
-                // Keep the session cache in sync with live model changes.
-                if !is_replay {
-                    self.cache_session_mode_state();
                 }
             }
             EventKind::LlmRequestEnd {
@@ -1702,25 +1744,6 @@ impl App {
                         session_id: sid.clone(),
                         agent_id,
                     });
-                    // Auto-apply delegate model preference if configured.
-                    if let Some(target_id) = target_agent_id.as_deref()
-                        && let Some((prov, mdl)) = self.get_delegate_model_preference(target_id)
-                    {
-                        let prov = prov.to_string();
-                        let mdl = mdl.to_string();
-                        if let Some(entry) = self
-                            .models
-                            .iter()
-                            .find(|m| m.provider == prov && m.model == mdl && m.node_id.is_none())
-                            .cloned()
-                        {
-                            self.pending_commands.push(ClientMsg::SetSessionModel {
-                                session_id: sid.clone(),
-                                model_id: entry.id,
-                                node_id: entry.node_id,
-                            });
-                        }
-                    }
                 }
             }
             EventKind::DelegationCompleted { delegation_id, .. } => {
@@ -1813,6 +1836,110 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    fn apply_control_capabilities_log(&mut self, data: serde_json::Value) {
+        let version = data
+            .get("querymt_control_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let agent = data.get("agent");
+        let kind = agent
+            .and_then(|a| a.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let display = agent
+            .and_then(|a| a.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let version_str = agent
+            .and_then(|a| a.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let transport = data.get("transport");
+        let mesh_on = transport
+            .and_then(|t| t.get("mesh"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mesh_transport = transport
+            .and_then(|t| t.get("mesh_transport"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("none");
+        self.push_log(
+            LogLevel::Info,
+            "capabilities",
+            format!(
+                "querymt control v{version}: {display} ({kind} {version_str}), mesh={mesh_on} transport={mesh_transport}"
+            ),
+        );
+
+        if let Some(features) = data.get("features") {
+            let mesh = features
+                .get("mesh")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let remote_sessions = features
+                .get("remote_sessions")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let profiles = features
+                .get("profiles")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let auth = features
+                .get("auth")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let models = features
+                .get("models")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.push_log(
+                LogLevel::Debug,
+                "capabilities",
+                format!(
+                    "features: mesh={mesh}, remote_sessions={remote_sessions}, profiles={profiles}, auth={auth}, models={models}"
+                ),
+            );
+        }
+
+        let methods = data
+            .get("methods")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let querymt_methods: Vec<&str> = methods
+            .iter()
+            .map(String::as_str)
+            .filter(|m| m.starts_with("querymt/"))
+            .collect();
+        self.push_log(
+            LogLevel::Debug,
+            "capabilities",
+            format!(
+                "methods: {} total ({} querymt/*)",
+                methods.len(),
+                querymt_methods.len()
+            ),
+        );
+        if !querymt_methods.is_empty() {
+            let preview: Vec<&str> = querymt_methods.iter().copied().take(12).collect();
+            let suffix = if querymt_methods.len() > preview.len() {
+                format!(" …+{}", querymt_methods.len() - preview.len())
+            } else {
+                String::new()
+            };
+            self.push_log(
+                LogLevel::Debug,
+                "capabilities",
+                format!("querymt methods: {}{suffix}", preview.join(", ")),
+            );
         }
     }
 }
@@ -3099,7 +3226,7 @@ mod fork_result_tests {
         assert_eq!(app.popup, Popup::None);
         assert_eq!(cmds.len(), 2);
         assert!(
-            matches!(&cmds[0], ClientMsg::LoadSession { session_id } if session_id == "fork-1")
+            matches!(&cmds[0], ClientMsg::LoadSession { session_id, .. } if session_id == "fork-1")
         );
         assert!(
             matches!(&cmds[1], ClientMsg::SubscribeSession { session_id, agent_id } if session_id == "fork-1" && agent_id.as_deref() == Some("agent-1"))

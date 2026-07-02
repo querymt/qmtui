@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod acp_client;
+mod acp_state;
 mod app;
 mod config;
 mod handlers;
@@ -8,11 +10,13 @@ mod input;
 mod markdown;
 mod protocol;
 mod server_manager;
+#[cfg(test)]
 mod server_msg;
 mod session;
 mod slash;
 mod theme;
 mod themes_gen;
+mod tool_detail;
 mod ui;
 
 use std::{
@@ -23,6 +27,7 @@ use std::{
     time::Duration,
 };
 
+use acp_state::AcpAppEvent;
 use app::{App, Screen};
 use clap::Parser;
 use crossterm::{
@@ -30,40 +35,19 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::{SinkExt, StreamExt};
-use protocol::{ClientMsg, RawServerMsg};
+use futures::StreamExt;
+use protocol::ClientMsg;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug)]
-enum ConnectionManagerEvent {
+pub(crate) enum ConnectionManagerEvent {
     State(app::ConnectionEvent),
 }
 
 #[derive(Debug)]
-enum ServerChannelMsg {
-    Parsed(RawServerMsg),
-    Invalid { error: String, raw: String },
-}
-
-fn parse_server_text_for_channel(text: &str) -> ServerChannelMsg {
-    match serde_json::from_str::<RawServerMsg>(text) {
-        Ok(raw) => ServerChannelMsg::Parsed(raw),
-        Err(err) => ServerChannelMsg::Invalid {
-            error: err.to_string(),
-            raw: text.to_string(),
-        },
-    }
-}
-
-fn log_invalid_server_message(app: &mut App, error: String, raw: String) {
-    app.status = format!("invalid server message: {error}");
-    app.push_log(
-        app::LogLevel::Error,
-        "protocol",
-        format!("invalid server message: {error}; raw: {raw}"),
-    );
+pub(crate) enum ServerChannelMsg {
+    Acp(AcpAppEvent),
 }
 
 fn reconnect_delay_ms(attempt: u32) -> u64 {
@@ -181,35 +165,11 @@ mod tests {
 
     #[test]
     fn raw_server_msg_missing_data_parses_as_none() {
-        let raw = serde_json::from_str::<RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
+        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#)
+            .unwrap();
 
         assert_eq!(raw.msg_type, "heartbeat");
         assert!(raw.data.is_none());
-    }
-
-    #[test]
-    fn invalid_server_message_log_includes_full_raw_payload() {
-        let raw = r#"{"data":"missing type","nested":{"value":"do not truncate"}}"#;
-        let ServerChannelMsg::Invalid {
-            error,
-            raw: parsed_raw,
-        } = parse_server_text_for_channel(raw)
-        else {
-            panic!("expected invalid server message");
-        };
-        let mut app = App::new();
-
-        log_invalid_server_message(&mut app, error.clone(), parsed_raw);
-
-        assert!(error.contains("missing field `type`"));
-        assert_eq!(app.status, format!("invalid server message: {error}"));
-        let log = app.logs.last().unwrap();
-        assert_eq!(log.level, app::LogLevel::Error);
-        assert_eq!(log.target, "protocol");
-        assert_eq!(
-            log.message,
-            format!("invalid server message: {error}; raw: {raw}")
-        );
     }
 
     // ── Elicitation key handling ──────────────────────────────────────────────
@@ -513,7 +473,7 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
-    use crate::config::{ServerConfig, TestPersistenceGuard, TuiConfig};
+    use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::handlers::*;
     use app::{ActivityState, App};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -687,9 +647,9 @@ mod external_editor_tests {
     fn log_server_binary_discovery_records_path_lookup_when_binary_path_unset() {
         let mut app = App::new();
         let cfg = TuiConfig {
-            server: ServerConfig {
+            acp: AcpConfig {
                 binary_path: None,
-                ..ServerConfig::default()
+                ..AcpConfig::default()
             },
             ..TuiConfig::default()
         };
@@ -705,10 +665,10 @@ mod external_editor_tests {
             },
         );
 
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
-            && entry.message == "server.binary_path not set; checking qmtcode on PATH"));
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+            && entry.message == "acp.binary_path not set; checking qmtcode on PATH"));
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
             && entry.message == "qmtcode not found on PATH"));
     }
@@ -1353,6 +1313,10 @@ mod external_editor_tests {
             ClientMsg::CancelSession
         ));
         assert_eq!(app.status, "stopping...");
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry) if entry.target == "activity" && entry.message == "stopping..."
+        ));
     }
 
     #[test]
@@ -1456,9 +1420,13 @@ mod external_editor_tests {
 #[command(version = env!("QMTUI_BUILD_VERSION"))]
 #[command(about = "querymt terminal interface")]
 struct Cli {
-    /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
+    /// Override the qmtcode binary used for ACP stdio for this run.
+    #[arg(short = 'b', long = "acp-binary")]
+    acp_binary: Option<String>,
+
+    /// Reserved for future ACP WebSocket transport support (ws://host/ws).
     #[arg(long)]
-    server: Option<String>,
+    acp_websocket: Option<String>,
 
     /// Restore a session by id.
     #[arg(short = 's', long)]
@@ -1502,7 +1470,7 @@ fn system_editor_command() -> Option<EditorCommand> {
     editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
 }
 
-use handlers::{AppAction, handle_key, handle_mouse, save_cache};
+use handlers::{AppAction, handle_key, handle_mouse};
 
 fn temp_editor_file_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -1584,18 +1552,18 @@ fn log_server_binary_discovery(
     if let Some(path) = discovery.configured_path.as_deref() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
+            "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
-    } else if cfg.server.binary_path.is_none() {
+    } else if cfg.acp.binary_path.is_none() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
-            "server.binary_path not set; checking qmtcode on PATH",
+            "acp",
+            "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(app::LogLevel::Info, "server", "qmtcode not found on PATH");
+        app.push_log(app::LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1628,18 +1596,9 @@ async fn main() -> anyhow::Result<()> {
     // Load persistent config; CLI args override config defaults.
     let cfg = config::TuiConfig::load();
 
-    let addr = cli
-        .server
-        .or_else(|| cfg.server.addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:42069".to_string());
-    let tls = cfg.server.tls.unwrap_or(false);
-
     // Apply saved theme (falls back to built-in default if absent or unknown).
     let theme_id = cfg.theme.as_deref().unwrap_or("base16-querymate");
     theme::Theme::init(theme_id);
-
-    let scheme = if tls { "wss" } else { "ws" };
-    let url = format!("{scheme}://{addr}/ui/ws");
 
     // channels for the event loop
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerChannelMsg>();
@@ -1655,54 +1614,63 @@ async fn main() -> anyhow::Result<()> {
             app.set_delegate_model_preference(agent_id, provider, model);
         }
     }
-    for (mode, model_key) in &cfg.mode_models {
-        if let Some((provider, model)) = model_key.split_once('/') {
-            app.set_mode_model_preference(mode, provider, model);
-        }
-    }
     if let Some(session_id) = cli.session.clone() {
         app.session_id = Some(session_id);
         app.screen = Screen::Chat;
     }
-    // Hydrate session effort cache from disk.
-    config::TuiCache::load().hydrate_app(&mut app);
-
-    // ── Server auto-start ─────────────────────────────────────────────────────
-    let auto_start = cfg.server.auto_start.unwrap_or(true);
-    let shutdown_on_exit = cfg.server.shutdown_on_exit.unwrap_or(true);
-    let launch_mode = cfg.server.launch_mode.unwrap_or_default();
+    // -- ACP auto-start ---------------------------------------------------------
+    let auto_start = cfg.acp.auto_start.unwrap_or(true);
+    let transport = cfg.acp.transport.unwrap_or_default();
     let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
-    let (sup_shutdown_tx, sup_shutdown_rx) = mpsc::channel::<()>(1);
 
-    let initial_server_state = if auto_start {
-        let discovery = server_manager::find_binary_info(cfg.server.binary_path.as_deref());
+    let (endpoint, initial_server_state) = if let Some(url) = cli
+        .acp_websocket
+        .clone()
+        .or_else(|| cfg.acp.websocket_url.clone())
+    {
+        // Minimal prep only: the agent crate has ws:// ACP support, but qmtcode
+        // does not yet expose a stable CLI flag for it. Keep the config/CLI
+        // shape here so the transport can be wired without touching UI state.
+        (
+            Some(acp_client::AcpEndpoint::WebSocket { url }),
+            server_manager::ServerState::Starting,
+        )
+    } else if transport == config::AcpTransportMode::WebSocket {
+        (
+            Some(acp_client::AcpEndpoint::WebSocket {
+                url: "ws://127.0.0.1:0/ws".to_string(),
+            }),
+            server_manager::ServerState::Starting,
+        )
+    } else if auto_start {
+        let acp_binary = cli.acp_binary.as_deref().or(cfg.acp.binary_path.as_deref());
+        let discovery = server_manager::find_binary_info(acp_binary);
         log_server_binary_discovery(&mut app, &cfg, &discovery);
 
         if let Some(binary) = discovery.binary {
-            let sup_config = server_manager::ServerManagerConfig {
-                addr: addr.clone(),
-                launch_mode,
-                binary_args: cfg.server.binary_args.clone().unwrap_or_default(),
-                shutdown_on_exit,
-                lock_path: None,
-                ready_timeout: None,
-            };
-            tokio::spawn(server_manager::supervisor(
-                sup_config,
-                binary,
-                sup_event_tx,
-                sup_shutdown_rx,
-            ));
-            server_manager::ServerState::Starting
+            let argv = server_manager::build_acp_argv(binary, cfg.acp_args());
+            (
+                Some(acp_client::AcpEndpoint::Stdio { argv }),
+                server_manager::ServerState::Starting,
+            )
         } else {
             let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            server_manager::ServerState::BinaryNotFound
+            (None, server_manager::ServerState::BinaryNotFound)
         }
     } else {
-        server_manager::ServerState::Disabled
+        (None, server_manager::ServerState::Disabled)
     };
 
-    tokio::spawn(connection_manager(url, srv_tx, cmd_rx, conn_tx));
+    if let Some(endpoint) = endpoint {
+        tokio::spawn(connection_manager(
+            endpoint,
+            srv_tx,
+            cmd_rx,
+            conn_tx,
+            sup_event_tx.clone(),
+            app.launch_cwd.clone(),
+        ));
+    }
 
     // setup terminal
     enable_raw_mode()?;
@@ -1721,9 +1689,6 @@ async fn main() -> anyhow::Result<()> {
         &cmd_tx,
     )
     .await;
-
-    // Signal supervisor to stop (and kill the child if configured).
-    let _ = sup_shutdown_tx.send(()).await;
 
     // restore terminal
     disable_raw_mode()?;
@@ -1748,72 +1713,71 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 async fn connection_manager(
-    url: String,
+    endpoint: acp_client::AcpEndpoint,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
     conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
+    sup_event_tx: mpsc::UnboundedSender<server_manager::ServerEvent>,
+    launch_cwd: Option<String>,
 ) {
-    let mut attempt = 0u32;
+    match endpoint {
+        acp_client::AcpEndpoint::Stdio { argv } => {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
+            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
+                Ok(agent) => agent,
+                Err(err) => {
+                    let message = format!("invalid ACP stdio command: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: message.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason: message },
+                    ));
+                    return;
+                }
+            };
 
-    loop {
-        if attempt > 0 {
-            let delay_ms = reconnect_delay_ms(attempt - 1);
-            let _ = conn_tx.send(ConnectionManagerEvent::State(
-                app::ConnectionEvent::Connecting { attempt, delay_ms },
-            ));
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Started);
+            let result = acp_client::run_stdio_agent(
+                agent,
+                &mut cmd_rx,
+                srv_tx,
+                conn_tx.clone(),
+                launch_cwd,
+            )
+            .await;
+
+            match result {
+                Ok(()) => {
+                    let reason = "ACP stdio connection ended".to_string();
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
+                        reason: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
+                Err(err) => {
+                    let reason = format!("ACP stdio connection failed: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
+            }
         }
-
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((ws_stream, _)) => {
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Connected,
-                ));
-                let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-                let disconnected_reason = loop {
-                    tokio::select! {
-                        biased;
-                        maybe_cmd = cmd_rx.recv() => {
-                            let Some(cmd) = maybe_cmd else { return; };
-                            if let Ok(json) = serde_json::to_string(&cmd)
-                                && ws_tx.send(Message::Text(json.into())).await.is_err()
-                            {
-                                break String::from("send failed");
-                            }
-                        }
-                        maybe_msg = ws_rx.next() => {
-                            match maybe_msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    let _ = srv_tx.send(parse_server_text_for_channel(&text));
-                                }
-                                Some(Ok(_)) => {}
-                                Some(Err(err)) => {
-                                    break err.to_string();
-                                }
-                                None => {
-                                    break String::from("socket closed");
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: disconnected_reason,
-                    },
-                ));
-                attempt = 1;
-            }
-            Err(err) => {
-                attempt = attempt.saturating_add(1).max(1);
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: err.to_string(),
-                    },
-                ));
-            }
+        acp_client::AcpEndpoint::WebSocket { url } => {
+            // TODO(ACP websocket): agent crate support exists for ws://.../ws,
+            // but qmtcode does not expose a stable client-side endpoint here yet.
+            let reason = format!("ACP WebSocket transport is reserved but not wired yet: {url}");
+            let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                error: reason.clone(),
+            });
+            let _ = conn_tx.send(ConnectionManagerEvent::State(
+                app::ConnectionEvent::Disconnected { reason },
+            ));
         }
     }
 }
@@ -1845,9 +1809,7 @@ async fn run_loop(
                         if app.conn == app::ConnState::Connected {
                             cmd_tx.send(ClientMsg::Init)?;
                             cmd_tx.send(ClientMsg::list_sessions_browse())?;
-                            cmd_tx.send(ClientMsg::ListProfiles)?;
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
-                            cmd_tx.send(ClientMsg::GetAgentMode)?;
                             if let Some(session_id) = app.session_id.clone() {
                                 if let Some(node_id) = app.session_remote_node_id(&session_id) {
                                     cmd_tx.send(ClientMsg::AttachRemoteSession {
@@ -1863,6 +1825,7 @@ async fn run_loop(
                                 } else {
                                     cmd_tx.send(ClientMsg::LoadSession {
                                         session_id: session_id.clone(),
+                                        cwd: app.current_session_cwd(),
                                     })?;
                                     cmd_tx.send(ClientMsg::SubscribeSession {
                                         session_id,
@@ -1880,31 +1843,19 @@ async fn run_loop(
                     }
                 }
             }
-            // server messages
-            Some(msg) = srv_rx.recv() => {
-                match msg {
-                    ServerChannelMsg::Parsed(msg) => {
-                        // Save config when the server authoritatively updates effort.
-                        let is_effort_push = msg.msg_type == "reasoning_effort";
-                        for reply in app.handle_server_msg(msg) {
-                            // if reloading session, also re-subscribe
-                            if let ClientMsg::LoadSession { ref session_id } = reply {
-                                let sid = session_id.clone();
-                                cmd_tx.send(reply)?;
-                                cmd_tx.send(ClientMsg::SubscribeSession {
-                                    session_id: sid,
-                                    agent_id: app.agent_id.clone(),
-                                })?;
-                            } else {
-                                cmd_tx.send(reply)?;
-                            }
-                        }
-                        if is_effort_push {
-                            save_cache(app);
-                        }
-                    }
-                    ServerChannelMsg::Invalid { error, raw } => {
-                        log_invalid_server_message(app, error, raw);
+            // native ACP client events
+            Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
+                for reply in app.handle_acp_event(event) {
+                    // if reloading session, also re-subscribe
+                    if let ClientMsg::LoadSession { ref session_id, .. } = reply {
+                        let sid = session_id.clone();
+                        cmd_tx.send(reply)?;
+                        cmd_tx.send(ClientMsg::SubscribeSession {
+                            session_id: sid,
+                            agent_id: app.agent_id.clone(),
+                        })?;
+                    } else {
+                        cmd_tx.send(reply)?;
                     }
                 }
             }
@@ -1915,17 +1866,13 @@ async fn run_loop(
                     ServerEvent::Starting => {
                         app.server_state = ServerState::Starting;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "server", "starting local server...");
+                            app.set_status(app::LogLevel::Info, "acp", "starting qmtcode ACP agent...");
                         }
                     }
                     ServerEvent::Started => {
                         app.server_state = ServerState::Running;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                app::LogLevel::Info,
-                                "server",
-                                "local server started — connecting...",
-                            );
+                            app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
                         }
                     }
                     ServerEvent::BinaryNotFound => {
@@ -1933,8 +1880,8 @@ async fn run_loop(
                         if app.conn != app::ConnState::Connected {
                             app.set_status(
                                 app::LogLevel::Warn,
-                                "server",
-                                "qmtcode not found — install it or set server.binary_path in ~/.qmt/tui.toml",
+                                "acp",
+                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
                             );
                         }
                     }
@@ -1942,24 +1889,16 @@ async fn run_loop(
                         app.server_state = ServerState::StartFailed { error: error.clone() };
                         app.set_status(
                             app::LogLevel::Error,
-                            "server",
-                            format!("server start failed: {error}"),
+                            "acp",
+                            format!("ACP start failed: {error}"),
                         );
                     }
                     ServerEvent::Stopped { reason } => {
                         app.server_state = ServerState::Restarting { reason: reason.clone() };
                         app.set_status(
                             app::LogLevel::Warn,
-                            "server",
-                            format!("server stopped ({reason}) — restarting..."),
-                        );
-                    }
-                    ServerEvent::FallingBackToDashboard => {
-                        app.server_state = ServerState::Starting;
-                        app.set_status(
-                            app::LogLevel::Info,
-                            "server",
-                            "--api unsupported, retrying with --dashboard...",
+                            "acp",
+                            format!("ACP agent stopped ({reason})"),
                         );
                     }
                 }
@@ -2135,6 +2074,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2203,6 +2143,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2641,6 +2582,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -2682,6 +2624,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "s5".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2701,6 +2644,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2800,6 +2744,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3304,6 +3249,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-2".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3353,6 +3299,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-3".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
     }
@@ -3374,6 +3321,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-1".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3505,6 +3453,7 @@ mod reasoning_effort_integration_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }
@@ -3518,18 +3467,12 @@ mod reasoning_effort_integration_tests {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
 
-    // ── Ctrl+x t caches mode state per session ──────────────────────────────
-
     #[test]
     #[serial]
-    fn ctrl_t_caches_mode_state_for_session() {
+    fn ctrl_t_cycles_reasoning_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
         app.conn = app::ConnState::Connected;
 
         handle_key(
@@ -3539,16 +3482,16 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("low".into()));
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
+        ));
     }
-
-    // ── Tab: saves outgoing, restores incoming ────────────────────────────────
 
     #[test]
     #[serial]
-    fn tab_saves_outgoing_and_restores_incoming_mode_state() {
+    fn tab_switches_mode_without_changing_model_or_effort() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
@@ -3558,47 +3501,24 @@ mod reasoning_effort_integration_tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
-        app.models = vec![
-            make_model("anthropic", "claude-sonnet"),
-            make_model("openai", "gpt-4o"),
-        ];
 
-        // Pre-cache plan mode state for this session
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            app::CachedModeState {
-                model: "openai/gpt-4o".into(),
-                effort: Some("low".into()),
-            },
-        );
-
-        // Tab → switch build → plan
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
-        // Outgoing build state saved
-        let build = &app.session_cache["s1"]["build"];
-        assert_eq!(build.model, "anthropic/claude-sonnet");
-        assert_eq!(build.effort, Some("high".into()));
-
-        // Incoming plan state restored
         assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.reasoning_effort, Some("high".into()));
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
-            "expected SetSessionModel: {msgs:?}"
+                .any(|m| matches!(m, ClientMsg::SetAgentMode { mode } if mode == "plan")),
+            "expected SetAgentMode(plan): {msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
-                if reasoning_effort == "low"
-            )),
-            "expected SetReasoningEffort(low): {msgs:?}"
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "no effort restore on mode switch: {msgs:?}"
         );
     }
 
@@ -3642,9 +3562,9 @@ mod reasoning_effort_integration_tests {
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.agent_mode = "plan".into();
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             make_model("anthropic", "claude-sonnet"),
             make_model("openai", "gpt-4o"),
@@ -3666,7 +3586,8 @@ mod reasoning_effort_integration_tests {
 
         assert_eq!(app.popup, app::Popup::ModelSelect);
         assert_eq!(app.model_filter, "");
-        assert_eq!(app.model_cursor, 3);
+        let expected = app.model_popup_open_cursor();
+        assert_eq!(app.model_cursor, expected);
     }
 
     #[test]
@@ -3679,12 +3600,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3693,7 +3618,6 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        // Effort dropped to auto
         assert_eq!(app.reasoning_effort, None);
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -3709,35 +3633,6 @@ mod reasoning_effort_integration_tests {
 
     #[test]
     #[serial]
-    fn model_select_caches_new_model_with_auto_effort() {
-        let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
-        let mut app = App::new();
-        app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
-        app.popup = app::Popup::ModelSelect;
-        app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
-
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-opus");
-        assert_eq!(cms.effort, None); // auto
-    }
-
-    #[test]
-    #[serial]
     fn model_select_no_effort_msg_when_already_auto() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -3746,12 +3641,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = None; // already auto
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3769,42 +3668,14 @@ mod reasoning_effort_integration_tests {
         );
     }
 
-    // ── reasoning_effort server push caches per session+mode ──────────────────
-
     #[test]
-    fn server_push_caches_effort_for_session_and_mode() {
+    fn server_push_updates_reasoning_effort() {
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-
         app.handle_server_msg(crate::protocol::RawServerMsg {
             msg_type: "reasoning_effort".into(),
             data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
         });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("medium".into()));
-    }
-
-    #[test]
-    fn server_push_auto_caches_none_effort() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-
-        app.handle_server_msg(crate::protocol::RawServerMsg {
-            msg_type: "reasoning_effort".into(),
-            data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
-        });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.effort, None);
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
     }
 }
 
@@ -3836,6 +3707,21 @@ mod cli_tests {
         let b = bin();
         let cli = Cli::try_parse_from([b.as_str()]).unwrap();
         assert_eq!(cli.session, None);
+        assert_eq!(cli.acp_binary, None);
+    }
+
+    #[test]
+    fn cli_acp_binary_short_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn cli_acp_binary_long_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
     }
 
     #[test]

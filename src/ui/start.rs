@@ -8,7 +8,7 @@ use ratatui::{
 use crate::app::{App, session_group_count_text};
 use crate::theme::Theme;
 
-use super::{ELLIPSIS, draw_header, relative_time};
+use super::{ELLIPSIS, draw_header, mesh_header_span, relative_time};
 
 // ── Start-page session list ────────────────────────────────────────────────────
 
@@ -187,6 +187,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         .split(area);
 
     // ── header ────────────────────────────────────────────────────────────────
+    let right = mesh_header_span(app).into_iter().collect();
     draw_header(
         f,
         app,
@@ -195,7 +196,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
             format!(" profile:{} ", app.active_profile_label()),
             Theme::status(),
         )],
-        vec![],
+        right,
     );
 
     // ── hints ─────────────────────────────────────────────────────────────────

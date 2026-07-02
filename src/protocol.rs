@@ -71,6 +71,8 @@ pub enum ClientMsg {
     },
     LoadSession {
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     Prompt {
         prompt: Vec<PromptBlock>,
@@ -570,7 +572,7 @@ pub struct UndoStackFrame {
     pub message_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UndoResultData {
     pub success: bool,
     pub message_id: Option<String>,
@@ -581,7 +583,7 @@ pub struct UndoResultData {
     pub undo_stack: Vec<UndoStackFrame>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RedoResultData {
     pub success: bool,
     pub message: Option<String>,
@@ -781,6 +783,9 @@ pub enum EventKind {
         model: String,
         config_id: Option<i64>,
         context_limit: Option<u64>,
+        /// Mesh node hosting the provider when the session routes LLM calls remotely.
+        #[serde(default)]
+        provider_node_id: Option<String>,
     },
     ElicitationRequested {
         elicitation_id: String,
@@ -894,11 +899,6 @@ pub struct DelegationData {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AllModelsData {
-    pub models: Vec<ModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AudioCapabilitiesData {
     #[serde(default)]
     pub stt_models: Vec<AudioModelInfo>,
@@ -931,6 +931,8 @@ pub struct ModelEntry {
     pub provider: String,
     pub model: String,
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub node_label: Option<String>,
     pub family: Option<String>,
     pub quant: Option<String>,
 }

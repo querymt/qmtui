@@ -1,8 +1,6 @@
 // src/config.rs — TUI persistent configuration and session cache
 //
-// Two files:
-//   ~/.qmt/tui.toml              — user config (theme, server defaults)
-//   ~/.cache/qmt/tui-cache.toml  — per-session mode→model+effort cache
+//   ~/.qmt/qmtui.toml  - user config (theme, ACP defaults, delegate models)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,20 +8,13 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::CachedModeState;
-
 // ── path overrides for tests ─────────────────────────────────────────────────
 
 static CONFIG_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static CACHE_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static TEST_PERSISTENCE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn config_path_override() -> &'static Mutex<Option<PathBuf>> {
     CONFIG_PATH_OVERRIDE.get_or_init(|| Mutex::new(None))
-}
-
-fn cache_path_override() -> &'static Mutex<Option<PathBuf>> {
-    CACHE_PATH_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
 fn test_persistence_lock() -> &'static Mutex<()> {
@@ -34,12 +25,6 @@ fn test_persistence_lock() -> &'static Mutex<()> {
 /// Intended for tests only; production code should not call this.
 pub fn test_set_config_path_override(path: Option<PathBuf>) {
     *config_path_override().lock().unwrap() = path;
-}
-
-/// Override the cache path used by `TuiCache::load()` / `save()`.
-/// Intended for tests only; production code should not call this.
-pub fn test_set_cache_path_override(path: Option<PathBuf>) {
-    *cache_path_override().lock().unwrap() = path;
 }
 
 #[cfg(test)]
@@ -58,8 +43,7 @@ impl TestPersistenceGuard {
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("qmt-persistence-tests-{label}-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
-        test_set_config_path_override(Some(dir.join("tui.toml")));
-        test_set_cache_path_override(Some(dir.join("tui-cache.toml")));
+        test_set_config_path_override(Some(dir.join("qmtui.toml")));
         Self { _lock: lock }
     }
 }
@@ -68,37 +52,34 @@ impl TestPersistenceGuard {
 impl Drop for TestPersistenceGuard {
     fn drop(&mut self) {
         test_set_config_path_override(None);
-        test_set_cache_path_override(None);
     }
 }
 
-// ── TuiConfig — ~/.qmt/tui.toml ──────────────────────────────────────────────
+// -- TuiConfig - ~/.qmt/qmtui.toml -------------------------------------------
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ServerLaunchMode {
+pub enum AcpTransportMode {
     #[default]
-    Api,
-    Dashboard,
+    Stdio,
+    WebSocket,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ServerConfig {
-    pub addr: Option<String>,
-    pub tls: Option<bool>,
+pub struct AcpConfig {
+    /// ACP transport to use. Only stdio is wired today; WebSocket is reserved
+    /// because qmtcode can expose ACP at ws://host/ws once the CLI grows a flag.
+    pub transport: Option<AcpTransportMode>,
+    /// Reserved for future ACP WebSocket support.
+    pub websocket_url: Option<String>,
     /// Path to the `qmtcode` binary. Falls back to `$PATH` lookup when absent.
     pub binary_path: Option<String>,
-    /// Which built-in qmtcode server mode to launch when `binary_args` is absent.
-    /// Default: `api`.
-    pub launch_mode: Option<ServerLaunchMode>,
-    /// Extra CLI arguments passed to the spawned server.
-    /// Default (when absent): `["--api={addr}"]` or `["--dashboard={addr}"]`.
+    /// Extra CLI arguments passed to the spawned ACP agent.
+    /// Default (when absent): `["--acp"]`.
     pub binary_args: Option<Vec<String>>,
-    /// Automatically start a local server when none is found. Default: `true`.
+    /// Automatically start a local ACP stdio agent. Default: `true`.
     pub auto_start: Option<bool>,
-    /// Kill the spawned server when the TUI exits. Default: `true`.
-    pub shutdown_on_exit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -112,14 +93,10 @@ pub struct ProfileConfig {
 pub struct TuiConfig {
     pub theme: Option<String>,
     pub show_thinking: Option<bool>,
-    pub server: ServerConfig,
+    pub acp: AcpConfig,
     /// Per-agent-id model preferences: agent_id → "provider/model".
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub delegate_models: HashMap<String, String>,
-    /// Per-mode model preferences: mode → "provider/model".
-    /// Applied as defaults when creating new sessions.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub mode_models: HashMap<String, String>,
     pub profile: ProfileConfig,
 }
 
@@ -131,10 +108,10 @@ impl TuiConfig {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".qmt")
-            .join("tui.toml")
+            .join("qmtui.toml")
     }
 
-    /// Load from the default path (`~/.qmt/tui.toml`).
+    /// Load from the default path (`~/.qmt/qmtui.toml`).
     pub fn load() -> Self {
         Self::load_from_path(&Self::config_path())
     }
@@ -147,13 +124,13 @@ impl TuiConfig {
             .unwrap_or_default()
     }
 
-    /// Save to the default path (`~/.qmt/tui.toml`).
+    /// Save to the default path (`~/.qmt/qmtui.toml`).
     pub fn save(&self) {
         #[cfg(test)]
         assert!(
             config_path_override().lock().unwrap().is_some(),
             "TuiConfig::save() called in test without config path override! \
-             Use TestPersistenceGuard to avoid writing to the real ~/.qmt/tui.toml."
+             Use TestPersistenceGuard to avoid writing to the real ~/.qmt/qmtui.toml."
         );
         self.save_to_path(&Self::config_path());
     }
@@ -170,7 +147,7 @@ impl TuiConfig {
     }
 
     /// Return a copy of this config with app-owned UI fields refreshed.
-    /// This intentionally preserves unrelated persisted settings like `server.*`.
+    /// This intentionally preserves unrelated persisted settings like `acp.*`.
     pub fn with_app_settings(&self, app: &crate::app::App) -> Self {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
@@ -180,129 +157,15 @@ impl TuiConfig {
             .iter()
             .map(|(id, (p, m))| (id.clone(), format!("{p}/{m}")))
             .collect();
-        merged.mode_models = app
-            .mode_model_preferences
-            .iter()
-            .map(|(mode, (p, m))| (mode.clone(), format!("{p}/{m}")))
-            .collect();
         merged.profile.id = app.active_profile_id.clone();
         merged
     }
-}
 
-// ── TuiCache — ~/.cache/qmt/tui-cache.toml ───────────────────────────────────
-
-/// Serializable per-mode state: which model was used and at what effort.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModeState {
-    /// `"provider/model"` e.g. `"anthropic/claude-sonnet-4-20250514"`
-    pub model: String,
-    /// `"auto" | "low" | "medium" | "high" | "max"`
-    pub effort: String,
-}
-
-/// Per-session cache entry.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SessionCache {
-    /// Per-mode state. Key: `"build"` / `"plan"` etc.
-    pub modes: HashMap<String, ModeState>,
-}
-
-/// Top-level cache file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TuiCache {
-    pub sessions: HashMap<String, SessionCache>,
-}
-
-impl TuiCache {
-    pub fn cache_path() -> PathBuf {
-        if let Some(path) = cache_path_override().lock().unwrap().clone() {
-            return path;
-        }
-        dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("qmt")
-            .join("tui-cache.toml")
-    }
-
-    /// Load from the default path (`~/.cache/qmt/tui-cache.toml`).
-    pub fn load() -> Self {
-        Self::load_from_path(&Self::cache_path())
-    }
-
-    /// Load from an explicit path. Returns `Default` on any I/O or parse error.
-    pub fn load_from_path(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
-    }
-
-    /// Save to the default path (`~/.cache/qmt/tui-cache.toml`).
-    pub fn save(&self) {
-        #[cfg(test)]
-        assert!(
-            cache_path_override().lock().unwrap().is_some(),
-            "TuiCache::save() called in test without cache path override! \
-             Use TestPersistenceGuard to avoid writing to the real ~/.cache/qmt/tui-cache.toml."
-        );
-        self.save_to_path(&Self::cache_path());
-    }
-
-    /// Save to an explicit path. Creates parent directories if needed.
-    /// Errors are intentionally ignored (best-effort persistence).
-    pub fn save_to_path(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(path, text);
-        }
-    }
-
-    /// Build from live app state.
-    pub fn from_app(app: &crate::app::App) -> Self {
-        let sessions = app
-            .session_cache
-            .iter()
-            .map(|(sid, modes)| {
-                let modes = modes
-                    .iter()
-                    .map(|(mode, cms)| {
-                        let ms = ModeState {
-                            model: cms.model.clone(),
-                            effort: cms.effort.as_deref().unwrap_or("auto").to_string(),
-                        };
-                        (mode.clone(), ms)
-                    })
-                    .collect();
-                (sid.clone(), SessionCache { modes })
-            })
-            .collect();
-        TuiCache { sessions }
-    }
-
-    /// Hydrate `app.session_cache` from the loaded cache file.
-    pub fn hydrate_app(&self, app: &mut crate::app::App) {
-        for (sid, sc) in &self.sessions {
-            let modes = sc
-                .modes
-                .iter()
-                .map(|(mode, ms)| {
-                    let cms = CachedModeState {
-                        model: ms.model.clone(),
-                        effort: match ms.effort.as_str() {
-                            "auto" => None,
-                            s => Some(s.to_string()),
-                        },
-                    };
-                    (mode.clone(), cms)
-                })
-                .collect();
-            app.session_cache.insert(sid.clone(), modes);
-        }
+    pub fn acp_args(&self) -> Vec<String> {
+        self.acp
+            .binary_args
+            .clone()
+            .unwrap_or_else(|| vec!["--acp".to_string()])
     }
 }
 
@@ -311,7 +174,7 @@ impl TuiCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, CachedModeState};
+    use crate::app::App;
     use serial_test::serial;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -340,9 +203,10 @@ mod tests {
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(false),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(false),
+            acp: AcpConfig {
+                binary_path: Some("/usr/local/bin/qmtcode".into()),
+                binary_args: Some(vec!["--acp".into()]),
+                auto_start: Some(true),
                 ..Default::default()
             },
             ..Default::default()
@@ -372,122 +236,31 @@ mod tests {
 
     #[test]
     fn config_show_thinking_absent_means_none() {
-        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
+        let cfg: TuiConfig = toml::from_str("[acp]\n").unwrap();
         assert_eq!(cfg.show_thinking, None);
     }
 
     #[test]
-    fn config_launch_mode_defaults_to_api_when_absent() {
-        let cfg: TuiConfig = toml::from_str("[server]\n").unwrap();
-        assert_eq!(
-            cfg.server.launch_mode.unwrap_or_default(),
-            ServerLaunchMode::Api
-        );
+    fn config_acp_args_default_to_acp() {
+        let cfg: TuiConfig = toml::from_str("[acp]\n").unwrap();
+        assert_eq!(cfg.acp_args(), vec!["--acp"]);
     }
 
     #[test]
-    fn config_launch_mode_round_trips_dashboard() {
-        let cfg: TuiConfig = toml::from_str("[server]\nlaunch_mode = \"dashboard\"\n").unwrap();
-        assert_eq!(cfg.server.launch_mode, Some(ServerLaunchMode::Dashboard));
+    fn config_acp_transport_round_trips_websocket() {
+        let cfg: TuiConfig = toml::from_str(
+            "[acp]\ntransport = \"websocket\"\nwebsocket_url = \"ws://127.0.0.1:9123/ws\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.acp.transport, Some(AcpTransportMode::WebSocket));
+        assert_eq!(
+            cfg.acp.websocket_url.as_deref(),
+            Some("ws://127.0.0.1:9123/ws")
+        );
 
         let text = toml::to_string_pretty(&cfg).unwrap();
         let loaded: TuiConfig = toml::from_str(&text).unwrap();
-        assert_eq!(loaded.server.launch_mode, Some(ServerLaunchMode::Dashboard));
-    }
-
-    // ── TuiCache TOML ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn cache_round_trip() {
-        let mut sc = SessionCache::default();
-        sc.modes.insert(
-            "build".into(),
-            ModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: "high".into(),
-            },
-        );
-        sc.modes.insert(
-            "plan".into(),
-            ModeState {
-                model: "openai/gpt-4o".into(),
-                effort: "auto".into(),
-            },
-        );
-        let cache = TuiCache {
-            sessions: [("sid-1".into(), sc)].into_iter().collect(),
-        };
-        let text = toml::to_string_pretty(&cache).unwrap();
-        assert_eq!(toml::from_str::<TuiCache>(&text).unwrap(), cache);
-    }
-
-    #[test]
-    fn cache_empty_deserializes_to_default() {
-        assert_eq!(toml::from_str::<TuiCache>("").unwrap(), TuiCache::default());
-    }
-
-    #[test]
-    fn cache_bad_toml_returns_default() {
-        assert!(toml::from_str::<TuiCache>("not toml!!!").is_err());
-    }
-
-    #[test]
-    fn cache_load_from_path_missing_returns_default() {
-        let dir = unique_temp_dir("cache-missing");
-        let path = dir.join("missing.toml");
-        let loaded = TuiCache::load_from_path(&path);
-        assert_eq!(loaded, TuiCache::default());
-    }
-
-    #[test]
-    fn cache_load_from_path_malformed_returns_default() {
-        let dir = unique_temp_dir("cache-bad");
-        let path = dir.join("bad.toml");
-        std::fs::write(&path, "not toml ???").unwrap();
-        let loaded = TuiCache::load_from_path(&path);
-        assert_eq!(loaded, TuiCache::default());
-    }
-
-    #[test]
-    fn cache_save_to_path_and_load_round_trip() {
-        let mut sc = SessionCache::default();
-        sc.modes.insert(
-            "build".into(),
-            ModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: "high".into(),
-            },
-        );
-        let cache = TuiCache {
-            sessions: [("sid-1".into(), sc)].into_iter().collect(),
-        };
-
-        let dir = unique_temp_dir("cache-save");
-        let path = dir.join("nested").join("tui-cache.toml");
-        cache.save_to_path(&path);
-
-        let loaded = TuiCache::load_from_path(&path);
-        assert_eq!(loaded, cache);
-    }
-
-    #[test]
-    #[serial]
-    fn cache_default_load_save_respects_override_path() {
-        let _guard = TestPathGuard::new("cache-override");
-        let mut sc = SessionCache::default();
-        sc.modes.insert(
-            "build".into(),
-            ModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: "high".into(),
-            },
-        );
-        let cache = TuiCache {
-            sessions: [("sid-1".into(), sc)].into_iter().collect(),
-        };
-        cache.save();
-        let loaded = TuiCache::load();
-        assert_eq!(loaded, cache);
+        assert_eq!(loaded.acp.transport, Some(AcpTransportMode::WebSocket));
     }
 
     #[test]
@@ -510,13 +283,12 @@ mod tests {
     #[test]
     fn config_save_to_path_and_load_round_trip() {
         let dir = unique_temp_dir("cfg-save");
-        let path = dir.join("nested").join("tui.toml");
+        let path = dir.join("nested").join("qmtui.toml");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(false),
+            acp: AcpConfig {
+                binary_path: Some("/usr/local/bin/qmtcode".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -533,7 +305,7 @@ mod tests {
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
-            server: ServerConfig::default(),
+            acp: AcpConfig::default(),
             ..Default::default()
         };
         cfg.save();
@@ -543,19 +315,17 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_save_load_round_trip_preserves_server_fields() {
-        let _guard = TestPathGuard::new("cfg-preserve-server");
+    fn config_save_load_round_trip_preserves_acp_fields() {
+        let _guard = TestPathGuard::new("cfg-preserve-acp");
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(false),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(true),
+            acp: AcpConfig {
+                transport: Some(AcpTransportMode::Stdio),
+                websocket_url: Some("ws://127.0.0.1:9123/ws".into()),
                 binary_path: Some("/usr/local/bin/qmtcode".into()),
-                launch_mode: Some(ServerLaunchMode::Dashboard),
-                binary_args: Some(vec!["--dashboard=127.0.0.1:3030".into()]),
+                binary_args: Some(vec!["--acp".into()]),
                 auto_start: Some(false),
-                shutdown_on_exit: Some(false),
             },
             ..Default::default()
         };
@@ -567,124 +337,26 @@ mod tests {
     // ── from_app ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn with_app_settings_preserves_server_settings() {
+    fn with_app_settings_preserves_acp_settings() {
         let mut app = App::new();
         app.show_thinking = false;
 
         let existing = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: Some(true),
-            server: ServerConfig {
-                addr: Some("127.0.0.1:3030".into()),
-                tls: Some(true),
+            acp: AcpConfig {
+                transport: Some(AcpTransportMode::Stdio),
+                websocket_url: Some("ws://127.0.0.1:9123/ws".into()),
                 binary_path: Some("/usr/local/bin/qmtcode".into()),
-                launch_mode: Some(ServerLaunchMode::Dashboard),
-                binary_args: Some(vec!["--dashboard=127.0.0.1:3030".into()]),
+                binary_args: Some(vec!["--acp".into()]),
                 auto_start: Some(false),
-                shutdown_on_exit: Some(false),
             },
             ..Default::default()
         };
 
         let merged = existing.with_app_settings(&app);
         assert_eq!(merged.show_thinking, Some(false));
-        assert_eq!(merged.server, existing.server);
-    }
-
-    #[test]
-    fn from_app_captures_session_cache() {
-        let mut app = App::new();
-        let mut modes = HashMap::new();
-        modes.insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("high".into()),
-            },
-        );
-        modes.insert(
-            "plan".into(),
-            CachedModeState {
-                model: "openai/gpt-4o".into(),
-                effort: None, // auto
-            },
-        );
-        app.session_cache.insert("sid-1".into(), modes);
-
-        let cache = TuiCache::from_app(&app);
-        let sc = cache.sessions.get("sid-1").unwrap();
-        assert_eq!(sc.modes["build"].model, "anthropic/claude-sonnet");
-        assert_eq!(sc.modes["build"].effort, "high");
-        assert_eq!(sc.modes["plan"].model, "openai/gpt-4o");
-        assert_eq!(sc.modes["plan"].effort, "auto");
-    }
-
-    // ── hydrate_app ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn hydrate_app_restores_session_cache() {
-        let mut sc = SessionCache::default();
-        sc.modes.insert(
-            "build".into(),
-            ModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: "high".into(),
-            },
-        );
-        sc.modes.insert(
-            "plan".into(),
-            ModeState {
-                model: "openai/gpt-4o".into(),
-                effort: "auto".into(),
-            },
-        );
-        let cache = TuiCache {
-            sessions: [("sid-1".into(), sc)].into_iter().collect(),
-        };
-
-        let mut app = App::new();
-        cache.hydrate_app(&mut app);
-
-        let modes = app.session_cache.get("sid-1").unwrap();
-        assert_eq!(modes["build"].model, "anthropic/claude-sonnet");
-        assert_eq!(modes["build"].effort, Some("high".into()));
-        assert_eq!(modes["plan"].model, "openai/gpt-4o");
-        assert_eq!(modes["plan"].effort, None);
-    }
-
-    #[test]
-    fn hydrate_empty_cache_leaves_app_unchanged() {
-        let mut app = App::new();
-        TuiCache::default().hydrate_app(&mut app);
-        assert!(app.session_cache.is_empty());
-    }
-
-    // ── round-trip ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn from_app_hydrate_round_trip() {
-        let mut app = App::new();
-        let mut modes = HashMap::new();
-        modes.insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("max".into()),
-            },
-        );
-        app.session_cache.insert("sid-1".into(), modes);
-
-        let cache = TuiCache::from_app(&app);
-        let mut app2 = App::new();
-        cache.hydrate_app(&mut app2);
-
-        assert_eq!(
-            app2.session_cache["sid-1"]["build"],
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("max".into()),
-            }
-        );
+        assert_eq!(merged.acp, existing.acp);
     }
 
     // ── delegate_models persistence (via TuiConfig) ────────────────────────
@@ -729,48 +401,5 @@ coder = "anthropic/claude-sonnet"
             cfg.delegate_models.get("coder").map(String::as_str),
             Some("anthropic/claude-sonnet")
         );
-    }
-
-    // ── mode_models persistence ──────────────────────────────────────────────
-
-    #[test]
-    #[serial]
-    fn config_round_trip_with_mode_models() {
-        let _guard = TestPathGuard::new("mode-models-rt");
-        let mut app = App::new();
-        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
-
-        let cfg = TuiConfig::load().with_app_settings(&app);
-        cfg.save();
-        let loaded = TuiConfig::load();
-
-        assert_eq!(
-            loaded.mode_models.get("build").map(String::as_str),
-            Some("anthropic/claude-sonnet")
-        );
-        assert_eq!(
-            loaded.mode_models.get("plan").map(String::as_str),
-            Some("openai/gpt-4o")
-        );
-    }
-
-    #[test]
-    fn config_with_app_settings_serializes_mode_models() {
-        let mut app = App::new();
-        app.set_mode_model_preference("build", "anthropic", "claude-opus");
-
-        let cfg = TuiConfig::default().with_app_settings(&app);
-        assert_eq!(
-            cfg.mode_models.get("build").map(String::as_str),
-            Some("anthropic/claude-opus")
-        );
-    }
-
-    #[test]
-    fn config_with_app_settings_empty_mode_models() {
-        let app = App::new();
-        let cfg = TuiConfig::default().with_app_settings(&app);
-        assert!(cfg.mode_models.is_empty());
     }
 }
