@@ -676,7 +676,7 @@ async fn call_querymt_ext(
         .await
 }
 
-fn ext_payload<'a>(response: &'a Value) -> &'a Value {
+fn ext_payload(response: &Value) -> &Value {
     response.get("data").unwrap_or(response)
 }
 
@@ -724,15 +724,14 @@ async fn post_connect_diagnostics(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if methods.iter().any(|m| m == "querymt/mesh/nodes") {
-                if let Ok(nodes_resp) =
+            if methods.iter().any(|m| m == "querymt/mesh/nodes")
+                && let Ok(nodes_resp) =
                     call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
-                {
-                    send_acp(
-                        srv_tx,
-                        AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
-                    );
-                }
+            {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
+                );
             }
         }
         Err(err) => {
@@ -793,7 +792,7 @@ fn snapshot_provider_change_from_load_value(response: &Value) -> Option<Snapshot
     events
         .iter()
         .filter_map(snapshot_provider_change_from_event)
-        .last()
+        .next_back()
 }
 
 fn snapshot_provider_change_from_event(event: &Value) -> Option<SnapshotProviderChange> {
@@ -1210,19 +1209,19 @@ async fn finish_prompt(
     stop_reason: acp::StopReason,
 ) {
     let buffer = state.assistant_buffers.lock().await.remove(session_id);
-    if let Some(buffer) = buffer {
-        if !buffer.content.is_empty() || !buffer.thinking.is_empty() {
-            send_session_update(
-                srv_tx,
-                session_id,
-                AcpSessionUpdate::AssistantMessage {
-                    content: buffer.content,
-                    thinking: (!buffer.thinking.is_empty()).then_some(buffer.thinking),
-                    message_id: buffer.message_id,
-                },
-                false,
-            );
-        }
+    if let Some(buffer) = buffer
+        && (!buffer.content.is_empty() || !buffer.thinking.is_empty())
+    {
+        send_session_update(
+            srv_tx,
+            session_id,
+            AcpSessionUpdate::AssistantMessage {
+                content: buffer.content,
+                thinking: (!buffer.thinking.is_empty()).then_some(buffer.thinking),
+                message_id: buffer.message_id,
+            },
+            false,
+        );
     }
 
     if matches!(stop_reason, acp::StopReason::Cancelled) {
@@ -1260,7 +1259,7 @@ fn usage_update(update: acp::UsageUpdate) -> AcpSessionUpdate {
 }
 
 fn tool_call_update(update: acp::ToolCallUpdate) -> AcpSessionUpdate {
-    let status = update.fields.status.clone();
+    let status = update.fields.status;
     let tool_name = update
         .fields
         .title
@@ -1388,10 +1387,10 @@ fn model_entry_meta(
     node_id_override: Option<&str>,
 ) -> Option<serde_json::Map<String, Value>> {
     let mut entry = serde_json::to_value(model).ok()?;
-    if let Some(node_id) = node_id_override {
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("node_id".to_string(), Value::String(node_id.to_string()));
-        }
+    if let Some(node_id) = node_id_override
+        && let Some(object) = entry.as_object_mut()
+    {
+        object.insert("node_id".to_string(), Value::String(node_id.to_string()));
     }
     let mut meta = serde_json::Map::new();
     meta.insert("querymt".to_string(), json!({ "modelEntry": entry }));
@@ -2169,7 +2168,7 @@ mod tests {
 
         assert_eq!(response.models.len(), 1);
         assert_eq!(response.models[0].provider, "openai");
-        assert_eq!(response.meta.expect("meta").stale, true);
+        assert!(response.meta.expect("meta").stale);
     }
 
     #[test]
@@ -2183,7 +2182,7 @@ mod tests {
 
         assert_eq!(response.models.len(), 1);
         assert_eq!(response.models[0].model, "claude");
-        assert_eq!(response.meta.expect("meta").refresh_in_progress, true);
+        assert!(response.meta.expect("meta").refresh_in_progress);
     }
 
     #[test]
