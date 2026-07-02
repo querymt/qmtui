@@ -782,12 +782,13 @@ async fn handle_client_msg<C: AcpConnection>(
             post_connect_diagnostics(connection, srv_tx).await;
         }
         ClientMsg::ListSessions { cursor, cwd, .. } => {
+            let requested_cwd = cwd.and_then(|cwd| (cwd != "__none__").then_some(cwd));
             let mut req = acp::ListSessionsRequest::new().cursor(cursor);
-            if let Some(cwd) = cwd.and_then(|cwd| (cwd != "__none__").then_some(cwd)) {
+            if let Some(cwd) = requested_cwd.as_deref() {
                 req = req.cwd(PathBuf::from(cwd));
             }
             let response = connection.request(req).await?;
-            send_session_list(srv_tx, response);
+            send_session_list(srv_tx, requested_cwd, response);
         }
         ClientMsg::NewSession {
             cwd, profile_id, ..
@@ -2042,12 +2043,17 @@ fn flatten_select_entries(option: &Value) -> Vec<&Value> {
 
 fn send_session_list(
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    requested_cwd: Option<String>,
     response: acp::ListSessionsResponse,
 ) {
     let mut groups: BTreeMap<Option<String>, Vec<SessionSummary>> = BTreeMap::new();
+    let response_cursor = response.next_cursor.map(|cursor| cursor.to_string());
+
     for session in response.sessions {
         let cwd = session.cwd.to_string_lossy().to_string();
-        let group_key = (!cwd.is_empty()).then_some(cwd.clone());
+        let group_key = requested_cwd
+            .clone()
+            .or_else(|| (!cwd.is_empty()).then_some(cwd.clone()));
         groups.entry(group_key).or_default().push(SessionSummary {
             session_id: session.session_id.to_string(),
             name: session.title.clone(),
@@ -2070,17 +2076,31 @@ fn send_session_list(
         });
     }
 
+    if let Some(cwd) = requested_cwd.clone() {
+        groups.entry(Some(cwd)).or_default();
+    }
+
+    let root_has_more = requested_cwd.is_none() && response_cursor.is_some();
     let total_count: usize = groups.values().map(Vec::len).sum();
     let groups = groups
         .into_iter()
-        .map(|(cwd, sessions)| SessionGroup {
-            cwd,
-            latest_activity: sessions
-                .first()
-                .and_then(|session| session.updated_at.clone()),
-            total_count: Some(sessions.len() as u64),
-            next_cursor: None,
-            sessions,
+        .map(|(cwd, sessions)| {
+            let next_cursor = if requested_cwd.is_some() {
+                response_cursor.clone()
+            } else if root_has_more && !sessions.is_empty() {
+                Some(sessions.len().to_string())
+            } else {
+                None
+            };
+            SessionGroup {
+                cwd,
+                latest_activity: sessions
+                    .first()
+                    .and_then(|session| session.updated_at.clone()),
+                total_count: Some(sessions.len() as u64),
+                next_cursor,
+                sessions,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -2088,7 +2108,7 @@ fn send_session_list(
         srv_tx,
         AcpAppEvent::SessionList {
             groups,
-            next_cursor: response.next_cursor.map(|cursor| cursor.to_string()),
+            next_cursor: None,
             total_count: Some(total_count as u64),
         },
     );
@@ -2349,6 +2369,7 @@ fn value_to_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn model_value(id: &str, provider: &str, model: &str) -> Value {
         json!({
@@ -2358,6 +2379,59 @@ mod tests {
             "provider": provider,
             "model": model,
         })
+    }
+
+    #[test]
+    fn acp_root_session_list_maps_global_cursor_to_group_offsets() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let response = acp::ListSessionsResponse::new(vec![
+            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo")),
+            acp::SessionInfo::new(acp::SessionId::from("s2"), Path::new("/repo")),
+            acp::SessionInfo::new(acp::SessionId::from("s3"), Path::new("/other")),
+        ])
+        .next_cursor(Some("100".to_string()));
+
+        send_session_list(&tx, None, response);
+
+        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
+        assert!(matches!(
+            event,
+            AcpAppEvent::SessionList {
+                groups,
+                next_cursor: None,
+                ..
+            } if groups.len() == 2
+                && groups.iter().any(|group| group.cwd.as_deref() == Some("/repo")
+                    && group.next_cursor.as_deref() == Some("2"))
+                && groups.iter().any(|group| group.cwd.as_deref() == Some("/other")
+                    && group.next_cursor.as_deref() == Some("1"))
+        ));
+    }
+
+    #[test]
+    fn acp_cwd_session_list_maps_next_cursor_to_group_cursor() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let response = acp::ListSessionsResponse::new(vec![
+            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo"))
+                .title(Some("One".to_string()))
+                .updated_at(Some("2024-01-01T00:00:00Z".to_string())),
+        ])
+        .next_cursor(Some("cursor-2".to_string()));
+
+        send_session_list(&tx, Some("/repo".to_string()), response);
+
+        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
+        assert!(matches!(
+            event,
+            AcpAppEvent::SessionList {
+                groups,
+                next_cursor: None,
+                ..
+            } if groups.len() == 1
+                && groups[0].cwd.as_deref() == Some("/repo")
+                && groups[0].next_cursor.as_deref() == Some("cursor-2")
+                && groups[0].sessions[0].session_id == "s1"
+        ));
     }
 
     #[test]

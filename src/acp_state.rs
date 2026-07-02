@@ -240,10 +240,10 @@ impl crate::app::App {
             }
             AcpAppEvent::SessionList {
                 groups,
+                next_cursor,
                 total_count,
-                ..
             } => {
-                self.apply_acp_session_list(groups, total_count);
+                self.apply_acp_session_list(groups, next_cursor, total_count);
                 vec![]
             }
             AcpAppEvent::SessionCreated {
@@ -439,7 +439,12 @@ impl crate::app::App {
         }
     }
 
-    fn apply_acp_session_list(&mut self, mut groups: Vec<SessionGroup>, total_count: Option<u64>) {
+    fn apply_acp_session_list(
+        &mut self,
+        mut groups: Vec<SessionGroup>,
+        _next_cursor: Option<String>,
+        total_count: Option<u64>,
+    ) {
         let response_cwd = if groups.len() == 1 {
             groups.first().and_then(|group| group.cwd.clone())
         } else {
@@ -1429,6 +1434,7 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, Screen};
+    use crate::protocol::SessionSummary;
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -1437,6 +1443,24 @@ mod tests {
         let mut app = App::new();
         app.session_id = Some(TEST_SESSION_ID.into());
         app
+    }
+
+    fn session_group(cwd: &str, ids: &[&str]) -> SessionGroup {
+        SessionGroup {
+            cwd: Some(cwd.to_string()),
+            latest_activity: None,
+            total_count: Some(ids.len() as u64),
+            next_cursor: None,
+            sessions: ids
+                .iter()
+                .map(|id| SessionSummary {
+                    session_id: id.to_string(),
+                    title: Some(format!("Session {id}")),
+                    cwd: Some(cwd.to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+        }
     }
 
     fn apply_live_update(app: &mut App, update: AcpSessionUpdate) {
@@ -1475,6 +1499,36 @@ mod tests {
             thinking: thinking.map(str::to_string),
             message_id: Some(TEST_ASSISTANT_ID.into()),
         }
+    }
+
+    #[test]
+    fn acp_group_session_page_merges_group_and_dedupes() {
+        let mut app = App::new();
+        app.session_groups = vec![session_group("/repo", &["s1"])];
+        app.pending_session_group_loads.insert(Some("/repo".into()));
+
+        let mut group = session_group("/repo", &["s1", "s2"]);
+        group.next_cursor = Some("cursor-2".into());
+        app.handle_acp_event(AcpAppEvent::SessionList {
+            groups: vec![group],
+            next_cursor: None,
+            total_count: None,
+        });
+
+        assert!(app.pending_session_group_loads.is_empty());
+        assert_eq!(app.session_groups.len(), 1);
+        assert_eq!(
+            app.session_groups[0].next_cursor.as_deref(),
+            Some("cursor-2")
+        );
+        assert_eq!(
+            app.session_groups[0]
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"]
+        );
     }
 
     #[test]
