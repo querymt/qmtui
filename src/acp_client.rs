@@ -90,6 +90,14 @@ struct AcpModelsResponse {
     meta: Option<AcpModelsMeta>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotProviderChange {
+    provider: String,
+    model: String,
+    context_limit: Option<u64>,
+    provider_node_id: Option<String>,
+}
+
 impl AcpModelsResponse {
     fn should_retry_empty(&self) -> bool {
         self.models.is_empty()
@@ -343,8 +351,11 @@ async fn handle_client_msg(
             let result = connection.send_request(req).block_task().await;
             let replay_updates = state.end_loading(&session_id).await;
             let response = result?;
+            let response_value = serde_json::to_value(&response).unwrap_or(Value::Null);
+            let snapshot_provider_change =
+                snapshot_provider_change_from_load_value(&response_value);
             let snapshot_updates = if replay_updates.is_empty() {
-                snapshot_updates_from_load_response(&response)
+                snapshot_updates_from_load_value(&response_value)
             } else {
                 Vec::new()
             };
@@ -376,6 +387,9 @@ async fn handle_client_msg(
                         updates: history_updates,
                     },
                 );
+            }
+            if let Some(change) = snapshot_provider_change {
+                send_acp(srv_tx, snapshot_provider_change_event(change));
             }
 
             if let Some(config_options) = response.config_options {
@@ -773,12 +787,38 @@ fn session_load_audit_from_load_value(response: &Value) -> Value {
     }
 }
 
-fn snapshot_updates_from_load_response(
-    response: &acp::LoadSessionResponse,
-) -> Vec<AcpSessionUpdate> {
-    serde_json::to_value(response)
-        .map(|value| snapshot_updates_from_load_value(&value))
-        .unwrap_or_default()
+fn snapshot_provider_change_from_load_value(response: &Value) -> Option<SnapshotProviderChange> {
+    let audit = session_load_audit_from_load_value(response);
+    let events = audit.get("events").and_then(Value::as_array)?;
+    events
+        .iter()
+        .filter_map(snapshot_provider_change_from_event)
+        .last()
+}
+
+fn snapshot_provider_change_from_event(event: &Value) -> Option<SnapshotProviderChange> {
+    let kind = event.get("kind")?;
+    if kind.get("type").and_then(Value::as_str) != Some("provider_changed") {
+        return None;
+    }
+    let data = kind.get("data")?;
+    let provider = snapshot_string_field(data, "provider")?;
+    let model = snapshot_string_field(data, "model")?;
+    Some(SnapshotProviderChange {
+        provider,
+        model,
+        context_limit: snapshot_u64(data, "context_limit"),
+        provider_node_id: snapshot_string_field(data, "provider_node_id"),
+    })
+}
+
+fn snapshot_provider_change_event(change: SnapshotProviderChange) -> AcpAppEvent {
+    AcpAppEvent::ProviderChanged {
+        provider: change.provider,
+        model: change.model,
+        context_limit: change.context_limit,
+        provider_node_id: change.provider_node_id,
+    }
 }
 
 fn snapshot_updates_from_load_value(response: &Value) -> Vec<AcpSessionUpdate> {
@@ -924,6 +964,13 @@ fn snapshot_string(data: &Value, key: &str) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Null => None,
         other => serde_json::to_string(other).ok(),
+    }
+}
+
+fn snapshot_string_field(data: &Value, key: &str) -> Option<String> {
+    match data.get(key)? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        _ => None,
     }
 }
 
@@ -1795,6 +1842,94 @@ mod tests {
             audit.get("events").and_then(Value::as_array).map(Vec::len),
             Some(0)
         );
+    }
+
+    #[test]
+    fn snapshot_provider_change_uses_last_provider_changed_event() {
+        let change = snapshot_provider_change_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "provider_changed",
+                                    "data": {
+                                        "provider": "anthropic",
+                                        "model": "claude-3-5",
+                                        "context_limit": 200000
+                                    }
+                                }
+                            },
+                            {
+                                "kind": { "type": "assistant_message_stored", "data": { "content": "hello" } }
+                            },
+                            {
+                                "kind": {
+                                    "type": "provider_changed",
+                                    "data": {
+                                        "provider": "openrouter",
+                                        "model": "anthropic/claude-sonnet-4",
+                                        "context_limit": "1000000",
+                                        "provider_node_id": "node-1"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
+        .expect("provider change");
+
+        assert_eq!(change.provider, "openrouter");
+        assert_eq!(change.model, "anthropic/claude-sonnet-4");
+        assert_eq!(change.context_limit, Some(1_000_000));
+        assert_eq!(change.provider_node_id.as_deref(), Some("node-1"));
+    }
+
+    #[test]
+    fn snapshot_provider_change_ignores_malformed_provider_changed_event() {
+        let change = snapshot_provider_change_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "provider_changed",
+                                    "data": {
+                                        "provider": "anthropic",
+                                        "context_limit": 200000
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert!(change.is_none());
+    }
+
+    #[test]
+    fn snapshot_provider_change_event_maps_to_acp_provider_changed() {
+        let event = snapshot_provider_change_event(SnapshotProviderChange {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            context_limit: Some(200000),
+            provider_node_id: Some("node-1".to_string()),
+        });
+
+        assert!(matches!(
+            event,
+            AcpAppEvent::ProviderChanged { provider, model, context_limit, provider_node_id }
+                if provider == "anthropic"
+                    && model == "claude-sonnet-4"
+                    && context_limit == Some(200000)
+                    && provider_node_id.as_deref() == Some("node-1")
+        ));
     }
 
     #[test]
