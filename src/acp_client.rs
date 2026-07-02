@@ -787,15 +787,72 @@ fn snapshot_updates_from_load_value(response: &Value) -> Vec<AcpSessionUpdate> {
         return Vec::new();
     };
 
-    events
-        .iter()
-        .filter_map(|event| {
-            let kind = event.get("kind")?;
-            let kind_type = kind.get("type").and_then(Value::as_str)?;
-            let data = kind.get("data").unwrap_or(&Value::Null);
-            snapshot_event_to_update(kind_type, data)
-        })
-        .collect()
+    let mut updates = Vec::new();
+    let mut context_limit = 0;
+    let mut llm_started_at: Option<i64> = None;
+    for event in events {
+        let Some(kind) = event.get("kind") else {
+            continue;
+        };
+        let Some(kind_type) = kind.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let data = kind.get("data").unwrap_or(&Value::Null);
+        let timestamp = snapshot_i64(event, "timestamp");
+        match kind_type {
+            "llm_request_start" => {
+                llm_started_at = timestamp;
+            }
+            "provider_changed" => {
+                if let Some(limit) = snapshot_u64(data, "context_limit") {
+                    context_limit = limit;
+                    if limit > 0 {
+                        updates.push(AcpSessionUpdate::UsageUpdate {
+                            used: 0,
+                            size: limit,
+                            cost_usd: None,
+                        });
+                    }
+                }
+            }
+            "llm_request_end" => {
+                if let (Some(started), Some(ended)) = (llm_started_at.take(), timestamp)
+                    && ended >= started
+                {
+                    updates.push(AcpSessionUpdate::TimingUpdate {
+                        duration_secs: (ended - started) as u64,
+                    });
+                }
+                updates.push(AcpSessionUpdate::UsageUpdate {
+                    used: snapshot_u64(data, "context_tokens").unwrap_or(0),
+                    size: context_limit,
+                    cost_usd: snapshot_f64(data, "cumulative_cost_usd"),
+                });
+                updates.push(AcpSessionUpdate::Finished {
+                    finish_reason: snapshot_string(data, "finish_reason")
+                        .unwrap_or_else(|| "completed".to_string()),
+                });
+            }
+            "cancelled" | "error" => {
+                if let (Some(started), Some(ended)) = (llm_started_at.take(), timestamp)
+                    && ended >= started
+                {
+                    updates.push(AcpSessionUpdate::TimingUpdate {
+                        duration_secs: (ended - started) as u64,
+                    });
+                }
+                if let Some(update) = snapshot_event_to_update(kind_type, data) {
+                    updates.push(update);
+                }
+            }
+            _ => {
+                if let Some(update) = snapshot_event_to_update(kind_type, data) {
+                    updates.push(update);
+                }
+            }
+        }
+    }
+    updates
 }
 
 fn snapshot_event_to_update(kind_type: &str, data: &Value) -> Option<AcpSessionUpdate> {
@@ -834,10 +891,30 @@ fn snapshot_event_to_update(kind_type: &str, data: &Value) -> Option<AcpSessionU
                 .or_else(|| snapshot_string(data, "content")),
         }),
         "cancelled" => Some(AcpSessionUpdate::Cancelled),
-        "llm_request_end" => Some(AcpSessionUpdate::Finished {
-            finish_reason: snapshot_string(data, "finish_reason")
-                .unwrap_or_else(|| "completed".to_string()),
-        }),
+        _ => None,
+    }
+}
+
+fn snapshot_i64(data: &Value, key: &str) -> Option<i64> {
+    match data.get(key)? {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn snapshot_u64(data: &Value, key: &str) -> Option<u64> {
+    match data.get(key)? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn snapshot_f64(data: &Value, key: &str) -> Option<f64> {
+    match data.get(key)? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse().ok(),
         _ => None,
     }
 }
@@ -1046,8 +1123,11 @@ async fn handle_session_notification(
         acp::SessionUpdate::ConfigOptionUpdate(update) => {
             send_config_updates(state, srv_tx, update.config_options).await;
         }
-        // TODO(ACP parity): map these native ACP updates into status/sidebar state.
-        acp::SessionUpdate::SessionInfoUpdate(_) | acp::SessionUpdate::UsageUpdate(_) => {}
+        acp::SessionUpdate::UsageUpdate(update) => {
+            emit_or_queue_update(state, srv_tx, &session_id, usage_update(update), loading).await;
+        }
+        // TODO(ACP parity): map native session info into sidebar/header state.
+        acp::SessionUpdate::SessionInfoUpdate(_) => {}
         // TODO(ACP parity): add native plan/available-command rendering once the TUI UX is defined.
         acp::SessionUpdate::Plan(_) | acp::SessionUpdate::AvailableCommandsUpdate(_) => {}
         _ => {}
@@ -1117,6 +1197,18 @@ fn tool_start_update(tool_call: &acp::ToolCall) -> AcpSessionUpdate {
         tool_call_id: Some(tool_call.tool_call_id.to_string()),
         name: tool_name_from_title(&tool_call.title),
         arguments: tool_call.raw_input.clone(),
+    }
+}
+
+fn usage_update(update: acp::UsageUpdate) -> AcpSessionUpdate {
+    let cost_usd = update
+        .cost
+        .filter(|cost| cost.currency.eq_ignore_ascii_case("USD"))
+        .map(|cost| cost.amount);
+    AcpSessionUpdate::UsageUpdate {
+        used: update.used,
+        size: update.size,
+        cost_usd,
     }
 }
 
@@ -1794,6 +1886,142 @@ mod tests {
                     && name == "read_tool"
                     && !is_error
                     && result.as_deref() == Some("ok")
+        ));
+    }
+
+    #[test]
+    fn snapshot_updates_restore_usage_and_active_time_from_acp_load_metadata() {
+        let updates = snapshot_updates_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "timestamp": 100,
+                                "kind": { "type": "session_created" }
+                            },
+                            {
+                                "timestamp": 120,
+                                "kind": {
+                                    "type": "provider_changed",
+                                    "data": { "context_limit": 8192 }
+                                }
+                            },
+                            {
+                                "timestamp": 130,
+                                "kind": { "type": "llm_request_start", "data": { "message_count": 1 } }
+                            },
+                            {
+                                "timestamp": 160,
+                                "kind": {
+                                    "type": "llm_request_end",
+                                    "data": {
+                                        "context_tokens": 2048,
+                                        "cumulative_cost_usd": 0.0123,
+                                        "finish_reason": "stop"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(updates.len(), 4);
+        assert!(matches!(
+            &updates[0],
+            AcpSessionUpdate::UsageUpdate {
+                used: 0,
+                size: 8192,
+                cost_usd: None
+            }
+        ));
+        assert!(matches!(
+            &updates[1],
+            AcpSessionUpdate::TimingUpdate { duration_secs: 30 }
+        ));
+        assert!(matches!(
+            &updates[2],
+            AcpSessionUpdate::UsageUpdate { used: 2048, size: 8192, cost_usd: Some(cost) }
+                if (*cost - 0.0123).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            &updates[3],
+            AcpSessionUpdate::Finished { finish_reason } if finish_reason == "stop"
+        ));
+    }
+
+    #[test]
+    fn snapshot_updates_do_not_use_wall_clock_session_age() {
+        let updates = snapshot_updates_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "timestamp": 200,
+                                "kind": { "type": "session_created" }
+                            },
+                            {
+                                "timestamp": 250,
+                                "kind": { "type": "assistant_message_stored", "data": { "content": "hello" } }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, AcpSessionUpdate::TimingUpdate { .. }))
+        );
+    }
+
+    #[test]
+    fn snapshot_updates_restore_usage_even_without_context_limit() {
+        let updates = snapshot_updates_from_load_value(&json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": {
+                        "events": [
+                            {
+                                "kind": {
+                                    "type": "llm_request_end",
+                                    "data": { "context_tokens": "512" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(updates.len(), 2);
+        assert!(matches!(
+            &updates[0],
+            AcpSessionUpdate::UsageUpdate {
+                used: 512,
+                size: 0,
+                cost_usd: None
+            }
+        ));
+    }
+
+    #[test]
+    fn usage_update_maps_context_limit_and_usd_cost() {
+        let update =
+            usage_update(acp::UsageUpdate::new(2048, 8192).cost(acp::Cost::new(0.25, "USD")));
+
+        assert!(matches!(
+            update,
+            AcpSessionUpdate::UsageUpdate {
+                used: 2048,
+                size: 8192,
+                cost_usd: Some(0.25)
+            }
         ));
     }
 

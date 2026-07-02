@@ -660,6 +660,22 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 
 // ── Shared header builder ─────────────────────────────────────────────────────
 
+fn format_status_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
+}
+
 /// Build left + right span vectors for the chat/delegate header bar.
 fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let model_str = match (&app.current_provider, &app.current_model) {
@@ -687,13 +703,10 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
     let mut right_spans: Vec<Span<'static>> = Vec::new();
 
     if let Some(dur) = app.llm_request_elapsed() {
-        let secs = dur.as_secs();
-        let time_str = if secs < 60 {
-            format!("{secs}s")
-        } else {
-            format!("{}m{}s", secs / 60, secs % 60)
-        };
-        right_spans.push(Span::styled(format!(" {time_str} "), Theme::status()));
+        right_spans.push(Span::styled(
+            format!(" {} ", format_status_duration(dur)),
+            Theme::status(),
+        ));
     }
 
     if let Some(context_tokens) = app.session_stats.latest_context_tokens

@@ -46,6 +46,14 @@ pub(crate) enum AcpSessionUpdate {
         is_error: bool,
         result: Option<String>,
     },
+    UsageUpdate {
+        used: u64,
+        size: u64,
+        cost_usd: Option<f64>,
+    },
+    TimingUpdate {
+        duration_secs: u64,
+    },
     ElicitationRequested {
         elicitation_id: String,
         message: String,
@@ -260,6 +268,11 @@ impl crate::app::App {
                 updates,
             } => {
                 let updates = normalize_replay_updates(updates);
+                self.push_log(
+                    LogLevel::Info,
+                    "session",
+                    format!("session replay: {} update(s)", updates.len()),
+                );
                 for update in updates {
                     self.apply_acp_session_update(&session_id, update, true);
                 }
@@ -385,6 +398,7 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::Error { message } => {
+                self.end_llm_request_span(None);
                 self.push_acp_error(&message);
                 self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
                 vec![]
@@ -569,6 +583,9 @@ impl crate::app::App {
         match update {
             AcpSessionUpdate::TurnStarted => {
                 self.clear_cancel_confirm();
+                if !is_replay {
+                    self.begin_llm_request_span(None);
+                }
                 self.activity = ActivityState::Thinking;
                 self.streaming_content.clear();
                 self.invalidate_streaming_caches();
@@ -626,6 +643,8 @@ impl crate::app::App {
                         self.card_cache.invalidate();
                         return;
                     }
+                    self.session_stats.total_tool_calls =
+                        self.session_stats.total_tool_calls.saturating_add(1);
                     if !self.streaming_thinking.is_empty() {
                         let thinking = std::mem::take(&mut self.streaming_thinking);
                         let thinking_message_id = self.streaming_thinking_message_id.take();
@@ -678,6 +697,45 @@ impl crate::app::App {
                     self.card_cache.invalidate();
                 }
             }
+            AcpSessionUpdate::UsageUpdate {
+                used,
+                size,
+                cost_usd,
+            } => {
+                if used > 0 {
+                    self.session_stats.latest_context_tokens = Some(used);
+                }
+                if size > 0 {
+                    self.context_limit = size;
+                }
+                if let Some(cost_usd) = cost_usd {
+                    self.cumulative_cost = Some(cost_usd);
+                }
+                let pct = if used > 0 && size > 0 {
+                    format!(" ({}%)", (used as f64 / size as f64 * 100.0) as u32)
+                } else {
+                    String::new()
+                };
+                let cost = cost_usd
+                    .map(|amount| format!(", cost ${amount:.4}"))
+                    .unwrap_or_default();
+                self.push_log(
+                    LogLevel::Info,
+                    "usage",
+                    format!("usage: context {used}/{size} tokens{pct}{cost}"),
+                );
+            }
+            AcpSessionUpdate::TimingUpdate { duration_secs } => {
+                if duration_secs > 0 {
+                    self.session_stats.active_llm_duration +=
+                        std::time::Duration::from_secs(duration_secs);
+                    self.push_log(
+                        LogLevel::Info,
+                        "usage",
+                        format!("usage: active time {duration_secs}s"),
+                    );
+                }
+            }
             AcpSessionUpdate::ElicitationRequested {
                 elicitation_id,
                 message,
@@ -692,12 +750,18 @@ impl crate::app::App {
                 );
             }
             AcpSessionUpdate::Cancelled => {
+                if !is_replay {
+                    self.end_llm_request_span(None);
+                }
                 self.activity = ActivityState::Idle;
                 self.streaming_content.clear();
                 self.invalidate_streaming_caches();
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
             AcpSessionUpdate::Finished { finish_reason } => {
+                if !is_replay {
+                    self.end_llm_request_span(None);
+                }
                 self.activity = ActivityState::Idle;
                 self.streaming_content.clear();
                 self.streaming_thinking.clear();
@@ -1389,6 +1453,134 @@ mod tests {
                 ..
             }] if command == "cargo check --examples" && workdir.as_deref() == Some("/repo")
         ));
+        assert_eq!(app.session_stats.total_tool_calls, 1);
+    }
+
+    #[test]
+    fn native_usage_update_updates_status_metrics() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::UsageUpdate {
+                used: 2048,
+                size: 8192,
+                cost_usd: Some(0.0123),
+            },
+        });
+
+        assert_eq!(app.session_stats.latest_context_tokens, Some(2048));
+        assert_eq!(app.context_limit, 8192);
+        assert_eq!(app.cumulative_cost, Some(0.0123));
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry)
+                if entry.level == LogLevel::Info
+                    && entry.target == "usage"
+                    && entry.message == "usage: context 2048/8192 tokens (25%), cost $0.0123"
+        ));
+    }
+
+    #[test]
+    fn native_timing_update_adds_active_time() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: true,
+            update: AcpSessionUpdate::TimingUpdate { duration_secs: 42 },
+        });
+
+        assert_eq!(
+            app.llm_request_elapsed(),
+            Some(std::time::Duration::from_secs(42))
+        );
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry)
+                if entry.level == LogLevel::Info
+                    && entry.target == "usage"
+                    && entry.message == "usage: active time 42s"
+        ));
+    }
+
+    #[test]
+    fn native_live_turn_updates_realtime_elapsed() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::TurnStarted,
+        });
+
+        assert!(app.session_stats.open_llm_request_instant.is_some());
+        app.session_stats.open_llm_request_instant = app
+            .session_stats
+            .open_llm_request_instant
+            .map(|started| started - std::time::Duration::from_secs(2));
+        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+            elapsed >= std::time::Duration::from_secs(2)
+                && elapsed < std::time::Duration::from_secs(3)
+        }));
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::Finished {
+                finish_reason: "EndTurn".into(),
+            },
+        });
+
+        assert!(app.session_stats.open_llm_request_instant.is_none());
+        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+            elapsed >= std::time::Duration::from_secs(2)
+                && elapsed < std::time::Duration::from_secs(3)
+        }));
+    }
+
+    #[test]
+    fn native_replay_turn_does_not_start_realtime_elapsed() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: true,
+            update: AcpSessionUpdate::TurnStarted,
+        });
+
+        assert!(app.session_stats.open_llm_request_instant.is_none());
+        assert_eq!(app.llm_request_elapsed(), None);
+    }
+
+    #[test]
+    fn native_acp_error_closes_realtime_elapsed() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "session-1".into(),
+            is_replay: false,
+            update: AcpSessionUpdate::TurnStarted,
+        });
+        app.session_stats.open_llm_request_instant = app
+            .session_stats
+            .open_llm_request_instant
+            .map(|started| started - std::time::Duration::from_secs(3));
+        app.handle_acp_event(AcpAppEvent::Error {
+            message: "prompt failed".into(),
+        });
+
+        assert!(app.session_stats.open_llm_request_instant.is_none());
+        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+            elapsed >= std::time::Duration::from_secs(3)
+                && elapsed < std::time::Duration::from_secs(4)
+        }));
     }
 
     #[test]
