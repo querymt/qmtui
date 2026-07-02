@@ -824,31 +824,72 @@ impl crate::app::App {
         thinking: Option<String>,
         message_id: Option<String>,
     ) {
+        let explicit_thinking = thinking.filter(|text| !text.is_empty());
         let streaming_thinking_message_id = self.streaming_thinking_message_id.clone();
-        let thinking_text = thinking.filter(|text| !text.is_empty()).or_else(|| {
-            (!self.streaming_thinking.is_empty())
-                .then(|| std::mem::take(&mut self.streaming_thinking))
-        });
         let thinking_message_id = message_id.clone().or(streaming_thinking_message_id);
         self.streaming_content.clear();
-        self.invalidate_streaming_caches();
+        self.streaming_cache.invalidate();
         if self.is_turn_active() {
             self.activity = ActivityState::Thinking;
         }
-        if content.is_empty() && thinking_text.is_none() {
+        if content.is_empty() && explicit_thinking.is_none() && self.streaming_thinking.is_empty() {
+            self.streaming_thinking_message_id = None;
+            self.streaming_thinking_cache.invalidate();
             return;
         }
         self.recent_prompt_text = None;
         if self.suppress_turn_output {
+            self.streaming_thinking.clear();
+            self.streaming_thinking_message_id = None;
+            self.streaming_thinking_cache.invalidate();
             return;
         }
-        if let Some(message_id) = message_id.as_deref()
-            && self.messages.iter().any(|entry| {
-                matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } | ChatEntry::Thinking { message_id: Some(mid), .. } if mid == message_id)
-            })
-        {
-            return;
+
+        if let Some(message_id) = message_id.as_deref() {
+            if self.messages.iter().any(|entry| {
+                matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } if mid == message_id)
+            }) {
+                self.streaming_thinking.clear();
+                self.streaming_thinking_message_id = None;
+                self.streaming_thinking_cache.invalidate();
+                return;
+            }
+
+            if let Some(idx) = self.messages.iter().position(|entry| {
+                matches!(entry, ChatEntry::Thinking { message_id: Some(mid), .. } if mid == message_id)
+            }) {
+                if content.is_empty() {
+                    self.streaming_thinking.clear();
+                    self.streaming_thinking_message_id = None;
+                    self.streaming_thinking_cache.invalidate();
+                    return;
+                }
+                let existing_thinking = match self.messages.remove(idx) {
+                    ChatEntry::Thinking { content, .. } => content,
+                    _ => String::new(),
+                };
+                let streaming_thinking = (!self.streaming_thinking.is_empty())
+                    .then(|| std::mem::take(&mut self.streaming_thinking));
+                let thinking_text = explicit_thinking
+                    .or_else(|| (!existing_thinking.is_empty()).then_some(existing_thinking))
+                    .or(streaming_thinking);
+                self.streaming_thinking_message_id = None;
+                self.streaming_thinking_cache.invalidate();
+                self.messages.push(ChatEntry::Assistant {
+                    content,
+                    thinking: thinking_text,
+                    message_id: Some(message_id.to_string()),
+                });
+                self.card_cache.invalidate();
+                return;
+            }
         }
+
+        let streaming_thinking = (!self.streaming_thinking.is_empty())
+            .then(|| std::mem::take(&mut self.streaming_thinking));
+        let thinking_text = explicit_thinking.or(streaming_thinking);
+        self.streaming_thinking_message_id = None;
+        self.streaming_thinking_cache.invalidate();
         if content.is_empty() {
             if let Some(thinking) = thinking_text {
                 self.messages.push(ChatEntry::Thinking {
@@ -1356,6 +1397,53 @@ mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, Screen};
 
+    const TEST_SESSION_ID: &str = "session-1";
+    const TEST_ASSISTANT_ID: &str = "a1";
+
+    fn app_with_active_session() -> App {
+        let mut app = App::new();
+        app.session_id = Some(TEST_SESSION_ID.into());
+        app
+    }
+
+    fn apply_live_update(app: &mut App, update: AcpSessionUpdate) {
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: TEST_SESSION_ID.into(),
+            is_replay: false,
+            update,
+        });
+    }
+
+    fn assert_single_assistant(
+        app: &App,
+        expected_content: &str,
+        expected_thinking: Option<&str>,
+        expected_message_id: &str,
+    ) {
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking, message_id: Some(message_id) }]
+                if content == expected_content
+                    && thinking.as_deref() == expected_thinking
+                    && message_id == expected_message_id
+        ));
+    }
+
+    fn push_thinking_entry(app: &mut App, content: &str) {
+        app.messages.push(ChatEntry::Thinking {
+            content: content.into(),
+            message_id: Some(TEST_ASSISTANT_ID.into()),
+        });
+    }
+
+    fn final_assistant_update(content: &str, thinking: Option<&str>) -> AcpSessionUpdate {
+        AcpSessionUpdate::AssistantMessage {
+            content: content.into(),
+            thinking: thinking.map(str::to_string),
+            message_id: Some(TEST_ASSISTANT_ID.into()),
+        }
+    }
+
     #[test]
     fn native_session_created_resets_view_and_subscribes() {
         let mut app = App::new();
@@ -1380,26 +1468,16 @@ mod tests {
 
     #[test]
     fn native_session_updates_append_user_and_assistant_messages() {
-        let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        let mut app = app_with_active_session();
 
-        app.handle_acp_event(AcpAppEvent::SessionUpdate {
-            session_id: "session-1".into(),
-            is_replay: false,
-            update: AcpSessionUpdate::UserMessage {
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::UserMessage {
                 content: serde_json::json!({ "text": "hello" }),
                 message_id: Some("u1".into()),
             },
-        });
-        app.handle_acp_event(AcpAppEvent::SessionUpdate {
-            session_id: "session-1".into(),
-            is_replay: false,
-            update: AcpSessionUpdate::AssistantMessage {
-                content: "world".into(),
-                thinking: None,
-                message_id: Some("a1".into()),
-            },
-        });
+        );
+        apply_live_update(&mut app, final_assistant_update("world", None));
 
         assert!(matches!(
             app.messages.as_slice(),
@@ -1412,20 +1490,110 @@ mod tests {
 
     #[test]
     fn native_thinking_delta_updates_streaming_thinking() {
-        let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        let mut app = app_with_active_session();
 
-        app.handle_acp_event(AcpAppEvent::SessionUpdate {
-            session_id: "session-1".into(),
-            is_replay: false,
-            update: AcpSessionUpdate::AssistantThinkingDelta {
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantThinkingDelta {
                 content: "thinking".into(),
-                message_id: Some("a1".into()),
+                message_id: Some(TEST_ASSISTANT_ID.into()),
             },
-        });
+        );
 
         assert_eq!(app.streaming_thinking, "thinking");
         assert_eq!(app.streaming_thinking_message_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn native_final_message_preserves_streamed_thinking_and_content_after_finished() {
+        let mut app = app_with_active_session();
+
+        apply_live_update(&mut app, AcpSessionUpdate::TurnStarted);
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantThinkingDelta {
+                content: "streamed thinking".into(),
+                message_id: Some(TEST_ASSISTANT_ID.into()),
+            },
+        );
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantContentDelta {
+                content: "visible stream".into(),
+                message_id: Some(TEST_ASSISTANT_ID.into()),
+            },
+        );
+        apply_live_update(&mut app, final_assistant_update("final answer", None));
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::Finished {
+                finish_reason: "EndTurn".into(),
+            },
+        );
+
+        assert!(app.streaming_content.is_empty());
+        assert!(app.streaming_thinking.is_empty());
+        assert_single_assistant(
+            &app,
+            "final answer",
+            Some("streamed thinking"),
+            TEST_ASSISTANT_ID,
+        );
+    }
+
+    #[test]
+    fn native_final_message_replaces_matching_thinking_entry() {
+        let mut app = app_with_active_session();
+        push_thinking_entry(&mut app, "existing thinking");
+
+        apply_live_update(&mut app, final_assistant_update("final answer", None));
+
+        assert_single_assistant(
+            &app,
+            "final answer",
+            Some("existing thinking"),
+            TEST_ASSISTANT_ID,
+        );
+    }
+
+    #[test]
+    fn native_final_message_prefers_explicit_thinking_when_replacing_thinking_entry() {
+        let mut app = app_with_active_session();
+        push_thinking_entry(&mut app, "existing thinking");
+
+        apply_live_update(
+            &mut app,
+            final_assistant_update("final answer", Some("explicit thinking")),
+        );
+
+        assert_single_assistant(
+            &app,
+            "final answer",
+            Some("explicit thinking"),
+            TEST_ASSISTANT_ID,
+        );
+    }
+
+    #[test]
+    fn native_duplicate_final_assistant_message_is_not_appended() {
+        let mut app = app_with_active_session();
+        app.messages.push(ChatEntry::Assistant {
+            content: "first answer".into(),
+            thinking: Some("first thinking".into()),
+            message_id: Some(TEST_ASSISTANT_ID.into()),
+        });
+
+        apply_live_update(
+            &mut app,
+            final_assistant_update("duplicate answer", Some("duplicate thinking")),
+        );
+
+        assert_single_assistant(
+            &app,
+            "first answer",
+            Some("first thinking"),
+            TEST_ASSISTANT_ID,
+        );
     }
 
     #[test]
