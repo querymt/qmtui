@@ -591,7 +591,7 @@ pub struct RedoResultData {
     pub undo_stack: Vec<UndoStackFrame>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ForkResultData {
     pub success: bool,
     #[serde(default)]

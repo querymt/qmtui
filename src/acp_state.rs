@@ -2,10 +2,10 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Screen, ToolDetail};
+use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Popup, Screen, ToolDetail};
 use crate::protocol::{
-    AgentInfo, AuthProviderEntry, ClientMsg, ModelEntry, OAuthFlowData, OAuthResultData,
-    ProfileInfo, RedoResultData, SessionGroup, UndoResultData, UndoStackFrame,
+    AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, ModelEntry, OAuthFlowData,
+    OAuthResultData, ProfileInfo, RedoResultData, SessionGroup, UndoResultData, UndoStackFrame,
 };
 use crate::tool_detail;
 
@@ -126,6 +126,7 @@ pub(crate) enum AcpAppEvent {
     UndoStack(Vec<UndoStackFrame>),
     UndoResult(UndoResultData),
     RedoResult(RedoResultData),
+    ForkResult(ForkResultData),
     AuthProviders(Vec<AuthProviderEntry>),
     OAuthFlowStarted(OAuthFlowData),
     OAuthResult(OAuthResultData),
@@ -335,6 +336,38 @@ impl crate::app::App {
                         LogLevel::Warn,
                         "session",
                         rr.message.unwrap_or_else(|| "redo failed".into()),
+                    );
+                }
+                vec![]
+            }
+            AcpAppEvent::ForkResult(fr) => {
+                self.pending_fork_message_id = None;
+                if fr.success {
+                    if let Some(forked_session_id) = fr.forked_session_id {
+                        self.popup = Popup::None;
+                        self.set_status(LogLevel::Info, "fork", "forked - loading session");
+                        return vec![
+                            ClientMsg::LoadSession {
+                                session_id: forked_session_id.clone(),
+                                cwd: self.current_session_cwd(),
+                            },
+                            ClientMsg::SubscribeSession {
+                                session_id: forked_session_id,
+                                agent_id: self.agent_id.clone(),
+                            },
+                        ];
+                    }
+                    self.set_status(
+                        LogLevel::Warn,
+                        "fork",
+                        fr.message
+                            .unwrap_or_else(|| "fork succeeded without session id".into()),
+                    );
+                } else {
+                    self.set_status(
+                        LogLevel::Warn,
+                        "fork",
+                        fr.message.unwrap_or_else(|| "fork failed".into()),
                     );
                 }
                 vec![]
@@ -1864,6 +1897,51 @@ mod tests {
             app.logs.last(),
             Some(entry) if entry.level == LogLevel::Warn && entry.target == "session"
         ));
+    }
+
+    #[test]
+    fn native_fork_result_success_loads_forked_session() {
+        let mut app = App::new();
+        app.agent_id = Some("agent-1".into());
+        app.popup = Popup::ForkTurnSelect;
+        app.pending_fork_message_id = Some("msg-1".into());
+
+        let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResultData {
+            success: true,
+            source_session_id: Some("source-1".into()),
+            forked_session_id: Some("fork-1".into()),
+            message: None,
+        }));
+
+        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.popup, Popup::None);
+        assert_eq!(app.status, "forked - loading session");
+        assert!(matches!(
+            replies.as_slice(),
+            [
+                ClientMsg::LoadSession { session_id: load_id, .. },
+                ClientMsg::SubscribeSession { session_id: subscribe_id, agent_id }
+            ] if load_id == "fork-1" && subscribe_id == "fork-1" && agent_id.as_deref() == Some("agent-1")
+        ));
+    }
+
+    #[test]
+    fn native_fork_result_failure_clears_pending_and_keeps_popup() {
+        let mut app = App::new();
+        app.popup = Popup::ForkTurnSelect;
+        app.pending_fork_message_id = Some("msg-1".into());
+
+        let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResultData {
+            success: false,
+            source_session_id: Some("source-1".into()),
+            forked_session_id: None,
+            message: Some("fork failed".into()),
+        }));
+
+        assert!(replies.is_empty());
+        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.popup, Popup::ForkTurnSelect);
+        assert_eq!(app.status, "fork failed");
     }
 
     #[test]

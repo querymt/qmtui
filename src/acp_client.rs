@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::protocol::{
-    AuthProvidersData, ClientMsg, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
-    SessionGroup, SessionSummary, UndoResultData, UndoStackFrame,
+    AuthProvidersData, ClientMsg, ForkResultData, OAuthFlowData, OAuthResultData, ProfileInfo,
+    RedoResultData, SessionGroup, SessionSummary, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone)]
@@ -354,11 +354,7 @@ async fn handle_client_msg(
             let response_value = serde_json::to_value(&response).unwrap_or(Value::Null);
             let snapshot_provider_change =
                 snapshot_provider_change_from_load_value(&response_value);
-            let snapshot_updates = if replay_updates.is_empty() {
-                snapshot_updates_from_load_value(&response_value)
-            } else {
-                Vec::new()
-            };
+            let snapshot_updates = snapshot_updates_from_load_value(&response_value);
 
             let identity = state.agent_identity().await;
             let profile_id = response
@@ -374,11 +370,8 @@ async fn handle_client_msg(
                     profile_id,
                 },
             );
-            let history_updates = if replay_updates.is_empty() {
-                snapshot_updates
-            } else {
-                replay_updates
-            };
+            let history_updates =
+                merge_replay_with_snapshot_stats(replay_updates, snapshot_updates);
             if !history_updates.is_empty() {
                 send_acp(
                     srv_tx,
@@ -566,6 +559,42 @@ async fn handle_client_msg(
         } => {
             respond_to_elicitation(state, &elicitation_id, &action, content).await;
         }
+        ClientMsg::ForkSession { message_id } => {
+            let Some(session_id) = state.current_session_id().await else {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::ForkResult(ForkResultData {
+                        success: false,
+                        source_session_id: None,
+                        forked_session_id: None,
+                        message: Some("cannot fork before a session is loaded".to_string()),
+                    }),
+                );
+                return Ok(());
+            };
+            let req = acp::ForkSessionRequest::new(session_id.clone(), state.default_cwd())
+                .meta(fork_session_meta(&message_id));
+            match connection.send_request(req).block_task().await {
+                Ok(response) => send_acp(
+                    srv_tx,
+                    AcpAppEvent::ForkResult(ForkResultData {
+                        success: true,
+                        source_session_id: Some(session_id),
+                        forked_session_id: Some(response.session_id.to_string()),
+                        message: None,
+                    }),
+                ),
+                Err(err) => send_acp(
+                    srv_tx,
+                    AcpAppEvent::ForkResult(ForkResultData {
+                        success: false,
+                        source_session_id: Some(session_id),
+                        forked_session_id: None,
+                        message: Some(format!("ACP fork failed: {err:?}")),
+                    }),
+                ),
+            }
+        }
         ClientMsg::SubscribeSession { .. } => {}
         ClientMsg::GetAgentMode => {}
         ClientMsg::GetFileIndex => {
@@ -610,8 +639,7 @@ async fn handle_client_msg(
                 send_acp(srv_tx, AcpAppEvent::RedoResult(result));
             }
         }
-        ClientMsg::ForkSession { .. }
-        | ClientMsg::ListSessionChildren { .. }
+        ClientMsg::ListSessionChildren { .. }
         | ClientMsg::ListRemoteNodes
         | ClientMsg::ListRemoteSessions { .. }
         | ClientMsg::CreateRemoteSession { .. }
@@ -772,6 +800,14 @@ fn profile_meta(profile_id: &str) -> serde_json::Map<String, Value> {
     meta
 }
 
+fn fork_session_meta(message_id: &str) -> serde_json::Map<String, Value> {
+    let mut meta = serde_json::Map::new();
+    // ACP session/fork has no native fork-point field. QueryMT agents honor
+    // this metadata hint and fall back to latest-message fork when it is absent.
+    meta.insert("querymt".to_string(), json!({ "message_id": message_id }));
+    meta
+}
+
 const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 
 fn session_load_audit_from_load_value(response: &Value) -> Value {
@@ -818,6 +854,33 @@ fn snapshot_provider_change_event(change: SnapshotProviderChange) -> AcpAppEvent
         context_limit: change.context_limit,
         provider_node_id: change.provider_node_id,
     }
+}
+
+fn merge_replay_with_snapshot_stats(
+    replay_updates: Vec<AcpSessionUpdate>,
+    snapshot_updates: Vec<AcpSessionUpdate>,
+) -> Vec<AcpSessionUpdate> {
+    if replay_updates.is_empty() {
+        return snapshot_updates;
+    }
+
+    let replay_has_usage = replay_updates
+        .iter()
+        .any(|update| matches!(update, AcpSessionUpdate::UsageUpdate { .. }));
+    let replay_has_timing = replay_updates
+        .iter()
+        .any(|update| matches!(update, AcpSessionUpdate::TimingUpdate { .. }));
+
+    let mut merged = replay_updates;
+    // Backend ACP replay currently sends visual history but not usage stats.
+    // Snapshot stats come from QueryMT load metadata and keep status-bar context
+    // accurate for loaded/forked sessions without duplicating chat entries.
+    merged.extend(snapshot_updates.into_iter().filter(|update| match update {
+        AcpSessionUpdate::UsageUpdate { .. } => !replay_has_usage,
+        AcpSessionUpdate::TimingUpdate { .. } => !replay_has_timing,
+        _ => false,
+    }));
+    merged
 }
 
 fn snapshot_updates_from_load_value(response: &Value) -> Vec<AcpSessionUpdate> {
@@ -1807,6 +1870,17 @@ mod tests {
     }
 
     #[test]
+    fn fork_session_meta_uses_querymt_message_id_hint() {
+        let meta = fork_session_meta("msg-123");
+        assert_eq!(
+            meta.get("querymt")
+                .and_then(|value| value.get("message_id"))
+                .and_then(Value::as_str),
+            Some("msg-123")
+        );
+    }
+
+    #[test]
     fn session_load_audit_reads_querymt_snapshot_from_meta() {
         let response = json!({
             "_meta": {
@@ -2083,6 +2157,80 @@ mod tests {
         assert!(matches!(
             &updates[3],
             AcpSessionUpdate::Finished { finish_reason } if finish_reason == "stop"
+        ));
+    }
+
+    #[test]
+    fn merge_replay_with_snapshot_stats_preserves_replay_and_adds_usage() {
+        let replay = vec![AcpSessionUpdate::UserMessage {
+            content: json!({ "text": "hello" }),
+            message_id: Some("u1".into()),
+        }];
+        let snapshot = vec![
+            AcpSessionUpdate::UserMessage {
+                content: json!({ "text": "duplicate" }),
+                message_id: Some("u1".into()),
+            },
+            AcpSessionUpdate::TimingUpdate { duration_secs: 30 },
+            AcpSessionUpdate::UsageUpdate {
+                used: 2048,
+                size: 8192,
+                cost_usd: Some(0.0123),
+            },
+            AcpSessionUpdate::Finished {
+                finish_reason: "stop".into(),
+            },
+        ];
+
+        let merged = merge_replay_with_snapshot_stats(replay, snapshot);
+
+        assert_eq!(merged.len(), 3);
+        assert!(matches!(
+            &merged[0],
+            AcpSessionUpdate::UserMessage { content, message_id }
+                if content == &json!({ "text": "hello" }) && message_id.as_deref() == Some("u1")
+        ));
+        assert!(matches!(
+            &merged[1],
+            AcpSessionUpdate::TimingUpdate { duration_secs: 30 }
+        ));
+        assert!(matches!(
+            &merged[2],
+            AcpSessionUpdate::UsageUpdate { used: 2048, size: 8192, cost_usd: Some(cost) }
+                if (*cost - 0.0123).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn merge_replay_with_snapshot_stats_does_not_duplicate_native_usage() {
+        let replay = vec![AcpSessionUpdate::UsageUpdate {
+            used: 1024,
+            size: 8192,
+            cost_usd: None,
+        }];
+        let snapshot = vec![
+            AcpSessionUpdate::TimingUpdate { duration_secs: 30 },
+            AcpSessionUpdate::UsageUpdate {
+                used: 2048,
+                size: 8192,
+                cost_usd: Some(0.0123),
+            },
+        ];
+
+        let merged = merge_replay_with_snapshot_stats(replay, snapshot);
+
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(
+            &merged[0],
+            AcpSessionUpdate::UsageUpdate {
+                used: 1024,
+                size: 8192,
+                cost_usd: None
+            }
+        ));
+        assert!(matches!(
+            &merged[1],
+            AcpSessionUpdate::TimingUpdate { duration_secs: 30 }
         ));
     }
 
