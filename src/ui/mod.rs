@@ -7,8 +7,9 @@ pub(crate) use chat::{
 };
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
-    draw_auth_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup, draw_model_popup,
-    draw_new_session_popup, draw_profile_popup, draw_session_popup, draw_theme_popup,
+    draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
+    draw_log_popup, draw_model_popup, draw_new_session_popup, draw_profile_popup,
+    draw_session_popup, draw_theme_popup,
 };
 use start::draw_start;
 
@@ -308,6 +309,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     match app.popup {
+        Popup::CommandPalette => draw_command_palette_popup(f, app),
         Popup::ModelSelect => draw_model_popup(f, app),
         Popup::SessionSelect => draw_session_popup(f, app),
         Popup::NewSession => draw_new_session_popup(f, app),
@@ -1933,6 +1935,38 @@ mod tests {
 
         assert!(!local_marker, "local duplicate must not show live marker");
         assert!(remote_marker, "remote live row must show marker");
+    }
+
+    #[test]
+    fn draw_command_palette_popup_aligns_columns_and_highlights_selection() {
+        let mut app = App::new();
+        app.popup = Popup::CommandPalette;
+        app.screen = Screen::Chat;
+        app.command_palette_cursor = 1;
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_command_palette_popup(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (title_x, row_y) =
+            find_buffer_text(&buffer, "Session switcher").expect("selected command row missing");
+        let (shortcut_x, shortcut_y) =
+            find_buffer_text(&buffer, "C-x l").expect("selected shortcut missing");
+        let (description_x, description_y) =
+            find_buffer_text(&buffer, "Browse and load sessions").expect("description missing");
+
+        assert_eq!(row_y, shortcut_y);
+        assert_eq!(row_y, description_y);
+        assert!(shortcut_x > title_x);
+        assert!(description_x > shortcut_x);
+        assert!(
+            find_buffer_text(&buffer, "action").is_none(),
+            "table headers should not render"
+        );
+        assert_eq!(buffer[(shortcut_x, row_y)].style().bg, Theme::selected().bg);
     }
 
     #[test]

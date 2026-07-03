@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, ActivityState, App, LogLevel, Popup, Screen};
+use crate::app::{self, ActivityState, App, CommandPaletteAction, LogLevel, Popup, Screen};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -148,6 +148,124 @@ pub(crate) fn handle_elicitation_key(
     Ok(())
 }
 
+fn open_model_popup(
+    app: &mut App,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    if app.screen != Screen::Chat {
+        app.set_status(
+            app::LogLevel::Warn,
+            "model",
+            "model select is only available in chat",
+        );
+        return Ok(());
+    }
+    if !can_send_server_commands(app) {
+        return Ok(());
+    }
+    app.popup = Popup::ModelSelect;
+    app.model_filter.clear();
+    app.model_popup_agent_tab = 0;
+    app.model_cursor = app.model_popup_open_cursor();
+    cmd_tx.send(ClientMsg::ListAllModels { refresh: true })?;
+    Ok(())
+}
+
+fn open_session_popup(
+    app: &mut App,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    if !can_send_server_commands(app) {
+        return Ok(());
+    }
+    app.popup = Popup::SessionSelect;
+    app.session_popup_tab = 0;
+    app.session_cursor = 0;
+    app.session_filter.clear();
+    cmd_tx.send(ClientMsg::list_sessions_browse())?;
+    Ok(())
+}
+
+fn open_log_popup(app: &mut App) {
+    app.popup = Popup::Log;
+    app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+    app.log_filter.clear();
+}
+
+fn execute_command_palette_action(
+    app: &mut App,
+    action: CommandPaletteAction,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match action {
+        CommandPaletteAction::ModelSelect => open_model_popup(app, cmd_tx)?,
+        CommandPaletteAction::SessionSelect => open_session_popup(app, cmd_tx)?,
+        CommandPaletteAction::DelegateSessions => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_delegate_popup();
+        }
+        CommandPaletteAction::NewSession => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_new_session_popup();
+        }
+        CommandPaletteAction::ThemeSelect => {
+            app.popup = Popup::ThemeSelect;
+            app.theme_filter.clear();
+            app.theme_cursor = theme::Theme::current_index();
+        }
+        CommandPaletteAction::Help => {
+            app.popup = Popup::Help;
+            app.help_scroll = 0;
+        }
+        CommandPaletteAction::Log => open_log_popup(app),
+        CommandPaletteAction::ProviderAuth => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_auth_popup();
+            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+        CommandPaletteAction::ForkTurnSelect => {
+            app.open_fork_turn_popup();
+        }
+        CommandPaletteAction::ProfileSelect => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_profile_popup();
+            cmd_tx.send(ClientMsg::ListProfiles)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_command_palette_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Up => app.move_command_palette_cursor(-1),
+        KeyCode::Down => app.move_command_palette_cursor(1),
+        KeyCode::Backspace => app.command_palette_filter_backspace(),
+        KeyCode::Enter => {
+            if let Some(action) = app.selected_command_palette_action() {
+                execute_command_palette_action(app, action, cmd_tx)?;
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.command_palette_filter_insert(c);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -167,6 +285,15 @@ pub(crate) fn handle_key(
         } else {
             app.should_quit = true;
         }
+        return Ok(AppAction::None);
+    }
+
+    // direct: ctrl+p opens the command palette, replacing any active popup.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        app.chord = false;
+        app.open_command_palette();
         return Ok(AppAction::None);
     }
 
@@ -227,9 +354,7 @@ pub(crate) fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
     {
-        app.popup = Popup::Log;
-        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        app.log_filter.clear();
+        open_log_popup(app);
         return Ok(AppAction::None);
     }
 
@@ -242,6 +367,10 @@ pub(crate) fn handle_key(
 
     // popup handling
     match app.popup {
+        Popup::CommandPalette => {
+            handle_command_palette_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
         Popup::ModelSelect => {
             handle_model_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
@@ -337,21 +466,7 @@ pub(crate) fn handle_chord(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Char('m') => {
-            if app.screen != Screen::Chat {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "model",
-                    "model select is only available in chat",
-                );
-                return Ok(());
-            }
-            app.popup = Popup::ModelSelect;
-            app.model_filter.clear();
-            app.model_popup_agent_tab = 0;
-            app.model_cursor = app.model_popup_open_cursor();
-            if can_send_server_commands(app) {
-                cmd_tx.send(ClientMsg::ListAllModels { refresh: true })?;
-            }
+            open_model_popup(app, cmd_tx)?;
         }
         KeyCode::Char('n') => {
             if !can_send_server_commands(app) {
@@ -376,14 +491,7 @@ pub(crate) fn handle_chord(
             app.theme_cursor = theme::Theme::current_index();
         }
         KeyCode::Char('l') => {
-            if !can_send_server_commands(app) {
-                return Ok(());
-            }
-            app.popup = Popup::SessionSelect;
-            app.session_popup_tab = 0;
-            app.session_cursor = 0;
-            app.session_filter.clear();
-            cmd_tx.send(ClientMsg::list_sessions_browse())?;
+            open_session_popup(app, cmd_tx)?;
         }
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
@@ -2449,6 +2557,50 @@ mod model_popup_tests {
             }
         );
         assert!(matches!(app.popup, Popup::None));
+    }
+
+    #[test]
+    fn ctrl_p_opens_command_palette_over_existing_popup() {
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(app.popup, Popup::CommandPalette));
+        assert_eq!(app.command_palette_cursor, 0);
+        assert!(app.command_palette_filter.is_empty());
+    }
+
+    #[test]
+    fn command_palette_enter_opens_theme_picker() {
+        let mut app = App::new();
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "theme".into();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::ThemeSelect));
+    }
+
+    #[test]
+    fn command_palette_profile_lists_profiles() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "profile".into();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListProfiles)));
     }
 
     #[test]
