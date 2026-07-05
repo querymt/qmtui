@@ -7,6 +7,7 @@ use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
+use crate::mesh::{MeshFocus, MeshInviteFormField};
 use crate::protocol::*;
 use crate::ui::{CardCache, OUTCOME_BULLET};
 
@@ -61,6 +62,9 @@ pub enum Screen {
 pub enum Popup {
     None,
     CommandPalette,
+    Mesh,
+    MeshInvite,
+    MeshInviteQr,
     ModelSelect,
     SessionSelect,
     NewSession,
@@ -74,6 +78,10 @@ pub enum Popup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandPaletteAction {
+    OpenMesh,
+    AttachRemoteSession,
+    CreateRemoteSession,
+    CreateMeshInvite,
     ModelSelect,
     SessionSelect,
     DelegateSessions,
@@ -96,6 +104,34 @@ pub struct CommandPaletteCommand {
 }
 
 pub const COMMAND_PALETTE_COMMANDS: &[CommandPaletteCommand] = &[
+    CommandPaletteCommand {
+        title: "Open Mesh",
+        description: "View mesh nodes and remote sessions",
+        shortcut: "",
+        action: CommandPaletteAction::OpenMesh,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Attach remote session",
+        description: "Attach an existing session from a mesh node",
+        shortcut: "",
+        action: CommandPaletteAction::AttachRemoteSession,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Create remote session",
+        description: "Start a new session on a mesh node",
+        shortcut: "",
+        action: CommandPaletteAction::CreateRemoteSession,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Create mesh invite",
+        description: "Generate a mesh invite link and QR code",
+        shortcut: "",
+        action: CommandPaletteAction::CreateMeshInvite,
+        chat_only: false,
+    },
     CommandPaletteCommand {
         title: "Model selector",
         description: "Choose the model for this session or delegates",
@@ -1153,8 +1189,22 @@ pub struct App {
     pub status: String,
 
     // mesh / remote (from ACP extensions)
-    /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch (connect-time).
+    /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch.
     pub mesh_node_count: Option<u32>,
+    pub mesh_status: Option<MeshStatusInfo>,
+    pub mesh_nodes: Vec<RemoteNodeInfo>,
+    pub remote_sessions_by_node: HashMap<String, Vec<RemoteSessionInfo>>,
+    pub mesh_node_cursor: usize,
+    pub remote_session_cursor: usize,
+    pub mesh_focus: MeshFocus,
+    pub mesh_error: Option<String>,
+    pub mesh_error_until: Option<Instant>,
+    pub mesh_invite: Option<MeshInviteCreatedInfo>,
+    pub mesh_invite_name: String,
+    pub mesh_invite_ttl: String,
+    pub mesh_invite_max_uses: String,
+    pub mesh_invite_form_field: MeshInviteFormField,
+    pub mesh_clipboard_fallback: Option<String>,
 
     // connection
     pub conn: ConnState,
@@ -1353,6 +1403,20 @@ impl App {
             session_stats: SessionStatsLite::default(),
             pending_cancel_confirm_until: None,
             mesh_node_count: None,
+            mesh_status: None,
+            mesh_nodes: Vec::new(),
+            remote_sessions_by_node: HashMap::new(),
+            mesh_node_cursor: 0,
+            remote_session_cursor: 0,
+            mesh_focus: MeshFocus::Nodes,
+            mesh_error: None,
+            mesh_error_until: None,
+            mesh_invite: None,
+            mesh_invite_name: String::new(),
+            mesh_invite_ttl: "24h".into(),
+            mesh_invite_max_uses: "1".into(),
+            mesh_invite_form_field: MeshInviteFormField::MeshName,
+            mesh_clipboard_fallback: None,
             conn: ConnState::Connecting,
             reconnect_attempt: 0,
             reconnect_delay_ms: None,

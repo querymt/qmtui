@@ -4,8 +4,9 @@ use serde_json::Value;
 
 use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Popup, Screen, ToolDetail};
 use crate::protocol::{
-    AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, ModelEntry, OAuthFlowData,
-    OAuthResultData, ProfileInfo, RedoResultData, SessionGroup, UndoResultData, UndoStackFrame,
+    AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
+    MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
+    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, UndoResultData, UndoStackFrame,
 };
 use crate::tool_detail;
 
@@ -94,7 +95,11 @@ pub(crate) enum AcpAppEvent {
     },
     ControlCapabilities(Value),
     ControlCapabilitiesUnavailable(String),
-    MeshNodes(Value),
+    MeshStatus(MeshStatusInfo),
+    MeshNodes(MeshNodesInfo),
+    MeshInviteCreated(MeshInviteCreatedInfo),
+    RemoteSessions(RemoteSessionListInfo),
+    RemoteSessionAttached(RemoteSessionAttachInfo),
     SessionList {
         groups: Vec<SessionGroup>,
         next_cursor: Option<String>,
@@ -228,16 +233,24 @@ impl crate::app::App {
                 );
                 vec![]
             }
-            AcpAppEvent::MeshNodes(data) => {
-                let count = data
-                    .get("nodes")
-                    .and_then(Value::as_array)
-                    .map(|nodes| nodes.len() as u32)
-                    .unwrap_or(0);
-                self.mesh_node_count = Some(count);
-                self.push_log(LogLevel::Info, "mesh", format!("mesh nodes: {count}"));
+            AcpAppEvent::MeshStatus(status) => {
+                self.apply_mesh_status(status);
                 vec![]
             }
+            AcpAppEvent::MeshNodes(nodes) => self.apply_mesh_nodes(nodes),
+            AcpAppEvent::MeshInviteCreated(invite) => {
+                self.apply_mesh_invite_created(invite);
+                vec![]
+            }
+            AcpAppEvent::RemoteSessions(list) => {
+                self.apply_remote_sessions(list);
+                vec![]
+            }
+            AcpAppEvent::RemoteSessionAttached(attached) => self.apply_remote_session_attached(
+                &attached.session_id,
+                &attached.node_id,
+                attached.attached,
+            ),
             AcpAppEvent::SessionList {
                 groups,
                 next_cursor,
@@ -1499,6 +1512,66 @@ mod tests {
             thinking: thinking.map(str::to_string),
             message_id: Some(TEST_ASSISTANT_ID.into()),
         }
+    }
+
+    #[test]
+    fn native_mesh_nodes_store_state_and_requests_first_node_sessions() {
+        let mut app = App::new();
+
+        let replies = app.handle_acp_event(AcpAppEvent::MeshNodes(MeshNodesInfo {
+            nodes: vec![crate::protocol::RemoteNodeInfo {
+                id: "node-1".into(),
+                label: "framework".into(),
+                active_sessions: 2,
+                ..Default::default()
+            }],
+        }));
+
+        assert_eq!(app.mesh_node_count, Some(1));
+        assert_eq!(app.selected_mesh_node_id(), Some("node-1"));
+        assert!(matches!(
+            replies.as_slice(),
+            [ClientMsg::ListRemoteSessions { node_id, offset: Some(0), limit: Some(50) }]
+                if node_id == "node-1"
+        ));
+    }
+
+    #[test]
+    fn native_mesh_invite_created_stores_invite_and_opens_invite_view() {
+        let mut app = App::new();
+
+        app.handle_acp_event(AcpAppEvent::MeshInviteCreated(MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: Some("Team Mesh".into()),
+        }));
+
+        assert!(matches!(app.popup, Popup::MeshInviteQr));
+        assert_eq!(app.mesh_invite_url(), Some("qmt://mesh/join/token"));
+    }
+
+    #[test]
+    fn native_remote_attach_loads_attached_session() {
+        let mut app = App::new();
+
+        let replies = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
+            RemoteSessionAttachInfo {
+                session_id: "remote-1".into(),
+                node_id: "node-1".into(),
+                attached: true,
+                config_options: Vec::new(),
+                snapshot: Value::Null,
+            },
+        ));
+
+        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
+        assert!(matches!(
+            replies.as_slice(),
+            [ClientMsg::LoadSession { session_id, .. }] if session_id == "remote-1"
+        ));
     }
 
     #[test]

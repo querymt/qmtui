@@ -8,8 +8,9 @@ pub(crate) use chat::{
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
-    draw_log_popup, draw_model_popup, draw_new_session_popup, draw_profile_popup,
-    draw_session_popup, draw_theme_popup,
+    draw_log_popup, draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
+    draw_model_popup, draw_new_session_popup, draw_profile_popup, draw_session_popup,
+    draw_theme_popup,
 };
 use start::draw_start;
 
@@ -310,6 +311,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.popup {
         Popup::CommandPalette => draw_command_palette_popup(f, app),
+        Popup::Mesh => draw_mesh_popup(f, app),
+        Popup::MeshInvite => draw_mesh_invite_popup(f, app),
+        Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, app),
         Popup::ModelSelect => draw_model_popup(f, app),
         Popup::SessionSelect => draw_session_popup(f, app),
         Popup::NewSession => draw_new_session_popup(f, app),
@@ -1938,11 +1942,89 @@ mod tests {
     }
 
     #[test]
+    fn draw_mesh_popup_shows_nodes_sessions_and_hints() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.mesh_nodes = vec![crate::protocol::RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "framework".into(),
+            active_sessions: 1,
+            ..Default::default()
+        }];
+        app.remote_sessions_by_node.insert(
+            "node-1".into(),
+            vec![crate::protocol::RemoteSessionInfo {
+                id: "remote-1".into(),
+                node_id: "node-1".into(),
+                title: Some("Fix bug".into()),
+                cwd: Some("/repo".into()),
+                ..Default::default()
+            }],
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_mesh_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "framework").is_some());
+        assert!(find_buffer_text(&buffer, "Fix bug").is_some());
+        assert!(find_buffer_text(&buffer, "new remote").is_some());
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_invite_form_defaults() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.open_mesh_invite_form();
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_mesh_invite_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "Create Invite").is_some());
+        assert!(find_buffer_text(&buffer, "24h").is_some());
+        assert!(find_buffer_text(&buffer, "max uses").is_some());
+        assert!(find_buffer_text(&buffer, "defaults: ttl 24h, max uses 1").is_some());
+        assert!(find_buffer_text(&buffer, "QR-LINE").is_none());
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_invite_url_and_qr() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.apply_mesh_invite_created(crate::protocol::MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR-LINE".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: None,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_mesh_invite_qr_popup(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "create invite").is_none());
+        assert!(find_buffer_text(&buffer, "QR Code Invite").is_some());
+        assert!(find_buffer_text(&buffer, "QR code").is_none());
+        assert!(find_buffer_text(&buffer, "QR-LINE").is_some());
+        assert!(find_buffer_text(&buffer, "qmt://mesh/join/token").is_none());
+        assert!(find_buffer_text(&buffer, "show URL").is_some());
+    }
+
+    #[test]
     fn draw_command_palette_popup_aligns_columns_and_highlights_selection() {
         let mut app = App::new();
         app.popup = Popup::CommandPalette;
         app.screen = Screen::Chat;
-        app.command_palette_cursor = 1;
+        app.command_palette_filter = "session switcher".into();
+        app.command_palette_cursor = 0;
 
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

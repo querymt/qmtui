@@ -20,8 +20,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::protocol::{
-    AuthProvidersData, ClientMsg, ForkResultData, OAuthFlowData, OAuthResultData, ProfileInfo,
-    RedoResultData, SessionGroup, SessionSummary, UndoResultData, UndoStackFrame,
+    AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
+    MeshStatusInfo, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
+    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, SessionSummary, UndoResultData,
+    UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,11 +590,10 @@ async fn handle_websocket_text(
         "querymt/mesh/nodesChanged" | "querymt/mesh/joined" | "querymt/mesh/peerExpired" => {
             if let Ok(nodes_resp) =
                 call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
+                && let Ok(nodes) =
+                    serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
             {
-                send_acp(
-                    srv_tx,
-                    AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
-                );
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
             }
         }
         _ => {}
@@ -1111,11 +1112,85 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::RedoResult(result));
             }
         }
+        ClientMsg::ListRemoteNodes => {
+            let status_resp =
+                call_querymt_ext(connection, "querymt/mesh/status", json!({})).await?;
+            if let Ok(status) =
+                serde_json::from_value::<MeshStatusInfo>(ext_payload(&status_resp).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::MeshStatus(status));
+            }
+            let nodes_resp = call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await?;
+            if let Ok(nodes) =
+                serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
+            }
+        }
+        ClientMsg::ListRemoteSessions {
+            node_id,
+            offset,
+            limit,
+        } => {
+            let response = call_querymt_ext(
+                connection,
+                "querymt/remote/sessions",
+                json!({ "node_id": node_id, "offset": offset.unwrap_or(0), "limit": limit.unwrap_or(50) }),
+            )
+            .await?;
+            if let Ok(list) =
+                serde_json::from_value::<RemoteSessionListInfo>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::RemoteSessions(list));
+            }
+        }
+        ClientMsg::CreateRemoteSession { node_id, cwd, .. } => {
+            let response = call_querymt_ext(
+                connection,
+                "querymt/remote/createSession",
+                json!({ "node_id": node_id, "cwd": cwd, "attach": true }),
+            )
+            .await?;
+            if let Ok(attached) =
+                serde_json::from_value::<RemoteSessionAttachInfo>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
+            }
+        }
+        ClientMsg::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            let response = call_querymt_ext(
+                connection,
+                "querymt/remote/attachSession",
+                json!({ "node_id": node_id, "session_id": session_id }),
+            )
+            .await?;
+            if let Ok(attached) =
+                serde_json::from_value::<RemoteSessionAttachInfo>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
+            }
+        }
+        ClientMsg::CreateMeshInvite {
+            mesh_name,
+            ttl,
+            max_uses,
+        } => {
+            let response = call_querymt_ext(
+                connection,
+                "querymt/mesh/createInvite",
+                json!({ "mesh_name": mesh_name, "ttl": ttl, "max_uses": max_uses }),
+            )
+            .await?;
+            if let Ok(invite) =
+                serde_json::from_value::<MeshInviteCreatedInfo>(ext_payload(&response).clone())
+            {
+                send_acp(srv_tx, AcpAppEvent::MeshInviteCreated(invite));
+            }
+        }
         ClientMsg::ListSessionChildren { .. }
-        | ClientMsg::ListRemoteNodes
-        | ClientMsg::ListRemoteSessions { .. }
-        | ClientMsg::CreateRemoteSession { .. }
-        | ClientMsg::AttachRemoteSession { .. }
         | ClientMsg::DismissRemoteSession { .. }
         | ClientMsg::ListProfiles
         | ClientMsg::SetActiveProfile { .. }
@@ -1225,11 +1300,10 @@ async fn post_connect_diagnostics<C: AcpConnection>(
             if methods.iter().any(|m| m == "querymt/mesh/nodes")
                 && let Ok(nodes_resp) =
                     call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
+                && let Ok(nodes) =
+                    serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
             {
-                send_acp(
-                    srv_tx,
-                    AcpAppEvent::MeshNodes(ext_payload(&nodes_resp).clone()),
-                );
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
             }
         }
         Err(err) => {

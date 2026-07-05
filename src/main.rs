@@ -8,6 +8,7 @@ mod handlers;
 mod highlight;
 mod input;
 mod markdown;
+mod mesh;
 mod protocol;
 mod server_manager;
 #[cfg(test)]

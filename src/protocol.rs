@@ -48,6 +48,14 @@ pub enum ClientMsg {
     DismissRemoteSession {
         session_id: String,
     },
+    CreateMeshInvite {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mesh_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+    },
     ListSessionChildren {
         parent_session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -935,6 +943,129 @@ pub struct ModelEntry {
     pub node_label: Option<String>,
     pub family: Option<String>,
     pub quant: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshStatusInfo {
+    pub enabled: bool,
+    #[serde(default)]
+    pub peer_id: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub known_peer_count: u32,
+    #[serde(default)]
+    pub has_invite_store: bool,
+    #[serde(default)]
+    pub has_mesh_state_store: bool,
+    #[serde(default)]
+    pub scopes: Vec<MeshScopeInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshScopeInfo {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RemoteNodeInfo {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub active_sessions: u32,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshNodesInfo {
+    #[serde(default)]
+    pub nodes: Vec<RemoteNodeInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RemoteSessionInfo {
+    pub id: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub node_label: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RemoteSessionListInfo {
+    pub node_id: String,
+    #[serde(default)]
+    pub sessions: Vec<RemoteSessionInfo>,
+    #[serde(default)]
+    pub next_offset: Option<u32>,
+    #[serde(default)]
+    pub total_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteSessionAttachInfo {
+    pub session_id: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub attached: bool,
+    #[serde(default)]
+    pub config_options: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshInviteCreatedInfo {
+    pub invite_id: String,
+    pub url: String,
+    #[serde(default)]
+    pub qr_code: Option<String>,
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default)]
+    pub max_uses: u32,
+    #[serde(default)]
+    pub mesh_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshInviteInfo {
+    pub invite_id: String,
+    #[serde(default)]
+    pub mesh_name: Option<String>,
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default)]
+    pub max_uses: u32,
+    #[serde(default)]
+    pub uses_remaining: u32,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub used_by: Vec<String>,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MeshInviteListInfo {
+    #[serde(default)]
+    pub invites: Vec<MeshInviteInfo>,
 }
 
 #[derive(Debug, Deserialize)]
