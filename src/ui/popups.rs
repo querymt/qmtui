@@ -1197,7 +1197,7 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
     .block(Block::default().style(Theme::popup_bg()))
     .style(Theme::popup_bg())
     .row_highlight_style(Theme::selected());
-    let selected = Some(app.profile_cursor).filter(|_| has_matches);
+    let selected = has_matches.then_some(app.profile_cursor);
     let mut state = TableState::default().with_selected(selected);
     f.render_stateful_widget(table, chunks[2], &mut state);
 
@@ -1292,7 +1292,7 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
             .block(Block::default().style(Theme::popup_bg()))
             .highlight_style(Theme::selected())
             .highlight_symbol("");
-        let selected = Some(completion.selected_index).filter(|_| !completion.results.is_empty());
+        let selected = (!completion.results.is_empty()).then_some(completion.selected_index);
         let mut state = ListState::default().with_selected(selected);
         f.render_stateful_widget(list, chunks[3], &mut state);
     }
@@ -2028,11 +2028,10 @@ pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
         .highlight_style(Theme::selected())
         .highlight_symbol("");
     let visible_rows = chunks[3].height as usize;
-    let selected = Some(
+    let selected = (!commands.is_empty()).then_some(
         app.command_palette_cursor
             .min(commands.len().saturating_sub(1)),
-    )
-    .filter(|_| !commands.is_empty());
+    );
     let offset = selected
         .unwrap_or(0)
         .saturating_sub(visible_rows.saturating_sub(1));
@@ -2260,7 +2259,7 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
     let selected =
-        Some(app.log_cursor.min(filtered.len().saturating_sub(1))).filter(|_| !filtered.is_empty());
+        (!filtered.is_empty()).then_some(app.log_cursor.min(filtered.len().saturating_sub(1)));
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, chunks[3], &mut state);
 
