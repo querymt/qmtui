@@ -3206,6 +3206,7 @@ mod model_popup_tests {
     #[test]
     fn opening_model_popup_starts_on_session_tab() {
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         app.screen = Screen::Chat;
         app.agent_mode = "review".into();
         app.current_provider = Some("openai".into());
