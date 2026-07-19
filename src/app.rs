@@ -1242,6 +1242,8 @@ pub struct App {
 
     // chat
     pub messages: Vec<ChatEntry>,
+    /// Monotonic identifier source for locally rendered prompts awaiting ACP echo.
+    pub pending_prompt_seq: u64,
     pub input: String,
     pub input_cursor: usize,
     pub input_scroll: u16,
@@ -1257,6 +1259,7 @@ pub struct App {
     pub prev_total_height: u16,
     pub activity: ActivityState,
     pub streaming_content: String,
+    pub streaming_content_message_id: Option<String>,
     pub streaming_cache: StreamingCache,
     pub streaming_thinking: String,
     pub streaming_thinking_message_id: Option<String>,
@@ -1495,6 +1498,7 @@ impl App {
             session_activity: HashMap::new(),
             remote_session_nodes: HashMap::new(),
             messages: Vec::new(),
+            pending_prompt_seq: 0,
             input: String::new(),
             input_cursor: 0,
             input_scroll: 0,
@@ -1507,6 +1511,7 @@ impl App {
             prev_total_height: 0,
             activity: ActivityState::Idle,
             streaming_content: String::new(),
+            streaming_content_message_id: None,
             streaming_cache: StreamingCache::new(),
             streaming_thinking: String::new(),
             streaming_thinking_message_id: None,
@@ -2227,6 +2232,18 @@ impl App {
 
     pub fn selected_fork_turn(&self) -> Option<ForkTurnItem> {
         self.visible_fork_turns().get(self.fork_cursor).cloned()
+    }
+
+    pub fn push_pending_prompt(&mut self, text: String) -> String {
+        self.pending_prompt_seq = self.pending_prompt_seq.saturating_add(1);
+        let local_id = format!("local:pending:{}", self.pending_prompt_seq);
+        self.messages.push(ChatEntry::User {
+            text,
+            message_id: Some(local_id.clone()),
+        });
+        self.card_cache.invalidate();
+        self.scroll_offset = 0;
+        local_id
     }
 
     pub fn input_blocked_by_activity(&self) -> bool {

@@ -143,6 +143,10 @@ pub(crate) enum AcpAppEvent {
     Error {
         message: String,
     },
+    PromptFailed {
+        local_id: String,
+        message: String,
+    },
 }
 
 impl crate::app::App {
@@ -316,6 +320,7 @@ impl crate::app::App {
                 if ur.success {
                     self.recent_prompt_text = None;
                     self.streaming_content.clear();
+                    self.streaming_content_message_id = None;
                     self.streaming_cache.invalidate();
                     self.set_status(LogLevel::Info, "session", "undone - reloading session");
                     if let Some(ref sid) = self.session_id {
@@ -446,6 +451,22 @@ impl crate::app::App {
             }
             AcpAppEvent::Error { message } => {
                 self.end_llm_request_span(None);
+                self.push_acp_error(&message);
+                self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
+                vec![]
+            }
+            AcpAppEvent::PromptFailed { local_id, message } => {
+                self.end_llm_request_span(None);
+                self.messages.retain(|entry| {
+                    !matches!(
+                        entry,
+                        ChatEntry::User {
+                            message_id: Some(message_id),
+                            ..
+                        } if message_id == &local_id
+                    )
+                });
+                self.card_cache.invalidate();
                 self.push_acp_error(&message);
                 self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
                 vec![]
@@ -592,7 +613,9 @@ impl crate::app::App {
 
     fn reset_active_session_view(&mut self) {
         self.messages.clear();
+        self.pending_prompt_seq = 0;
         self.streaming_content.clear();
+        self.streaming_content_message_id = None;
         self.streaming_thinking.clear();
         self.streaming_thinking_message_id = None;
         self.invalidate_streaming_caches();
@@ -640,6 +663,7 @@ impl crate::app::App {
                 }
                 self.activity = ActivityState::Thinking;
                 self.streaming_content.clear();
+                self.streaming_content_message_id = None;
                 self.invalidate_streaming_caches();
                 self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
@@ -647,9 +671,26 @@ impl crate::app::App {
                 content,
                 message_id,
             } => self.push_acp_user_message(content, message_id, is_replay),
-            AcpSessionUpdate::AssistantContentDelta { content, .. } => {
+            AcpSessionUpdate::AssistantContentDelta {
+                content,
+                message_id,
+            } => {
                 if self.is_turn_active() {
                     self.activity = ActivityState::Streaming;
+                }
+                let active_message_id = self
+                    .streaming_content_message_id
+                    .as_deref()
+                    .or(self.streaming_thinking_message_id.as_deref());
+                if message_id.as_deref().is_some_and(|incoming| {
+                    active_message_id.is_some_and(|active| active != incoming)
+                }) {
+                    self.finalize_streaming_segment();
+                }
+                if self.streaming_content.is_empty()
+                    || (self.streaming_content_message_id.is_none() && message_id.is_some())
+                {
+                    self.streaming_content_message_id = message_id;
                 }
                 self.streaming_content.push_str(&content);
             }
@@ -657,6 +698,15 @@ impl crate::app::App {
                 content,
                 message_id,
             } => {
+                let active_message_id = self
+                    .streaming_content_message_id
+                    .as_deref()
+                    .or(self.streaming_thinking_message_id.as_deref());
+                if message_id.as_deref().is_some_and(|incoming| {
+                    active_message_id.is_some_and(|active| active != incoming)
+                }) {
+                    self.finalize_streaming_segment();
+                }
                 if self.streaming_thinking.is_empty()
                     || (self.streaming_thinking_message_id.is_none() && message_id.is_some())
                 {
@@ -679,6 +729,7 @@ impl crate::app::App {
                 }
                 self.activity = ActivityState::RunningTool { name: name.clone() };
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
+                self.finalize_streaming_segment();
                 if name != "question" {
                     let cwd = self.current_session_cwd();
                     let detail =
@@ -809,6 +860,7 @@ impl crate::app::App {
                 }
                 self.activity = ActivityState::Idle;
                 self.streaming_content.clear();
+                self.streaming_content_message_id = None;
                 self.invalidate_streaming_caches();
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
@@ -818,6 +870,7 @@ impl crate::app::App {
                 }
                 self.activity = ActivityState::Idle;
                 self.streaming_content.clear();
+                self.streaming_content_message_id = None;
                 self.streaming_thinking.clear();
                 self.streaming_thinking_message_id = None;
                 self.invalidate_streaming_caches();
@@ -849,6 +902,37 @@ impl crate::app::App {
             self.suppress_turn_output = false;
             return;
         }
+        // QueryMT currently echoes prompts without the client's local ID. Correlating
+        // PromptRequest._meta with UserMessageChunk._meta would make this identity-based;
+        // until then, normalized text is the interoperable fallback for generic ACP agents.
+        if !is_replay
+            && let Some(entry) = self.messages.iter_mut().find(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::User {
+                        text: pending_text,
+                        message_id: Some(pending_id),
+                    } if pending_id.starts_with("local:pending:")
+                        && pending_text.trim() == text.trim()
+                )
+            })
+        {
+            if let ChatEntry::User {
+                text: pending_text,
+                message_id: pending_id,
+            } = entry
+            {
+                *pending_text = text.clone();
+                *pending_id = message_id.clone();
+            }
+            self.recent_prompt_text = Some(text.clone());
+            self.suppress_turn_output = false;
+            if let Some(message_id) = message_id {
+                self.push_undoable_user_turn(message_id, text);
+            }
+            self.card_cache.invalidate();
+            return;
+        }
         if !is_replay && (self.undo_state.is_some() || self.suppress_turn_output) {
             return;
         }
@@ -858,11 +942,44 @@ impl crate::app::App {
             message_id: message_id.clone(),
         });
         self.recent_prompt_text = Some(text.clone());
-        if let Some(message_id) = message_id
-            && !self
-                .undoable_turns
-                .iter()
-                .any(|turn| turn.message_id == message_id)
+        if let Some(message_id) = message_id {
+            self.push_undoable_user_turn(message_id, text);
+        }
+    }
+
+    fn finalize_streaming_segment(&mut self) {
+        if self.streaming_content.is_empty() && self.streaming_thinking.is_empty() {
+            return;
+        }
+        let content = std::mem::take(&mut self.streaming_content);
+        let content_message_id = self.streaming_content_message_id.take();
+        let thinking = (!self.streaming_thinking.is_empty())
+            .then(|| std::mem::take(&mut self.streaming_thinking));
+        let thinking_message_id = self.streaming_thinking_message_id.take();
+        self.invalidate_streaming_caches();
+
+        if content.is_empty() {
+            if let Some(thinking) = thinking {
+                self.messages.push(ChatEntry::Thinking {
+                    content: thinking,
+                    message_id: thinking_message_id,
+                });
+            }
+        } else {
+            self.messages.push(ChatEntry::Assistant {
+                content,
+                thinking,
+                message_id: content_message_id.or(thinking_message_id),
+            });
+        }
+        self.card_cache.invalidate();
+    }
+
+    fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
+        if !self
+            .undoable_turns
+            .iter()
+            .any(|turn| turn.message_id == message_id)
         {
             self.undoable_turns.push(crate::app::UndoableTurn {
                 turn_id: message_id.clone(),
@@ -882,6 +999,7 @@ impl crate::app::App {
         let streaming_thinking_message_id = self.streaming_thinking_message_id.clone();
         let thinking_message_id = message_id.clone().or(streaming_thinking_message_id);
         self.streaming_content.clear();
+        self.streaming_content_message_id = None;
         self.streaming_cache.invalidate();
         if self.is_turn_active() {
             self.activity = ActivityState::Thinking;
@@ -918,8 +1036,8 @@ impl crate::app::App {
                     self.streaming_thinking_cache.invalidate();
                     return;
                 }
-                let existing_thinking = match self.messages.remove(idx) {
-                    ChatEntry::Thinking { content, .. } => content,
+                let existing_thinking = match &self.messages[idx] {
+                    ChatEntry::Thinking { content, .. } => content.clone(),
                     _ => String::new(),
                 };
                 let streaming_thinking = (!self.streaming_thinking.is_empty())
@@ -929,11 +1047,11 @@ impl crate::app::App {
                     .or(streaming_thinking);
                 self.streaming_thinking_message_id = None;
                 self.streaming_thinking_cache.invalidate();
-                self.messages.push(ChatEntry::Assistant {
+                self.messages[idx] = ChatEntry::Assistant {
                     content,
                     thinking: thinking_text,
                     message_id: Some(message_id.to_string()),
-                });
+                };
                 self.card_cache.invalidate();
                 return;
             }
@@ -978,6 +1096,7 @@ impl crate::app::App {
         requested_schema: &Value,
         allow_custom: bool,
     ) {
+        self.finalize_streaming_segment();
         let fields = ElicitationState::parse_schema(requested_schema);
         if fields.is_empty() {
             let outcome = "unsupported schema - cannot answer in TUI";
@@ -1659,6 +1778,205 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_user_chunk_reconciles_optimistic_prompt_before_elicitation() {
+        let mut app = app_with_active_session();
+        app.push_pending_prompt("Choose a deployment target".into());
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::ElicitationRequested {
+                elicitation_id: "question-1".into(),
+                message: "Which target?".into(),
+                requested_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "selection": { "type": "string", "enum": ["staging"] }
+                    },
+                    "required": ["selection"]
+                }),
+                source: "builtin:question".into(),
+                allow_custom: true,
+            },
+        );
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::UserMessage {
+                content: serde_json::json!({ "text": "Choose a deployment target" }),
+                message_id: Some("user-1".into()),
+            },
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::User { message_id: Some(message_id), .. },
+                ChatEntry::Elicitation { elicitation_id, .. }
+            ] if message_id == "user-1" && elicitation_id == "question-1"
+        ));
+    }
+
+    #[test]
+    fn authoritative_user_chunk_reconciles_prompt_with_surrounding_whitespace() {
+        let mut app = app_with_active_session();
+        app.push_pending_prompt("  first line\nsecond line\n  ".into());
+
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::UserMessage {
+                content: serde_json::json!({ "text": "first line\nsecond line" }),
+                message_id: Some("user-1".into()),
+            },
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "first line\nsecond line" && message_id == "user-1"
+        ));
+    }
+
+    #[test]
+    fn identical_normalized_optimistic_prompts_reconcile_in_submission_order() {
+        let mut app = app_with_active_session();
+        app.push_pending_prompt("repeat  \n".into());
+        app.push_pending_prompt(" repeat".into());
+
+        for message_id in ["user-1", "user-2"] {
+            apply_live_update(
+                &mut app,
+                AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "repeat" }),
+                    message_id: Some(message_id.into()),
+                },
+            );
+        }
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::User { text: first_text, message_id: Some(first), .. },
+                ChatEntry::User { text: second_text, message_id: Some(second), .. }
+            ] if first_text == "repeat" && second_text == "repeat"
+                && first == "user-1" && second == "user-2"
+        ));
+    }
+
+    #[test]
+    fn identical_optimistic_prompts_reconcile_in_submission_order() {
+        let mut app = app_with_active_session();
+        app.push_pending_prompt("repeat".into());
+        app.push_pending_prompt("repeat".into());
+
+        for message_id in ["user-1", "user-2"] {
+            apply_live_update(
+                &mut app,
+                AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "repeat" }),
+                    message_id: Some(message_id.into()),
+                },
+            );
+        }
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::User { message_id: Some(first), .. },
+                ChatEntry::User { message_id: Some(second), .. }
+            ] if first == "user-1" && second == "user-2"
+        ));
+    }
+
+    #[test]
+    fn assistant_message_id_change_finalizes_previous_streaming_segment() {
+        let mut app = app_with_active_session();
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantContentDelta {
+                content: "first".into(),
+                message_id: Some("assistant-1".into()),
+            },
+        );
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantContentDelta {
+                content: "second".into(),
+                message_id: Some("assistant-2".into()),
+            },
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Assistant { content, message_id: Some(message_id), .. }]
+                if content == "first" && message_id == "assistant-1"
+        ));
+        assert_eq!(app.streaming_content, "second");
+        assert_eq!(
+            app.streaming_content_message_id.as_deref(),
+            Some("assistant-2")
+        );
+    }
+
+    #[test]
+    fn tool_start_finalizes_streaming_assistant_before_tool() {
+        let mut app = app_with_active_session();
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantContentDelta {
+                content: "Let me check.".into(),
+                message_id: Some("assistant-1".into()),
+            },
+        );
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "pwd" })),
+            },
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, message_id: Some(message_id), .. },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. }
+            ] if content == "Let me check." && message_id == "assistant-1" && tool_call_id == "tool-1"
+        ));
+        assert!(app.streaming_content.is_empty());
+    }
+
+    #[test]
+    fn final_assistant_replaces_matching_thinking_without_crossing_tool() {
+        let mut app = app_with_active_session();
+        app.messages.push(ChatEntry::Thinking {
+            content: "Need to inspect".into(),
+            message_id: Some("assistant-1".into()),
+        });
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("tool-1".into()),
+            name: "read_tool".into(),
+            is_error: false,
+            detail: ToolDetail::None,
+        });
+
+        apply_live_update(
+            &mut app,
+            AcpSessionUpdate::AssistantMessage {
+                content: "Found it".into(),
+                thinking: None,
+                message_id: Some("assistant-1".into()),
+            },
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, thinking: Some(thinking), .. },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. }
+            ] if content == "Found it" && thinking == "Need to inspect" && tool_call_id == "tool-1"
+        ));
+    }
+
+    #[test]
     fn native_thinking_delta_updates_streaming_thinking() {
         let mut app = app_with_active_session();
 
@@ -1894,6 +2212,31 @@ mod tests {
 
         assert!(app.session_stats.open_llm_request_instant.is_none());
         assert_eq!(app.llm_request_elapsed(), None);
+    }
+
+    #[test]
+    fn native_prompt_failure_removes_only_matching_optimistic_prompt() {
+        let mut app = app_with_active_session();
+        let first = app.push_pending_prompt("first".into());
+        let second = app.push_pending_prompt("second".into());
+
+        app.handle_acp_event(AcpAppEvent::PromptFailed {
+            local_id: first,
+            message: "ACP prompt failed".into(),
+        });
+
+        assert!(matches!(
+            app.messages.first(),
+            Some(ChatEntry::User { text, message_id: Some(message_id) })
+                if text == "second" && message_id == &second
+        ));
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::User { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

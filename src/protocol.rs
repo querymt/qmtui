@@ -84,6 +84,8 @@ pub enum ClientMsg {
     },
     Prompt {
         prompt: Vec<PromptBlock>,
+        #[serde(skip)]
+        local_id: String,
     },
     CancelSession,
     ListAllModels {

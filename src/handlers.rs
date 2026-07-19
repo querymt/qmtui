@@ -1696,15 +1696,35 @@ pub(crate) fn handle_chat_key(
                     return Ok(AppAction::None);
                 }
                 let (text, links) = app.build_prompt_text_and_links(&app.input);
+                let text = text.trim().to_string();
                 let _ = app.take_input();
-                let mut prompt = vec![PromptBlock::Text { text }];
+                if text.is_empty() {
+                    return Ok(AppAction::None);
+                }
+                let mut prompt = vec![PromptBlock::Text { text: text.clone() }];
                 for path in links {
                     prompt.push(PromptBlock::ResourceLink {
                         name: path.clone(),
                         uri: path,
                     });
                 }
-                cmd_tx.send(ClientMsg::Prompt { prompt })?;
+                let local_id = app.push_pending_prompt(text);
+                if let Err(error) = cmd_tx.send(ClientMsg::Prompt {
+                    prompt,
+                    local_id: local_id.clone(),
+                }) {
+                    app.messages.retain(|entry| {
+                        !matches!(
+                            entry,
+                            crate::app::ChatEntry::User {
+                                message_id: Some(message_id),
+                                ..
+                            } if message_id == &local_id
+                        )
+                    });
+                    app.card_cache.invalidate();
+                    return Err(error.into());
+                }
             }
         }
         KeyCode::Tab if !input_blocked => {

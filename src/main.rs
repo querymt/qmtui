@@ -570,7 +570,7 @@ mod external_editor_tests {
     use super::*;
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::handlers::*;
-    use app::{ActivityState, App};
+    use app::{ActivityState, App, ChatEntry};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use protocol::PromptBlock;
     use serial_test::serial;
@@ -804,8 +804,64 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("prompt sent"),
-            ClientMsg::Prompt { prompt } if matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
+            ClientMsg::Prompt { prompt, local_id }
+                if local_id.starts_with("local:pending:")
+                    && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
         ));
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "n" && message_id.starts_with("local:pending:")
+        ));
+    }
+
+    #[test]
+    fn chat_submit_normalizes_prompt_before_sending_and_rendering() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.input = "  first line\nsecond line\n  ".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("prompt sent"),
+            ClientMsg::Prompt { prompt, .. }
+                if matches!(prompt.as_slice(), [PromptBlock::Text { text }]
+                    if text == "first line\nsecond line")
+        ));
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::User { text, .. }] if text == "first line\nsecond line"
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_chat_submit_does_not_send_or_render_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.input = " \n  ".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.messages.is_empty());
         assert!(app.input.is_empty());
     }
 

@@ -120,7 +120,8 @@ impl AcpModelsResponse {
 struct AssistantBuffer {
     content: String,
     thinking: String,
-    message_id: Option<String>,
+    content_message_id: Option<String>,
+    thinking_message_id: Option<String>,
 }
 
 enum PendingElicitationResponse {
@@ -672,23 +673,20 @@ async fn handle_ws_elicitation_request(
     id: Value,
     request: acp::CreateElicitationRequest,
 ) {
+    let session_id = elicitation_request_session_id(&request);
+    flush_assistant_buffer(state, srv_tx, &session_id).await;
     let elicitation_id = id
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| id.to_string());
     let (metadata_source, allow_custom) = elicitation_metadata(&request, "acp-ws");
-    let (session_id, requested_schema, source) = match &request.mode {
+    let (requested_schema, source) = match &request.mode {
         acp::ElicitationMode::Form(form) => (
-            elicitation_scope_session_id(&form.scope),
             serde_json::to_value(&form.requested_schema).unwrap_or_else(|_| json!({})),
             metadata_source,
         ),
-        acp::ElicitationMode::Url(url) => (
-            elicitation_scope_session_id(&url.scope),
-            json!({}),
-            format!("acp-url:{}", url.url),
-        ),
-        _ => ("request".to_string(), json!({}), metadata_source),
+        acp::ElicitationMode::Url(url) => (json!({}), format!("acp-url:{}", url.url)),
+        _ => (json!({}), metadata_source),
     };
     state.pending_elicitations.lock().await.insert(
         elicitation_id.clone(),
@@ -882,7 +880,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::UndoStack(undo_stack));
             }
         }
-        ClientMsg::Prompt { prompt } => {
+        ClientMsg::Prompt { prompt, local_id } => {
             let Some(session_id) = state.current_session_id().await else {
                 send_error(srv_tx, "cannot prompt before a session is loaded");
                 return Ok(());
@@ -905,7 +903,13 @@ async fn handle_client_msg<C: AcpConnection>(
                         .await;
                     }
                     Err(err) => {
-                        send_error(&prompt_srv_tx, format!("ACP prompt failed: {err:?}"));
+                        send_acp(
+                            &prompt_srv_tx,
+                            AcpAppEvent::PromptFailed {
+                                local_id,
+                                message: format!("ACP prompt failed: {err:?}"),
+                            },
+                        );
                     }
                 }
                 Ok(())
@@ -1729,6 +1733,13 @@ async fn handle_session_notification(
                 )
                 .await;
             } else {
+                flush_assistant_buffer_for_message(
+                    state,
+                    srv_tx,
+                    &session_id,
+                    message_id.as_deref(),
+                )
+                .await;
                 remember_assistant_chunk(state, &session_id, message_id.clone(), &text, false)
                     .await;
                 send_session_update(
@@ -1746,6 +1757,13 @@ async fn handle_session_notification(
             let text = content_block_text(&chunk.content);
             let message_id = chunk.message_id.as_ref().map(ToString::to_string);
             if !loading {
+                flush_assistant_buffer_for_message(
+                    state,
+                    srv_tx,
+                    &session_id,
+                    message_id.as_deref(),
+                )
+                .await;
                 remember_assistant_chunk(state, &session_id, message_id.clone(), &text, true).await;
             }
             emit_or_queue_update(
@@ -1761,6 +1779,9 @@ async fn handle_session_notification(
             .await;
         }
         acp::SessionUpdate::ToolCall(tool_call) => {
+            if !loading {
+                flush_assistant_buffer(state, srv_tx, &session_id).await;
+            }
             emit_or_queue_update(
                 state,
                 srv_tx,
@@ -1814,13 +1835,75 @@ async fn remember_assistant_chunk(
     }
     let mut buffers = state.assistant_buffers.lock().await;
     let buffer = buffers.entry(session_id.to_string()).or_default();
-    if buffer.message_id.is_none() && message_id.is_some() {
-        buffer.message_id = message_id;
-    }
     if thinking {
+        if buffer.thinking_message_id.is_none() && message_id.is_some() {
+            buffer.thinking_message_id = message_id;
+        }
         buffer.thinking.push_str(text);
     } else {
+        if buffer.content_message_id.is_none() && message_id.is_some() {
+            buffer.content_message_id = message_id;
+        }
         buffer.content.push_str(text);
+    }
+}
+
+fn assistant_buffer_message_id(buffer: &AssistantBuffer) -> Option<String> {
+    buffer
+        .content_message_id
+        .clone()
+        .or_else(|| buffer.thinking_message_id.clone())
+}
+
+fn assistant_buffer_has_different_message(
+    buffer: &AssistantBuffer,
+    incoming_message_id: Option<&str>,
+) -> bool {
+    let Some(incoming) = incoming_message_id else {
+        return false;
+    };
+    assistant_buffer_message_id(buffer)
+        .as_deref()
+        .is_some_and(|current| current != incoming)
+}
+
+async fn flush_assistant_buffer_for_message(
+    state: &Arc<AcpRuntimeState>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    session_id: &str,
+    incoming_message_id: Option<&str>,
+) {
+    let should_flush = state
+        .assistant_buffers
+        .lock()
+        .await
+        .get(session_id)
+        .is_some_and(|buffer| assistant_buffer_has_different_message(buffer, incoming_message_id));
+    if should_flush {
+        flush_assistant_buffer(state, srv_tx, session_id).await;
+    }
+}
+
+async fn flush_assistant_buffer(
+    state: &Arc<AcpRuntimeState>,
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    session_id: &str,
+) {
+    let buffer = state.assistant_buffers.lock().await.remove(session_id);
+    if let Some(buffer) = buffer
+        && (!buffer.content.is_empty() || !buffer.thinking.is_empty())
+    {
+        let message_id = assistant_buffer_message_id(&buffer);
+        send_session_update(
+            srv_tx,
+            session_id,
+            AcpSessionUpdate::AssistantMessage {
+                content: buffer.content,
+                thinking: (!buffer.thinking.is_empty()).then_some(buffer.thinking),
+                message_id,
+            },
+            false,
+        );
     }
 }
 
@@ -1830,21 +1913,7 @@ async fn finish_prompt(
     session_id: &str,
     stop_reason: acp::StopReason,
 ) {
-    let buffer = state.assistant_buffers.lock().await.remove(session_id);
-    if let Some(buffer) = buffer
-        && (!buffer.content.is_empty() || !buffer.thinking.is_empty())
-    {
-        send_session_update(
-            srv_tx,
-            session_id,
-            AcpSessionUpdate::AssistantMessage {
-                content: buffer.content,
-                thinking: (!buffer.thinking.is_empty()).then_some(buffer.thinking),
-                message_id: buffer.message_id,
-            },
-            false,
-        );
-    }
+    flush_assistant_buffer(state, srv_tx, session_id).await;
 
     if matches!(stop_reason, acp::StopReason::Cancelled) {
         send_session_update(srv_tx, session_id, AcpSessionUpdate::Cancelled, false);
@@ -2230,24 +2299,21 @@ async fn handle_elicitation_request(
     request: acp::CreateElicitationRequest,
     responder: acp_sdk::Responder<acp::CreateElicitationResponse>,
 ) {
+    let session_id = elicitation_request_session_id(&request);
+    flush_assistant_buffer(state, srv_tx, &session_id).await;
     let responder_id = responder.id();
     let elicitation_id = responder_id
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| responder_id.to_string());
     let (metadata_source, allow_custom) = elicitation_metadata(&request, "acp");
-    let (session_id, requested_schema, source) = match &request.mode {
+    let (requested_schema, source) = match &request.mode {
         acp::ElicitationMode::Form(form) => (
-            elicitation_scope_session_id(&form.scope),
             serde_json::to_value(&form.requested_schema).unwrap_or_else(|_| json!({})),
             metadata_source,
         ),
-        acp::ElicitationMode::Url(url) => (
-            elicitation_scope_session_id(&url.scope),
-            json!({}),
-            format!("acp-url:{}", url.url),
-        ),
-        _ => ("request".to_string(), json!({}), metadata_source),
+        acp::ElicitationMode::Url(url) => (json!({}), format!("acp-url:{}", url.url)),
+        _ => (json!({}), metadata_source),
     };
 
     state.pending_elicitations.lock().await.insert(
@@ -2267,6 +2333,14 @@ async fn handle_elicitation_request(
         },
         false,
     );
+}
+
+fn elicitation_request_session_id(request: &acp::CreateElicitationRequest) -> String {
+    match &request.mode {
+        acp::ElicitationMode::Form(form) => elicitation_scope_session_id(&form.scope),
+        acp::ElicitationMode::Url(url) => elicitation_scope_session_id(&url.scope),
+        _ => "request".to_string(),
+    }
 }
 
 fn elicitation_metadata(
@@ -2488,6 +2562,63 @@ mod tests {
             "provider": provider,
             "model": model,
         })
+    }
+
+    #[tokio::test]
+    async fn assistant_buffer_flushes_segments_in_order_around_tool_boundary() {
+        let state = Arc::new(AcpRuntimeState::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        remember_assistant_chunk(&state, "session-1", Some("a1".into()), "before", false).await;
+        flush_assistant_buffer(&state, &tx, "session-1").await;
+        send_session_update(
+            &tx,
+            "session-1",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: None,
+            },
+            false,
+        );
+        remember_assistant_chunk(&state, "session-1", Some("a2".into()), "after", false).await;
+        flush_assistant_buffer(&state, &tx, "session-1").await;
+
+        let updates = (0..3)
+            .map(|_| match rx.try_recv().expect("ordered update") {
+                ServerChannelMsg::Acp(AcpAppEvent::SessionUpdate { update, .. }) => update,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            updates.as_slice(),
+            [
+                AcpSessionUpdate::AssistantMessage { content: before, .. },
+                AcpSessionUpdate::ToolCallStart { tool_call_id: Some(tool_id), .. },
+                AcpSessionUpdate::AssistantMessage { content: after, .. },
+            ] if before == "before" && tool_id == "tool-1" && after == "after"
+        ));
+    }
+
+    #[tokio::test]
+    async fn assistant_message_id_change_flushes_previous_segment() {
+        let state = Arc::new(AcpRuntimeState::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        remember_assistant_chunk(&state, "session-1", Some("a1".into()), "first", false).await;
+
+        flush_assistant_buffer_for_message(&state, &tx, "session-1", Some("a2")).await;
+
+        assert!(matches!(
+            rx.try_recv().expect("flushed message"),
+            ServerChannelMsg::Acp(AcpAppEvent::SessionUpdate {
+                update: AcpSessionUpdate::AssistantMessage {
+                    content,
+                    message_id: Some(message_id),
+                    ..
+                },
+                ..
+            }) if content == "first" && message_id == "a1"
+        ));
     }
 
     #[test]
