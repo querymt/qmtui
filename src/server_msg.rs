@@ -200,6 +200,12 @@ impl App {
                 selected: HashMap::new(),
                 text_input: String::new(),
                 text_cursor: 0,
+                allow_custom: source == "builtin:question",
+                custom_active: false,
+                custom_input: String::new(),
+                custom_cursor: 0,
+                custom_line_width: 1,
+                custom_scroll: 0,
             });
             self.messages.push(ChatEntry::Elicitation {
                 elicitation_id: elicitation_id.to_string(),

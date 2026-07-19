@@ -3,7 +3,7 @@ use std::cell::{Cell, Ref, RefCell};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
@@ -12,6 +12,8 @@ use crate::app::{
     ActivityState, App, ChatEntry, DelegateEntry, DiffPreviewSection, SessionOp, ShellOutputTail,
     ToolDetail,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -50,7 +52,7 @@ pub(crate) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
 // ── Elicitation symbols ───────────────────────────────────────────────────────
 const RADIO_SELECTED: &str = "\u{25CF} "; // ● filled circle  – single-select active
 const RADIO_UNSELECTED: &str = "\u{25CB} "; // ○ empty circle   – single-select inactive
-pub(crate) const CHECK_CHECKED: &str = "\u{2611}"; // ☑ ballot box checked   – success/done
+pub(crate) const CHECK_CHECKED: &str = "\u{2611} "; // ☑ ballot box checked   – success/done
 pub(crate) const CHECK_FAILED: &str = "\u{2612}"; // ☒ ballot box with X     – failed
 const CHECK_UNCHECKED: &str = "\u{2610} "; // ☐ ballot box unchecked – multi-select off
 
@@ -929,11 +931,103 @@ fn input_layout_metrics(app: &App, area: Rect) -> (u16, InputVisualLayout) {
     (input_height, input_layout)
 }
 
+fn wrap_elicitation_message(text: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut rows = Vec::new();
+
+    for logical_line in text.lines() {
+        let mut row = String::new();
+        let mut row_width = 0;
+        for word in logical_line.split_whitespace() {
+            let word_width = UnicodeWidthStr::width(word);
+            if !row.is_empty() && row_width + 1 + word_width > width {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+
+            if word_width > width {
+                if !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                }
+                for ch in word.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if row_width > 0 && row_width + ch_width > width {
+                        rows.push(std::mem::take(&mut row));
+                        row_width = 0;
+                    }
+                    row.push(ch);
+                    row_width += ch_width;
+                }
+            } else {
+                if !row.is_empty() {
+                    row.push(' ');
+                    row_width += 1;
+                }
+                row.push_str(word);
+                row_width += word_width;
+            }
+        }
+        rows.push(row);
+    }
+
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+fn wrapped_text_rows(text: &str, width: u16) -> u16 {
+    wrap_elicitation_message(text, width)
+        .len()
+        .min(u16::MAX as usize) as u16
+}
+
+fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
+    description
+        .map(|description| format!("{label}  {description}"))
+        .unwrap_or_else(|| label.to_string())
+}
+
+fn elicitation_option_rows(app: &App, width: u16) -> u16 {
+    use crate::app::ElicitationFieldKind;
+
+    let Some(state) = &app.elicitation else {
+        return 0;
+    };
+    let schema_rows = match state.current_field().map(|field| &field.kind) {
+        Some(ElicitationFieldKind::SingleSelect { options })
+        | Some(ElicitationFieldKind::MultiSelect { options }) => options
+            .iter()
+            .map(|option| {
+                wrapped_text_rows(
+                    &elicitation_option_text(&option.label, option.description.as_deref()),
+                    width,
+                )
+            })
+            .sum(),
+        _ => 1,
+    };
+    schema_rows + u16::from(state.custom_available())
+}
+
 fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
     if let Some(state) = &app.elicitation {
-        let option_rows = state.current_option_count() as u16;
-        // header line + message line + options-or-input (min 1) + hint line
-        (2 + 1 + option_rows.max(1) + 1).min(area.height / 2)
+        let message_width = area.width.saturating_sub(4).max(1);
+        let message_rows = wrapped_text_rows(&state.message, message_width);
+        let option_width = area.width.saturating_sub(6).max(1);
+        let option_rows = elicitation_option_rows(app, option_width);
+        let custom_rows = if state.custom_active {
+            let width = area.width.saturating_sub(4) as usize;
+            build_input_visual_layout(&state.custom_input, state.custom_cursor, width.max(1), 2)
+                .total_rows() as u16
+        } else {
+            0
+        };
+        // Top padding, title, wrapped message, choices/input, and hint, each separated as needed.
+        let content_rows = option_rows.max(1) + custom_rows.min(5);
+        let custom_spacing = u16::from(state.custom_active);
+        (7 + message_rows.max(1) + content_rows + custom_spacing).min(area.height.saturating_sub(3))
     } else {
         0
     }
@@ -1049,16 +1143,14 @@ fn draw_input_panel(
 fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
     use crate::app::ElicitationFieldKind;
 
-    let Some(state) = &app.elicitation else {
-        return;
-    };
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let Some(state) = app.elicitation.as_mut() else {
+        return;
+    };
 
-    // Background
     f.render_widget(Block::default().style(Theme::popup_bg()), area);
-
     let inner = Rect {
         x: area.x + 1,
         y: area.y,
@@ -1071,137 +1163,220 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut row = inner.y;
     let max_y = inner.y + inner.height;
-
-    // ── Title row ────────────────────────────────────────────────────────────
+    // Leave one row of padding before the header.
+    row = row.saturating_add(1).min(max_y);
     if row < max_y {
-        let source_label = state.source_label().to_string();
+        let title_style = Theme::status_accent().add_modifier(Modifier::BOLD);
         let title = Line::from(vec![
-            Span::styled(OUTCOME_BULLET, Theme::status_accent()),
-            Span::styled("Question", Theme::status_accent()),
-            Span::styled(format!("  via {source_label}"), Theme::status()),
+            Span::styled(OUTCOME_BULLET, title_style),
+            Span::styled("Question", title_style),
         ]);
         f.render_widget(
             Paragraph::new(title).style(Theme::popup_bg()),
-            Rect {
-                x: inner.x,
-                y: row,
-                width: inner.width,
-                height: 1,
-            },
+            Rect::new(inner.x, row, inner.width, 1),
         );
         row += 1;
     }
-
-    // ── Message ───────────────────────────────────────────────────────────────
+    // Keep the title visually separate from the question body.
+    row = row.saturating_add(1).min(max_y);
     if row < max_y {
+        let message_area = Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), max_y - row);
+        let message_lines: Vec<Line<'static>> =
+            wrap_elicitation_message(&state.message, message_area.width)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, Theme::fg())))
+                .collect();
+        let message_rows = message_lines.len().max(1) as u16;
+        let message = Paragraph::new(message_lines).style(Theme::popup_bg());
+        let visible_rows = message_rows.min(message_area.height);
         f.render_widget(
-            Paragraph::new(Span::styled(format!("  {}", state.message), Theme::fg()))
-                .style(Theme::popup_bg()),
-            Rect {
-                x: inner.x,
-                y: row,
-                width: inner.width,
-                height: 1,
-            },
+            message,
+            Rect::new(
+                message_area.x,
+                message_area.y,
+                message_area.width,
+                visible_rows,
+            ),
         );
-        row += 1;
+        row += visible_rows;
     }
+    // Keep the choices visually separate from the question text.
+    row = row.saturating_add(1).min(max_y);
 
-    // ── Field content ─────────────────────────────────────────────────────────
-    if row < max_y {
-        let Some(field) = state.current_field() else {
-            return;
-        };
-        match &field.kind {
-            ElicitationFieldKind::SingleSelect { options }
-            | ElicitationFieldKind::MultiSelect { options } => {
-                let is_multi = matches!(&field.kind, ElicitationFieldKind::MultiSelect { .. });
-                let selected_vals = state.selected.get(&field.name);
-                for (idx, opt) in options.iter().enumerate() {
-                    if row >= max_y {
-                        break;
-                    }
-                    let highlighted = idx == state.option_cursor;
-                    let is_chosen = if is_multi {
-                        if let Some(serde_json::Value::Array(arr)) = selected_vals {
-                            arr.contains(&opt.value)
-                        } else {
-                            false
-                        }
-                    } else {
-                        selected_vals == Some(&opt.value)
-                    };
-
-                    let bullet = if is_multi {
-                        if is_chosen {
-                            CHECK_CHECKED
-                        } else {
-                            CHECK_UNCHECKED
-                        }
-                    } else if highlighted {
-                        RADIO_SELECTED
-                    } else {
-                        RADIO_UNSELECTED
-                    };
-                    let style = if highlighted {
-                        Theme::status_accent()
-                    } else {
-                        Theme::status()
-                    };
-                    let line = Line::from(vec![
-                        Span::styled(format!("  {bullet}"), style),
-                        Span::styled(opt.label.clone(), style),
-                        if let Some(desc) = &opt.description {
-                            Span::styled(format!("  {desc}"), Theme::dim())
-                        } else {
-                            Span::raw("")
-                        },
-                    ]);
-                    f.render_widget(
-                        Paragraph::new(line).style(Theme::popup_bg()),
-                        Rect {
-                            x: inner.x,
-                            y: row,
-                            width: inner.width,
-                            height: 1,
-                        },
-                    );
-                    row += 1;
+    let Some(field) = state.current_field().cloned() else {
+        return;
+    };
+    match &field.kind {
+        ElicitationFieldKind::SingleSelect { options }
+        | ElicitationFieldKind::MultiSelect { options } => {
+            let is_multi = matches!(&field.kind, ElicitationFieldKind::MultiSelect { .. });
+            let selected_vals = state.selected.get(&field.name);
+            for (idx, opt) in options.iter().enumerate() {
+                if row >= max_y {
+                    break;
                 }
-            }
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                let placeholder = if matches!(&field.kind, ElicitationFieldKind::NumberInput { .. })
-                {
-                    "enter number\u{2026}"
+                let highlighted = !state.custom_active && idx == state.option_cursor;
+                let is_chosen = if is_multi {
+                    matches!(selected_vals, Some(serde_json::Value::Array(arr)) if arr.contains(&opt.value))
                 } else {
-                    "enter text\u{2026}"
+                    selected_vals == Some(&opt.value)
                 };
-                let display = if state.text_input.is_empty() {
-                    Span::styled(placeholder, Theme::dim())
+                let bullet = if is_multi {
+                    if is_chosen {
+                        CHECK_CHECKED
+                    } else {
+                        CHECK_UNCHECKED
+                    }
+                } else if highlighted {
+                    RADIO_SELECTED
                 } else {
-                    Span::styled(state.text_input.clone(), Theme::fg())
+                    RADIO_UNSELECTED
                 };
-                let line = Line::from(vec![Span::styled("  > ", Theme::status_accent()), display]);
+                let style = if highlighted {
+                    Theme::status_accent()
+                } else {
+                    Theme::status()
+                };
+                let text_width = inner.width.saturating_sub(4).max(1);
+                let option_rows = wrapped_text_rows(
+                    &elicitation_option_text(&opt.label, opt.description.as_deref()),
+                    text_width,
+                )
+                .min(max_y - row);
                 f.render_widget(
-                    Paragraph::new(line).style(Theme::popup_bg()),
-                    Rect {
-                        x: inner.x,
-                        y: row,
-                        width: inner.width,
-                        height: 1,
-                    },
+                    Paragraph::new(Span::styled(format!("  {bullet}"), style))
+                        .style(Theme::popup_bg()),
+                    Rect::new(inner.x, row, 4.min(inner.width), option_rows),
+                );
+                let option_line = Line::from(vec![
+                    Span::styled(opt.label.clone(), style),
+                    opt.description
+                        .as_ref()
+                        .map(|desc| Span::styled(format!("  {desc}"), Theme::dim()))
+                        .unwrap_or_else(|| Span::raw("")),
+                ]);
+                f.render_widget(
+                    Paragraph::new(option_line)
+                        .style(Theme::popup_bg())
+                        .wrap(Wrap { trim: true }),
+                    Rect::new(inner.x + 4, row, text_width, option_rows),
+                );
+                row += option_rows;
+            }
+
+            if state.custom_available() && row < max_y {
+                let highlighted = state.custom_option_selected();
+                let style = if highlighted || state.custom_active {
+                    Theme::status_accent()
+                } else {
+                    Theme::status()
+                };
+                let bullet = if is_multi {
+                    if state.custom_active {
+                        CHECK_CHECKED
+                    } else {
+                        CHECK_UNCHECKED
+                    }
+                } else if highlighted {
+                    RADIO_SELECTED
+                } else {
+                    RADIO_UNSELECTED
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!("  {bullet}"), style),
+                        Span::styled("Custom answer…", style),
+                    ]))
+                    .style(Theme::popup_bg()),
+                    Rect::new(inner.x, row, inner.width, 1),
                 );
                 row += 1;
             }
-            ElicitationFieldKind::BooleanToggle => {
-                let val = state
-                    .selected
-                    .get(&field.name)
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let line = Line::from(vec![
+
+            if state.custom_active && row < max_y {
+                // Keep the custom editor visually separate from the choices.
+                row = row.saturating_add(1).min(max_y);
+                let line_width = inner.width.saturating_sub(2) as usize;
+                state.custom_line_width = line_width.max(1);
+                let layout = build_input_visual_layout(
+                    &state.custom_input,
+                    state.custom_cursor,
+                    state.custom_line_width,
+                    2,
+                );
+                let total_rows = layout.total_rows() as u16;
+                // Reserve a spacer, the help row, and bottom padding below the editor.
+                let visible = total_rows.min(max_y.saturating_sub(row + 3)).min(5);
+                if layout.cursor_row as u16 >= state.custom_scroll + visible {
+                    state.custom_scroll = layout.cursor_row as u16 - visible + 1;
+                }
+                if (layout.cursor_row as u16) < state.custom_scroll {
+                    state.custom_scroll = layout.cursor_row as u16;
+                }
+                state.custom_scroll = state.custom_scroll.min(total_rows.saturating_sub(visible));
+
+                let lines: Vec<Line<'static>> = layout
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, visual_row)| {
+                        if idx == 0 {
+                            Line::from(vec![
+                                Span::styled("> ", Theme::status_accent()),
+                                Span::styled(visual_row.text.clone(), Theme::fg()),
+                            ])
+                        } else {
+                            Line::from(Span::styled(visual_row.text.clone(), Theme::fg()))
+                        }
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .style(Theme::popup_bg())
+                        .scroll((state.custom_scroll, 0)),
+                    Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), visible),
+                );
+                let cursor_row = (layout.cursor_row as u16).saturating_sub(state.custom_scroll);
+                if cursor_row < visible {
+                    f.set_cursor_position((
+                        inner.x + 2 + layout.cursor_col as u16,
+                        row + cursor_row,
+                    ));
+                }
+                row += visible;
+            }
+        }
+        ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
+            let placeholder = if matches!(&field.kind, ElicitationFieldKind::NumberInput { .. }) {
+                "enter number..."
+            } else {
+                "enter text..."
+            };
+            let display = if state.text_input.is_empty() {
+                Span::styled(placeholder, Theme::dim())
+            } else {
+                Span::styled(state.text_input.clone(), Theme::fg())
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  > ", Theme::status_accent()),
+                    display,
+                ]))
+                .style(Theme::popup_bg()),
+                Rect::new(inner.x, row, inner.width, 1),
+            );
+            row += 1;
+        }
+        ElicitationFieldKind::BooleanToggle => {
+            let value = state
+                .selected
+                .get(&field.name)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
                     Span::styled(
-                        if val {
+                        if value {
                             format!("  {CHECK_CHECKED}Yes")
                         } else {
                             format!("  {CHECK_UNCHECKED}No")
@@ -1209,50 +1384,42 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                         Theme::status_accent(),
                     ),
                     Span::styled("  (Space to toggle)", Theme::dim()),
-                ]);
-                f.render_widget(
-                    Paragraph::new(line).style(Theme::popup_bg()),
-                    Rect {
-                        x: inner.x,
-                        y: row,
-                        width: inner.width,
-                        height: 1,
-                    },
-                );
-                row += 1;
-            }
+                ]))
+                .style(Theme::popup_bg()),
+                Rect::new(inner.x, row, inner.width, 1),
+            );
+            row += 1;
         }
     }
 
-    // ── Hint row ──────────────────────────────────────────────────────────────
+    // Keep controls visually separate from the answer area.
+    row = row.saturating_add(1).min(max_y);
     if row < max_y {
-        let Some(field) = state.current_field() else {
-            return;
-        };
-        let arrow_up = super::ARROW_UP;
-        let arrow_down = super::ARROW_DOWN;
-        let hint = match field.kind {
-            ElicitationFieldKind::MultiSelect { .. } => {
-                format!(" {arrow_up}{arrow_down} navigate  Space toggle  Enter submit  Esc decline")
-            }
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                " type answer  Enter submit  Esc decline".to_string()
-            }
-            ElicitationFieldKind::BooleanToggle => {
-                " Space toggle  Enter submit  Esc decline".to_string()
-            }
-            ElicitationFieldKind::SingleSelect { .. } => {
-                format!(" {arrow_up}{arrow_down} navigate  Enter select  Esc decline")
+        let hint = if state.custom_active {
+            " type answer  Shift+Enter newline  Enter submit  Esc back".to_string()
+        } else {
+            match field.kind {
+                ElicitationFieldKind::MultiSelect { .. } => format!(
+                    " {0}{1} navigate  Space toggle  Enter submit  Esc decline",
+                    super::ARROW_UP,
+                    super::ARROW_DOWN
+                ),
+                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
+                    " type answer  Enter submit  Esc decline".to_string()
+                }
+                ElicitationFieldKind::BooleanToggle => {
+                    " Space toggle  Enter submit  Esc decline".to_string()
+                }
+                ElicitationFieldKind::SingleSelect { .. } => format!(
+                    " {0}{1} navigate  Enter select  Esc decline",
+                    super::ARROW_UP,
+                    super::ARROW_DOWN
+                ),
             }
         };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Theme::dim())).style(Theme::popup_bg()),
-            Rect {
-                x: inner.x,
-                y: row,
-                width: inner.width,
-                height: 1,
-            },
+            Rect::new(inner.x, row, inner.width, 1),
         );
     }
 }

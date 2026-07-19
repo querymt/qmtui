@@ -1586,6 +1586,114 @@ mod tests {
     }
 
     #[test]
+    fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "a deliberately long custom response that wraps\nsecond line".into();
+        state.custom_cursor = state.custom_input.len();
+        app.elicitation = Some(state);
+
+        let buffer = render_chat_buffer(&mut app, 40, 21);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Custom answer…"));
+        assert!(rendered.contains("> a deliberately long custom"));
+        assert!(rendered.contains("second line"));
+        assert!(rendered.contains("Shift+Enter newline"));
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_question() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.message = "When designing a new system-level tool, which approach best describes how you balance rapid prototyping and maintainability?".into();
+        app.elicitation = Some(state);
+
+        let buffer = render_chat_buffer(&mut app, 50, 21);
+        let first =
+            find_buffer_text(&buffer, "When designing").expect("missing first question row");
+        let second =
+            find_buffer_text(&buffer, "best describes how").expect("missing wrapped question row");
+        let option = find_buffer_text(&buffer, "Alpha").expect("missing option");
+
+        assert!(second.1 > first.1);
+        assert!(option.1 > second.1);
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_answers() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Keep the validated prototype as the production foundation and improve it gradually through careful iteration".into(),
+                    description: None,
+                }],
+            },
+        }]));
+
+        let buffer = render_chat_buffer(&mut app, 50, 21);
+        let first = find_buffer_text(&buffer, "Keep the validated").expect("missing answer row");
+        let second = find_buffer_text(&buffer, "foundation and improve")
+            .expect("missing wrapped answer row");
+        let custom = find_buffer_text(&buffer, "Custom answer…").expect("missing custom option");
+
+        assert!(second.1 > first.1);
+        assert!(custom.1 > second.1);
+    }
+
+    #[test]
     fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
         use crate::app::{
             ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
@@ -1620,7 +1728,7 @@ mod tests {
             },
         }]));
 
-        let buffer = render_delegate_buffer(&mut app, 100, 16);
+        let buffer = render_delegate_buffer(&mut app, 100, 17);
         let rendered = buffer_text(&buffer);
 
         assert!(

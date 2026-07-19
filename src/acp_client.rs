@@ -634,6 +634,18 @@ async fn handle_ws_elicitation_requested(
         .and_then(Value::as_str)
         .unwrap_or("acp-ws")
         .to_string();
+    let querymt = params
+        .get("_meta")
+        .or_else(|| params.get("meta"))
+        .and_then(|meta| meta.get("querymt"));
+    let allow_custom = source == "builtin:question"
+        || params
+            .get("allow_custom")
+            .or_else(|| params.get("allowCustom"))
+            .or_else(|| querymt.and_then(|meta| meta.get("allow_custom")))
+            .or_else(|| querymt.and_then(|meta| meta.get("allowCustom")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
     state.pending_elicitations.lock().await.insert(
         elicitation_id.clone(),
@@ -647,6 +659,7 @@ async fn handle_ws_elicitation_requested(
             message,
             requested_schema,
             source,
+            allow_custom,
         },
         false,
     );
@@ -663,18 +676,19 @@ async fn handle_ws_elicitation_request(
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| id.to_string());
+    let (metadata_source, allow_custom) = elicitation_metadata(&request, "acp-ws");
     let (session_id, requested_schema, source) = match &request.mode {
         acp::ElicitationMode::Form(form) => (
             elicitation_scope_session_id(&form.scope),
             serde_json::to_value(&form.requested_schema).unwrap_or_else(|_| json!({})),
-            "acp-ws".to_string(),
+            metadata_source,
         ),
         acp::ElicitationMode::Url(url) => (
             elicitation_scope_session_id(&url.scope),
             json!({}),
             format!("acp-url:{}", url.url),
         ),
-        _ => ("request".to_string(), json!({}), "acp-ws".to_string()),
+        _ => ("request".to_string(), json!({}), metadata_source),
     };
     state.pending_elicitations.lock().await.insert(
         elicitation_id.clone(),
@@ -688,6 +702,7 @@ async fn handle_ws_elicitation_request(
             message: request.message,
             requested_schema,
             source,
+            allow_custom,
         },
         false,
     );
@@ -2220,18 +2235,19 @@ async fn handle_elicitation_request(
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| responder_id.to_string());
+    let (metadata_source, allow_custom) = elicitation_metadata(&request, "acp");
     let (session_id, requested_schema, source) = match &request.mode {
         acp::ElicitationMode::Form(form) => (
             elicitation_scope_session_id(&form.scope),
             serde_json::to_value(&form.requested_schema).unwrap_or_else(|_| json!({})),
-            "acp".to_string(),
+            metadata_source,
         ),
         acp::ElicitationMode::Url(url) => (
             elicitation_scope_session_id(&url.scope),
             json!({}),
             format!("acp-url:{}", url.url),
         ),
-        _ => ("request".to_string(), json!({}), "acp".to_string()),
+        _ => ("request".to_string(), json!({}), metadata_source),
     };
 
     state.pending_elicitations.lock().await.insert(
@@ -2247,9 +2263,28 @@ async fn handle_elicitation_request(
             message: request.message,
             requested_schema,
             source,
+            allow_custom,
         },
         false,
     );
+}
+
+fn elicitation_metadata(
+    request: &acp::CreateElicitationRequest,
+    default_source: &str,
+) -> (String, bool) {
+    let querymt = request.meta.as_ref().and_then(|meta| meta.get("querymt"));
+    let source = querymt
+        .and_then(|meta| meta.get("source"))
+        .and_then(Value::as_str)
+        .unwrap_or(default_source)
+        .to_string();
+    let allow_custom = source == "builtin:question"
+        || querymt
+            .and_then(|meta| meta.get("allow_custom").or_else(|| meta.get("allowCustom")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    (source, allow_custom)
 }
 
 fn elicitation_scope_session_id(scope: &acp::ElicitationScope) -> String {
@@ -2506,6 +2541,57 @@ mod tests {
                 && groups[0].next_cursor.as_deref() == Some("cursor-2")
                 && groups[0].sessions[0].session_id == "s1"
         ));
+    }
+
+    #[test]
+    fn elicitation_metadata_enables_builtin_custom_answers() {
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(
+                acp::ElicitationSessionScope::new("session-1"),
+                acp::ElicitationSchema::new().string("selection", true),
+            ),
+            "Choose",
+        )
+        .meta(serde_json::Map::from_iter([(
+            "querymt".to_string(),
+            json!({ "source": "builtin:question" }),
+        )]));
+
+        assert_eq!(
+            elicitation_metadata(&request, "acp"),
+            ("builtin:question".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn elicitation_metadata_respects_explicit_custom_flag_but_keeps_mcp_strict() {
+        let mode = || {
+            acp::ElicitationFormMode::new(
+                acp::ElicitationSessionScope::new("session-1"),
+                acp::ElicitationSchema::new().string("selection", true),
+            )
+        };
+        let strict = acp::CreateElicitationRequest::new(mode(), "Choose").meta(
+            serde_json::Map::from_iter([(
+                "querymt".to_string(),
+                json!({ "source": "mcp:strict-server" }),
+            )]),
+        );
+        let opted_in = acp::CreateElicitationRequest::new(mode(), "Choose").meta(
+            serde_json::Map::from_iter([(
+                "querymt".to_string(),
+                json!({ "source": "mcp:flexible-server", "allow_custom": true }),
+            )]),
+        );
+
+        assert_eq!(
+            elicitation_metadata(&strict, "acp"),
+            ("mcp:strict-server".to_string(), false)
+        );
+        assert_eq!(
+            elicitation_metadata(&opted_in, "acp"),
+            ("mcp:flexible-server".to_string(), true)
+        );
     }
 
     #[test]

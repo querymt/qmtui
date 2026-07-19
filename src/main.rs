@@ -94,6 +94,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
     fn make_elicitation_single_select() -> ElicitationState {
         ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
@@ -229,6 +233,80 @@ mod tests {
         assert!(app.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
         )));
+    }
+
+    #[test]
+    fn elicitation_other_opens_multiline_editor_and_submits_custom_answer() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert!(
+            app.elicitation
+                .as_ref()
+                .is_some_and(|state| state.custom_active)
+        );
+
+        for c in "custom".chars() {
+            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+        }
+        handle_elicitation_key(
+            &mut app,
+            modified_key(KeyCode::Enter, KeyModifiers::SHIFT),
+            &tx,
+        )
+        .unwrap();
+        for c in "answer".chars() {
+            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_none());
+        assert!(matches!(rx.try_recv().expect("message sent"),
+            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            if action == "accept" && c["choice"] == "custom\nanswer"
+        ));
+    }
+
+    #[test]
+    fn elicitation_custom_esc_returns_to_choices_before_declining() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..2 {
+            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+
+        assert!(
+            app.elicitation
+                .as_ref()
+                .is_some_and(|state| !state.custom_active)
+        );
+        assert!(rx.try_recv().is_err());
+
+        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert!(app.elicitation.is_none());
+        assert!(matches!(rx.try_recv().expect("decline sent"),
+            ClientMsg::ElicitationResponse { action, .. } if action == "decline"
+        ));
+    }
+
+    #[test]
+    fn elicitation_empty_custom_answer_stays_open() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..2 {
+            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_some());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

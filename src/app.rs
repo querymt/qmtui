@@ -491,11 +491,19 @@ pub struct ElicitationState {
     pub field_cursor: usize,
     /// Which option within the current select field is highlighted.
     pub option_cursor: usize,
-    /// Accumulated selections (field name → value).
+    /// Accumulated selections (field name -> value).
     pub selected: HashMap<String, serde_json::Value>,
     /// Text buffer for TextInput / NumberInput fields.
     pub text_input: String,
     pub text_cursor: usize,
+    /// Whether select fields may offer a free-form custom response.
+    pub allow_custom: bool,
+    /// Whether the custom response editor currently has focus.
+    pub custom_active: bool,
+    pub custom_input: String,
+    pub custom_cursor: usize,
+    pub custom_line_width: usize,
+    pub custom_scroll: u16,
 }
 
 impl ElicitationState {
@@ -609,7 +617,7 @@ impl ElicitationState {
             .get(self.field_cursor.min(self.fields.len().saturating_sub(1)))
     }
 
-    /// Number of options in the current field's select list (0 for non-select).
+    /// Number of schema-provided options in the current select field.
     pub fn current_option_count(&self) -> usize {
         match self.current_field().map(|field| &field.kind) {
             Some(ElicitationFieldKind::SingleSelect { options }) => options.len(),
@@ -618,14 +626,125 @@ impl ElicitationState {
         }
     }
 
+    pub fn custom_available(&self) -> bool {
+        self.allow_custom && self.current_option_count() > 0
+    }
+
+    pub fn custom_option_selected(&self) -> bool {
+        self.custom_available() && self.option_cursor == self.current_option_count()
+    }
+
+    /// Number of visible choices, including the virtual custom-answer choice.
+    pub fn visible_option_count(&self) -> usize {
+        self.current_option_count() + usize::from(self.custom_available())
+    }
+
     /// Move the option cursor by `delta`, clamped to valid range.
     pub fn move_cursor(&mut self, delta: i32) {
-        let max = self.current_option_count().saturating_sub(1);
+        let max = self.visible_option_count().saturating_sub(1);
         self.option_cursor = (self.option_cursor as i32 + delta).clamp(0, max as i32) as usize;
+    }
+
+    pub fn activate_custom(&mut self) {
+        if !self.custom_option_selected() {
+            return;
+        }
+        self.custom_active = true;
+        self.custom_cursor = self.custom_input.len();
+        if let Some(name) = self.current_field().map(|field| field.name.clone()) {
+            self.selected.remove(&name);
+        }
+    }
+
+    pub fn deactivate_custom(&mut self) {
+        self.custom_active = false;
+        self.custom_scroll = 0;
+    }
+
+    pub fn custom_insert(&mut self, c: char) {
+        self.custom_input.insert(self.custom_cursor, c);
+        self.custom_cursor += c.len_utf8();
+    }
+
+    pub fn custom_backspace(&mut self) {
+        if self.custom_cursor == 0 {
+            return;
+        }
+        let previous = self.custom_input[..self.custom_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.custom_input.drain(previous..self.custom_cursor);
+        self.custom_cursor = previous;
+    }
+
+    pub fn custom_delete(&mut self) {
+        if self.custom_cursor >= self.custom_input.len() {
+            return;
+        }
+        let next = self.custom_input[self.custom_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.custom_cursor + index)
+            .unwrap_or(self.custom_input.len());
+        self.custom_input.drain(self.custom_cursor..next);
+    }
+
+    pub fn custom_left(&mut self) {
+        if self.custom_cursor > 0 {
+            self.custom_cursor = self.custom_input[..self.custom_cursor]
+                .char_indices()
+                .last()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn custom_right(&mut self) {
+        if self.custom_cursor < self.custom_input.len() {
+            self.custom_cursor = self.custom_input[self.custom_cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(index, _)| self.custom_cursor + index)
+                .unwrap_or(self.custom_input.len());
+        }
+    }
+
+    pub fn custom_home(&mut self) {
+        let line_start = self.custom_input[..self.custom_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.custom_cursor = line_start;
+    }
+
+    pub fn custom_end(&mut self) {
+        let line_end = self.custom_input[self.custom_cursor..]
+            .find('\n')
+            .map(|index| self.custom_cursor + index)
+            .unwrap_or(self.custom_input.len());
+        self.custom_cursor = line_end;
+    }
+
+    pub fn custom_move_visual(&mut self, delta: i32) {
+        let layout = crate::ui::build_input_visual_layout(
+            &self.custom_input,
+            self.custom_cursor,
+            self.custom_line_width.max(1),
+            2,
+        );
+        let row = (layout.cursor_row as i32 + delta)
+            .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
+        self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
     }
 
     /// For SingleSelect: record the highlighted option as the field's value.
     pub fn select_current_option(&mut self) {
+        if self.custom_option_selected() {
+            self.activate_custom();
+            return;
+        }
         let Some(field) = self.current_field() else {
             return;
         };
@@ -634,6 +753,9 @@ impl ElicitationState {
         {
             let name = field.name.clone();
             let value = opt.value.clone();
+            self.custom_active = false;
+            self.custom_input.clear();
+            self.custom_cursor = 0;
             self.selected.insert(name, value);
         }
     }
@@ -641,6 +763,10 @@ impl ElicitationState {
     /// For MultiSelect: toggle the highlighted option in the field's array value.
     /// For BooleanToggle: flip between explicit true and false.
     pub fn toggle_current_option(&mut self) {
+        if self.custom_option_selected() {
+            self.activate_custom();
+            return;
+        }
         let Some(field) = self.current_field() else {
             return;
         };
@@ -649,6 +775,8 @@ impl ElicitationState {
                 if let Some(opt) = options.get(self.option_cursor) {
                     let name = field.name.clone();
                     let val = opt.value.clone();
+                    self.custom_input.clear();
+                    self.custom_cursor = 0;
                     let arr = self
                         .selected
                         .entry(name)
@@ -685,7 +813,17 @@ impl ElicitationState {
             match &field.kind {
                 ElicitationFieldKind::SingleSelect { .. }
                 | ElicitationFieldKind::MultiSelect { .. } => {
-                    if let Some(v) = self.selected.get(&field.name) {
+                    if self.custom_active {
+                        let custom =
+                            serde_json::Value::String(self.custom_input.trim().to_string());
+                        let value =
+                            if matches!(&field.kind, ElicitationFieldKind::MultiSelect { .. }) {
+                                serde_json::Value::Array(vec![custom])
+                            } else {
+                                custom
+                            };
+                        obj.insert(field.name.clone(), value);
+                    } else if let Some(v) = self.selected.get(&field.name) {
                         obj.insert(field.name.clone(), v.clone());
                     }
                 }
@@ -725,23 +863,24 @@ impl ElicitationState {
 
     /// Returns true if all required fields have a value.
     pub fn is_valid(&self) -> bool {
+        if self.custom_active {
+            return !self.custom_input.trim().is_empty();
+        }
         for field in &self.fields {
-            if !field.required {
-                continue;
-            }
             match &field.kind {
                 ElicitationFieldKind::SingleSelect { .. }
                 | ElicitationFieldKind::MultiSelect { .. }
-                | ElicitationFieldKind::BooleanToggle => {
-                    if !self.selected.contains_key(&field.name) {
-                        return false;
-                    }
+                | ElicitationFieldKind::BooleanToggle
+                    if field.required && !self.selected.contains_key(&field.name) =>
+                {
+                    return false;
                 }
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                    if self.text_input.is_empty() {
-                        return false;
-                    }
+                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
+                    if field.required && self.text_input.is_empty() =>
+                {
+                    return false;
                 }
+                _ => {}
             }
         }
         true
@@ -769,6 +908,9 @@ impl ElicitationState {
         let Some(field) = self.fields.first() else {
             return String::new();
         };
+        if self.custom_active {
+            return format!("{OUTCOME_BULLET}{}", self.custom_input.trim());
+        }
         match &field.kind {
             ElicitationFieldKind::SingleSelect { options } => {
                 let val = self.selected.get(&field.name);
@@ -816,6 +958,12 @@ impl ElicitationState {
             selected: HashMap::new(),
             text_input: String::new(),
             text_cursor: 0,
+            allow_custom: true,
+            custom_active: false,
+            custom_input: String::new(),
+            custom_cursor: 0,
+            custom_line_width: 1,
+            custom_scroll: 0,
         }
     }
 }
@@ -7916,10 +8064,12 @@ mod tests {
         assert_eq!(state.option_cursor, 1);
         state.move_cursor(1);
         assert_eq!(state.option_cursor, 2);
+        state.move_cursor(1); // built-in questions include a virtual Other choice
+        assert_eq!(state.option_cursor, 3);
         state.move_cursor(1); // clamps at max
-        assert_eq!(state.option_cursor, 2);
+        assert_eq!(state.option_cursor, 3);
         state.move_cursor(-1);
-        assert_eq!(state.option_cursor, 1);
+        assert_eq!(state.option_cursor, 2);
         state.move_cursor(-10);
         assert_eq!(state.option_cursor, 0);
     }
@@ -7950,6 +8100,85 @@ mod tests {
         state.select_current_option(); // select "yes"
         let content = state.build_accept_content();
         assert_eq!(content, serde_json::json!({ "choice": "yes" }));
+    }
+
+    #[test]
+    fn elicitation_custom_single_select_trims_and_replaces_options() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("yes"),
+                    label: "Yes".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "  something else\nwith detail  ".into();
+
+        assert!(state.is_valid());
+        assert_eq!(
+            state.build_accept_content(),
+            serde_json::json!({ "choice": "something else\nwith detail" })
+        );
+        assert_eq!(
+            state.selected_display(),
+            format!("{OUTCOME_BULLET}something else\nwith detail")
+        );
+    }
+
+    #[test]
+    fn elicitation_custom_multi_select_is_exclusive() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choices".into(),
+            title: "Choices".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::MultiSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "A".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state
+            .selected
+            .insert("choices".into(), serde_json::json!(["a"]));
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "custom".into();
+
+        assert_eq!(
+            state.build_accept_content(),
+            serde_json::json!({ "choices": ["custom"] })
+        );
+    }
+
+    #[test]
+    fn elicitation_custom_answer_requires_non_whitespace_text() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: false,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "A".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "  \n ".into();
+        assert!(!state.is_valid());
     }
 
     #[test]

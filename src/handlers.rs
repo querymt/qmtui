@@ -41,13 +41,44 @@ pub(crate) fn handle_elicitation_key(
 ) -> anyhow::Result<()> {
     use app::ElicitationFieldKind;
 
-    // Take a snapshot of what we need before the mutable borrow on app.
     let Some(state) = app.elicitation.as_mut() else {
         return Ok(());
     };
 
+    if state.custom_active {
+        match key.code {
+            KeyCode::Esc => state.deactivate_custom(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                state.custom_insert('\n');
+            }
+            KeyCode::Enter if state.is_valid() => {
+                let eid = state.elicitation_id.clone();
+                let content = state.build_accept_content();
+                let display = state.selected_display();
+                cmd_tx.send(ClientMsg::ElicitationResponse {
+                    elicitation_id: eid.clone(),
+                    action: "accept".into(),
+                    content: Some(content),
+                })?;
+                app.resolve_elicitation(&eid, &display);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.custom_insert(c);
+            }
+            KeyCode::Backspace => state.custom_backspace(),
+            KeyCode::Delete => state.custom_delete(),
+            KeyCode::Left => state.custom_left(),
+            KeyCode::Right => state.custom_right(),
+            KeyCode::Home => state.custom_home(),
+            KeyCode::End => state.custom_end(),
+            KeyCode::Up => state.custom_move_visual(-1),
+            KeyCode::Down => state.custom_move_visual(1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
-        // ── Cancel / decline ─────────────────────────────────────────────────
         KeyCode::Esc => {
             let eid = state.elicitation_id.clone();
             cmd_tx.send(ClientMsg::ElicitationResponse {
@@ -57,16 +88,8 @@ pub(crate) fn handle_elicitation_key(
             })?;
             app.resolve_elicitation(&eid, "declined");
         }
-
-        // ── Navigation (select fields) ────────────────────────────────────────
-        KeyCode::Down => {
-            state.move_cursor(1);
-        }
-        KeyCode::Up => {
-            state.move_cursor(-1);
-        }
-
-        // ── Space: toggle multi-select / boolean ──────────────────────────────
+        KeyCode::Down => state.move_cursor(1),
+        KeyCode::Up => state.move_cursor(-1),
         KeyCode::Char(' ') => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
@@ -78,23 +101,25 @@ pub(crate) fn handle_elicitation_key(
                 state.toggle_current_option();
             }
         }
-
-        // ── Submit ────────────────────────────────────────────────────────────
         KeyCode::Enter => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
             };
             match kind {
                 ElicitationFieldKind::SingleSelect { .. } => {
-                    // Select the highlighted option first
                     state.select_current_option();
+                    if state.custom_active {
+                        return Ok(());
+                    }
+                }
+                ElicitationFieldKind::MultiSelect { .. } if state.custom_option_selected() => {
+                    state.activate_custom();
+                    return Ok(());
                 }
                 ElicitationFieldKind::TextInput
                 | ElicitationFieldKind::NumberInput { .. }
                 | ElicitationFieldKind::BooleanToggle
-                | ElicitationFieldKind::MultiSelect { .. } => {
-                    // Already captured in state; fall through to submit
-                }
+                | ElicitationFieldKind::MultiSelect { .. } => {}
             }
 
             if state.is_valid() {
@@ -108,10 +133,7 @@ pub(crate) fn handle_elicitation_key(
                 })?;
                 app.resolve_elicitation(&eid, &display);
             }
-            // If not valid (required field missing), do nothing — keep popup open.
         }
-
-        // ── Text / number input ───────────────────────────────────────────────
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
@@ -134,7 +156,6 @@ pub(crate) fn handle_elicitation_key(
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
             ) && state.text_cursor > 0
             {
-                // Remove the char just before the cursor
                 let cursor = state.text_cursor;
                 let ch = state.text_input[..cursor].chars().next_back().unwrap();
                 let ch_len = ch.len_utf8();
@@ -142,7 +163,6 @@ pub(crate) fn handle_elicitation_key(
                 state.text_cursor -= ch_len;
             }
         }
-
         _ => {}
     }
     Ok(())

@@ -60,6 +60,7 @@ pub(crate) enum AcpSessionUpdate {
         message: String,
         requested_schema: Value,
         source: String,
+        allow_custom: bool,
     },
     Cancelled,
     Finished {
@@ -792,12 +793,14 @@ impl crate::app::App {
                 message,
                 requested_schema,
                 source,
+                allow_custom,
             } => {
                 self.handle_acp_elicitation_requested(
                     &elicitation_id,
                     &message,
                     &source,
                     &requested_schema,
+                    allow_custom,
                 );
             }
             AcpSessionUpdate::Cancelled => {
@@ -973,6 +976,7 @@ impl crate::app::App {
         message: &str,
         source: &str,
         requested_schema: &Value,
+        allow_custom: bool,
     ) {
         let fields = ElicitationState::parse_schema(requested_schema);
         if fields.is_empty() {
@@ -1000,6 +1004,12 @@ impl crate::app::App {
                 selected: std::collections::HashMap::new(),
                 text_input: String::new(),
                 text_cursor: 0,
+                allow_custom,
+                custom_active: false,
+                custom_input: String::new(),
+                custom_cursor: 0,
+                custom_line_width: 1,
+                custom_scroll: 0,
             });
             self.messages.push(ChatEntry::Elicitation {
                 elicitation_id: elicitation_id.to_string(),
