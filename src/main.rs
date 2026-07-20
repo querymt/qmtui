@@ -1,18 +1,23 @@
 #![allow(dead_code)]
 
+mod acp_client;
+mod acp_state;
 mod app;
 mod config;
 mod handlers;
 mod highlight;
 mod input;
 mod markdown;
+mod mesh;
 mod protocol;
 mod server_manager;
+#[cfg(test)]
 mod server_msg;
 mod session;
 mod slash;
 mod theme;
 mod themes_gen;
+mod tool_detail;
 mod ui;
 
 use std::{
@@ -23,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use acp_state::AcpAppEvent;
 use app::{App, Screen};
 use clap::Parser;
 use crossterm::{
@@ -30,40 +36,35 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::{SinkExt, StreamExt};
-use protocol::{ClientMsg, RawServerMsg};
+use futures::StreamExt;
+use protocol::ClientMsg;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+
+const DEFAULT_ACP_WS_HOST: &str = "127.0.0.1";
+const DEFAULT_ACP_WS_PORT: &str = "3030";
+const DEFAULT_ACP_WS_PATH: &str = "/ws";
 
 #[derive(Debug)]
-enum ConnectionManagerEvent {
+pub(crate) enum ConnectionManagerEvent {
     State(app::ConnectionEvent),
 }
 
 #[derive(Debug)]
-enum ServerChannelMsg {
-    Parsed(RawServerMsg),
-    Invalid { error: String, raw: String },
+pub(crate) enum ServerChannelMsg {
+    Acp(AcpAppEvent),
 }
 
-fn parse_server_text_for_channel(text: &str) -> ServerChannelMsg {
-    match serde_json::from_str::<RawServerMsg>(text) {
-        Ok(raw) => ServerChannelMsg::Parsed(raw),
-        Err(err) => ServerChannelMsg::Invalid {
-            error: err.to_string(),
-            raw: text.to_string(),
-        },
-    }
-}
-
-fn log_invalid_server_message(app: &mut App, error: String, raw: String) {
-    app.status = format!("invalid server message: {error}");
-    app.push_log(
-        app::LogLevel::Error,
-        "protocol",
-        format!("invalid server message: {error}; raw: {raw}"),
-    );
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndpointSelection {
+    Endpoint {
+        endpoint: acp_client::AcpEndpoint,
+        state: server_manager::ServerState,
+        discovered_ws: Option<String>,
+        missing_binary_fallback: bool,
+    },
+    BinaryNotFound,
+    Disabled,
 }
 
 fn reconnect_delay_ms(attempt: u32) -> u64 {
@@ -91,6 +92,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     fn make_elicitation_single_select() -> ElicitationState {
@@ -181,35 +186,11 @@ mod tests {
 
     #[test]
     fn raw_server_msg_missing_data_parses_as_none() {
-        let raw = serde_json::from_str::<RawServerMsg>(r#"{"type":"heartbeat"}"#).unwrap();
+        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#)
+            .unwrap();
 
         assert_eq!(raw.msg_type, "heartbeat");
         assert!(raw.data.is_none());
-    }
-
-    #[test]
-    fn invalid_server_message_log_includes_full_raw_payload() {
-        let raw = r#"{"data":"missing type","nested":{"value":"do not truncate"}}"#;
-        let ServerChannelMsg::Invalid {
-            error,
-            raw: parsed_raw,
-        } = parse_server_text_for_channel(raw)
-        else {
-            panic!("expected invalid server message");
-        };
-        let mut app = App::new();
-
-        log_invalid_server_message(&mut app, error.clone(), parsed_raw);
-
-        assert!(error.contains("missing field `type`"));
-        assert_eq!(app.status, format!("invalid server message: {error}"));
-        let log = app.logs.last().unwrap();
-        assert_eq!(log.level, app::LogLevel::Error);
-        assert_eq!(log.target, "protocol");
-        assert_eq!(
-            log.message,
-            format!("invalid server message: {error}; raw: {raw}")
-        );
     }
 
     // ── Elicitation key handling ──────────────────────────────────────────────
@@ -252,6 +233,80 @@ mod tests {
         assert!(app.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
         )));
+    }
+
+    #[test]
+    fn elicitation_other_opens_multiline_editor_and_submits_custom_answer() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        assert!(
+            app.elicitation
+                .as_ref()
+                .is_some_and(|state| state.custom_active)
+        );
+
+        for c in "custom".chars() {
+            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+        }
+        handle_elicitation_key(
+            &mut app,
+            modified_key(KeyCode::Enter, KeyModifiers::SHIFT),
+            &tx,
+        )
+        .unwrap();
+        for c in "answer".chars() {
+            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_none());
+        assert!(matches!(rx.try_recv().expect("message sent"),
+            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            if action == "accept" && c["choice"] == "custom\nanswer"
+        ));
+    }
+
+    #[test]
+    fn elicitation_custom_esc_returns_to_choices_before_declining() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..2 {
+            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+
+        assert!(
+            app.elicitation
+                .as_ref()
+                .is_some_and(|state| !state.custom_active)
+        );
+        assert!(rx.try_recv().is_err());
+
+        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert!(app.elicitation.is_none());
+        assert!(matches!(rx.try_recv().expect("decline sent"),
+            ClientMsg::ElicitationResponse { action, .. } if action == "decline"
+        ));
+    }
+
+    #[test]
+    fn elicitation_empty_custom_answer_stays_open() {
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..2 {
+            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        }
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.elicitation.is_some());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -513,9 +568,9 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
-    use crate::config::{ServerConfig, TestPersistenceGuard, TuiConfig};
+    use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::handlers::*;
-    use app::{ActivityState, App};
+    use app::{ActivityState, App, ChatEntry};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use protocol::PromptBlock;
     use serial_test::serial;
@@ -687,9 +742,9 @@ mod external_editor_tests {
     fn log_server_binary_discovery_records_path_lookup_when_binary_path_unset() {
         let mut app = App::new();
         let cfg = TuiConfig {
-            server: ServerConfig {
+            acp: AcpConfig {
                 binary_path: None,
-                ..ServerConfig::default()
+                ..AcpConfig::default()
             },
             ..TuiConfig::default()
         };
@@ -705,10 +760,10 @@ mod external_editor_tests {
             },
         );
 
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
-            && entry.message == "server.binary_path not set; checking qmtcode on PATH"));
-        assert!(app.logs.iter().any(|entry| entry.target == "server"
+            && entry.message == "acp.binary_path not set; checking qmtcode on PATH"));
+        assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
             && entry.message == "qmtcode not found on PATH"));
     }
@@ -749,8 +804,64 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("prompt sent"),
-            ClientMsg::Prompt { prompt } if matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
+            ClientMsg::Prompt { prompt, local_id }
+                if local_id.starts_with("local:pending:")
+                    && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
         ));
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "n" && message_id.starts_with("local:pending:")
+        ));
+    }
+
+    #[test]
+    fn chat_submit_normalizes_prompt_before_sending_and_rendering() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.input = "  first line\nsecond line\n  ".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().expect("prompt sent"),
+            ClientMsg::Prompt { prompt, .. }
+                if matches!(prompt.as_slice(), [PromptBlock::Text { text }]
+                    if text == "first line\nsecond line")
+        ));
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::User { text, .. }] if text == "first line\nsecond line"
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_chat_submit_does_not_send_or_render_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.conn = app::ConnState::Connected;
+        app.input = " \n  ".into();
+        app.input_cursor = app.input.len();
+
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(app.messages.is_empty());
         assert!(app.input.is_empty());
     }
 
@@ -1353,6 +1464,10 @@ mod external_editor_tests {
             ClientMsg::CancelSession
         ));
         assert_eq!(app.status, "stopping...");
+        assert!(matches!(
+            app.logs.last(),
+            Some(entry) if entry.target == "activity" && entry.message == "stopping..."
+        ));
     }
 
     #[test]
@@ -1456,13 +1571,146 @@ mod external_editor_tests {
 #[command(version = env!("QMTUI_BUILD_VERSION"))]
 #[command(about = "querymt terminal interface")]
 struct Cli {
-    /// Server address (e.g. 127.0.0.1:3030). Overrides the value in ~/.qmt/tui.toml.
-    #[arg(long)]
-    server: Option<String>,
+    /// Override the qmtcode binary used for ACP stdio for this run.
+    #[arg(short = 'b', long = "acp-binary")]
+    acp_binary: Option<String>,
+
+    /// Connect to an ACP WebSocket server; defaults to 127.0.0.1:3030.
+    #[arg(short = 'w', long = "ws", value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_ACP_WS_HOST)]
+    ws: Option<String>,
+
+    /// Backcompat alias for --ws.
+    #[arg(long, hide = true)]
+    acp_websocket: Option<String>,
 
     /// Restore a session by id.
     #[arg(short = 's', long)]
     session: Option<String>,
+}
+
+fn normalize_acp_ws_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default_acp_ws_url();
+    }
+
+    let mut url = if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed.to_string()
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    let scheme_end = url.find("://").map(|idx| idx + 3).unwrap_or(0);
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map(|idx| scheme_end + idx)
+        .unwrap_or(url.len());
+    if !url[scheme_end..authority_end].contains(':') {
+        url.insert_str(authority_end, &format!(":{DEFAULT_ACP_WS_PORT}"));
+    }
+
+    let path_start = url[scheme_end..].find('/').map(|idx| scheme_end + idx);
+    match path_start {
+        Some(path_start) if url[path_start..].trim_end_matches('/').is_empty() => {
+            url.truncate(path_start);
+            url.push_str(DEFAULT_ACP_WS_PATH);
+        }
+        Some(_) => {}
+        None => url.push_str(DEFAULT_ACP_WS_PATH),
+    }
+    url
+}
+
+fn default_acp_ws_url() -> String {
+    normalize_acp_ws_url(DEFAULT_ACP_WS_HOST)
+}
+
+fn select_acp_endpoint(
+    cli: &Cli,
+    cfg: &config::TuiConfig,
+    default_ws_available: bool,
+) -> EndpointSelection {
+    if let Some(url) = cli
+        .ws
+        .as_deref()
+        .or(cli.acp_websocket.as_deref())
+        .map(normalize_acp_ws_url)
+    {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket { url },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if let Some(binary_path) = cli.acp_binary.as_deref() {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::Stdio {
+                argv: server_manager::build_acp_argv(OsString::from(binary_path), cfg.acp_args()),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if let Some(url) = cfg.acp.websocket_url.as_deref().map(normalize_acp_ws_url) {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket { url },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    let transport = cfg.acp.transport.unwrap_or_default();
+    if transport == config::AcpTransportMode::WebSocket {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_acp_ws_url(),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        };
+    }
+
+    if !cfg.acp.auto_start.unwrap_or(true) {
+        return EndpointSelection::Disabled;
+    }
+
+    let default_ws_url = default_acp_ws_url();
+    if default_ws_available {
+        return EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_ws_url.clone(),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: Some(default_ws_url),
+            missing_binary_fallback: false,
+        };
+    }
+
+    let discovery = server_manager::find_binary_info(cfg.acp.binary_path.as_deref());
+    discovery.binary.map_or_else(
+        || EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::WebSocket {
+                url: default_ws_url,
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: true,
+        },
+        |binary| EndpointSelection::Endpoint {
+            endpoint: acp_client::AcpEndpoint::Stdio {
+                argv: server_manager::build_acp_argv(binary, cfg.acp_args()),
+            },
+            state: server_manager::ServerState::Starting,
+            discovered_ws: None,
+            missing_binary_fallback: false,
+        },
+    )
 }
 
 fn detect_launch_cwd() -> Option<String> {
@@ -1502,7 +1750,7 @@ fn system_editor_command() -> Option<EditorCommand> {
     editor_command_from_env(&[("VISUAL", visual.as_deref()), ("EDITOR", editor.as_deref())])
 }
 
-use handlers::{AppAction, handle_key, handle_mouse, save_cache};
+use handlers::{AppAction, handle_key, handle_mouse};
 
 fn temp_editor_file_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -1584,18 +1832,18 @@ fn log_server_binary_discovery(
     if let Some(path) = discovery.configured_path.as_deref() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
+            "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
-    } else if cfg.server.binary_path.is_none() {
+    } else if cfg.acp.binary_path.is_none() {
         app.push_log(
             app::LogLevel::Info,
-            "server",
-            "server.binary_path not set; checking qmtcode on PATH",
+            "acp",
+            "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(app::LogLevel::Info, "server", "qmtcode not found on PATH");
+        app.push_log(app::LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1628,18 +1876,9 @@ async fn main() -> anyhow::Result<()> {
     // Load persistent config; CLI args override config defaults.
     let cfg = config::TuiConfig::load();
 
-    let addr = cli
-        .server
-        .or_else(|| cfg.server.addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:42069".to_string());
-    let tls = cfg.server.tls.unwrap_or(false);
-
     // Apply saved theme (falls back to built-in default if absent or unknown).
     let theme_id = cfg.theme.as_deref().unwrap_or("base16-querymate");
     theme::Theme::init(theme_id);
-
-    let scheme = if tls { "wss" } else { "ws" };
-    let url = format!("{scheme}://{addr}/ui/ws");
 
     // channels for the event loop
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerChannelMsg>();
@@ -1655,54 +1894,86 @@ async fn main() -> anyhow::Result<()> {
             app.set_delegate_model_preference(agent_id, provider, model);
         }
     }
-    for (mode, model_key) in &cfg.mode_models {
-        if let Some((provider, model)) = model_key.split_once('/') {
-            app.set_mode_model_preference(mode, provider, model);
-        }
-    }
     if let Some(session_id) = cli.session.clone() {
         app.session_id = Some(session_id);
         app.screen = Screen::Chat;
     }
-    // Hydrate session effort cache from disk.
-    config::TuiCache::load().hydrate_app(&mut app);
-
-    // ── Server auto-start ─────────────────────────────────────────────────────
-    let auto_start = cfg.server.auto_start.unwrap_or(true);
-    let shutdown_on_exit = cfg.server.shutdown_on_exit.unwrap_or(true);
-    let launch_mode = cfg.server.launch_mode.unwrap_or_default();
+    // -- ACP auto-start ---------------------------------------------------------
     let (sup_event_tx, mut sup_event_rx) = mpsc::unbounded_channel::<server_manager::ServerEvent>();
-    let (sup_shutdown_tx, sup_shutdown_rx) = mpsc::channel::<()>(1);
+    let default_ws_available = cli.ws.is_none()
+        && cli.acp_websocket.is_none()
+        && cli.acp_binary.is_none()
+        && cfg.acp.websocket_url.is_none()
+        && cfg.acp.transport.unwrap_or_default() != config::AcpTransportMode::WebSocket
+        && cfg.acp.auto_start.unwrap_or(true)
+        && acp_client::probe_websocket(&default_acp_ws_url(), Duration::from_millis(250)).await;
 
-    let initial_server_state = if auto_start {
-        let discovery = server_manager::find_binary_info(cfg.server.binary_path.as_deref());
-        log_server_binary_discovery(&mut app, &cfg, &discovery);
-
-        if let Some(binary) = discovery.binary {
-            let sup_config = server_manager::ServerManagerConfig {
-                addr: addr.clone(),
-                launch_mode,
-                binary_args: cfg.server.binary_args.clone().unwrap_or_default(),
-                shutdown_on_exit,
-                lock_path: None,
-                ready_timeout: None,
-            };
-            tokio::spawn(server_manager::supervisor(
-                sup_config,
-                binary,
-                sup_event_tx,
-                sup_shutdown_rx,
-            ));
-            server_manager::ServerState::Starting
-        } else {
-            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            server_manager::ServerState::BinaryNotFound
+    let selection = select_acp_endpoint(&cli, &cfg, default_ws_available);
+    if let EndpointSelection::Endpoint {
+        discovered_ws: Some(url),
+        ..
+    } = &selection
+    {
+        app.push_log(
+            app::LogLevel::Info,
+            "acp",
+            format!("found ACP WebSocket server at {url}"),
+        );
+    }
+    if cli.acp_binary.is_none()
+        && cfg.acp.transport.unwrap_or_default() == config::AcpTransportMode::Stdio
+    {
+        let discovery = server_manager::find_binary_info(cfg.acp.binary_path.as_deref());
+        if matches!(
+            selection,
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::Stdio { .. },
+                ..
+            } | EndpointSelection::Endpoint {
+                missing_binary_fallback: true,
+                ..
+            } | EndpointSelection::BinaryNotFound
+        ) {
+            log_server_binary_discovery(&mut app, &cfg, &discovery);
         }
-    } else {
-        server_manager::ServerState::Disabled
+    }
+    if let EndpointSelection::Endpoint {
+        missing_binary_fallback: true,
+        endpoint: acp_client::AcpEndpoint::WebSocket { url },
+        ..
+    } = &selection
+    {
+        app.push_log(
+            app::LogLevel::Warn,
+            "acp",
+            format!("qmtcode unavailable; waiting for ACP WebSocket at {url}"),
+        );
+    }
+
+    let (endpoint, initial_server_state) = match selection {
+        EndpointSelection::Endpoint {
+            endpoint,
+            state,
+            discovered_ws: _,
+            missing_binary_fallback: _,
+        } => (Some(endpoint), state),
+        EndpointSelection::BinaryNotFound => {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
+            (None, server_manager::ServerState::BinaryNotFound)
+        }
+        EndpointSelection::Disabled => (None, server_manager::ServerState::Disabled),
     };
 
-    tokio::spawn(connection_manager(url, srv_tx, cmd_rx, conn_tx));
+    if let Some(endpoint) = endpoint {
+        tokio::spawn(connection_manager(
+            endpoint,
+            srv_tx,
+            cmd_rx,
+            conn_tx,
+            sup_event_tx.clone(),
+            app.launch_cwd.clone(),
+        ));
+    }
 
     // setup terminal
     enable_raw_mode()?;
@@ -1721,9 +1992,6 @@ async fn main() -> anyhow::Result<()> {
         &cmd_tx,
     )
     .await;
-
-    // Signal supervisor to stop (and kill the child if configured).
-    let _ = sup_shutdown_tx.send(()).await;
 
     // restore terminal
     disable_raw_mode()?;
@@ -1748,71 +2016,104 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 async fn connection_manager(
-    url: String,
+    endpoint: acp_client::AcpEndpoint,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
     conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
+    sup_event_tx: mpsc::UnboundedSender<server_manager::ServerEvent>,
+    launch_cwd: Option<String>,
 ) {
-    let mut attempt = 0u32;
+    match endpoint {
+        acp_client::AcpEndpoint::Stdio { argv } => {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
+            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
+                Ok(agent) => agent,
+                Err(err) => {
+                    let message = format!("invalid ACP stdio command: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: message.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason: message },
+                    ));
+                    return;
+                }
+            };
 
-    loop {
-        if attempt > 0 {
-            let delay_ms = reconnect_delay_ms(attempt - 1);
-            let _ = conn_tx.send(ConnectionManagerEvent::State(
-                app::ConnectionEvent::Connecting { attempt, delay_ms },
-            ));
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
+            let _ = sup_event_tx.send(server_manager::ServerEvent::Started);
+            let result = acp_client::run_stdio_agent(
+                agent,
+                &mut cmd_rx,
+                srv_tx,
+                conn_tx.clone(),
+                launch_cwd,
+            )
+            .await;
 
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((ws_stream, _)) => {
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Connected,
-                ));
-                let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-                let disconnected_reason = loop {
-                    tokio::select! {
-                        biased;
-                        maybe_cmd = cmd_rx.recv() => {
-                            let Some(cmd) = maybe_cmd else { return; };
-                            if let Ok(json) = serde_json::to_string(&cmd)
-                                && ws_tx.send(Message::Text(json.into())).await.is_err()
-                            {
-                                break String::from("send failed");
-                            }
-                        }
-                        maybe_msg = ws_rx.next() => {
-                            match maybe_msg {
-                                Some(Ok(Message::Text(text))) => {
-                                    let _ = srv_tx.send(parse_server_text_for_channel(&text));
-                                }
-                                Some(Ok(_)) => {}
-                                Some(Err(err)) => {
-                                    break err.to_string();
-                                }
-                                None => {
-                                    break String::from("socket closed");
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: disconnected_reason,
-                    },
-                ));
-                attempt = 1;
+            match result {
+                Ok(()) => {
+                    let reason = "ACP stdio connection ended".to_string();
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
+                        reason: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
+                Err(err) => {
+                    let reason = format!("ACP stdio connection failed: {err:?}");
+                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                        error: reason.clone(),
+                    });
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Disconnected { reason },
+                    ));
+                }
             }
-            Err(err) => {
-                attempt = attempt.saturating_add(1).max(1);
-                let _ = conn_tx.send(ConnectionManagerEvent::State(
-                    app::ConnectionEvent::Disconnected {
-                        reason: err.to_string(),
-                    },
-                ));
+        }
+        acp_client::AcpEndpoint::WebSocket { url } => {
+            let mut attempt = 0u32;
+            loop {
+                if attempt > 0 {
+                    let delay_ms = reconnect_delay_ms(attempt - 1);
+                    let _ = conn_tx.send(ConnectionManagerEvent::State(
+                        app::ConnectionEvent::Connecting { attempt, delay_ms },
+                    ));
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
+                let result = acp_client::run_websocket_agent(
+                    url.clone(),
+                    &mut cmd_rx,
+                    srv_tx.clone(),
+                    conn_tx.clone(),
+                    launch_cwd.clone(),
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let reason = "ACP WebSocket connection ended".to_string();
+                        let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
+                            reason: reason.clone(),
+                        });
+                        let _ = conn_tx.send(ConnectionManagerEvent::State(
+                            app::ConnectionEvent::Disconnected { reason },
+                        ));
+                        return;
+                    }
+                    Err(err) => {
+                        let reason = format!("ACP WebSocket connection failed ({url}): {err:?}");
+                        let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
+                            error: reason.clone(),
+                        });
+                        let _ = conn_tx.send(ConnectionManagerEvent::State(
+                            app::ConnectionEvent::Disconnected { reason },
+                        ));
+                        attempt = attempt.saturating_add(1).max(1);
+                    }
+                }
             }
         }
     }
@@ -1845,9 +2146,7 @@ async fn run_loop(
                         if app.conn == app::ConnState::Connected {
                             cmd_tx.send(ClientMsg::Init)?;
                             cmd_tx.send(ClientMsg::list_sessions_browse())?;
-                            cmd_tx.send(ClientMsg::ListProfiles)?;
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
-                            cmd_tx.send(ClientMsg::GetAgentMode)?;
                             if let Some(session_id) = app.session_id.clone() {
                                 if let Some(node_id) = app.session_remote_node_id(&session_id) {
                                     cmd_tx.send(ClientMsg::AttachRemoteSession {
@@ -1863,6 +2162,7 @@ async fn run_loop(
                                 } else {
                                     cmd_tx.send(ClientMsg::LoadSession {
                                         session_id: session_id.clone(),
+                                        cwd: app.current_session_cwd(),
                                     })?;
                                     cmd_tx.send(ClientMsg::SubscribeSession {
                                         session_id,
@@ -1880,31 +2180,19 @@ async fn run_loop(
                     }
                 }
             }
-            // server messages
-            Some(msg) = srv_rx.recv() => {
-                match msg {
-                    ServerChannelMsg::Parsed(msg) => {
-                        // Save config when the server authoritatively updates effort.
-                        let is_effort_push = msg.msg_type == "reasoning_effort";
-                        for reply in app.handle_server_msg(msg) {
-                            // if reloading session, also re-subscribe
-                            if let ClientMsg::LoadSession { ref session_id } = reply {
-                                let sid = session_id.clone();
-                                cmd_tx.send(reply)?;
-                                cmd_tx.send(ClientMsg::SubscribeSession {
-                                    session_id: sid,
-                                    agent_id: app.agent_id.clone(),
-                                })?;
-                            } else {
-                                cmd_tx.send(reply)?;
-                            }
-                        }
-                        if is_effort_push {
-                            save_cache(app);
-                        }
-                    }
-                    ServerChannelMsg::Invalid { error, raw } => {
-                        log_invalid_server_message(app, error, raw);
+            // native ACP client events
+            Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
+                for reply in app.handle_acp_event(event) {
+                    // if reloading session, also re-subscribe
+                    if let ClientMsg::LoadSession { ref session_id, .. } = reply {
+                        let sid = session_id.clone();
+                        cmd_tx.send(reply)?;
+                        cmd_tx.send(ClientMsg::SubscribeSession {
+                            session_id: sid,
+                            agent_id: app.agent_id.clone(),
+                        })?;
+                    } else {
+                        cmd_tx.send(reply)?;
                     }
                 }
             }
@@ -1915,17 +2203,13 @@ async fn run_loop(
                     ServerEvent::Starting => {
                         app.server_state = ServerState::Starting;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "server", "starting local server...");
+                            app.set_status(app::LogLevel::Info, "acp", "starting qmtcode ACP agent...");
                         }
                     }
                     ServerEvent::Started => {
                         app.server_state = ServerState::Running;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                app::LogLevel::Info,
-                                "server",
-                                "local server started — connecting...",
-                            );
+                            app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
                         }
                     }
                     ServerEvent::BinaryNotFound => {
@@ -1933,8 +2217,8 @@ async fn run_loop(
                         if app.conn != app::ConnState::Connected {
                             app.set_status(
                                 app::LogLevel::Warn,
-                                "server",
-                                "qmtcode not found — install it or set server.binary_path in ~/.qmt/tui.toml",
+                                "acp",
+                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
                             );
                         }
                     }
@@ -1942,24 +2226,16 @@ async fn run_loop(
                         app.server_state = ServerState::StartFailed { error: error.clone() };
                         app.set_status(
                             app::LogLevel::Error,
-                            "server",
-                            format!("server start failed: {error}"),
+                            "acp",
+                            format!("ACP start failed: {error}"),
                         );
                     }
                     ServerEvent::Stopped { reason } => {
                         app.server_state = ServerState::Restarting { reason: reason.clone() };
                         app.set_status(
                             app::LogLevel::Warn,
-                            "server",
-                            format!("server stopped ({reason}) — restarting..."),
-                        );
-                    }
-                    ServerEvent::FallingBackToDashboard => {
-                        app.server_state = ServerState::Starting;
-                        app.set_status(
-                            app::LogLevel::Info,
-                            "server",
-                            "--api unsupported, retrying with --dashboard...",
+                            "acp",
+                            format!("ACP agent stopped ({reason})"),
                         );
                     }
                 }
@@ -2135,6 +2411,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2203,6 +2480,7 @@ mod sessions_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2641,6 +2919,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "abc12345".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -2682,6 +2961,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "s5".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
     }
@@ -2701,6 +2981,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "root".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert!(!app.expanded_session_children.contains("root"));
@@ -2800,6 +3081,7 @@ mod session_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child".to_string(),
                 agent_id: None,
+                cwd: Some("/a".to_string()),
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3304,6 +3586,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-2".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3353,6 +3636,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-3".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
     }
@@ -3374,6 +3658,7 @@ mod delegate_popup_key_tests {
             SessionKeyAction::LoadSession {
                 session_id: "child-1".into(),
                 agent_id: Some("coder".into()),
+                cwd: None,
             }
         );
         assert_eq!(app.popup, Popup::None);
@@ -3505,6 +3790,7 @@ mod reasoning_effort_integration_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }
@@ -3518,18 +3804,12 @@ mod reasoning_effort_integration_tests {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
 
-    // ── Ctrl+x t caches mode state per session ──────────────────────────────
-
     #[test]
     #[serial]
-    fn ctrl_t_caches_mode_state_for_session() {
+    fn ctrl_t_cycles_reasoning_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
         app.conn = app::ConnState::Connected;
 
         handle_key(
@@ -3539,16 +3819,16 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("low".into()));
+        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
+        ));
     }
-
-    // ── Tab: saves outgoing, restores incoming ────────────────────────────────
 
     #[test]
     #[serial]
-    fn tab_saves_outgoing_and_restores_incoming_mode_state() {
+    fn tab_switches_mode_without_changing_model_or_effort() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
@@ -3558,47 +3838,24 @@ mod reasoning_effort_integration_tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
-        app.models = vec![
-            make_model("anthropic", "claude-sonnet"),
-            make_model("openai", "gpt-4o"),
-        ];
 
-        // Pre-cache plan mode state for this session
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            app::CachedModeState {
-                model: "openai/gpt-4o".into(),
-                effort: Some("low".into()),
-            },
-        );
-
-        // Tab → switch build → plan
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
-        // Outgoing build state saved
-        let build = &app.session_cache["s1"]["build"];
-        assert_eq!(build.model, "anthropic/claude-sonnet");
-        assert_eq!(build.effort, Some("high".into()));
-
-        // Incoming plan state restored
         assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.reasoning_effort, Some("high".into()));
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
-            "expected SetSessionModel: {msgs:?}"
+                .any(|m| matches!(m, ClientMsg::SetAgentMode { mode } if mode == "plan")),
+            "expected SetAgentMode(plan): {msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
-                if reasoning_effort == "low"
-            )),
-            "expected SetReasoningEffort(low): {msgs:?}"
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "no effort restore on mode switch: {msgs:?}"
         );
     }
 
@@ -3642,9 +3899,9 @@ mod reasoning_effort_integration_tests {
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.agent_mode = "plan".into();
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             make_model("anthropic", "claude-sonnet"),
             make_model("openai", "gpt-4o"),
@@ -3666,7 +3923,8 @@ mod reasoning_effort_integration_tests {
 
         assert_eq!(app.popup, app::Popup::ModelSelect);
         assert_eq!(app.model_filter, "");
-        assert_eq!(app.model_cursor, 3);
+        let expected = app.model_popup_open_cursor();
+        assert_eq!(app.model_cursor, expected);
     }
 
     #[test]
@@ -3679,12 +3937,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = Some("high".into());
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3693,7 +3955,6 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        // Effort dropped to auto
         assert_eq!(app.reasoning_effort, None);
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -3709,35 +3970,6 @@ mod reasoning_effort_integration_tests {
 
     #[test]
     #[serial]
-    fn model_select_caches_new_model_with_auto_effort() {
-        let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
-        let mut app = App::new();
-        app.conn = app::ConnState::Connected;
-        app.session_id = Some("s1".into());
-        app.popup = app::Popup::ModelSelect;
-        app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
-
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-opus");
-        assert_eq!(cms.effort, None); // auto
-    }
-
-    #[test]
-    #[serial]
     fn model_select_no_effort_msg_when_already_auto() {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -3746,12 +3978,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.popup = app::Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.reasoning_effort = None; // already auto
         app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = 1;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         handle_key(
             &mut app,
@@ -3769,42 +4005,14 @@ mod reasoning_effort_integration_tests {
         );
     }
 
-    // ── reasoning_effort server push caches per session+mode ──────────────────
-
     #[test]
-    fn server_push_caches_effort_for_session_and_mode() {
+    fn server_push_updates_reasoning_effort() {
         let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-
         app.handle_server_msg(crate::protocol::RawServerMsg {
             msg_type: "reasoning_effort".into(),
             data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
         });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("medium".into()));
-    }
-
-    #[test]
-    fn server_push_auto_caches_none_effort() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-
-        app.handle_server_msg(crate::protocol::RawServerMsg {
-            msg_type: "reasoning_effort".into(),
-            data: Some(serde_json::json!({ "reasoning_effort": "auto" })),
-        });
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.effort, None);
+        assert_eq!(app.reasoning_effort, Some("medium".into()));
     }
 }
 
@@ -3836,6 +4044,165 @@ mod cli_tests {
         let b = bin();
         let cli = Cli::try_parse_from([b.as_str()]).unwrap();
         assert_eq!(cli.session, None);
+        assert_eq!(cli.acp_binary, None);
+        assert_eq!(cli.ws, None);
+    }
+
+    #[test]
+    fn cli_ws_flag_defaults_to_localhost() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_flag_accepts_address() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws=0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_defaults_to_localhost() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-w"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_accepts_address() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-w", "0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn acp_ws_url_normalization_adds_defaults() {
+        assert_eq!(normalize_acp_ws_url("127.0.0.1"), "ws://127.0.0.1:3030/ws");
+        assert_eq!(
+            normalize_acp_ws_url("127.0.0.1:42069"),
+            "ws://127.0.0.1:42069/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999"),
+            "ws://localhost:9999/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999/custom"),
+            "ws://localhost:9999/custom"
+        );
+    }
+
+    #[test]
+    fn cli_acp_binary_short_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn cli_acp_binary_long_flag() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn explicit_ws_selection_wins_over_default_stdio() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "--ws=localhost:42069"]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_binary_selection_wins_over_default_ws_probe() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_args = Some(vec!["--acp".into()]);
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::Stdio {
+                    argv: vec!["/tmp/qmtcode".into(), "--acp".into()]
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn configured_websocket_selection_wins_over_default_ws_probe() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.websocket_url = Some("localhost:42069".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_default_ws_selection_records_discovery() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: Some("ws://127.0.0.1:3030/ws".into()),
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_binary_missing_retries_default_websocket_forever() {
+        let b = bin();
+        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_path = Some("/definitely/missing/qmtcode".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: acp_client::AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: server_manager::ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: true,
+            }
+        );
     }
 
     #[test]

@@ -81,38 +81,10 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
     }
 }
 
-/// Single-mode marker: returns vec with the mode name if this model matches
-/// the preference for that specific mode, empty vec otherwise.
-fn popup_single_mode_marker(
-    app: &App,
-    model: &crate::protocol::ModelEntry,
-    mode: &'static str,
-) -> Vec<&'static str> {
-    let fallback_current = if app.agent_mode == mode {
-        match (
-            app.current_provider.as_deref(),
-            app.current_model.as_deref(),
-        ) {
-            (Some(provider), Some(model_name)) => Some((provider, model_name)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let target = app.get_mode_model_preference(mode).or(fallback_current);
-    if target.is_some_and(|(provider, model_name)| {
-        provider == model.provider && model_name == model.model
-    }) {
-        vec![mode]
-    } else {
-        vec![]
-    }
-}
-
 /// Whether the given model matches a delegate agent's preferred model.
 fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
     app.get_delegate_model_preference(agent_id)
-        .is_some_and(|(p, m)| p == model.provider && m == model.model)
+        .is_some_and(|(p, m)| App::model_entry_matches_node(model, p, m, None))
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -125,7 +97,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
 
-    let has_tabs = true;
+    let has_tabs = app.model_popup_has_tabs();
 
     let area = f.area();
     let popup_width = area
@@ -192,16 +164,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         for i in 0..app.model_popup_tab_count() {
             let label = app.model_popup_tab_label(i);
             let is_active = i == app.model_popup_agent_tab;
-            let style = if let Some(mode) = app.model_popup_tab_mode(i) {
-                let mut s = ratatui::style::Style::default()
-                    .fg(Theme::mode_color(mode))
-                    .bg(Theme::bg_dim())
-                    .add_modifier(Modifier::BOLD);
-                if is_active {
-                    s = s.add_modifier(Modifier::UNDERLINED);
-                }
-                s
-            } else if is_active {
+            let style = if is_active {
                 Theme::popup_title().add_modifier(Modifier::UNDERLINED)
             } else {
                 Theme::status()
@@ -232,8 +195,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
 
-    // Resolve current tab's mode (for mode tabs) or agent_id (for agent tabs).
-    let active_mode = app.model_popup_tab_mode(app.model_popup_agent_tab);
+    let on_session_tab = app.model_popup_is_session_tab(app.model_popup_agent_tab);
     let active_agent_id = app
         .model_popup_tab_agent_id(app.model_popup_agent_tab)
         .map(str::to_string);
@@ -249,18 +211,11 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
             ModelPopupItem::ProviderHeader {
                 provider,
                 model_count,
+                node_suffix,
             } => {
                 let selected = i == app.model_cursor;
                 let marker = COLLAPSE_CLOSED;
                 let count = format!(" {model_count}");
-                let avail = list_w.saturating_sub(4 + count.chars().count());
-                let label = if provider.chars().count() > avail {
-                    let t: String = provider.chars().take(avail.saturating_sub(1)).collect();
-                    format!("{t}{ELLIPSIS}")
-                } else {
-                    provider.clone()
-                };
-                let gap = avail.saturating_sub(label.chars().count());
                 let marker_style = if selected {
                     Theme::selected()
                 } else {
@@ -272,30 +227,42 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 } else {
                     Theme::status()
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {marker} "), marker_style),
-                    Span::styled(label, provider_style),
+                let suffix_style = Theme::status_accent();
+
+                let marker_w = 2usize;
+                let count_w = count.chars().count();
+                let suffix = node_suffix.as_ref().map(|n| format!("@ {n}"));
+                let suffix_w = suffix.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+                let avail = list_w.saturating_sub(marker_w + 1 + count_w + suffix_w + 1);
+
+                let provider_display = if provider.chars().count() > avail {
+                    let t: String = provider.chars().take(avail.saturating_sub(1)).collect();
+                    format!("{t}{ELLIPSIS}")
+                } else {
+                    provider.clone()
+                };
+                let gap = avail.saturating_sub(provider_display.chars().count());
+
+                let mut line_spans = vec![
+                    Span::styled(format!("{marker} "), marker_style),
+                    Span::styled(provider_display, provider_style),
                     Span::styled(" ".repeat(gap), dim_style),
-                    Span::styled(count, dim_style),
-                ]))
+                ];
+                if let Some(s) = suffix {
+                    line_spans.push(Span::styled(s, suffix_style));
+                }
+                line_spans.push(Span::styled(count, dim_style));
+                ListItem::new(Line::from(line_spans))
             }
             ModelPopupItem::Model { model_idx } => {
                 let selected = i == app.model_cursor;
                 let model = &app.models[*model_idx];
 
-                // On a mode tab show that mode's marker;
-                // on an agent tab show a delegate preference marker.
-                let marker_modes: Vec<&str> = match (active_mode, active_agent_id.as_deref()) {
-                    (Some(mode), _) => popup_single_mode_marker(app, model, mode),
-                    (_, Some(aid)) => {
-                        if popup_delegate_marker(app, model, aid) {
-                            vec!["delegate"]
-                        } else {
-                            vec![]
-                        }
-                    }
-                    _ => vec![],
-                };
+                let show_live = on_session_tab && app.live_model_selection_matches_entry(model);
+                let show_delegate = active_agent_id
+                    .as_deref()
+                    .is_some_and(|aid| popup_delegate_marker(app, model, aid));
+                let marker_count = usize::from(show_live) + usize::from(show_delegate);
 
                 let marker_bg = if selected {
                     Theme::bg_hl()
@@ -304,11 +271,12 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 };
                 let marker_w = MODEL_MARKER_COL_W as usize;
                 let avail = list_w.saturating_sub(marker_w);
-                let label = if model.label.chars().count() > avail {
-                    let t: String = model.label.chars().take(avail.saturating_sub(1)).collect();
+                let base_label = model.label.clone();
+                let label = if base_label.chars().count() > avail {
+                    let t: String = base_label.chars().take(avail.saturating_sub(1)).collect();
                     format!("{t}{ELLIPSIS}")
                 } else {
-                    model.label.clone()
+                    base_label
                 };
                 let gap = avail.saturating_sub(label.chars().count());
                 let main_style = if selected {
@@ -316,18 +284,24 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 } else {
                     Theme::popup_bg()
                 };
-                let mut spans = Vec::with_capacity(1 + marker_modes.len() * 2 + 2);
+                let mut spans = Vec::with_capacity(4);
                 spans.push(Span::styled(" ", main_style));
-                for mode in &marker_modes {
+                if show_live {
                     spans.push(Span::styled(
                         "\u{25cf}",
-                        ratatui::style::Style::default()
-                            .fg(Theme::mode_color(mode))
-                            .bg(marker_bg),
+                        Theme::status_accent().bg(marker_bg),
+                    ));
+                }
+                if show_delegate {
+                    spans.push(Span::styled(
+                        "\u{25cf}",
+                        Theme::status_accent()
+                            .bg(marker_bg)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
                 spans.push(Span::styled(
-                    " ".repeat(marker_w.saturating_sub(1 + marker_modes.len())),
+                    " ".repeat(marker_w.saturating_sub(1 + marker_count)),
                     main_style,
                 ));
                 spans.push(Span::styled(label, main_style));
@@ -353,8 +327,10 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
         Span::styled("enter ", Theme::status_accent()),
         Span::styled("select", Theme::status()),
     ];
-    hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
-    hint_spans.push(Span::styled("switch", Theme::status()));
+    if has_tabs {
+        hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
+        hint_spans.push(Span::styled("agent", Theme::status()));
+    }
     f.render_widget(
         Paragraph::new(Line::from(hint_spans)).style(Theme::popup_bg()),
         chunks[hint_idx],
@@ -1221,7 +1197,7 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
     .block(Block::default().style(Theme::popup_bg()))
     .style(Theme::popup_bg())
     .row_highlight_style(Theme::selected());
-    let selected = Some(app.profile_cursor).filter(|_| has_matches);
+    let selected = has_matches.then_some(app.profile_cursor);
     let mut state = TableState::default().with_selected(selected);
     f.render_stateful_widget(table, chunks[2], &mut state);
 
@@ -1316,7 +1292,7 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
             .block(Block::default().style(Theme::popup_bg()))
             .highlight_style(Theme::selected())
             .highlight_symbol("");
-        let selected = Some(completion.selected_index).filter(|_| !completion.results.is_empty());
+        let selected = (!completion.results.is_empty()).then_some(completion.selected_index);
         let mut state = ListState::default().with_selected(selected);
         f.render_stateful_widget(list, chunks[3], &mut state);
     }
@@ -1452,6 +1428,627 @@ pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
         Span::styled("filter", Theme::status()),
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+// ── Command palette ───────────────────────────────────────────────────────────
+
+pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
+    const MESH_POPUP_MIN_W: u16 = 54;
+    const MESH_POPUP_MAX_W: u16 = 96;
+    const MESH_POPUP_MIN_H: u16 = 16;
+    const MESH_POPUP_MAX_H: u16 = 28;
+
+    let area = f.area();
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(MESH_POPUP_MIN_W.min(area.width), MESH_POPUP_MAX_W);
+    let popup_height = area
+        .height
+        .saturating_sub(2)
+        .clamp(MESH_POPUP_MIN_H.min(area.height), MESH_POPUP_MAX_H);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 3,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let title = app
+        .mesh_status
+        .as_ref()
+        .map(|status| {
+            format!(
+                "mesh - {} peer{}",
+                status.known_peer_count,
+                if status.known_peer_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        })
+        .unwrap_or_else(|| "mesh".to_string());
+    let subtitle = app
+        .selected_mesh_node_label()
+        .map(|label| format!("selected node: {label}"))
+        .unwrap_or_else(|| "no mesh nodes loaded".to_string());
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(title, Theme::popup_title())),
+            Line::from(Span::styled(subtitle, Theme::status())),
+        ])
+        .style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(chunks[1]);
+
+    let node_items: Vec<ListItem> = if app.mesh_nodes.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  no nodes",
+            Theme::status(),
+        )))]
+    } else {
+        app.mesh_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let selected = i == app.mesh_node_cursor;
+                let style = if selected {
+                    Theme::selected()
+                } else {
+                    Theme::popup_bg()
+                };
+                let marker = if selected { "▸" } else { " " };
+                let label =
+                    truncate_with_ellipsis(&node.label, body[0].width.saturating_sub(14) as usize);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {marker} "), style),
+                    Span::styled(label, style),
+                    Span::styled(format!("  {}", node.active_sessions), Theme::status()),
+                ]))
+            })
+            .collect()
+    };
+    let node_block = Block::bordered()
+        .title(" nodes ")
+        .border_style(if matches!(app.mesh_focus, crate::mesh::MeshFocus::Nodes) {
+            Theme::status_accent()
+        } else {
+            Theme::status()
+        })
+        .style(Theme::popup_bg());
+    let mut node_state = ListState::default().with_selected(
+        (!app.mesh_nodes.is_empty()).then(|| app.mesh_node_cursor.min(app.mesh_nodes.len() - 1)),
+    );
+    f.render_stateful_widget(
+        List::new(node_items).block(node_block),
+        body[0],
+        &mut node_state,
+    );
+
+    let sessions = app.selected_remote_sessions();
+    let session_items: Vec<ListItem> = if sessions.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  no remote sessions",
+            Theme::status(),
+        )))]
+    } else {
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(i, session)| {
+                let selected = i == app.remote_session_cursor;
+                let style = if selected {
+                    Theme::selected()
+                } else {
+                    Theme::popup_bg()
+                };
+                let marker = if selected { "▸" } else { " " };
+                let title = session.title.as_deref().unwrap_or(&session.id);
+                let cwd = session.cwd.as_deref().unwrap_or("");
+                let available = body[1].width.saturating_sub(7) as usize;
+                let text = truncate_with_ellipsis(&format!("{title}  {cwd}"), available);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {marker} "), style),
+                    Span::styled(text, style),
+                ]))
+            })
+            .collect()
+    };
+    let session_block = Block::bordered()
+        .title(" remote sessions ")
+        .border_style(
+            if matches!(app.mesh_focus, crate::mesh::MeshFocus::Sessions) {
+                Theme::status_accent()
+            } else {
+                Theme::status()
+            },
+        )
+        .style(Theme::popup_bg());
+    let mut session_state = ListState::default().with_selected(
+        (!sessions.is_empty()).then(|| app.remote_session_cursor.min(sessions.len() - 1)),
+    );
+    f.render_stateful_widget(
+        List::new(session_items).block(session_block),
+        body[1],
+        &mut session_state,
+    );
+
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("close/back  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("open/attach/create  ", Theme::status()),
+        Span::styled("n ", Theme::status_accent()),
+        Span::styled("new remote  ", Theme::status()),
+        Span::styled("r ", Theme::status_accent()),
+        Span::styled("refresh", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[2]);
+}
+
+pub(super) fn draw_mesh_invite_popup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup_width = area.width.saturating_sub(6).clamp(48.min(area.width), 54);
+    let popup_height = area.height.saturating_sub(4).clamp(9.min(area.height), 11);
+    let popup_area = sized_centered_rect(area, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Create Invite",
+            Theme::popup_title(),
+        )))
+        .style(Theme::popup_bg()),
+        chunks[0],
+    );
+    draw_mesh_invite_form(f, app, chunks[2]);
+
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("close  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("create", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[3]);
+}
+
+pub(super) fn draw_mesh_invite_qr_popup(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let (qr_width, qr_height) = app
+        .mesh_invite
+        .as_ref()
+        .and_then(|invite| invite.qr_code.as_deref())
+        .map(qr_text_size)
+        .unwrap_or((36, 1));
+    let title_width = "QR Code Invite".len() as u16;
+    let hint_width = 32;
+    let popup_width = qr_width
+        .max(title_width)
+        .max(hint_width)
+        .saturating_add(5)
+        .min(area.width.saturating_sub(2).max(1));
+    let popup_height = qr_height
+        .saturating_add(5)
+        .min(area.height.saturating_sub(2).max(1));
+    let popup_area = sized_centered_rect(area, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "QR Code Invite",
+            Theme::popup_title(),
+        )))
+        .style(Theme::popup_bg()),
+        chunks[0],
+    );
+    draw_mesh_invite_details(f, app, chunks[2]);
+
+    if let Some(ref url) = app.mesh_clipboard_fallback {
+        draw_mesh_clipboard_fallback(f, inner, url);
+    }
+
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("back  ", Theme::status()),
+        Span::styled("u ", Theme::status_accent()),
+        Span::styled("show URL  ", Theme::status()),
+        Span::styled("C-y ", Theme::status_accent()),
+        Span::styled("copy", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[3]);
+}
+
+fn qr_text_size(qr: &str) -> (u16, u16) {
+    let width = qr
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(1) as u16;
+    let height = qr.lines().count().max(1) as u16;
+    (width, height)
+}
+
+fn sized_centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    }
+}
+
+fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let field = app.mesh_invite_form_field;
+    let line = |label: &'static str, value: &str, selected: bool| {
+        let label_style = Theme::status();
+        let value_style = if selected {
+            Theme::selected()
+        } else {
+            Theme::popup_bg()
+        };
+        let cursor = if selected { ">" } else { " " };
+        Line::from(vec![
+            Span::styled(format!("{cursor} {label:<10}"), label_style),
+            Span::styled(" ", Theme::popup_bg()),
+            Span::styled(format!("{value:<18}"), value_style),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(line(
+            "mesh name",
+            if app.mesh_invite_name.is_empty() {
+                "(none)"
+            } else {
+                &app.mesh_invite_name
+            },
+            matches!(field, crate::mesh::MeshInviteFormField::MeshName),
+        ))
+        .style(Theme::popup_bg()),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(line(
+            "ttl",
+            &app.mesh_invite_ttl,
+            matches!(field, crate::mesh::MeshInviteFormField::Ttl),
+        ))
+        .style(Theme::popup_bg()),
+        rows[1],
+    );
+    f.render_widget(
+        Paragraph::new(line(
+            "max uses",
+            &app.mesh_invite_max_uses,
+            matches!(field, crate::mesh::MeshInviteFormField::MaxUses),
+        ))
+        .style(Theme::popup_bg()),
+        rows[2],
+    );
+    if let Some(message) = app.current_mesh_error() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" ! {message}"),
+                Theme::error_text(),
+            )))
+            .style(Theme::popup_bg()),
+            rows[4],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " defaults: ttl 24h, max uses 1",
+                Theme::status(),
+            )))
+            .style(Theme::popup_bg()),
+            rows[4],
+        );
+    }
+}
+
+fn draw_mesh_invite_details(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(invite) = app.mesh_invite.as_ref() {
+        if let Some(qr) = invite.qr_code.as_deref() {
+            for row in qr.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!(" {row}"),
+                    Theme::popup_bg(),
+                )));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                " no QR code returned",
+                Theme::status(),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            " create an invite to show the QR code",
+            Theme::status(),
+        )));
+    }
+
+    for (i, line) in lines.into_iter().enumerate() {
+        if i as u16 >= area.height {
+            break;
+        }
+        let row = Rect {
+            x: area.x,
+            y: area.y + i as u16,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(line).style(Theme::popup_bg()), row);
+    }
+}
+
+fn draw_mesh_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
+    let popup = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(4).max(6),
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Clipboard not available",
+            Theme::popup_title(),
+        )),
+        Line::from(Span::styled(
+            " Copy this invite URL manually:",
+            Theme::status(),
+        )),
+        Line::from(""),
+    ];
+    for chunk in wrap_plain_text(url, popup.width.saturating_sub(2) as usize) {
+        lines.push(Line::from(Span::styled(
+            format!(" {chunk}"),
+            Theme::popup_bg(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " press any key to dismiss",
+        Theme::status(),
+    )));
+    f.render_widget(Paragraph::new(lines).style(Theme::popup_bg()), popup);
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut remaining = text;
+    let mut out = Vec::new();
+    while !remaining.is_empty() {
+        let take = remaining.len().min(width);
+        out.push(remaining[..take].to_string());
+        remaining = &remaining[take..];
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
+    const PALETTE_MIN_W: u16 = 48;
+    const PALETTE_MAX_W: u16 = 82;
+    const PALETTE_MIN_H: u16 = 14;
+    const PALETTE_MAX_H: u16 = 22;
+    const TITLE_COL_W: usize = 24;
+    const SHORTCUT_COL_W: usize = 10;
+
+    let area = f.area();
+    let commands = app.filtered_command_palette_commands();
+    let desired_h = (commands.len() as u16).saturating_add(7);
+    let popup_width = area
+        .width
+        .saturating_sub(4)
+        .clamp(PALETTE_MIN_W.min(area.width), PALETTE_MAX_W);
+    let popup_height = desired_h
+        .clamp(PALETTE_MIN_H, PALETTE_MAX_H)
+        .min(area.height.saturating_sub(2).max(1));
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 3,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // spacer
+            Constraint::Min(1),    // commands
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // hints
+        ])
+        .split(inner);
+
+    let title = Line::from(vec![
+        Span::styled("command palette", Theme::popup_title()),
+        Span::styled(
+            format!(
+                "  {} command{}",
+                commands.len(),
+                if commands.len() == 1 { "" } else { "s" }
+            ),
+            Theme::status(),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(title).style(Theme::popup_bg()), chunks[0]);
+
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (filter_display, filter_cur) = scroll_input(
+        &app.command_palette_filter,
+        app.command_palette_filter.len(),
+        avail,
+    );
+    let placeholder = if app.command_palette_filter.is_empty() {
+        "type to filter..."
+    } else {
+        ""
+    };
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(filter_display, Theme::popup_bg()),
+        Span::styled(placeholder, Theme::status()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+
+    let list_w = chunks[3].width as usize;
+    let desc_avail = list_w.saturating_sub(3 + TITLE_COL_W + 1 + SHORTCUT_COL_W + 1);
+    let items: Vec<ListItem> = if commands.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  no commands match current filter",
+            Theme::status(),
+        )))]
+    } else {
+        commands
+            .iter()
+            .enumerate()
+            .map(|(i, command)| {
+                let selected = i == app.command_palette_cursor;
+                let row_style = if selected {
+                    Theme::selected()
+                } else {
+                    Theme::popup_bg()
+                };
+                let dim_style = if selected {
+                    Theme::selected()
+                } else {
+                    Theme::status()
+                };
+                let marker = if selected { "▸" } else { " " };
+                let title = truncate_with_ellipsis(command.title, TITLE_COL_W);
+                let shortcut = truncate_with_ellipsis(command.shortcut, SHORTCUT_COL_W);
+                let description = truncate_with_ellipsis(command.description, desc_avail);
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {marker} "), row_style),
+                    Span::styled(format!("{title:<TITLE_COL_W$}"), row_style),
+                    Span::styled(" ", row_style),
+                    Span::styled(format!("{shortcut:<SHORTCUT_COL_W$}"), dim_style),
+                    Span::styled(" ", row_style),
+                    Span::styled(description, dim_style),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items)
+        .block(Block::default().style(Theme::popup_bg()))
+        .highlight_style(Theme::selected())
+        .highlight_symbol("");
+    let visible_rows = chunks[3].height as usize;
+    let selected = (!commands.is_empty()).then_some(
+        app.command_palette_cursor
+            .min(commands.len().saturating_sub(1)),
+    );
+    let offset = selected
+        .unwrap_or(0)
+        .saturating_sub(visible_rows.saturating_sub(1));
+    let mut state = ListState::default()
+        .with_offset(offset)
+        .with_selected(selected);
+    f.render_stateful_widget(list, chunks[3], &mut state);
+
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("close  ", Theme::status()),
+        Span::styled("enter ", Theme::status_accent()),
+        Span::styled("open  ", Theme::status()),
+        Span::styled("↑↓ ", Theme::status_accent()),
+        Span::styled("navigate", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[5]);
 }
 
 // ── Theme popup ───────────────────────────────────────────────────────────────
@@ -1662,7 +2259,7 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
     let selected =
-        Some(app.log_cursor.min(filtered.len().saturating_sub(1))).filter(|_| !filtered.is_empty());
+        (!filtered.is_empty()).then_some(app.log_cursor.min(filtered.len().saturating_sub(1)));
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, chunks[3], &mut state);
 
@@ -1690,6 +2287,7 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
         ShortcutSection {
             title: "global",
             rows: &[
+                ("C-p", "command palette"),
                 ("C-x \u{2026}", "chord prefix"),
                 ("Tab", "cycle mode (build \u{2192} plan \u{2192} review)"),
                 ("C-c", "clear input / quit"),
@@ -1747,10 +2345,11 @@ pub(crate) fn shortcut_sections() -> &'static [ShortcutSection] {
         ShortcutSection {
             title: "popups",
             rows: &[
+                ("C-p", "open command palette from anywhere"),
                 ("\u{2191} \u{2193}", "navigate"),
                 ("Enter", "confirm"),
                 ("Esc", "close"),
-                ("type", "filter (sessions, models, themes)"),
+                ("type", "filter"),
             ],
         },
         ShortcutSection {

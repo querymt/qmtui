@@ -7,8 +7,10 @@ pub(crate) use chat::{
 };
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
-    draw_auth_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup, draw_model_popup,
-    draw_new_session_popup, draw_profile_popup, draw_session_popup, draw_theme_popup,
+    draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
+    draw_log_popup, draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
+    draw_model_popup, draw_new_session_popup, draw_profile_popup, draw_session_popup,
+    draw_theme_popup,
 };
 use start::draw_start;
 
@@ -308,6 +310,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     match app.popup {
+        Popup::CommandPalette => draw_command_palette_popup(f, app),
+        Popup::Mesh => draw_mesh_popup(f, app),
+        Popup::MeshInvite => draw_mesh_invite_popup(f, app),
+        Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, app),
         Popup::ModelSelect => draw_model_popup(f, app),
         Popup::SessionSelect => draw_session_popup(f, app),
         Popup::NewSession => draw_new_session_popup(f, app),
@@ -333,6 +339,14 @@ fn conn_indicator(app: &App) -> Span<'static> {
             .fg(color)
             .bg(Theme::bg_dim()),
     )
+}
+
+pub(crate) fn mesh_header_span(app: &App) -> Option<Span<'static>> {
+    let n = app.mesh_node_count.filter(|&n| n > 0)?;
+    Some(Span::styled(
+        format!(" {} {n} ", chat::ICON_MESH),
+        Theme::status(),
+    ))
 }
 
 fn draw_header(
@@ -1572,6 +1586,114 @@ mod tests {
     }
 
     #[test]
+    fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.agent_mode = "build".into();
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "a deliberately long custom response that wraps\nsecond line".into();
+        state.custom_cursor = state.custom_input.len();
+        app.elicitation = Some(state);
+
+        let buffer = render_chat_buffer(&mut app, 40, 21);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Custom answer…"));
+        assert!(rendered.contains("> a deliberately long custom"));
+        assert!(rendered.contains("second line"));
+        assert!(rendered.contains("Shift+Enter newline"));
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_question() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.message = "When designing a new system-level tool, which approach best describes how you balance rapid prototyping and maintainability?".into();
+        app.elicitation = Some(state);
+
+        let buffer = render_chat_buffer(&mut app, 50, 21);
+        let first =
+            find_buffer_text(&buffer, "When designing").expect("missing first question row");
+        let second =
+            find_buffer_text(&buffer, "best describes how").expect("missing wrapped question row");
+        let option = find_buffer_text(&buffer, "Alpha").expect("missing option");
+
+        assert!(second.1 > first.1);
+        assert!(option.1 > second.1);
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_answers() {
+        use crate::app::{
+            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+        };
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Keep the validated prototype as the production foundation and improve it gradually through careful iteration".into(),
+                    description: None,
+                }],
+            },
+        }]));
+
+        let buffer = render_chat_buffer(&mut app, 50, 21);
+        let first = find_buffer_text(&buffer, "Keep the validated").expect("missing answer row");
+        let second = find_buffer_text(&buffer, "foundation and improve")
+            .expect("missing wrapped answer row");
+        let custom = find_buffer_text(&buffer, "Custom answer…").expect("missing custom option");
+
+        assert!(second.1 > first.1);
+        assert!(custom.1 > second.1);
+    }
+
+    #[test]
     fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
         use crate::app::{
             ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
@@ -1606,7 +1728,7 @@ mod tests {
             },
         }]));
 
-        let buffer = render_delegate_buffer(&mut app, 100, 16);
+        let buffer = render_delegate_buffer(&mut app, 100, 17);
         let rendered = buffer_text(&buffer);
 
         assert!(
@@ -1754,9 +1876,9 @@ mod tests {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
         app.models = vec![
             crate::protocol::ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
@@ -1764,6 +1886,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1773,6 +1896,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1826,11 +1950,11 @@ mod tests {
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_marker_on_build_tab() {
+    fn draw_model_popup_live_marker_uses_status_accent_on_session_tab() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 1; // Build tab
+        app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.models = vec![
@@ -1840,6 +1964,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1849,6 +1974,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
@@ -1858,41 +1984,47 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let (build_x, build_y) =
-            find_buffer_text(&buffer, "Claude Sonnet").expect("build model missing");
-        let build_marker_x = (0..build_x)
-            .find(|x| buffer[(*x, build_y)].symbol() == "●")
-            .expect("build marker missing");
+        let (model_x, model_y) =
+            find_buffer_text(&buffer, "Claude Sonnet").expect("live model missing");
+        let marker_x = (0..model_x)
+            .find(|x| buffer[(*x, model_y)].symbol() == "●")
+            .expect("live marker missing");
 
         assert_eq!(
-            buffer[(build_marker_x, build_y)].fg,
-            crate::theme::Theme::mode_color("build")
+            buffer[(marker_x, model_y)].fg,
+            crate::theme::Theme::status_accent()
+                .fg
+                .expect("status_accent fg")
         );
     }
 
     #[test]
-    fn draw_model_popup_colors_mode_marker_on_planner_tab() {
+    fn draw_model_popup_marks_only_remote_live_row_when_duplicates() {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0; // Planner tab
-        app.set_mode_model_preference("plan", "openai", "gpt-4o");
+        app.model_popup_agent_tab = 0;
+        app.current_provider = Some("codex".into());
+        app.current_model = Some("gpt-5".into());
+        app.current_model_node_id = Some("node-1".into());
         app.models = vec![
             crate::protocol::ModelEntry {
-                id: "anthropic/claude-sonnet".into(),
-                label: "Claude Sonnet".into(),
-                provider: "anthropic".into(),
-                model: "claude-sonnet".into(),
+                id: "codex/gpt-5".into(),
+                label: "gpt-5".into(),
+                provider: "codex".into(),
+                model: "gpt-5".into(),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             },
             crate::protocol::ModelEntry {
-                id: "openai/gpt-4o".into(),
-                label: "GPT-4o".into(),
-                provider: "openai".into(),
-                model: "gpt-4o".into(),
-                node_id: None,
+                id: "codex@node-1/gpt-5".into(),
+                label: "gpt-5".into(),
+                provider: "codex".into(),
+                model: "gpt-5".into(),
+                node_id: Some("node-1".into()),
+                node_label: Some("framework".into()),
                 family: None,
                 quant: None,
             },
@@ -1902,15 +2034,129 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let (plan_x, plan_y) = find_buffer_text(&buffer, "GPT-4o").expect("plan model missing");
-        let plan_marker_x = (0..plan_x)
-            .find(|x| buffer[(*x, plan_y)].symbol() == "●")
-            .expect("plan marker missing");
+        let (_, local_y) = find_buffer_text(&buffer, "codex").expect("local header");
+        let (_, remote_y) = find_buffer_text(&buffer, "framework").expect("remote node label");
+        let local_row = local_y + 1;
+        let remote_row = if remote_y == local_y {
+            local_y + 3
+        } else {
+            remote_y + 1
+        };
+        let local_marker = (0..buffer.area.width).any(|x| buffer[(x, local_row)].symbol() == "●");
+        let remote_marker = (0..buffer.area.width).any(|x| buffer[(x, remote_row)].symbol() == "●");
 
-        assert_eq!(
-            buffer[(plan_marker_x, plan_y)].fg,
-            crate::theme::Theme::mode_color("plan")
+        assert!(!local_marker, "local duplicate must not show live marker");
+        assert!(remote_marker, "remote live row must show marker");
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_nodes_sessions_and_hints() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.mesh_nodes = vec![crate::protocol::RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "framework".into(),
+            active_sessions: 1,
+            ..Default::default()
+        }];
+        app.remote_sessions_by_node.insert(
+            "node-1".into(),
+            vec![crate::protocol::RemoteSessionInfo {
+                id: "remote-1".into(),
+                node_id: "node-1".into(),
+                title: Some("Fix bug".into()),
+                cwd: Some("/repo".into()),
+                ..Default::default()
+            }],
         );
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_mesh_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "framework").is_some());
+        assert!(find_buffer_text(&buffer, "Fix bug").is_some());
+        assert!(find_buffer_text(&buffer, "new remote").is_some());
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_invite_form_defaults() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.open_mesh_invite_form();
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_mesh_invite_popup(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "Create Invite").is_some());
+        assert!(find_buffer_text(&buffer, "24h").is_some());
+        assert!(find_buffer_text(&buffer, "max uses").is_some());
+        assert!(find_buffer_text(&buffer, "defaults: ttl 24h, max uses 1").is_some());
+        assert!(find_buffer_text(&buffer, "QR-LINE").is_none());
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_invite_url_and_qr() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.apply_mesh_invite_created(crate::protocol::MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR-LINE".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: None,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_mesh_invite_qr_popup(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "create invite").is_none());
+        assert!(find_buffer_text(&buffer, "QR Code Invite").is_some());
+        assert!(find_buffer_text(&buffer, "QR code").is_none());
+        assert!(find_buffer_text(&buffer, "QR-LINE").is_some());
+        assert!(find_buffer_text(&buffer, "qmt://mesh/join/token").is_none());
+        assert!(find_buffer_text(&buffer, "show URL").is_some());
+    }
+
+    #[test]
+    fn draw_command_palette_popup_aligns_columns_and_highlights_selection() {
+        let mut app = App::new();
+        app.popup = Popup::CommandPalette;
+        app.screen = Screen::Chat;
+        app.command_palette_filter = "session switcher".into();
+        app.command_palette_cursor = 0;
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_command_palette_popup(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (title_x, row_y) =
+            find_buffer_text(&buffer, "Session switcher").expect("selected command row missing");
+        let (shortcut_x, shortcut_y) =
+            find_buffer_text(&buffer, "C-x l").expect("selected shortcut missing");
+        let (description_x, description_y) =
+            find_buffer_text(&buffer, "Browse and load sessions").expect("description missing");
+
+        assert_eq!(row_y, shortcut_y);
+        assert_eq!(row_y, description_y);
+        assert!(shortcut_x > title_x);
+        assert!(description_x > shortcut_x);
+        assert!(
+            find_buffer_text(&buffer, "action").is_none(),
+            "table headers should not render"
+        );
+        assert_eq!(buffer[(shortcut_x, row_y)].style().bg, Theme::selected().bg);
     }
 
     #[test]
@@ -1948,14 +2194,14 @@ mod tests {
                 provider: "anthropic".into(),
                 model: format!("model-{i}"),
                 node_id: None,
+                node_label: None,
                 family: None,
                 quant: None,
             })
             .collect();
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("model-8".into());
-        app.set_mode_model_preference("plan", "anthropic", "model-3");
-        app.model_cursor = 9;
+        app.model_cursor = app.model_popup_open_cursor();
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

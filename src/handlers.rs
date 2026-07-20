@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, ActivityState, App, LogLevel, Popup, Screen};
+use crate::app::{self, ActivityState, App, CommandPaletteAction, LogLevel, Popup, Screen};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -41,13 +41,44 @@ pub(crate) fn handle_elicitation_key(
 ) -> anyhow::Result<()> {
     use app::ElicitationFieldKind;
 
-    // Take a snapshot of what we need before the mutable borrow on app.
     let Some(state) = app.elicitation.as_mut() else {
         return Ok(());
     };
 
+    if state.custom_active {
+        match key.code {
+            KeyCode::Esc => state.deactivate_custom(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                state.custom_insert('\n');
+            }
+            KeyCode::Enter if state.is_valid() => {
+                let eid = state.elicitation_id.clone();
+                let content = state.build_accept_content();
+                let display = state.selected_display();
+                cmd_tx.send(ClientMsg::ElicitationResponse {
+                    elicitation_id: eid.clone(),
+                    action: "accept".into(),
+                    content: Some(content),
+                })?;
+                app.resolve_elicitation(&eid, &display);
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.custom_insert(c);
+            }
+            KeyCode::Backspace => state.custom_backspace(),
+            KeyCode::Delete => state.custom_delete(),
+            KeyCode::Left => state.custom_left(),
+            KeyCode::Right => state.custom_right(),
+            KeyCode::Home => state.custom_home(),
+            KeyCode::End => state.custom_end(),
+            KeyCode::Up => state.custom_move_visual(-1),
+            KeyCode::Down => state.custom_move_visual(1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
-        // ── Cancel / decline ─────────────────────────────────────────────────
         KeyCode::Esc => {
             let eid = state.elicitation_id.clone();
             cmd_tx.send(ClientMsg::ElicitationResponse {
@@ -57,16 +88,8 @@ pub(crate) fn handle_elicitation_key(
             })?;
             app.resolve_elicitation(&eid, "declined");
         }
-
-        // ── Navigation (select fields) ────────────────────────────────────────
-        KeyCode::Down => {
-            state.move_cursor(1);
-        }
-        KeyCode::Up => {
-            state.move_cursor(-1);
-        }
-
-        // ── Space: toggle multi-select / boolean ──────────────────────────────
+        KeyCode::Down => state.move_cursor(1),
+        KeyCode::Up => state.move_cursor(-1),
         KeyCode::Char(' ') => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
@@ -78,23 +101,25 @@ pub(crate) fn handle_elicitation_key(
                 state.toggle_current_option();
             }
         }
-
-        // ── Submit ────────────────────────────────────────────────────────────
         KeyCode::Enter => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
             };
             match kind {
                 ElicitationFieldKind::SingleSelect { .. } => {
-                    // Select the highlighted option first
                     state.select_current_option();
+                    if state.custom_active {
+                        return Ok(());
+                    }
+                }
+                ElicitationFieldKind::MultiSelect { .. } if state.custom_option_selected() => {
+                    state.activate_custom();
+                    return Ok(());
                 }
                 ElicitationFieldKind::TextInput
                 | ElicitationFieldKind::NumberInput { .. }
                 | ElicitationFieldKind::BooleanToggle
-                | ElicitationFieldKind::MultiSelect { .. } => {
-                    // Already captured in state; fall through to submit
-                }
+                | ElicitationFieldKind::MultiSelect { .. } => {}
             }
 
             if state.is_valid() {
@@ -108,10 +133,7 @@ pub(crate) fn handle_elicitation_key(
                 })?;
                 app.resolve_elicitation(&eid, &display);
             }
-            // If not valid (required field missing), do nothing — keep popup open.
         }
-
-        // ── Text / number input ───────────────────────────────────────────────
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
                 return Ok(());
@@ -134,7 +156,6 @@ pub(crate) fn handle_elicitation_key(
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
             ) && state.text_cursor > 0
             {
-                // Remove the char just before the cursor
                 let cursor = state.text_cursor;
                 let ch = state.text_input[..cursor].chars().next_back().unwrap();
                 let ch_len = ch.len_utf8();
@@ -142,54 +163,298 @@ pub(crate) fn handle_elicitation_key(
                 state.text_cursor -= ch_len;
             }
         }
-
         _ => {}
     }
     Ok(())
 }
 
-/// If the app has a stored model preference for its current agent mode, and the
-/// active session is running a different model, send a `SetSessionModel` message
-/// to switch automatically.  Mirrors the `useEffect` in `AppShell.tsx`.
-pub(crate) fn apply_mode_model_if_preferred(
+fn open_model_popup(
     app: &mut App,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
-    let Some(sid) = app.session_id.clone() else {
-        return Ok(());
-    };
-    if app.current_session_is_remote() {
-        return Ok(());
-    }
-    let Some((provider, model)) = app.get_mode_model_preference(&app.agent_mode) else {
-        return Ok(());
-    };
-    let differs = app.current_provider.as_deref() != Some(provider)
-        || app.current_model.as_deref() != Some(model);
-    if !differs {
-        return Ok(());
-    }
-    // Resolve the canonical model entry so we have the right model_id / node_id.
-    let provider = provider.to_string();
-    let model = model.to_string();
-    if let Some(entry) = app
-        .models
-        .iter()
-        .find(|m| m.provider == provider && m.model == model && m.node_id.is_none())
-        .cloned()
-    {
-        app.current_provider = Some(entry.provider.clone());
-        app.current_model = Some(entry.model.clone());
+    if app.screen != Screen::Chat {
         app.set_status(
-            app::LogLevel::Info,
+            app::LogLevel::Warn,
             "model",
-            format!("mode: {} → model: {}", app.agent_mode, entry.label),
+            "model select is only available in chat",
         );
-        cmd_tx.send(ClientMsg::SetSessionModel {
-            session_id: sid,
-            model_id: entry.id,
-            node_id: entry.node_id,
-        })?;
+        return Ok(());
+    }
+    if !can_send_server_commands(app) {
+        return Ok(());
+    }
+    app.popup = Popup::ModelSelect;
+    app.model_filter.clear();
+    app.model_popup_agent_tab = 0;
+    app.model_cursor = app.model_popup_open_cursor();
+    cmd_tx.send(ClientMsg::ListAllModels { refresh: true })?;
+    Ok(())
+}
+
+fn open_session_popup(
+    app: &mut App,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    if !can_send_server_commands(app) {
+        return Ok(());
+    }
+    app.popup = Popup::SessionSelect;
+    app.session_popup_tab = 0;
+    app.session_cursor = 0;
+    app.session_filter.clear();
+    cmd_tx.send(ClientMsg::list_sessions_browse())?;
+    Ok(())
+}
+
+fn open_log_popup(app: &mut App) {
+    app.popup = Popup::Log;
+    app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+    app.log_filter.clear();
+}
+
+fn execute_command_palette_action(
+    app: &mut App,
+    action: CommandPaletteAction,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match action {
+        CommandPaletteAction::OpenMesh | CommandPaletteAction::AttachRemoteSession => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_mesh_popup();
+            cmd_tx.send(ClientMsg::ListRemoteNodes)?;
+        }
+        CommandPaletteAction::CreateRemoteSession => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_mesh_popup();
+            cmd_tx.send(ClientMsg::ListRemoteNodes)?;
+        }
+        CommandPaletteAction::CreateMeshInvite => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_mesh_invite_form();
+        }
+        CommandPaletteAction::ModelSelect => open_model_popup(app, cmd_tx)?,
+        CommandPaletteAction::SessionSelect => open_session_popup(app, cmd_tx)?,
+        CommandPaletteAction::DelegateSessions => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_delegate_popup();
+        }
+        CommandPaletteAction::NewSession => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_new_session_popup();
+        }
+        CommandPaletteAction::ThemeSelect => {
+            app.popup = Popup::ThemeSelect;
+            app.theme_filter.clear();
+            app.theme_cursor = theme::Theme::current_index();
+        }
+        CommandPaletteAction::Help => {
+            app.popup = Popup::Help;
+            app.help_scroll = 0;
+        }
+        CommandPaletteAction::Log => open_log_popup(app),
+        CommandPaletteAction::ProviderAuth => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_auth_popup();
+            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+        }
+        CommandPaletteAction::ForkTurnSelect => {
+            app.open_fork_turn_popup();
+        }
+        CommandPaletteAction::ProfileSelect => {
+            if !can_send_server_commands(app) {
+                return Ok(());
+            }
+            app.open_profile_popup();
+            cmd_tx.send(ClientMsg::ListProfiles)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_mesh_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
+            app.mesh_focus = match app.mesh_focus {
+                crate::mesh::MeshFocus::Nodes => crate::mesh::MeshFocus::Sessions,
+                crate::mesh::MeshFocus::Sessions => crate::mesh::MeshFocus::Nodes,
+            };
+        }
+        KeyCode::Up => match app.mesh_focus {
+            crate::mesh::MeshFocus::Nodes => {
+                if let Some(msg) = app.move_mesh_node_cursor(-1) {
+                    cmd_tx.send(msg)?;
+                }
+            }
+            crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(-1),
+        },
+        KeyCode::Down => match app.mesh_focus {
+            crate::mesh::MeshFocus::Nodes => {
+                if let Some(msg) = app.move_mesh_node_cursor(1) {
+                    cmd_tx.send(msg)?;
+                }
+            }
+            crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(1),
+        },
+        KeyCode::Char('r') => cmd_tx.send(ClientMsg::ListRemoteNodes)?,
+        KeyCode::Enter => match app.mesh_focus {
+            crate::mesh::MeshFocus::Nodes => {
+                app.mesh_focus = crate::mesh::MeshFocus::Sessions;
+                if let Some(node_id) = app.selected_mesh_node_id() {
+                    cmd_tx.send(ClientMsg::ListRemoteSessions {
+                        node_id: node_id.to_string(),
+                        offset: Some(0),
+                        limit: Some(50),
+                    })?;
+                }
+            }
+            crate::mesh::MeshFocus::Sessions => {
+                if let Some(session) = app.selected_remote_session() {
+                    cmd_tx.send(ClientMsg::AttachRemoteSession {
+                        node_id: session.node_id.clone(),
+                        session_id: session.id.clone(),
+                    })?;
+                }
+            }
+        },
+        KeyCode::Char('n') => {
+            if let Some(node_id) = app.selected_mesh_node_id() {
+                cmd_tx.send(ClientMsg::CreateRemoteSession {
+                    node_id: node_id.to_string(),
+                    cwd: app.current_session_cwd(),
+                    request_id: None,
+                })?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_mesh_invite_popup_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    if app.mesh_clipboard_fallback.is_some() {
+        app.mesh_clipboard_fallback = None;
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Up => {
+            app.mesh_invite_form_field = match app.mesh_invite_form_field {
+                crate::mesh::MeshInviteFormField::MeshName => {
+                    crate::mesh::MeshInviteFormField::MaxUses
+                }
+                crate::mesh::MeshInviteFormField::Ttl => crate::mesh::MeshInviteFormField::MeshName,
+                crate::mesh::MeshInviteFormField::MaxUses => crate::mesh::MeshInviteFormField::Ttl,
+            };
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            app.mesh_invite_form_field = match app.mesh_invite_form_field {
+                crate::mesh::MeshInviteFormField::MeshName => crate::mesh::MeshInviteFormField::Ttl,
+                crate::mesh::MeshInviteFormField::Ttl => crate::mesh::MeshInviteFormField::MaxUses,
+                crate::mesh::MeshInviteFormField::MaxUses => {
+                    crate::mesh::MeshInviteFormField::MeshName
+                }
+            };
+        }
+        KeyCode::Backspace => match app.mesh_invite_form_field {
+            crate::mesh::MeshInviteFormField::MeshName => {
+                app.mesh_invite_name.pop();
+            }
+            crate::mesh::MeshInviteFormField::Ttl => {
+                app.mesh_invite_ttl.pop();
+            }
+            crate::mesh::MeshInviteFormField::MaxUses => {
+                app.mesh_invite_max_uses.pop();
+            }
+        },
+        KeyCode::Enter => {
+            if let Some(msg) = app.mesh_invite_form_command() {
+                cmd_tx.send(msg)?;
+                app.set_status(app::LogLevel::Info, "mesh", "creating invite...");
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match app.mesh_invite_form_field {
+                crate::mesh::MeshInviteFormField::MeshName => app.mesh_invite_name.push(c),
+                crate::mesh::MeshInviteFormField::Ttl => app.mesh_invite_ttl.push(c),
+                crate::mesh::MeshInviteFormField::MaxUses if c.is_ascii_digit() => {
+                    app.mesh_invite_max_uses.push(c)
+                }
+                crate::mesh::MeshInviteFormField::MaxUses => {}
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+    if app.mesh_clipboard_fallback.is_some() {
+        app.mesh_clipboard_fallback = None;
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::MeshInvite,
+        KeyCode::Char('u') => {
+            if let Some(url) = app.mesh_invite_url().map(str::to_string) {
+                app.mesh_clipboard_fallback = Some(url);
+            }
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(url) = app.mesh_invite_url().map(str::to_string) {
+                if copy_text_to_clipboard(&url) {
+                    app.set_status(app::LogLevel::Info, "mesh", "invite URL copied");
+                } else {
+                    app.mesh_clipboard_fallback = Some(url);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_command_palette_key(
+    app: &mut App,
+    key: KeyEvent,
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Up => app.move_command_palette_cursor(-1),
+        KeyCode::Down => app.move_command_palette_cursor(1),
+        KeyCode::Backspace => app.command_palette_filter_backspace(),
+        KeyCode::Enter => {
+            if let Some(action) = app.selected_command_palette_action() {
+                execute_command_palette_action(app, action, cmd_tx)?;
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.command_palette_filter_insert(c);
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -213,6 +478,15 @@ pub(crate) fn handle_key(
         } else {
             app.should_quit = true;
         }
+        return Ok(AppAction::None);
+    }
+
+    // direct: ctrl+p opens the command palette, replacing any active popup.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+    {
+        app.chord = false;
+        app.open_command_palette();
         return Ok(AppAction::None);
     }
 
@@ -254,7 +528,6 @@ pub(crate) fn handle_key(
                     "model",
                     format!("thinking: {}", app.reasoning_effort_label()),
                 );
-                save_cache(app);
             }
             None => {
                 app.set_status(
@@ -274,9 +547,7 @@ pub(crate) fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
     {
-        app.popup = Popup::Log;
-        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        app.log_filter.clear();
+        open_log_popup(app);
         return Ok(AppAction::None);
     }
 
@@ -289,6 +560,22 @@ pub(crate) fn handle_key(
 
     // popup handling
     match app.popup {
+        Popup::CommandPalette => {
+            handle_command_palette_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
+        Popup::Mesh => {
+            handle_mesh_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
+        Popup::MeshInvite => {
+            handle_mesh_invite_popup_key(app, key, cmd_tx)?;
+            return Ok(AppAction::None);
+        }
+        Popup::MeshInviteQr => {
+            handle_mesh_invite_qr_popup_key(app, key)?;
+            return Ok(AppAction::None);
+        }
         Popup::ModelSelect => {
             handle_model_popup_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
@@ -369,16 +656,11 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
-/// Persist current app state to `~/.qmt/tui.toml`.  Called at every
+/// Persist current app state to `~/.qmt/qmtui.toml`.  Called at every
 /// user-initiated change that should survive a restart.
 pub(crate) fn save_config(app: &App) {
     let merged = config::TuiConfig::load().with_app_settings(app);
     merged.save();
-}
-
-/// Persist session effort cache to `~/.cache/qmt/tui-cache.toml`.
-pub(crate) fn save_cache(app: &App) {
-    config::TuiCache::from_app(app).save();
 }
 
 /// Handle second key of a ctrl+x chord. Works in any screen.
@@ -389,22 +671,7 @@ pub(crate) fn handle_chord(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Char('m') => {
-            if app.screen != Screen::Chat {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "model",
-                    "model select is only available in chat",
-                );
-                return Ok(());
-            }
-            app.popup = Popup::ModelSelect;
-            app.model_filter.clear();
-            app.model_popup_agent_tab = match app.agent_mode.as_str() {
-                "plan" => 0,
-                "review" => 2,
-                _ => 1,
-            };
-            app.model_cursor = app.current_mode_model_cursor();
+            open_model_popup(app, cmd_tx)?;
         }
         KeyCode::Char('n') => {
             if !can_send_server_commands(app) {
@@ -429,14 +696,7 @@ pub(crate) fn handle_chord(
             app.theme_cursor = theme::Theme::current_index();
         }
         KeyCode::Char('l') => {
-            if !can_send_server_commands(app) {
-                return Ok(());
-            }
-            app.popup = Popup::SessionSelect;
-            app.session_popup_tab = 0;
-            app.session_cursor = 0;
-            app.session_filter.clear();
-            cmd_tx.send(ClientMsg::list_sessions_browse())?;
+            open_session_popup(app, cmd_tx)?;
         }
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
@@ -468,6 +728,7 @@ pub(crate) fn handle_chord(
             if let Some(parent_sid) = app.parent_session_id.clone() {
                 cmd_tx.send(ClientMsg::LoadSession {
                     session_id: parent_sid.clone(),
+                    cwd: app.current_session_cwd(),
                 })?;
                 cmd_tx.send(ClientMsg::SubscribeSession {
                     session_id: parent_sid,
@@ -587,9 +848,11 @@ pub(crate) fn handle_sessions_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -684,9 +947,11 @@ pub(crate) fn handle_session_popup_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -797,6 +1062,9 @@ pub(crate) fn apply_popup_session_key(
                             return SessionKeyAction::LoadSession {
                                 session_id,
                                 agent_id: None,
+                                cwd: session
+                                    .cwd
+                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
@@ -931,6 +1199,7 @@ fn handle_delegate_view_key(
             if let Some(parent_sid) = app.parent_session_id.clone() {
                 cmd_tx.send(ClientMsg::LoadSession {
                     session_id: parent_sid.clone(),
+                    cwd: app.current_session_cwd(),
                 })?;
                 cmd_tx.send(ClientMsg::SubscribeSession {
                     session_id: parent_sid,
@@ -961,9 +1230,11 @@ pub(crate) fn handle_delegate_popup_key(
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
+            cwd,
         } => {
             cmd_tx.send(ClientMsg::LoadSession {
                 session_id: session_id.clone(),
+                cwd,
             })?;
             cmd_tx.send(ClientMsg::SubscribeSession {
                 session_id,
@@ -1030,6 +1301,7 @@ pub(crate) fn apply_delegate_popup_key(
                     return SessionKeyAction::LoadSession {
                         session_id: sid,
                         agent_id: target_agent_id,
+                        cwd: app.current_session_cwd(),
                     };
                 } else {
                     app.set_status(
@@ -1424,15 +1696,35 @@ pub(crate) fn handle_chat_key(
                     return Ok(AppAction::None);
                 }
                 let (text, links) = app.build_prompt_text_and_links(&app.input);
+                let text = text.trim().to_string();
                 let _ = app.take_input();
-                let mut prompt = vec![PromptBlock::Text { text }];
+                if text.is_empty() {
+                    return Ok(AppAction::None);
+                }
+                let mut prompt = vec![PromptBlock::Text { text: text.clone() }];
                 for path in links {
                     prompt.push(PromptBlock::ResourceLink {
                         name: path.clone(),
                         uri: path,
                     });
                 }
-                cmd_tx.send(ClientMsg::Prompt { prompt })?;
+                let local_id = app.push_pending_prompt(text);
+                if let Err(error) = cmd_tx.send(ClientMsg::Prompt {
+                    prompt,
+                    local_id: local_id.clone(),
+                }) {
+                    app.messages.retain(|entry| {
+                        !matches!(
+                            entry,
+                            crate::app::ChatEntry::User {
+                                message_id: Some(message_id),
+                                ..
+                            } if message_id == &local_id
+                        )
+                    });
+                    app.card_cache.invalidate();
+                    return Err(error.into());
+                }
             }
         }
         KeyCode::Tab if !input_blocked => {
@@ -1520,16 +1812,9 @@ fn switch_mode(
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
     target: &str,
 ) -> anyhow::Result<()> {
-    app.cache_session_mode_state();
-
     cmd_tx.send(ClientMsg::SetAgentMode {
         mode: target.to_string(),
     })?;
-    if let (Some(provider), Some(model)) = (app.current_provider.clone(), app.current_model.clone())
-    {
-        let outgoing_mode = app.agent_mode.clone();
-        app.set_mode_model_preference(&outgoing_mode, &provider, &model);
-    }
 
     if target == "review" {
         if app.agent_mode != "review" {
@@ -1541,19 +1826,7 @@ fn switch_mode(
 
     app.agent_mode = target.to_string();
 
-    for msg in app.apply_cached_mode_state() {
-        cmd_tx.send(msg)?;
-    }
-    if !app
-        .session_cache
-        .get(app.session_id.as_deref().unwrap_or(""))
-        .is_some_and(|modes| modes.contains_key(&app.agent_mode))
-    {
-        apply_mode_model_if_preferred(app, cmd_tx)?;
-    }
-
     save_config(app);
-    save_cache(app);
     Ok(())
 }
 
@@ -1611,14 +1884,10 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.popup = crate::app::Popup::ModelSelect;
-            app.model_popup_agent_tab = match app.agent_mode.as_str() {
-                "plan" => 0,
-                "review" => 2,
-                _ => 1,
-            };
+            app.model_popup_agent_tab = 0;
             if arg.is_empty() {
                 app.model_filter.clear();
-                app.model_cursor = app.current_mode_model_cursor();
+                app.model_cursor = app.model_popup_open_cursor();
             } else {
                 app.model_filter = arg;
                 app.model_cursor = 0;
@@ -1696,7 +1965,6 @@ fn try_execute_slash_command(
                         "model",
                         format!("thinking: {}", app.reasoning_effort_label()),
                     );
-                    save_cache(app);
                 }
             }
         }
@@ -2122,11 +2390,10 @@ pub(crate) fn handle_auth_popup_key(
 
 /// Try to copy text to the system clipboard. On failure, store in the fallback
 /// field so the draw function can show a popup with the URL for manual copy.
-fn try_copy_to_clipboard(app: &mut App, text: &str) {
+fn copy_text_to_clipboard(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    // Try common clipboard commands in order
     let commands = [
         ("xclip", &["-selection", "clipboard"] as &[&str]),
         ("xsel", &["--clipboard", "--input"]),
@@ -2146,14 +2413,19 @@ fn try_copy_to_clipboard(app: &mut App, text: &str) {
                 let _ = stdin.write_all(text.as_bytes());
             }
             if child.wait().is_ok_and(|s| s.success()) {
-                app.auth_result_message = Some((true, "Copied to clipboard".into()));
-                return;
+                return true;
             }
         }
     }
+    false
+}
 
-    // Clipboard not available — store for fallback display
-    app.auth_clipboard_fallback = Some(text.to_string());
+fn try_copy_to_clipboard(app: &mut App, text: &str) {
+    if copy_text_to_clipboard(text) {
+        app.auth_result_message = Some((true, "Copied to clipboard".into()));
+    } else {
+        app.auth_clipboard_fallback = Some(text.to_string());
+    }
 }
 
 pub(crate) fn handle_model_popup_key(
@@ -2166,6 +2438,9 @@ pub(crate) fn handle_model_popup_key(
             app.popup = Popup::None;
         }
         KeyCode::Tab | KeyCode::BackTab => {
+            if !app.model_popup_has_tabs() {
+                return Ok(());
+            }
             let n = app.model_popup_tab_count();
             if key.code == KeyCode::BackTab {
                 app.model_popup_agent_tab = if app.model_popup_agent_tab == 0 {
@@ -2177,17 +2452,16 @@ pub(crate) fn handle_model_popup_key(
                 app.model_popup_agent_tab = (app.model_popup_agent_tab + 1) % n;
             }
             app.model_filter.clear();
-            let agent_id = app
+            app.model_cursor = if app.model_popup_is_session_tab(app.model_popup_agent_tab) {
+                app.model_popup_open_cursor()
+            } else if let Some(aid) = app
                 .model_popup_tab_agent_id(app.model_popup_agent_tab)
-                .map(str::to_string);
-            app.model_cursor =
-                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
-                    app.mode_model_cursor(mode)
-                } else if let Some(ref aid) = agent_id {
-                    app.delegate_model_cursor(aid)
-                } else {
-                    0
-                };
+                .map(str::to_string)
+            {
+                app.delegate_model_cursor(&aid)
+            } else {
+                0
+            };
         }
         KeyCode::Up => {
             app.model_cursor = app.model_cursor.saturating_sub(1);
@@ -2206,60 +2480,43 @@ pub(crate) fn handle_model_popup_key(
                 })
                 .cloned();
             if let Some(model) = selected {
-                if let Some(mode) = app.model_popup_tab_mode(app.model_popup_agent_tab) {
-                    // Mode tab (plan / build / review): store preference for that mode
-                    app.set_mode_model_preference(mode, &model.provider, &model.model);
-                    let current_is_remote = app.current_session_is_remote();
-                    if app.agent_mode == mode {
-                        if !current_is_remote {
-                            // If current mode matches, also apply to the live session.
-                            if let Some(sid) = app.session_id.clone() {
-                                cmd_tx.send(ClientMsg::SetSessionModel {
-                                    session_id: sid,
-                                    model_id: model.id.clone(),
-                                    node_id: model.node_id.clone(),
-                                })?;
-                            }
-                            app.current_model = Some(model.model.clone());
-                            app.current_provider = Some(model.provider.clone());
-                            if app.reasoning_effort.is_some() {
-                                app.reasoning_effort = None;
-                                cmd_tx.send(ClientMsg::SetReasoningEffort {
-                                    reasoning_effort: "auto".into(),
-                                })?;
-                            }
-                            app.cache_session_mode_state();
+                let tab_label = app
+                    .model_popup_tab_label(app.model_popup_agent_tab)
+                    .to_string();
+                if app.model_popup_is_session_tab(app.model_popup_agent_tab) {
+                    if !app.current_session_is_remote() {
+                        if let Some(sid) = app.session_id.clone() {
+                            cmd_tx.send(ClientMsg::SetSessionModel {
+                                session_id: sid,
+                                model_id: model.id.clone(),
+                                node_id: model.node_id.clone(),
+                            })?;
                         }
-                    } else if !current_is_remote {
-                        // Update the session cache for the target mode so that a later
-                        // switch_mode does not restore a stale cached model.
-                        app.update_cached_mode_model(mode, &model.provider, &model.model);
+                        app.apply_model_selection_from_entry(&model);
+                        if app.reasoning_effort.is_some() {
+                            app.reasoning_effort = None;
+                            cmd_tx.send(ClientMsg::SetReasoningEffort {
+                                reasoning_effort: "auto".into(),
+                            })?;
+                        }
                     }
-                    let tab_label = app
-                        .model_popup_tab_label(app.model_popup_agent_tab)
-                        .to_string();
                     app.set_status(
                         app::LogLevel::Info,
                         "model",
-                        format!("{}: {}", tab_label, model.label),
+                        format!("session: {}", model.label),
                     );
                 } else if let Some(agent_id) = app
                     .model_popup_tab_agent_id(app.model_popup_agent_tab)
                     .map(str::to_string)
                 {
-                    // Agent tab: store delegate preference
-                    let tab_label = app
-                        .model_popup_tab_label(app.model_popup_agent_tab)
-                        .to_string();
                     app.set_delegate_model_preference(&agent_id, &model.provider, &model.model);
                     app.set_status(
                         app::LogLevel::Info,
                         "model",
-                        format!("{}: {}", tab_label, model.label),
+                        format!("{tab_label}: {}", model.label),
                     );
                 }
                 save_config(app);
-                save_cache(app);
             }
         }
         KeyCode::Backspace => {
@@ -2290,6 +2547,7 @@ pub(crate) enum SessionKeyAction {
     LoadSession {
         session_id: String,
         agent_id: Option<String>,
+        cwd: Option<String>,
     },
     /// Attach a remote session through its node.
     AttachRemoteSession { node_id: String, session_id: String },
@@ -2371,6 +2629,9 @@ pub(crate) fn apply_sessions_key(
                             return SessionKeyAction::LoadSession {
                                 session_id,
                                 agent_id: None,
+                                cwd: session
+                                    .cwd
+                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
@@ -2454,8 +2715,16 @@ mod model_popup_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
+        }
+    }
+
+    fn make_agent(id: &str, name: &str) -> crate::protocol::AgentInfo {
+        crate::protocol::AgentInfo {
+            id: id.into(),
+            name: name.into(),
         }
     }
 
@@ -2520,6 +2789,204 @@ mod model_popup_tests {
     }
 
     #[test]
+    fn ctrl_p_opens_command_palette_over_existing_popup() {
+        let mut app = App::new();
+        app.popup = Popup::ThemeSelect;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(app.popup, Popup::CommandPalette));
+        assert_eq!(app.command_palette_cursor, 0);
+        assert!(app.command_palette_filter.is_empty());
+    }
+
+    #[test]
+    fn command_palette_enter_opens_theme_picker() {
+        let mut app = App::new();
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "theme".into();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::ThemeSelect));
+    }
+
+    #[test]
+    fn command_palette_open_mesh_refreshes_remote_nodes() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "open mesh".into();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::Mesh));
+        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListRemoteNodes)));
+    }
+
+    #[test]
+    fn mesh_popup_enter_on_session_attaches_remote_session() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.mesh_focus = crate::mesh::MeshFocus::Sessions;
+        app.mesh_nodes = vec![crate::protocol::RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "framework".into(),
+            ..Default::default()
+        }];
+        app.remote_sessions_by_node.insert(
+            "node-1".into(),
+            vec![crate::protocol::RemoteSessionInfo {
+                id: "remote-1".into(),
+                node_id: "node-1".into(),
+                title: Some("Fix bug".into()),
+                ..Default::default()
+            }],
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_mesh_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::AttachRemoteSession { node_id, session_id })
+                if node_id == "node-1" && session_id == "remote-1"
+        ));
+    }
+
+    #[test]
+    fn command_palette_create_mesh_invite_opens_prefilled_invite_popup() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "mesh invite".into();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::MeshInvite));
+        assert_eq!(app.mesh_invite_ttl, "24h");
+        assert_eq!(app.mesh_invite_max_uses, "1");
+    }
+
+    #[test]
+    fn mesh_popup_i_no_longer_opens_invite_popup() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_mesh_popup_key(&mut app, key(KeyCode::Char('i')), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::Mesh));
+    }
+
+    #[test]
+    fn mesh_invite_u_shows_manual_url_overlay() {
+        let mut app = App::new();
+        app.open_mesh_invite_form();
+        app.apply_mesh_invite_created(crate::protocol::MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: None,
+        });
+
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Char('u'))).unwrap();
+
+        assert_eq!(
+            app.mesh_clipboard_fallback.as_deref(),
+            Some("qmt://mesh/join/token")
+        );
+    }
+
+    #[test]
+    fn mesh_invite_form_rejects_invalid_ttl_and_max_uses() {
+        let mut app = App::new();
+        app.open_mesh_invite_form();
+        app.mesh_invite_ttl = "lol".into();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.mesh_error.as_deref(),
+            Some("ttl must be like 30m, 1d3h, or 1d3h5m")
+        );
+
+        app.mesh_invite_ttl = "24h".into();
+        app.mesh_invite_max_uses = "0".into();
+        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            app.mesh_error.as_deref(),
+            Some("max uses must be at least 1")
+        );
+    }
+
+    #[test]
+    fn mesh_invite_form_enter_sends_create_invite() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.open_mesh_invite_form();
+        app.mesh_invite_name = "Team Mesh".into();
+        app.mesh_invite_ttl = "1d3h5m".into();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::CreateMeshInvite { mesh_name, ttl, max_uses })
+                if mesh_name.as_deref() == Some("Team Mesh")
+                    && ttl.as_deref() == Some("1d3h5m")
+                    && max_uses == Some(1)
+        ));
+    }
+
+    #[test]
+    fn mesh_invite_qr_esc_returns_to_create_invite_popup() {
+        let mut app = App::new();
+        app.apply_mesh_invite_created(crate::protocol::MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: None,
+        });
+
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.popup, Popup::MeshInvite));
+    }
+
+    #[test]
+    fn command_palette_profile_lists_profiles() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::CommandPalette;
+        app.command_palette_filter = "profile".into();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListProfiles)));
+    }
+
+    #[test]
     fn slash_profile_without_arg_opens_selector_and_lists_profiles() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -2558,6 +3025,7 @@ mod model_popup_tests {
 
     #[test]
     fn profile_popup_enter_sends_selected_profile() {
+        let _guard = TestPersistenceGuard::new("profile-popup-enter");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.popup = Popup::ProfileSelect;
@@ -2575,103 +3043,45 @@ mod model_popup_tests {
     }
 
     #[test]
-    fn select_model_for_inactive_build_tab_updates_build_cache() {
-        let _guard = TestPersistenceGuard::new("inactive-build");
+    fn select_model_on_delegate_tab_saves_pref_not_session_model() {
+        let _guard = TestPersistenceGuard::new("delegate-tab");
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.agent_mode = "plan".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
-
-        // Pre-populate stale build cache
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            crate::app::CachedModeState {
-                model: "old/stale".into(),
-                effort: Some("high".into()),
-            },
-        );
-
+        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
         app.models = vec![
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.model_popup_agent_tab = 1; // build tab
-        app.model_cursor = 3; // anthropic/claude-sonnet (skipping headers)
+        app.model_popup_agent_tab = 1; // delegate tab
+        let items = app.visible_model_popup_items();
+        app.model_cursor = items
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].model == "claude-sonnet"
+                )
+            })
+            .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        // No live SetSessionModel should be sent because build is not active
         assert!(rx.try_recv().is_err());
-
-        // Build cache should be updated, plan cache should not exist yet
-        let build_cache = &app.session_cache["s1"]["build"];
-        assert_eq!(build_cache.model, "anthropic/claude-sonnet");
-        assert_eq!(build_cache.effort, None);
-
-        // Live plan state must be untouched
         assert_eq!(app.current_provider.as_deref(), Some("openai"));
         assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-
-        // Preference should be persisted
         assert_eq!(
-            app.get_mode_model_preference("build"),
+            app.get_delegate_model_preference("coder"),
             Some(("anthropic", "claude-sonnet"))
         );
     }
 
     #[test]
-    fn select_model_for_inactive_plan_tab_updates_plan_cache() {
-        let _guard = TestPersistenceGuard::new("inactive-plan");
-        let mut app = App::new();
-        app.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-opus".into());
-
-        // Pre-populate stale plan cache
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            crate::app::CachedModeState {
-                model: "old/stale".into(),
-                effort: Some("max".into()),
-            },
-        );
-
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.model_popup_agent_tab = 0; // plan tab
-        app.model_cursor = 1; // openai/gpt-4o
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        // No live SetSessionModel should be sent because plan is not active
-        assert!(rx.try_recv().is_err());
-
-        // Plan cache should be updated
-        let plan_cache = &app.session_cache["s1"]["plan"];
-        assert_eq!(plan_cache.model, "openai/gpt-4o");
-        assert_eq!(plan_cache.effort, None);
-
-        // Live build state must be untouched
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
-
-        // Preference should be persisted
-        assert_eq!(
-            app.get_mode_model_preference("plan"),
-            Some(("openai", "gpt-4o"))
-        );
-    }
-
-    #[test]
-    fn select_model_for_active_mode_still_works() {
+    fn select_model_on_session_tab_applies_set_session_model() {
         let _guard = TestPersistenceGuard::new("active-mode");
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
@@ -2685,13 +3095,21 @@ mod model_popup_tests {
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.model_popup_agent_tab = 1; // build tab (active)
-        app.model_cursor = 3; // anthropic/claude-sonnet
+        app.model_popup_agent_tab = 0;
+        let items = app.visible_model_popup_items();
+        app.model_cursor = items
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].model == "claude-sonnet"
+                )
+            })
+            .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        // Live commands should be sent
         let msg1 = rx.try_recv().expect("expected SetSessionModel");
         assert!(matches!(msg1, ClientMsg::SetSessionModel { .. }));
         let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
@@ -2700,27 +3118,70 @@ mod model_popup_tests {
         );
         assert!(rx.try_recv().is_err());
 
-        // Live state updated
         assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
         assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
         assert_eq!(app.reasoning_effort, None);
-
-        // Cache updated for active mode
-        let build_cache = &app.session_cache["s1"]["build"];
-        assert_eq!(build_cache.model, "anthropic/claude-sonnet");
-        assert_eq!(build_cache.effort, None);
     }
 
     #[test]
-    fn select_model_for_active_remote_mode_only_saves_preference() {
+    fn select_remote_model_on_local_session_sends_node_id() {
+        let _guard = TestPersistenceGuard::new("remote-mesh-model");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.agent_mode = "build".into();
+        app.current_provider = Some("openai".into());
+        app.current_model = Some("gpt-4o".into());
+        app.models = vec![
+            make_model("openai", "gpt-4o"),
+            ModelEntry {
+                id: "mesh/anthropic/claude".into(),
+                label: "Claude".into(),
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                node_id: Some("node-a".into()),
+                node_label: Some("peer-a".into()),
+                family: None,
+                quant: None,
+            },
+        ];
+        app.model_popup_agent_tab = 0;
+        let items = app.visible_model_popup_items();
+        app.model_cursor = items
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].node_id.is_some()
+                )
+            })
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        match rx.try_recv().expect("SetSessionModel") {
+            ClientMsg::SetSessionModel {
+                node_id, model_id, ..
+            } => {
+                assert_eq!(node_id.as_deref(), Some("node-a"));
+                assert_eq!(model_id, "mesh/anthropic/claude");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.current_model.as_deref(), Some("claude"));
+        assert_eq!(app.current_model_node_id.as_deref(), Some("node-a"));
+    }
+
+    #[test]
+    fn select_model_on_attached_remote_session_does_not_apply() {
         let _guard = TestPersistenceGuard::new("active-remote-mode");
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.session_id = Some("remote-1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.reasoning_effort = Some("high".into());
         app.session_groups = vec![protocol::SessionGroup {
             sessions: vec![protocol::SessionSummary {
                 session_id: "remote-1".into(),
@@ -2729,147 +3190,23 @@ mod model_popup_tests {
             }],
             ..Default::default()
         }];
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.model_popup_agent_tab = 1;
-        app.model_cursor = 3;
+        app.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.model_popup_agent_tab = 0;
+        app.model_cursor = app
+            .visible_model_popup_items()
+            .iter()
+            .position(|i| matches!(i, crate::app::ModelPopupItem::Model { .. }))
+            .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
         assert!(rx.try_recv().is_err());
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
-        assert!(!app.session_cache.contains_key("remote-1"));
-        assert_eq!(
-            app.get_mode_model_preference("build"),
-            Some(("anthropic", "claude-sonnet"))
-        );
     }
 
     #[test]
-    fn select_model_for_inactive_remote_mode_only_saves_preference() {
-        let _guard = TestPersistenceGuard::new("inactive-remote-mode");
+    fn opening_model_popup_starts_on_session_tab() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
-        app.session_id = Some("remote-1".into());
-        app.agent_mode = "plan".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.session_groups = vec![protocol::SessionGroup {
-            sessions: vec![protocol::SessionSummary {
-                session_id: "remote-1".into(),
-                node_id: Some("node-1".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }];
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.model_popup_agent_tab = 1;
-        app.model_cursor = 3;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(rx.try_recv().is_err());
-        assert!(!app.session_cache.contains_key("remote-1"));
-        assert_eq!(
-            app.get_mode_model_preference("build"),
-            Some(("anthropic", "claude-sonnet"))
-        );
-    }
-
-    #[test]
-    fn select_model_for_inactive_review_tab_updates_review_cache() {
-        let _guard = TestPersistenceGuard::new("inactive-review");
-        let mut app = App::new();
-        app.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "review".into(),
-            crate::app::CachedModeState {
-                model: "old/stale".into(),
-                effort: Some("max".into()),
-            },
-        );
-
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.model_popup_agent_tab = 2; // review tab
-        app.model_cursor = 3; // anthropic/claude-sonnet
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(rx.try_recv().is_err());
-
-        let review_cache = &app.session_cache["s1"]["review"];
-        assert_eq!(review_cache.model, "anthropic/claude-sonnet");
-        assert_eq!(review_cache.effort, None);
-
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
-
-        assert_eq!(
-            app.get_mode_model_preference("review"),
-            Some(("anthropic", "claude-sonnet"))
-        );
-    }
-
-    #[test]
-    fn select_model_for_active_review_mode_updates_live_session() {
-        let _guard = TestPersistenceGuard::new("active-review");
-        let mut app = App::new();
-        app.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "review".into();
-        app.mode_before_review = Some("plan".into());
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.reasoning_effort = Some("high".into());
-
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.model_popup_agent_tab = 2; // review tab (active)
-        app.model_cursor = 3; // anthropic/claude-sonnet
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        let msg1 = rx.try_recv().expect("expected SetSessionModel");
-        assert!(matches!(msg1, ClientMsg::SetSessionModel { .. }));
-        let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
-        assert!(
-            matches!(msg2, ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
-        );
-        assert!(rx.try_recv().is_err());
-
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
-        assert_eq!(app.reasoning_effort, None);
-
-        let review_cache = &app.session_cache["s1"]["review"];
-        assert_eq!(review_cache.model, "anthropic/claude-sonnet");
-        assert_eq!(review_cache.effort, None);
-    }
-
-    #[test]
-    fn opening_model_popup_in_review_starts_on_review_tab() {
-        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
         app.screen = Screen::Chat;
         app.agent_mode = "review".into();
         app.current_provider = Some("openai".into());
@@ -2880,12 +3217,12 @@ mod model_popup_tests {
         handle_chord(&mut app, key(KeyCode::Char('m')), &tx).unwrap();
 
         assert!(matches!(app.popup, Popup::ModelSelect));
-        assert_eq!(app.model_popup_agent_tab, 2);
-        assert_eq!(app.model_cursor, 1);
+        assert_eq!(app.model_popup_agent_tab, 0);
+        assert_eq!(app.model_cursor, app.model_popup_open_cursor());
     }
 
     #[test]
-    fn slash_model_in_review_starts_on_review_tab() {
+    fn slash_model_starts_on_session_tab() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.screen = Screen::Chat;
@@ -2901,8 +3238,8 @@ mod model_popup_tests {
 
         assert!(matches!(action, AppAction::None));
         assert!(matches!(app.popup, Popup::ModelSelect));
-        assert_eq!(app.model_popup_agent_tab, 2);
-        assert_eq!(app.model_cursor, 1);
+        assert_eq!(app.model_popup_agent_tab, 0);
+        assert_eq!(app.model_cursor, app.model_popup_open_cursor());
     }
 
     #[test]
@@ -2961,7 +3298,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv().expect("expected LoadSession"),
-            ClientMsg::LoadSession { session_id } if session_id == "child-1"
+            ClientMsg::LoadSession { session_id, .. } if session_id == "child-1"
         ));
         assert!(matches!(
             rx.try_recv().expect("expected SubscribeSession"),

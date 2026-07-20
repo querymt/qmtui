@@ -7,6 +7,7 @@ use ratatui::text::Line;
 
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
+use crate::mesh::{MeshFocus, MeshInviteFormField};
 use crate::protocol::*;
 use crate::ui::{CardCache, OUTCOME_BULLET};
 
@@ -60,6 +61,10 @@ pub enum Screen {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
     None,
+    CommandPalette,
+    Mesh,
+    MeshInvite,
+    MeshInviteQr,
     ModelSelect,
     SessionSelect,
     NewSession,
@@ -70,6 +75,134 @@ pub enum Popup {
     ForkTurnSelect,
     ProfileSelect,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPaletteAction {
+    OpenMesh,
+    AttachRemoteSession,
+    CreateRemoteSession,
+    CreateMeshInvite,
+    ModelSelect,
+    SessionSelect,
+    DelegateSessions,
+    NewSession,
+    ThemeSelect,
+    Help,
+    Log,
+    ProviderAuth,
+    ForkTurnSelect,
+    ProfileSelect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandPaletteCommand {
+    pub title: &'static str,
+    pub description: &'static str,
+    pub shortcut: &'static str,
+    pub action: CommandPaletteAction,
+    pub chat_only: bool,
+}
+
+pub const COMMAND_PALETTE_COMMANDS: &[CommandPaletteCommand] = &[
+    CommandPaletteCommand {
+        title: "Open Mesh",
+        description: "View mesh nodes and remote sessions",
+        shortcut: "",
+        action: CommandPaletteAction::OpenMesh,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Attach remote session",
+        description: "Attach an existing session from a mesh node",
+        shortcut: "",
+        action: CommandPaletteAction::AttachRemoteSession,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Create remote session",
+        description: "Start a new session on a mesh node",
+        shortcut: "",
+        action: CommandPaletteAction::CreateRemoteSession,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Create mesh invite",
+        description: "Generate a mesh invite link and QR code",
+        shortcut: "",
+        action: CommandPaletteAction::CreateMeshInvite,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Model selector",
+        description: "Choose the model for this session or delegates",
+        shortcut: "C-x m",
+        action: CommandPaletteAction::ModelSelect,
+        chat_only: true,
+    },
+    CommandPaletteCommand {
+        title: "Session switcher",
+        description: "Browse and load sessions",
+        shortcut: "C-x l",
+        action: CommandPaletteAction::SessionSelect,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Delegate sessions",
+        description: "Browse delegate child sessions",
+        shortcut: "",
+        action: CommandPaletteAction::DelegateSessions,
+        chat_only: true,
+    },
+    CommandPaletteCommand {
+        title: "New session",
+        description: "Start a new session in a directory",
+        shortcut: "C-x n",
+        action: CommandPaletteAction::NewSession,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Theme picker",
+        description: "Change the UI theme",
+        shortcut: "C-x t",
+        action: CommandPaletteAction::ThemeSelect,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Help",
+        description: "Show keyboard shortcuts and commands",
+        shortcut: "C-x ?",
+        action: CommandPaletteAction::Help,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Logs",
+        description: "Show in-memory logs",
+        shortcut: "Ctrl+l",
+        action: CommandPaletteAction::Log,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Provider auth",
+        description: "Manage provider authentication",
+        shortcut: "C-x a",
+        action: CommandPaletteAction::ProviderAuth,
+        chat_only: false,
+    },
+    CommandPaletteCommand {
+        title: "Fork selector",
+        description: "Choose a turn to fork from",
+        shortcut: "C-x f",
+        action: CommandPaletteAction::ForkTurnSelect,
+        chat_only: true,
+    },
+    CommandPaletteCommand {
+        title: "Profile selector",
+        description: "Choose the active profile for new sessions",
+        shortcut: "C-x p",
+        action: CommandPaletteAction::ProfileSelect,
+        chat_only: false,
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -358,11 +491,19 @@ pub struct ElicitationState {
     pub field_cursor: usize,
     /// Which option within the current select field is highlighted.
     pub option_cursor: usize,
-    /// Accumulated selections (field name → value).
+    /// Accumulated selections (field name -> value).
     pub selected: HashMap<String, serde_json::Value>,
     /// Text buffer for TextInput / NumberInput fields.
     pub text_input: String,
     pub text_cursor: usize,
+    /// Whether select fields may offer a free-form custom response.
+    pub allow_custom: bool,
+    /// Whether the custom response editor currently has focus.
+    pub custom_active: bool,
+    pub custom_input: String,
+    pub custom_cursor: usize,
+    pub custom_line_width: usize,
+    pub custom_scroll: u16,
 }
 
 impl ElicitationState {
@@ -476,7 +617,7 @@ impl ElicitationState {
             .get(self.field_cursor.min(self.fields.len().saturating_sub(1)))
     }
 
-    /// Number of options in the current field's select list (0 for non-select).
+    /// Number of schema-provided options in the current select field.
     pub fn current_option_count(&self) -> usize {
         match self.current_field().map(|field| &field.kind) {
             Some(ElicitationFieldKind::SingleSelect { options }) => options.len(),
@@ -485,14 +626,125 @@ impl ElicitationState {
         }
     }
 
+    pub fn custom_available(&self) -> bool {
+        self.allow_custom && self.current_option_count() > 0
+    }
+
+    pub fn custom_option_selected(&self) -> bool {
+        self.custom_available() && self.option_cursor == self.current_option_count()
+    }
+
+    /// Number of visible choices, including the virtual custom-answer choice.
+    pub fn visible_option_count(&self) -> usize {
+        self.current_option_count() + usize::from(self.custom_available())
+    }
+
     /// Move the option cursor by `delta`, clamped to valid range.
     pub fn move_cursor(&mut self, delta: i32) {
-        let max = self.current_option_count().saturating_sub(1);
+        let max = self.visible_option_count().saturating_sub(1);
         self.option_cursor = (self.option_cursor as i32 + delta).clamp(0, max as i32) as usize;
+    }
+
+    pub fn activate_custom(&mut self) {
+        if !self.custom_option_selected() {
+            return;
+        }
+        self.custom_active = true;
+        self.custom_cursor = self.custom_input.len();
+        if let Some(name) = self.current_field().map(|field| field.name.clone()) {
+            self.selected.remove(&name);
+        }
+    }
+
+    pub fn deactivate_custom(&mut self) {
+        self.custom_active = false;
+        self.custom_scroll = 0;
+    }
+
+    pub fn custom_insert(&mut self, c: char) {
+        self.custom_input.insert(self.custom_cursor, c);
+        self.custom_cursor += c.len_utf8();
+    }
+
+    pub fn custom_backspace(&mut self) {
+        if self.custom_cursor == 0 {
+            return;
+        }
+        let previous = self.custom_input[..self.custom_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.custom_input.drain(previous..self.custom_cursor);
+        self.custom_cursor = previous;
+    }
+
+    pub fn custom_delete(&mut self) {
+        if self.custom_cursor >= self.custom_input.len() {
+            return;
+        }
+        let next = self.custom_input[self.custom_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.custom_cursor + index)
+            .unwrap_or(self.custom_input.len());
+        self.custom_input.drain(self.custom_cursor..next);
+    }
+
+    pub fn custom_left(&mut self) {
+        if self.custom_cursor > 0 {
+            self.custom_cursor = self.custom_input[..self.custom_cursor]
+                .char_indices()
+                .last()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn custom_right(&mut self) {
+        if self.custom_cursor < self.custom_input.len() {
+            self.custom_cursor = self.custom_input[self.custom_cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(index, _)| self.custom_cursor + index)
+                .unwrap_or(self.custom_input.len());
+        }
+    }
+
+    pub fn custom_home(&mut self) {
+        let line_start = self.custom_input[..self.custom_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.custom_cursor = line_start;
+    }
+
+    pub fn custom_end(&mut self) {
+        let line_end = self.custom_input[self.custom_cursor..]
+            .find('\n')
+            .map(|index| self.custom_cursor + index)
+            .unwrap_or(self.custom_input.len());
+        self.custom_cursor = line_end;
+    }
+
+    pub fn custom_move_visual(&mut self, delta: i32) {
+        let layout = crate::ui::build_input_visual_layout(
+            &self.custom_input,
+            self.custom_cursor,
+            self.custom_line_width.max(1),
+            2,
+        );
+        let row = (layout.cursor_row as i32 + delta)
+            .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
+        self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
     }
 
     /// For SingleSelect: record the highlighted option as the field's value.
     pub fn select_current_option(&mut self) {
+        if self.custom_option_selected() {
+            self.activate_custom();
+            return;
+        }
         let Some(field) = self.current_field() else {
             return;
         };
@@ -501,6 +753,9 @@ impl ElicitationState {
         {
             let name = field.name.clone();
             let value = opt.value.clone();
+            self.custom_active = false;
+            self.custom_input.clear();
+            self.custom_cursor = 0;
             self.selected.insert(name, value);
         }
     }
@@ -508,6 +763,10 @@ impl ElicitationState {
     /// For MultiSelect: toggle the highlighted option in the field's array value.
     /// For BooleanToggle: flip between explicit true and false.
     pub fn toggle_current_option(&mut self) {
+        if self.custom_option_selected() {
+            self.activate_custom();
+            return;
+        }
         let Some(field) = self.current_field() else {
             return;
         };
@@ -516,6 +775,8 @@ impl ElicitationState {
                 if let Some(opt) = options.get(self.option_cursor) {
                     let name = field.name.clone();
                     let val = opt.value.clone();
+                    self.custom_input.clear();
+                    self.custom_cursor = 0;
                     let arr = self
                         .selected
                         .entry(name)
@@ -552,7 +813,17 @@ impl ElicitationState {
             match &field.kind {
                 ElicitationFieldKind::SingleSelect { .. }
                 | ElicitationFieldKind::MultiSelect { .. } => {
-                    if let Some(v) = self.selected.get(&field.name) {
+                    if self.custom_active {
+                        let custom =
+                            serde_json::Value::String(self.custom_input.trim().to_string());
+                        let value =
+                            if matches!(&field.kind, ElicitationFieldKind::MultiSelect { .. }) {
+                                serde_json::Value::Array(vec![custom])
+                            } else {
+                                custom
+                            };
+                        obj.insert(field.name.clone(), value);
+                    } else if let Some(v) = self.selected.get(&field.name) {
                         obj.insert(field.name.clone(), v.clone());
                     }
                 }
@@ -592,23 +863,24 @@ impl ElicitationState {
 
     /// Returns true if all required fields have a value.
     pub fn is_valid(&self) -> bool {
+        if self.custom_active {
+            return !self.custom_input.trim().is_empty();
+        }
         for field in &self.fields {
-            if !field.required {
-                continue;
-            }
             match &field.kind {
                 ElicitationFieldKind::SingleSelect { .. }
                 | ElicitationFieldKind::MultiSelect { .. }
-                | ElicitationFieldKind::BooleanToggle => {
-                    if !self.selected.contains_key(&field.name) {
-                        return false;
-                    }
+                | ElicitationFieldKind::BooleanToggle
+                    if field.required && !self.selected.contains_key(&field.name) =>
+                {
+                    return false;
                 }
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                    if self.text_input.is_empty() {
-                        return false;
-                    }
+                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
+                    if field.required && self.text_input.is_empty() =>
+                {
+                    return false;
                 }
+                _ => {}
             }
         }
         true
@@ -636,6 +908,9 @@ impl ElicitationState {
         let Some(field) = self.fields.first() else {
             return String::new();
         };
+        if self.custom_active {
+            return format!("{OUTCOME_BULLET}{}", self.custom_input.trim());
+        }
         match &field.kind {
             ElicitationFieldKind::SingleSelect { options } => {
                 let val = self.selected.get(&field.name);
@@ -683,6 +958,12 @@ impl ElicitationState {
             selected: HashMap::new(),
             text_input: String::new(),
             text_cursor: 0,
+            allow_custom: true,
+            custom_active: false,
+            custom_input: String::new(),
+            custom_cursor: 0,
+            custom_line_width: 1,
+            custom_scroll: 0,
         }
     }
 }
@@ -848,15 +1129,6 @@ pub const SESSION_CHILD_PAGE_LIMIT: u32 = 10;
 /// through the session popup.
 pub const MAX_VISIBLE_GROUPS: usize = 3;
 
-/// In-memory per-mode cached state within a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedModeState {
-    /// `"provider/model"` e.g. `"anthropic/claude-sonnet-4-20250514"`
-    pub model: String,
-    /// Reasoning effort level. `None` = auto.
-    pub effort: Option<String>,
-}
-
 /// A single visible row in the sessions popup.
 ///
 /// Built by [`App::visible_popup_items`]. Unlike [`StartPageItem`] there is no
@@ -903,6 +1175,8 @@ pub enum ModelPopupItem {
     ProviderHeader {
         provider: String,
         model_count: usize,
+        /// When set, header shows `@ {node}` right-aligned (remote mesh group).
+        node_suffix: Option<String>,
     },
     Model {
         model_idx: usize,
@@ -925,6 +1199,8 @@ pub struct App {
     pub screen: Screen,
     pub popup: Popup,
     pub chord: bool, // true after ctrl+x pressed, waiting for second key
+    pub command_palette_cursor: usize,
+    pub command_palette_filter: String,
 
     // sessions
     /// Session groups as received from the server (preserve group structure for start page).
@@ -966,6 +1242,8 @@ pub struct App {
 
     // chat
     pub messages: Vec<ChatEntry>,
+    /// Monotonic identifier source for locally rendered prompts awaiting ACP echo.
+    pub pending_prompt_seq: u64,
     pub input: String,
     pub input_cursor: usize,
     pub input_scroll: u16,
@@ -981,6 +1259,7 @@ pub struct App {
     pub prev_total_height: u16,
     pub activity: ActivityState,
     pub streaming_content: String,
+    pub streaming_content_message_id: Option<String>,
     pub streaming_cache: StreamingCache,
     pub streaming_thinking: String,
     pub streaming_thinking_message_id: Option<String>,
@@ -1002,11 +1281,6 @@ pub struct App {
     /// Current reasoning-effort level. `None` = "auto" (server default).
     /// Matches `reasoningEffort: string | null` in the web UI.
     pub reasoning_effort: Option<String>,
-    /// Per-session, per-mode cache: session_id → mode → CachedModeState.
-    /// Stores which model and reasoning effort were used in each mode within each
-    /// session.  Loaded from `~/.cache/qmt/tui-cache.toml` on startup.
-    pub session_cache: HashMap<String, HashMap<String, CachedModeState>>,
-
     // profile info
     pub profiles: Vec<ProfileInfo>,
     pub active_profile_id: Option<String>,
@@ -1017,12 +1291,11 @@ pub struct App {
     // model info
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
+    /// Mesh node for the active catalog model (`None` = local provider host).
+    pub current_model_node_id: Option<String>,
     pub models: Vec<ModelEntry>,
     pub model_cursor: usize,
     pub model_filter: String,
-    /// Per-mode model preferences: mode -> (provider, model).
-    /// Set when the user manually selects a model; applied automatically on mode switch.
-    pub mode_model_preferences: HashMap<String, (String, String)>,
 
     // delegate agent model preferences
     /// Known agents from the server's `state` message.
@@ -1066,6 +1339,24 @@ pub struct App {
     // status line
     pub status: String,
 
+    // mesh / remote (from ACP extensions)
+    /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch.
+    pub mesh_node_count: Option<u32>,
+    pub mesh_status: Option<MeshStatusInfo>,
+    pub mesh_nodes: Vec<RemoteNodeInfo>,
+    pub remote_sessions_by_node: HashMap<String, Vec<RemoteSessionInfo>>,
+    pub mesh_node_cursor: usize,
+    pub remote_session_cursor: usize,
+    pub mesh_focus: MeshFocus,
+    pub mesh_error: Option<String>,
+    pub mesh_error_until: Option<Instant>,
+    pub mesh_invite: Option<MeshInviteCreatedInfo>,
+    pub mesh_invite_name: String,
+    pub mesh_invite_ttl: String,
+    pub mesh_invite_max_uses: String,
+    pub mesh_invite_form_field: MeshInviteFormField,
+    pub mesh_clipboard_fallback: Option<String>,
+
     // connection
     pub conn: ConnState,
     pub reconnect_attempt: u32,
@@ -1108,7 +1399,7 @@ pub struct App {
     /// UserMessageStored to suppress the noisy batch-result message.
     pub suppress_delegation_result: bool,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
-    /// Drained by handle_server_msg after each event/replay batch.
+    /// Drained by native ACP and legacy reducers after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
@@ -1182,6 +1473,8 @@ impl App {
             screen: Screen::Sessions,
             popup: Popup::None,
             chord: false,
+            command_palette_cursor: 0,
+            command_palette_filter: String::new(),
             session_groups: Vec::new(),
             session_cursor: 0,
             session_filter: String::new(),
@@ -1205,6 +1498,7 @@ impl App {
             session_activity: HashMap::new(),
             remote_session_nodes: HashMap::new(),
             messages: Vec::new(),
+            pending_prompt_seq: 0,
             input: String::new(),
             input_cursor: 0,
             input_scroll: 0,
@@ -1217,6 +1511,7 @@ impl App {
             prev_total_height: 0,
             activity: ActivityState::Idle,
             streaming_content: String::new(),
+            streaming_content_message_id: None,
             streaming_cache: StreamingCache::new(),
             streaming_thinking: String::new(),
             streaming_thinking_message_id: None,
@@ -1231,7 +1526,6 @@ impl App {
             elicitation: None,
             show_thinking: true,
             reasoning_effort: None,
-            session_cache: HashMap::new(),
             profiles: Vec::new(),
             active_profile_id: None,
             session_profiles: HashMap::new(),
@@ -1239,10 +1533,10 @@ impl App {
             profile_filter: String::new(),
             current_model: None,
             current_provider: None,
+            current_model_node_id: None,
             models: Vec::new(),
             model_cursor: 0,
             model_filter: String::new(),
-            mode_model_preferences: HashMap::new(),
             agents: Vec::new(),
             model_popup_agent_tab: 0,
             delegate_model_preferences: HashMap::new(),
@@ -1261,6 +1555,21 @@ impl App {
             context_limit: 0,
             session_stats: SessionStatsLite::default(),
             pending_cancel_confirm_until: None,
+            mesh_node_count: None,
+            mesh_status: None,
+            mesh_nodes: Vec::new(),
+            remote_sessions_by_node: HashMap::new(),
+            mesh_node_cursor: 0,
+            remote_session_cursor: 0,
+            mesh_focus: MeshFocus::Nodes,
+            mesh_error: None,
+            mesh_error_until: None,
+            mesh_invite: None,
+            mesh_invite_name: String::new(),
+            mesh_invite_ttl: "24h".into(),
+            mesh_invite_max_uses: "1".into(),
+            mesh_invite_form_field: MeshInviteFormField::MeshName,
+            mesh_clipboard_fallback: None,
             conn: ConnState::Connecting,
             reconnect_attempt: 0,
             reconnect_delay_ms: None,
@@ -1294,6 +1603,50 @@ impl App {
             tick: 0,
             should_quit: false,
         }
+    }
+
+    pub fn open_command_palette(&mut self) {
+        self.popup = Popup::CommandPalette;
+        self.command_palette_filter.clear();
+        self.command_palette_cursor = 0;
+    }
+
+    pub fn filtered_command_palette_commands(&self) -> Vec<&'static CommandPaletteCommand> {
+        let q = self.command_palette_filter.trim().to_lowercase();
+        COMMAND_PALETTE_COMMANDS
+            .iter()
+            .filter(|command| !command.chat_only || matches!(self.screen, Screen::Chat))
+            .filter(|command| {
+                q.is_empty()
+                    || command.title.to_lowercase().contains(&q)
+                    || command.description.to_lowercase().contains(&q)
+                    || command.shortcut.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    pub fn move_command_palette_cursor(&mut self, delta: isize) {
+        self.command_palette_cursor = move_wrapping_cursor(
+            self.command_palette_cursor,
+            self.filtered_command_palette_commands().len(),
+            delta,
+        );
+    }
+
+    pub fn selected_command_palette_action(&self) -> Option<CommandPaletteAction> {
+        self.filtered_command_palette_commands()
+            .get(self.command_palette_cursor)
+            .map(|command| command.action)
+    }
+
+    pub fn command_palette_filter_insert(&mut self, c: char) {
+        self.command_palette_filter.push(c);
+        self.command_palette_cursor = 0;
+    }
+
+    pub fn command_palette_filter_backspace(&mut self) {
+        self.command_palette_filter.pop();
+        self.command_palette_cursor = 0;
     }
 
     /// Invalidate both streaming caches and clear the thinking buffer.
@@ -1348,14 +1701,12 @@ impl App {
 
     /// Set the reasoning effort to a specific level.
     /// `None` or `Some("auto")` both map to the "auto" (no override) state.
-    /// Updates `self.reasoning_effort`, caches the session mode state, and
-    /// returns the [`ClientMsg`] to forward to the server.
+    /// Updates `self.reasoning_effort` and returns the [`ClientMsg`] to forward to the server.
     /// Returns `None` if the level is invalid (state is unchanged).
     pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> Option<ClientMsg> {
         match validate_reasoning_effort(level) {
             Some(normalized) => {
                 self.reasoning_effort = normalized;
-                self.cache_session_mode_state();
                 let effort_str = self
                     .reasoning_effort
                     .as_deref()
@@ -1367,107 +1718,6 @@ impl App {
             }
             None => None,
         }
-    }
-
-    /// Save the current model + reasoning effort into the session cache for
-    /// the current `session_id` + `agent_mode`.
-    /// No-op if session_id, provider, or model are unknown.
-    pub fn cache_session_mode_state(&mut self) {
-        let (Some(sid), Some(provider), Some(model)) = (
-            self.session_id.clone(),
-            self.current_provider.clone(),
-            self.current_model.clone(),
-        ) else {
-            return;
-        };
-        let model_key = format!("{provider}/{model}");
-        self.session_cache.entry(sid).or_default().insert(
-            self.agent_mode.clone(),
-            CachedModeState {
-                model: model_key,
-                effort: self.reasoning_effort.clone(),
-            },
-        );
-    }
-
-    /// Update the cached model for a specific mode in the current session.
-    /// Resets effort to `None` (auto) to match active-mode model-selection behaviour.
-    /// No-op if there is no current session.
-    pub fn update_cached_mode_model(&mut self, mode: &str, provider: &str, model: &str) {
-        let Some(sid) = self.session_id.clone() else {
-            return;
-        };
-        let model_key = format!("{provider}/{model}");
-        self.session_cache.entry(sid).or_default().insert(
-            mode.to_string(),
-            CachedModeState {
-                model: model_key,
-                effort: None,
-            },
-        );
-    }
-
-    /// Look up the cached mode state for the current `session_id` +
-    /// `agent_mode` and restore the model and effort from it.
-    ///
-    /// Returns a list of commands to send to the server:
-    /// - `SetSessionModel` if the cached model differs from the current one
-    /// - `SetReasoningEffort` if the cached effort differs from the current one
-    ///
-    /// Returns empty vec when there is no cache entry or nothing changed.
-    pub fn apply_cached_mode_state(&mut self) -> Vec<ClientMsg> {
-        let Some(sid) = self.session_id.clone() else {
-            return vec![];
-        };
-        let cached = self
-            .session_cache
-            .get(&sid)
-            .and_then(|modes| modes.get(&self.agent_mode))
-            .cloned();
-        let Some(cached) = cached else {
-            return vec![];
-        };
-
-        let mut cmds = Vec::new();
-
-        // Restore model if it differs from what the session currently has.
-        let current_model_key = match (
-            self.current_provider.as_deref(),
-            self.current_model.as_deref(),
-        ) {
-            (Some(p), Some(m)) => format!("{p}/{m}"),
-            _ => String::new(),
-        };
-        if cached.model != current_model_key {
-            // Parse "provider/model" back into parts.
-            if let Some((provider, model)) = cached.model.split_once('/') {
-                // Find the model entry to get its full id + node_id.
-                let model_entry = self
-                    .models
-                    .iter()
-                    .find(|e| e.provider == provider && e.model == model);
-                if let Some(entry) = model_entry {
-                    cmds.push(ClientMsg::SetSessionModel {
-                        session_id: sid.clone(),
-                        model_id: entry.id.clone(),
-                        node_id: entry.node_id.clone(),
-                    });
-                    self.current_provider = Some(provider.to_string());
-                    self.current_model = Some(model.to_string());
-                }
-            }
-        }
-
-        // Restore effort if it differs.
-        if cached.effort != self.reasoning_effort {
-            self.reasoning_effort = cached.effort.clone();
-            let effort_str = cached.effort.as_deref().unwrap_or("auto").to_string();
-            cmds.push(ClientMsg::SetReasoningEffort {
-                reasoning_effort: effort_str,
-            });
-        }
-
-        cmds
     }
 
     /// Filtered auth providers matching the current `auth_filter`.
@@ -1652,75 +1902,123 @@ impl App {
         }
     }
 
+    fn model_index_for_entry(&self, entry: &ModelEntry) -> Option<usize> {
+        self.models
+            .iter()
+            .position(|m| m.id == entry.id && m.node_id == entry.node_id)
+    }
+
+    /// Match catalog row to a provider/model pair, disambiguating local vs mesh.
+    pub fn model_entry_matches_node(
+        entry: &ModelEntry,
+        provider: &str,
+        model: &str,
+        node_id: Option<&str>,
+    ) -> bool {
+        if entry.provider != provider || entry.model != model {
+            return false;
+        }
+        match node_id {
+            Some(node) => entry.node_id.as_deref() == Some(node),
+            None => entry.node_id.is_none(),
+        }
+    }
+
+    pub fn apply_model_selection_from_entry(&mut self, entry: &ModelEntry) {
+        self.current_provider = Some(entry.provider.clone());
+        self.current_model = Some(entry.model.clone());
+        self.current_model_node_id = entry.node_id.clone();
+    }
+
+    pub fn live_model_selection_matches_entry(&self, entry: &ModelEntry) -> bool {
+        let (Some(cp), Some(cm)) = (
+            self.current_provider.as_deref(),
+            self.current_model.as_deref(),
+        ) else {
+            return false;
+        };
+        Self::model_entry_matches_node(entry, cp, cm, self.current_model_node_id.as_deref())
+    }
+
+    pub fn model_popup_open_cursor(&self) -> usize {
+        let items = self.visible_model_popup_items();
+        items
+            .iter()
+            .position(|item| match item {
+                ModelPopupItem::Model { model_idx } => self
+                    .models
+                    .get(*model_idx)
+                    .is_some_and(|e| self.live_model_selection_matches_entry(e)),
+                _ => false,
+            })
+            .or_else(|| {
+                items
+                    .iter()
+                    .position(|item| matches!(item, ModelPopupItem::Model { .. }))
+            })
+            .unwrap_or(0)
+    }
+
     pub fn visible_model_popup_items(&self) -> Vec<ModelPopupItem> {
         let filtered = self.filtered_models();
         let mut items = Vec::new();
-        let mut current_provider: Option<&str> = None;
 
-        for model in filtered {
-            if current_provider != Some(model.provider.as_str()) {
-                current_provider = Some(model.provider.as_str());
-                let provider_count = self
-                    .filtered_models()
-                    .into_iter()
-                    .filter(|m| m.provider == model.provider)
-                    .count();
-                items.push(ModelPopupItem::ProviderHeader {
-                    provider: model.provider.clone(),
-                    model_count: provider_count,
-                });
-            }
-            if let Some(model_idx) = self.models.iter().position(|m| m.id == model.id) {
-                items.push(ModelPopupItem::Model { model_idx });
+        #[derive(Eq, PartialEq, Ord, PartialOrd)]
+        struct GroupKey {
+            provider: String,
+            node_id: Option<String>,
+        }
+
+        let mut groups: std::collections::BTreeMap<GroupKey, Vec<&ModelEntry>> =
+            std::collections::BTreeMap::new();
+        for model in filtered.iter() {
+            let key = GroupKey {
+                provider: model.provider.clone(),
+                node_id: model.node_id.clone(),
+            };
+            groups.entry(key).or_default().push(model);
+        }
+
+        for (key, models_in_group) in groups {
+            let node_suffix = key.node_id.as_ref().map(|nid| {
+                models_in_group
+                    .first()
+                    .and_then(|m| m.node_label.clone())
+                    .unwrap_or_else(|| nid.clone())
+            });
+            items.push(ModelPopupItem::ProviderHeader {
+                provider: key.provider.clone(),
+                model_count: models_in_group.len(),
+                node_suffix,
+            });
+            for model in models_in_group {
+                if let Some(model_idx) = self.model_index_for_entry(model) {
+                    items.push(ModelPopupItem::Model { model_idx });
+                }
             }
         }
 
         items
     }
 
-    pub fn current_mode_model_cursor(&self) -> usize {
-        self.mode_model_cursor(&self.agent_mode.clone())
-    }
-
-    /// Cursor position for a given mode's preferred model in the popup list.
-    pub fn mode_model_cursor(&self, mode: &str) -> usize {
-        let target = self
-            .get_mode_model_preference(mode)
-            .or(if self.agent_mode == mode {
-                match (
-                    self.current_provider.as_deref(),
-                    self.current_model.as_deref(),
-                ) {
-                    (Some(provider), Some(model)) => Some((provider, model)),
-                    _ => None,
-                }
-            } else {
-                None
-            });
-
-        let Some((provider, model)) = target else {
-            return self
-                .visible_model_popup_items()
-                .iter()
-                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
-                .unwrap_or(0);
-        };
-
-        self.visible_model_popup_items()
-            .iter()
-            .position(|item| match item {
-                ModelPopupItem::Model { model_idx } => self
-                    .models
-                    .get(*model_idx)
-                    .is_some_and(|entry| entry.provider == provider && entry.model == model),
-                ModelPopupItem::ProviderHeader { .. } => false,
-            })
-            .unwrap_or_else(|| {
-                self.visible_model_popup_items()
-                    .iter()
-                    .position(|item| matches!(item, ModelPopupItem::Model { .. }))
-                    .unwrap_or(0)
-            })
+    #[cfg(test)]
+    pub(crate) fn test_model_entry(
+        id: &str,
+        provider: &str,
+        model: &str,
+        node_id: Option<&str>,
+        node_label: Option<&str>,
+    ) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            label: model.into(),
+            provider: provider.into(),
+            model: model.into(),
+            node_id: node_id.map(str::to_string),
+            node_label: node_label.map(str::to_string),
+            family: None,
+            quant: None,
+        }
     }
 
     pub fn push_log(&mut self, level: LogLevel, target: &'static str, message: impl Into<String>) {
@@ -1934,6 +2232,18 @@ impl App {
 
     pub fn selected_fork_turn(&self) -> Option<ForkTurnItem> {
         self.visible_fork_turns().get(self.fork_cursor).cloned()
+    }
+
+    pub fn push_pending_prompt(&mut self, text: String) -> String {
+        self.pending_prompt_seq = self.pending_prompt_seq.saturating_add(1);
+        let local_id = format!("local:pending:{}", self.pending_prompt_seq);
+        self.messages.push(ChatEntry::User {
+            text,
+            message_id: Some(local_id.clone()),
+        });
+        self.card_cache.invalidate();
+        self.scroll_offset = 0;
+        local_id
     }
 
     pub fn input_blocked_by_activity(&self) -> bool {
@@ -2240,17 +2550,6 @@ impl App {
         self.refresh_transient_status();
     }
 
-    pub fn set_mode_model_preference(&mut self, mode: &str, provider: &str, model: &str) {
-        self.mode_model_preferences
-            .insert(mode.to_string(), (provider.to_string(), model.to_string()));
-    }
-
-    pub fn get_mode_model_preference(&self, mode: &str) -> Option<(&str, &str)> {
-        self.mode_model_preferences
-            .get(mode)
-            .map(|(p, m)| (p.as_str(), m.as_str()))
-    }
-
     pub fn next_mode(&self) -> String {
         match self.agent_mode.as_str() {
             "build" => "plan".into(),
@@ -2270,44 +2569,41 @@ impl App {
         self.agents.len() > 1
     }
 
-    /// Total number of tabs in the model popup.
-    /// Always at least 3 (Plan + Build + Review), plus one tab per delegation agent.
+    /// Tabs: 0 = session model; 1.. = delegate agents when `agents.len() > 1`.
     pub fn model_popup_tab_count(&self) -> usize {
-        3 + self.agents.len().saturating_sub(1)
-    }
-
-    /// Label for a model popup tab.
-    /// 0 = "plan", 1 = "build", 2 = "review", 3+ maps to `agents[1..].name`.
-    pub fn model_popup_tab_label(&self, tab_idx: usize) -> &str {
-        match tab_idx {
-            0 => "plan",
-            1 => "build",
-            2 => "review",
-            _ => self
-                .agents
-                .get(tab_idx - 2)
-                .map(|a| a.name.as_str())
-                .unwrap_or("???"),
+        if self.agents.len() > 1 {
+            self.agents.len()
+        } else {
+            1
         }
     }
 
-    /// The agent_id for an agent tab (index 3+), None for mode tabs (0, 1, 2).
+    pub fn model_popup_has_tabs(&self) -> bool {
+        self.agents.len() > 1
+    }
+
+    pub fn model_popup_tab_label(&self, tab_idx: usize) -> &str {
+        if tab_idx == 0 {
+            "session"
+        } else {
+            self.agents
+                .get(tab_idx)
+                .map(|a| a.name.as_str())
+                .unwrap_or("???")
+        }
+    }
+
+    /// `None` on session tab; delegate agent id on agent tabs.
     pub fn model_popup_tab_agent_id(&self, tab_idx: usize) -> Option<&str> {
-        if tab_idx < 3 {
+        if tab_idx == 0 {
             None
         } else {
-            self.agents.get(tab_idx - 2).map(|a| a.id.as_str())
+            self.agents.get(tab_idx).map(|a| a.id.as_str())
         }
     }
 
-    /// The mode name for a mode tab (0 = "plan", 1 = "build", 2 = "review"), None for agent tabs.
-    pub fn model_popup_tab_mode(&self, tab_idx: usize) -> Option<&'static str> {
-        match tab_idx {
-            0 => Some("plan"),
-            1 => Some("build"),
-            2 => Some("review"),
-            _ => None,
-        }
+    pub fn model_popup_is_session_tab(&self, tab_idx: usize) -> bool {
+        tab_idx == 0
     }
 
     pub fn set_delegate_model_preference(&mut self, agent_id: &str, provider: &str, model: &str) {
@@ -3476,6 +3772,7 @@ mod delegate_entry_tests {
                 model: "claude-sonnet".into(),
                 config_id: None,
                 context_limit: Some(200_000),
+                provider_node_id: None,
             },
         );
         assert_eq!(stats.context_limit, 200_000);
@@ -4234,7 +4531,7 @@ mod delegate_entry_tests {
     }
 
     #[test]
-    fn session_forked_applies_delegate_model_preference() {
+    fn session_forked_with_delegate_pref_does_not_send_set_session_model() {
         let mut app = App::new();
         app.agent_id = Some("parent-agent".into());
         app.models = vec![crate::protocol::ModelEntry {
@@ -4243,6 +4540,7 @@ mod delegate_entry_tests {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
@@ -4269,13 +4567,11 @@ mod delegate_entry_tests {
             false,
             None,
         );
-        // Should have SubscribeSession + SetSessionModel
-        assert_eq!(app.pending_commands.len(), 2);
+        // Child inherits parent session model; delegate prefs are not applied on fork.
+        assert_eq!(app.pending_commands.len(), 1);
         assert!(
-            app.pending_commands
-                .iter()
-                .any(|m| matches!(m, ClientMsg::SetSessionModel { session_id, .. } if session_id == "child-1")),
-            "expected SetSessionModel for child-1: {:?}",
+            matches!(&app.pending_commands[0], ClientMsg::SubscribeSession { .. }),
+            "expected only SubscribeSession: {:?}",
             app.pending_commands
         );
     }
@@ -4948,330 +5244,83 @@ mod delegate_entry_tests {
     // ── delegation duration tracking ─────────────────────────────────────────
 }
 
-// ── session_cache_tests ───────────────────────────────────────────────────────
-
 #[cfg(test)]
-mod session_cache_tests {
+mod model_node_selection_tests {
     use super::*;
 
-    fn set_ctx(app: &mut App, sid: &str, mode: &str, provider: &str, model: &str) {
-        app.session_id = Some(sid.into());
-        app.agent_mode = mode.into();
-        app.current_provider = Some(provider.into());
-        app.current_model = Some(model.into());
-    }
-
-    fn make_model_entry(provider: &str, model: &str) -> ModelEntry {
-        ModelEntry {
-            id: format!("{provider}/{model}"),
-            label: model.into(),
-            provider: provider.into(),
-            model: model.into(),
-            node_id: None,
-            family: None,
-            quant: None,
-        }
-    }
-
-    // ── cache_session_mode_state ──────────────────────────────────────────────
-
     #[test]
-    fn cache_stores_model_and_effort_under_session_and_mode() {
+    fn live_selection_matches_only_one_of_local_and_remote_duplicate() {
         let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("high".into());
-
-        app.cache_session_mode_state();
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("high".into()));
-    }
-
-    #[test]
-    fn cache_stores_auto_effort_as_none() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "plan", "openai", "gpt-4o");
-        app.reasoning_effort = None;
-
-        app.cache_session_mode_state();
-
-        let cms = &app.session_cache["s1"]["plan"];
-        assert_eq!(cms.model, "openai/gpt-4o");
-        assert_eq!(cms.effort, None);
-    }
-
-    #[test]
-    fn cache_noop_when_no_session_id() {
-        let mut app = App::new();
-        app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-
-        app.cache_session_mode_state();
-
-        assert!(app.session_cache.is_empty());
-    }
-
-    #[test]
-    fn cache_noop_when_no_provider_or_model() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
-
-        app.cache_session_mode_state();
-
-        assert!(app.session_cache.is_empty());
-    }
-
-    #[test]
-    fn cache_overwrites_existing_mode_entry() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("low".into());
-        app.cache_session_mode_state();
-
-        // Switch model + effort, same session + mode
-        app.current_model = Some("claude-opus".into());
-        app.current_provider = Some("anthropic".into());
-        app.reasoning_effort = Some("max".into());
-        app.cache_session_mode_state();
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-opus");
-        assert_eq!(cms.effort, Some("max".into()));
-    }
-
-    #[test]
-    fn cache_different_modes_independent_within_session() {
-        let mut app = App::new();
-
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("high".into());
-        app.cache_session_mode_state();
-
-        set_ctx(&mut app, "s1", "plan", "openai", "gpt-4o");
-        app.reasoning_effort = Some("low".into());
-        app.cache_session_mode_state();
-
-        assert_eq!(
-            app.session_cache["s1"]["build"].model,
-            "anthropic/claude-sonnet"
+        let local = App::test_model_entry("codex/local", "codex", "gpt-5", None, None);
+        let remote = App::test_model_entry(
+            "codex@n1/remote",
+            "codex",
+            "gpt-5",
+            Some("n1"),
+            Some("peer"),
         );
-        assert_eq!(app.session_cache["s1"]["build"].effort, Some("high".into()));
-        assert_eq!(app.session_cache["s1"]["plan"].model, "openai/gpt-4o");
-        assert_eq!(app.session_cache["s1"]["plan"].effort, Some("low".into()));
+        app.models = vec![local.clone(), remote.clone()];
+        app.apply_model_selection_from_entry(&remote);
+
+        assert!(app.live_model_selection_matches_entry(&remote));
+        assert!(!app.live_model_selection_matches_entry(&local));
     }
 
     #[test]
-    fn cache_different_sessions_independent() {
+    fn model_popup_open_cursor_points_at_remote_when_node_id_set() {
         let mut app = App::new();
-
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("high".into());
-        app.cache_session_mode_state();
-
-        set_ctx(&mut app, "s2", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("low".into());
-        app.cache_session_mode_state();
-
-        assert_eq!(app.session_cache["s1"]["build"].effort, Some("high".into()));
-        assert_eq!(app.session_cache["s2"]["build"].effort, Some("low".into()));
-    }
-
-    // ── apply_cached_mode_state ───────────────────────────────────────────────
-
-    #[test]
-    fn apply_restores_effort_when_model_matches() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None;
-
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("high".into()),
-            },
-        );
-
-        let cmds = app.apply_cached_mode_state();
-        assert_eq!(app.reasoning_effort, Some("high".into()));
-        assert_eq!(cmds.len(), 1);
+        app.models = vec![
+            App::test_model_entry("codex/local", "codex", "gpt-5", None, None),
+            App::test_model_entry("codex@n1/gpt-5", "codex", "gpt-5", Some("n1"), Some("box")),
+        ];
+        let remote = app.models[1].clone();
+        app.apply_model_selection_from_entry(&remote);
+        let items = app.visible_model_popup_items();
+        let cursor = app.model_popup_open_cursor();
+        let item = &items[cursor];
         assert!(
-            matches!(&cmds[0], ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high")
+            matches!(item, ModelPopupItem::Model { model_idx } if app.models[*model_idx].node_id.is_some()),
+            "cursor should be on remote row"
         );
     }
 
     #[test]
-    fn apply_restores_model_and_effort_when_model_differs() {
+    fn provider_changed_live_sets_current_model_node_id() {
         let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None;
-        // The cached state says build mode used opus with max effort
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-opus".into(),
-                effort: Some("max".into()),
-            },
-        );
-        // Need the model in the models list for the lookup
-        app.models = vec![make_model_entry("anthropic", "claude-opus")];
-
-        let cmds = app.apply_cached_mode_state();
-
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
-        assert_eq!(app.reasoning_effort, Some("max".into()));
-        assert_eq!(cmds.len(), 2);
-        assert!(matches!(&cmds[0], ClientMsg::SetSessionModel { .. }));
-        assert!(
-            matches!(&cmds[1], ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "max")
-        );
-    }
-
-    #[test]
-    fn apply_returns_empty_when_no_cache_entry() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("high".into());
-
-        let cmds = app.apply_cached_mode_state();
-        assert!(cmds.is_empty());
-        // Nothing changed
-        assert_eq!(app.reasoning_effort, Some("high".into()));
-    }
-
-    #[test]
-    fn apply_returns_empty_when_everything_matches() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = Some("high".into());
-
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("high".into()),
-            },
-        );
-
-        let cmds = app.apply_cached_mode_state();
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn apply_returns_empty_when_no_session_id() {
-        let mut app = App::new();
+        app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("max".into());
-
-        let cmds = app.apply_cached_mode_state();
-        assert!(cmds.is_empty());
-        assert_eq!(app.reasoning_effort, Some("max".into()));
-    }
-
-    #[test]
-    fn apply_skips_model_switch_when_model_not_in_models_list() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-        app.reasoning_effort = None;
-
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            CachedModeState {
-                model: "anthropic/claude-opus".into(),
-                effort: Some("max".into()),
+        app.handle_event_kind(
+            &EventKind::ProviderChanged {
+                provider: "codex".into(),
+                model: "remote".into(),
+                config_id: None,
+                context_limit: None,
+                provider_node_id: Some("peer-1".into()),
             },
+            false,
+            None,
         );
-        // models list is empty — can't resolve opus
-        app.models = vec![];
-
-        let cmds = app.apply_cached_mode_state();
-        // Can't switch model, but effort still restored
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet")); // unchanged
-        assert_eq!(app.reasoning_effort, Some("max".into()));
-        assert_eq!(cmds.len(), 1);
-        assert!(matches!(&cmds[0], ClientMsg::SetReasoningEffort { .. }));
-    }
-
-    // ── cycle auto-caches ─────────────────────────────────────────────────────
-
-    #[test]
-    fn cycle_caches_mode_state() {
-        let mut app = App::new();
-        set_ctx(&mut app, "s1", "build", "anthropic", "claude-sonnet");
-
-        app.cycle_reasoning_effort();
-
-        assert_eq!(app.reasoning_effort, Some("low".into()));
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, Some("low".into()));
+        assert_eq!(app.current_model_node_id.as_deref(), Some("peer-1"));
     }
 
     #[test]
-    fn cycle_does_not_cache_when_no_context() {
+    fn provider_changed_replay_does_not_clear_node_when_field_missing() {
         let mut app = App::new();
-        app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("low".into()));
-        assert!(app.session_cache.is_empty());
-    }
-
-    // ── update_cached_mode_model ──────────────────────────────────────────────
-
-    #[test]
-    fn update_cached_mode_model_stores_model_and_resets_effort() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-sonnet");
-        assert_eq!(cms.effort, None);
-    }
-
-    #[test]
-    fn update_cached_mode_model_preserves_other_modes() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
-        app.update_cached_mode_model("plan", "openai", "gpt-4o");
-
-        assert_eq!(
-            app.session_cache["s1"]["build"].model,
-            "anthropic/claude-sonnet"
-        );
-        assert_eq!(app.session_cache["s1"]["plan"].model, "openai/gpt-4o");
-    }
-
-    #[test]
-    fn update_cached_mode_model_overwrites_existing_entry() {
-        let mut app = App::new();
-        app.session_id = Some("s1".into());
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "build".into(),
-            CachedModeState {
-                model: "old/model".into(),
-                effort: Some("high".into()),
+        app.current_provider = Some("codex".into());
+        app.current_model = Some("remote".into());
+        app.current_model_node_id = Some("peer-1".into());
+        app.handle_event_kind(
+            &EventKind::ProviderChanged {
+                provider: "codex".into(),
+                model: "remote".into(),
+                config_id: None,
+                context_limit: None,
+                provider_node_id: None,
             },
+            true,
+            None,
         );
-
-        app.update_cached_mode_model("build", "anthropic", "claude-opus");
-
-        let cms = &app.session_cache["s1"]["build"];
-        assert_eq!(cms.model, "anthropic/claude-opus");
-        assert_eq!(cms.effort, None);
-    }
-
-    #[test]
-    fn update_cached_mode_model_noop_without_session() {
-        let mut app = App::new();
-        app.update_cached_mode_model("build", "anthropic", "claude-sonnet");
-        assert!(app.session_cache.is_empty());
+        assert_eq!(app.current_model_node_id.as_deref(), Some("peer-1"));
     }
 }
 
@@ -5460,75 +5509,58 @@ mod session_mode_tests {
         assert_eq!(app.next_mode(), "build");
     }
 
-    // ── session_loaded restores mode state from session cache ──────────────────
+    // ── session_loaded: model/effort from audit only (no TUI cache) ─────────────
 
     #[test]
-    fn session_loaded_restores_effort_from_session_cache() {
+    fn session_loaded_does_not_push_reasoning_effort_from_tui_cache() {
         let mut app = App::new();
-        // Pre-cache: session s1, mode plan, model anthropic/claude-sonnet, effort high
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            CachedModeState {
-                model: "anthropic/claude-sonnet".into(),
-                effort: Some("high".into()),
-            },
-        );
+        app.reasoning_effort = Some("high".into());
 
         let audit = make_audit(&[
             provider_changed_event("anthropic", "claude-sonnet"),
             mode_changed_event("plan"),
         ]);
         let cmds = app.handle_server_msg(make_session_loaded(audit));
+
         assert!(
-            cmds.iter().any(|m| matches!(
-                m,
-                ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
-            )),
-            "expected SetReasoningEffort(high) in {cmds:?}"
+            !cmds
+                .iter()
+                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+            "effort is not restored from TUI cache on load: {cmds:?}"
         );
-        assert_eq!(app.reasoning_effort, Some("high".into()));
     }
 
     #[test]
-    fn session_loaded_restores_model_from_session_cache() {
+    fn session_loaded_uses_audit_model_not_set_session_model() {
         let mut app = App::new();
-        // Cache says plan mode used opus
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            CachedModeState {
-                model: "anthropic/claude-opus".into(),
-                effort: Some("max".into()),
-            },
-        );
-        // Need opus in the models list
         app.models = vec![ModelEntry {
             id: "anthropic/claude-opus".into(),
             label: "claude-opus".into(),
             provider: "anthropic".into(),
             model: "claude-opus".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
 
-        // Audit says session was in plan mode using sonnet (different from cache)
         let audit = make_audit(&[
             provider_changed_event("anthropic", "claude-sonnet"),
             mode_changed_event("plan"),
         ]);
         let cmds = app.handle_server_msg(make_session_loaded(audit));
 
-        // Cache wins: model switched to opus
         assert!(
-            cmds.iter()
+            !cmds
+                .iter()
                 .any(|m| matches!(m, ClientMsg::SetSessionModel { .. })),
-            "expected SetSessionModel in {cmds:?}"
+            "model comes from session audit replay only: {cmds:?}"
         );
-        assert_eq!(app.current_model.as_deref(), Some("claude-opus"));
+        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
     }
 
     #[test]
-    fn remote_session_loaded_does_not_restore_model_from_session_cache() {
+    fn remote_session_loaded_does_not_push_model_or_effort_cmds() {
         let mut app = App::new();
         app.session_groups = vec![SessionGroup {
             sessions: vec![SessionSummary {
@@ -5539,22 +5571,6 @@ mod session_mode_tests {
             ..Default::default()
         }];
         app.remember_remote_session_node("s1", "node-1");
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            CachedModeState {
-                model: "anthropic/claude-opus".into(),
-                effort: Some("max".into()),
-            },
-        );
-        app.models = vec![ModelEntry {
-            id: "anthropic/claude-opus".into(),
-            label: "claude-opus".into(),
-            provider: "anthropic".into(),
-            model: "claude-opus".into(),
-            node_id: None,
-            family: None,
-            quant: None,
-        }];
 
         let audit = make_audit(&[
             provider_changed_event("anthropic", "claude-sonnet"),
@@ -5578,25 +5594,9 @@ mod session_mode_tests {
     }
 
     #[test]
-    fn remembered_remote_session_loaded_skips_cache_before_list_refresh() {
+    fn remembered_remote_session_loaded_does_not_push_model_or_effort_cmds() {
         let mut app = App::new();
         app.remember_remote_session_node("s1", "node-1");
-        app.session_cache.entry("s1".into()).or_default().insert(
-            "plan".into(),
-            CachedModeState {
-                model: "anthropic/claude-opus".into(),
-                effort: Some("max".into()),
-            },
-        );
-        app.models = vec![ModelEntry {
-            id: "anthropic/claude-opus".into(),
-            label: "claude-opus".into(),
-            provider: "anthropic".into(),
-            model: "claude-opus".into(),
-            node_id: None,
-            family: None,
-            quant: None,
-        }];
 
         let audit = make_audit(&[
             provider_changed_event("anthropic", "claude-sonnet"),
@@ -5636,11 +5636,10 @@ mod session_mode_tests {
             provider: "anthropic".into(),
             model: "claude-sonnet".into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }];
-        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
-
         let cmds = app.handle_server_msg(RawServerMsg {
             msg_type: "session_created".into(),
             data: Some(serde_json::json!({
@@ -5720,39 +5719,7 @@ mod session_mode_tests {
     }
 
     #[test]
-    fn session_created_applies_mode_model_preference() {
-        let mut app = App::new();
-        app.models = vec![crate::protocol::ModelEntry {
-            id: "anthropic/claude-sonnet".into(),
-            label: "claude-sonnet".into(),
-            provider: "anthropic".into(),
-            model: "claude-sonnet".into(),
-            node_id: None,
-            family: None,
-            quant: None,
-        }];
-        app.set_mode_model_preference("build", "anthropic", "claude-sonnet");
-
-        let cmds = app.handle_server_msg(RawServerMsg {
-            msg_type: "session_created".into(),
-            data: Some(serde_json::json!({
-                "session_id": "s1",
-                "agent_id": "a1",
-                "request_id": null
-            })),
-        });
-        assert!(
-            cmds.iter().any(
-                |m| matches!(m, ClientMsg::SetSessionModel { session_id, .. } if session_id == "s1")
-            ),
-            "expected SetSessionModel for new session: {cmds:?}"
-        );
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
-    }
-
-    #[test]
-    fn session_created_no_preference_uses_server_default() {
+    fn session_created_only_subscribes() {
         let mut app = App::new();
         let cmds = app.handle_server_msg(RawServerMsg {
             msg_type: "session_created".into(),
@@ -7353,11 +7320,9 @@ mod tests {
                 "undo_stack": [{ "message_id": "msg-2" }]
             })),
         });
-        assert!(
-            cmds.iter().any(
-                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
-            )
-        );
+        assert!(cmds.iter().any(
+            |msg| matches!(msg, ClientMsg::LoadSession { session_id, .. } if session_id == "s1")
+        ));
 
         let loaded = RawServerMsg {
             msg_type: "session_loaded".into(),
@@ -7483,11 +7448,9 @@ mod tests {
                 "undo_stack": [{ "message_id": "msg-2" }]
             })),
         });
-        assert!(
-            cmds.iter().any(
-                |msg| matches!(msg, ClientMsg::LoadSession { session_id } if session_id == "s1")
-            )
-        );
+        assert!(cmds.iter().any(
+            |msg| matches!(msg, ClientMsg::LoadSession { session_id, .. } if session_id == "s1")
+        ));
 
         app.handle_server_msg(RawServerMsg {
             msg_type: "session_loaded".into(),
@@ -8118,10 +8081,12 @@ mod tests {
         assert_eq!(state.option_cursor, 1);
         state.move_cursor(1);
         assert_eq!(state.option_cursor, 2);
+        state.move_cursor(1); // built-in questions include a virtual Other choice
+        assert_eq!(state.option_cursor, 3);
         state.move_cursor(1); // clamps at max
-        assert_eq!(state.option_cursor, 2);
+        assert_eq!(state.option_cursor, 3);
         state.move_cursor(-1);
-        assert_eq!(state.option_cursor, 1);
+        assert_eq!(state.option_cursor, 2);
         state.move_cursor(-10);
         assert_eq!(state.option_cursor, 0);
     }
@@ -8152,6 +8117,85 @@ mod tests {
         state.select_current_option(); // select "yes"
         let content = state.build_accept_content();
         assert_eq!(content, serde_json::json!({ "choice": "yes" }));
+    }
+
+    #[test]
+    fn elicitation_custom_single_select_trims_and_replaces_options() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("yes"),
+                    label: "Yes".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "  something else\nwith detail  ".into();
+
+        assert!(state.is_valid());
+        assert_eq!(
+            state.build_accept_content(),
+            serde_json::json!({ "choice": "something else\nwith detail" })
+        );
+        assert_eq!(
+            state.selected_display(),
+            format!("{OUTCOME_BULLET}something else\nwith detail")
+        );
+    }
+
+    #[test]
+    fn elicitation_custom_multi_select_is_exclusive() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choices".into(),
+            title: "Choices".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::MultiSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "A".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state
+            .selected
+            .insert("choices".into(), serde_json::json!(["a"]));
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "custom".into();
+
+        assert_eq!(
+            state.build_accept_content(),
+            serde_json::json!({ "choices": ["custom"] })
+        );
+    }
+
+    #[test]
+    fn elicitation_custom_answer_requires_non_whitespace_text() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: false,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "A".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.option_cursor = 1;
+        state.activate_custom();
+        state.custom_input = "  \n ".into();
+        assert!(!state.is_valid());
     }
 
     #[test]
@@ -10117,6 +10161,51 @@ mod popup_item_tests {
         assert!(!app.collapsed_groups.contains("/a"));
     }
 
+    // ── command palette ───────────────────────────────────────────────────────
+
+    #[test]
+    fn command_palette_filters_commands_and_hides_chat_only_outside_chat() {
+        let mut app = App::new();
+        app.screen = Screen::Sessions;
+        app.command_palette_filter = "selector".into();
+
+        let titles: Vec<&str> = app
+            .filtered_command_palette_commands()
+            .iter()
+            .map(|command| command.title)
+            .collect();
+
+        assert_eq!(titles, vec!["Profile selector"]);
+    }
+
+    #[test]
+    fn command_palette_includes_chat_only_commands_in_chat() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.command_palette_filter = "model".into();
+
+        let actions: Vec<CommandPaletteAction> = app
+            .filtered_command_palette_commands()
+            .iter()
+            .map(|command| command.action)
+            .collect();
+
+        assert!(actions.contains(&CommandPaletteAction::ModelSelect));
+    }
+
+    #[test]
+    fn command_palette_cursor_wraps() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+
+        app.move_command_palette_cursor(-1);
+
+        assert_eq!(
+            app.command_palette_cursor,
+            app.filtered_command_palette_commands().len() - 1
+        );
+    }
+
     // ── slash completion state ─────────────────────────────────────────────────
 
     #[test]
@@ -10278,6 +10367,7 @@ mod delegate_model_preference_tests {
             provider: provider.into(),
             model: model.into(),
             node_id: None,
+            node_label: None,
             family: None,
             quant: None,
         }
@@ -10304,79 +10394,49 @@ mod delegate_model_preference_tests {
     }
 
     #[test]
-    fn tab_label_plan_at_zero() {
+    fn tab_label_session_at_zero() {
         let app = App::new();
-        assert_eq!(app.model_popup_tab_label(0), "plan");
+        assert_eq!(app.model_popup_tab_label(0), "session");
     }
 
     #[test]
-    fn tab_label_build_at_one() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_label(1), "build");
-    }
-
-    #[test]
-    fn tab_label_review_at_two() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_label(2), "review");
-    }
-
-    #[test]
-    fn tab_label_agent_at_three() {
+    fn tab_label_delegate_agent_at_one_when_multi_agent() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_label(3), "Coder");
+        assert_eq!(app.model_popup_tab_label(1), "Coder");
     }
 
     #[test]
-    fn tab_agent_id_none_at_zero() {
+    fn tab_agent_id_none_on_session_tab() {
         let app = App::new();
         assert_eq!(app.model_popup_tab_agent_id(0), None);
     }
 
     #[test]
-    fn tab_agent_id_none_at_one() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_agent_id(1), None);
-    }
-
-    #[test]
-    fn tab_agent_id_none_at_two() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_agent_id(2), None);
-    }
-
-    #[test]
-    fn tab_agent_id_some_at_three() {
+    fn tab_agent_id_some_for_delegate_tab() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_agent_id(3), Some("coder"));
+        assert_eq!(app.model_popup_tab_agent_id(1), Some("coder"));
     }
 
     #[test]
-    fn tab_mode_review_at_two() {
+    fn tab_count_single_agent_or_empty() {
         let app = App::new();
-        assert_eq!(app.model_popup_tab_mode(2), Some("review"));
+        assert_eq!(app.model_popup_tab_count(), 1);
+        let mut single = App::new();
+        single.agents = vec![make_agent("main", "Main")];
+        assert_eq!(single.model_popup_tab_count(), 1);
     }
 
     #[test]
-    fn tab_count_no_agents() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_count(), 3);
-    }
-
-    #[test]
-    fn tab_count_single_agent() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main")];
-        assert_eq!(app.model_popup_tab_count(), 3);
-    }
-
-    #[test]
-    fn tab_count_multi_agent() {
+    fn tab_count_multi_agent_matches_agent_list() {
         let mut app = App::new();
         app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_count(), 4);
+        assert_eq!(app.model_popup_tab_count(), 2);
+        assert!(app.model_popup_has_tabs());
+        app.agents.push(make_agent("reviewer", "Reviewer"));
+        assert_eq!(app.model_popup_tab_count(), 3);
+        assert!(app.model_popup_has_tabs());
     }
 
     #[test]
