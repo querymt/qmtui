@@ -456,7 +456,7 @@ pub async fn probe_websocket(url: &str, timeout: Duration) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
-pub async fn run_websocket_agent(
+pub(crate) async fn run_websocket_agent(
     url: String,
     cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
@@ -706,7 +706,7 @@ async fn handle_ws_elicitation_request(
     );
 }
 
-pub async fn run_stdio_agent(
+pub(crate) async fn run_stdio_agent(
     agent: AcpAgent,
     cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
