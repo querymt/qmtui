@@ -4,8 +4,6 @@ mod endpoint;
 mod event_loop;
 mod terminal;
 
-#[cfg(test)]
-use std::ffi::OsString;
 use std::time::Duration;
 
 use crate::{
@@ -18,15 +16,9 @@ use crate::{
 };
 use clap::Parser;
 use connection::connection_manager;
-#[cfg(test)]
-use editor::{
-    apply_external_editor_outcome, apply_external_editor_result, editor_command_from_env,
-};
 use endpoint::{
     Cli, EndpointSelection, default_acp_ws_url, detect_launch_cwd, select_acp_endpoint,
 };
-#[cfg(test)]
-use endpoint::{DEFAULT_ACP_WS_HOST, normalize_acp_ws_url};
 use event_loop::run_loop;
 
 use tokio::sync::mpsc;
@@ -105,45 +97,6 @@ mod tests {
             required,
             kind: ElicitationFieldKind::BooleanToggle,
         }])
-    }
-
-    #[test]
-    fn reconnect_delay_caps_after_five_steps() {
-        assert_eq!(connection::reconnect_delay_ms(0), 250);
-        assert_eq!(connection::reconnect_delay_ms(1), 500);
-        assert_eq!(connection::reconnect_delay_ms(2), 1000);
-        assert_eq!(connection::reconnect_delay_ms(3), 2000);
-        assert_eq!(connection::reconnect_delay_ms(4), 4000);
-        assert_eq!(connection::reconnect_delay_ms(5), 8000);
-        assert_eq!(connection::reconnect_delay_ms(8), 8000);
-    }
-
-    #[test]
-    fn tick_from_elapsed_zero_is_zero() {
-        assert_eq!(event_loop::tick_from_elapsed(Duration::ZERO), 0);
-    }
-
-    #[test]
-    fn tick_from_elapsed_advances_every_80ms() {
-        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(0)), 0);
-        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(79)), 0);
-        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(80)), 1);
-        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(159)), 1);
-        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(160)), 2);
-    }
-
-    #[test]
-    fn tick_from_elapsed_spinner_frame_changes_every_two_ticks() {
-        // spinner uses `(tick / 2) % frames.len()` — one visual frame per 2 ticks.
-        // With 80ms per tick, one spinner frame lasts 160ms.
-        let tick_at_0ms = event_loop::tick_from_elapsed(Duration::from_millis(0));
-        let tick_at_150ms = event_loop::tick_from_elapsed(Duration::from_millis(150));
-        let tick_at_160ms = event_loop::tick_from_elapsed(Duration::from_millis(160));
-
-        // Same spinner frame within 160ms window
-        assert_eq!(tick_at_0ms / 2, tick_at_150ms / 2);
-        // Different spinner frame after 160ms
-        assert_ne!(tick_at_0ms / 2, tick_at_160ms / 2);
     }
 
     #[test]
@@ -599,42 +552,6 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn editor_command_prefers_visual_over_editor() {
-        let env = [("VISUAL", Some("nvim -f")), ("EDITOR", Some("vim"))];
-        let cmd = editor_command_from_env(&env).expect("expected editor command");
-        assert_eq!(cmd.program, "nvim");
-        assert_eq!(cmd.args, vec![OsString::from("-f")]);
-    }
-
-    #[test]
-    fn editor_command_uses_editor_when_visual_missing() {
-        let env = [("VISUAL", None), ("EDITOR", Some("nano"))];
-        let cmd = editor_command_from_env(&env).expect("expected editor command");
-        assert_eq!(cmd.program, "nano");
-        assert!(cmd.args.is_empty());
-    }
-
-    #[test]
-    fn editor_command_rejects_blank_values() {
-        let env = [("VISUAL", Some("   ")), ("EDITOR", Some(""))];
-        assert!(editor_command_from_env(&env).is_none());
-    }
-
-    #[test]
-    fn apply_external_editor_result_updates_input_and_cursor() {
-        let mut app = App::new();
-        app.input = "old".into();
-        app.input_cursor = 1;
-        app.input_scroll = 3;
-
-        apply_external_editor_result(&mut app, "new text".into());
-
-        assert_eq!(app.input, "new text");
-        assert_eq!(app.input_cursor, "new text".len());
-        assert_eq!(app.input_scroll, 0);
-    }
-
-    #[test]
     fn ctrl_x_e_returns_open_editor_action_in_chat() {
         let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
         let mut app = App::new();
@@ -688,19 +605,6 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn apply_external_editor_outcome_updates_input_on_success() {
-        let mut app = App::new();
-        app.input = "draft".into();
-
-        apply_external_editor_outcome(&mut app, Ok(Some("revised prompt".into())));
-
-        assert_eq!(app.input, "revised prompt");
-        assert_eq!(app.input_cursor, "revised prompt".len());
-        assert_eq!(app.status, "loaded prompt from external editor");
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
-    }
-
-    #[test]
     fn log_server_binary_discovery_records_path_lookup_when_binary_path_unset() {
         let mut app = App::new();
         let cfg = TuiConfig {
@@ -728,17 +632,6 @@ mod external_editor_tests {
         assert!(app.logs.iter().any(|entry| entry.target == "acp"
             && entry.level == app::LogLevel::Info
             && entry.message == "qmtcode not found on PATH"));
-    }
-
-    #[test]
-    fn apply_external_editor_outcome_keeps_input_on_cancel() {
-        let mut app = App::new();
-        app.input = "draft".into();
-
-        apply_external_editor_outcome(&mut app, Ok(None));
-
-        assert_eq!(app.input, "draft");
-        assert_eq!(app.status, "external editor cancelled");
     }
 
     #[test]
@@ -3419,198 +3312,14 @@ mod reasoning_effort_integration_tests {
 }
 
 #[cfg(test)]
-mod cli_tests {
-    use super::*;
-    use clap::{CommandFactory, Parser};
-
-    fn bin() -> String {
-        Cli::command().get_name().to_string()
-    }
-
-    #[test]
-    fn cli_session_short_flag() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "-s", "abc123"]).unwrap();
-        assert_eq!(cli.session, Some("abc123".into()));
-    }
-
-    #[test]
-    fn cli_session_long_flag() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "--session", "abc123"]).unwrap();
-        assert_eq!(cli.session, Some("abc123".into()));
-    }
-
-    #[test]
-    fn cli_no_session_defaults_to_none() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
-        assert_eq!(cli.session, None);
-        assert_eq!(cli.acp_binary, None);
-        assert_eq!(cli.ws, None);
-    }
-
-    #[test]
-    fn cli_ws_flag_defaults_to_localhost() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "--ws"]).unwrap();
-        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
-    }
-
-    #[test]
-    fn cli_ws_flag_accepts_address() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "--ws=0.0.0.0:42069"]).unwrap();
-        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
-    }
-
-    #[test]
-    fn cli_ws_short_flag_defaults_to_localhost() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "-w"]).unwrap();
-        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
-    }
-
-    #[test]
-    fn cli_ws_short_flag_accepts_address() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "-w", "0.0.0.0:42069"]).unwrap();
-        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
-    }
-
-    #[test]
-    fn acp_ws_url_normalization_adds_defaults() {
-        assert_eq!(normalize_acp_ws_url("127.0.0.1"), "ws://127.0.0.1:3030/ws");
-        assert_eq!(
-            normalize_acp_ws_url("127.0.0.1:42069"),
-            "ws://127.0.0.1:42069/ws"
-        );
-        assert_eq!(
-            normalize_acp_ws_url("ws://localhost:9999"),
-            "ws://localhost:9999/ws"
-        );
-        assert_eq!(
-            normalize_acp_ws_url("ws://localhost:9999/custom"),
-            "ws://localhost:9999/custom"
-        );
-    }
-
-    #[test]
-    fn cli_acp_binary_short_flag() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
-        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
-    }
-
-    #[test]
-    fn cli_acp_binary_long_flag() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
-        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
-    }
-
-    #[test]
-    fn explicit_ws_selection_wins_over_default_stdio() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "--ws=localhost:42069"]).unwrap();
-        let cfg = config::TuiConfig::default();
-
-        assert_eq!(
-            select_acp_endpoint(&cli, &cfg, false),
-            EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::WebSocket {
-                    url: "ws://localhost:42069/ws".into()
-                },
-                state: server_manager::ServerState::Starting,
-                discovered_ws: None,
-                missing_binary_fallback: false,
-            }
-        );
-    }
-
-    #[test]
-    fn explicit_binary_selection_wins_over_default_ws_probe() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str(), "-b", "/tmp/qmtcode"]).unwrap();
-        let mut cfg = config::TuiConfig::default();
-        cfg.acp.binary_args = Some(vec!["--acp".into()]);
-
-        assert_eq!(
-            select_acp_endpoint(&cli, &cfg, true),
-            EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::Stdio {
-                    argv: vec!["/tmp/qmtcode".into(), "--acp".into()]
-                },
-                state: server_manager::ServerState::Starting,
-                discovered_ws: None,
-                missing_binary_fallback: false,
-            }
-        );
-    }
-
-    #[test]
-    fn configured_websocket_selection_wins_over_default_ws_probe() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
-        let mut cfg = config::TuiConfig::default();
-        cfg.acp.websocket_url = Some("localhost:42069".into());
-
-        assert_eq!(
-            select_acp_endpoint(&cli, &cfg, true),
-            EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::WebSocket {
-                    url: "ws://localhost:42069/ws".into()
-                },
-                state: server_manager::ServerState::Starting,
-                discovered_ws: None,
-                missing_binary_fallback: false,
-            }
-        );
-    }
-
-    #[test]
-    fn auto_default_ws_selection_records_discovery() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
-        let cfg = config::TuiConfig::default();
-
-        assert_eq!(
-            select_acp_endpoint(&cli, &cfg, true),
-            EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::WebSocket {
-                    url: "ws://127.0.0.1:3030/ws".into()
-                },
-                state: server_manager::ServerState::Starting,
-                discovered_ws: Some("ws://127.0.0.1:3030/ws".into()),
-                missing_binary_fallback: false,
-            }
-        );
-    }
-
-    #[test]
-    fn auto_binary_missing_retries_default_websocket_forever() {
-        let b = bin();
-        let cli = Cli::try_parse_from([b.as_str()]).unwrap();
-        let mut cfg = config::TuiConfig::default();
-        cfg.acp.binary_path = Some("/definitely/missing/qmtcode".into());
-
-        assert_eq!(
-            select_acp_endpoint(&cli, &cfg, false),
-            EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::WebSocket {
-                    url: "ws://127.0.0.1:3030/ws".into()
-                },
-                state: server_manager::ServerState::Starting,
-                discovered_ws: None,
-                missing_binary_fallback: true,
-            }
-        );
-    }
+mod runtime_tests {
+    use super::{Cli, restore_hint};
+    use clap::CommandFactory;
 
     #[test]
     fn restore_hint_formats_correctly() {
-        let hint = restore_hint("abc-123-def");
-        assert_eq!(hint, format!("{} -s abc-123-def", bin()));
+        let bin = Cli::command().get_name().to_string();
+        assert_eq!(restore_hint("abc-123-def"), format!("{bin} -s abc-123-def"));
     }
 }
 

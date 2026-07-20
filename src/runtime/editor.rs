@@ -105,3 +105,74 @@ pub(super) fn apply_external_editor_outcome(app: &mut App, result: anyhow::Resul
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use crate::app::App;
+
+    use super::{
+        apply_external_editor_outcome, apply_external_editor_result, editor_command_from_env,
+    };
+
+    #[test]
+    fn editor_command_prefers_visual_over_editor() {
+        let env = [("VISUAL", Some("nvim -f")), ("EDITOR", Some("vim"))];
+        let cmd = editor_command_from_env(&env).expect("expected editor command");
+        assert_eq!(cmd.program, "nvim");
+        assert_eq!(cmd.args, vec![OsString::from("-f")]);
+    }
+
+    #[test]
+    fn editor_command_uses_editor_when_visual_missing() {
+        let env = [("VISUAL", None), ("EDITOR", Some("nano"))];
+        let cmd = editor_command_from_env(&env).expect("expected editor command");
+        assert_eq!(cmd.program, "nano");
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn editor_command_rejects_blank_values() {
+        let env = [("VISUAL", Some("   ")), ("EDITOR", Some(""))];
+        assert!(editor_command_from_env(&env).is_none());
+    }
+
+    #[test]
+    fn apply_external_editor_result_updates_input_and_cursor() {
+        let mut app = App::new();
+        app.input = "old".into();
+        app.input_cursor = 1;
+        app.input_scroll = 3;
+
+        apply_external_editor_result(&mut app, "new text".into());
+
+        assert_eq!(app.input, "new text");
+        assert_eq!(app.input_cursor, "new text".len());
+        assert_eq!(app.input_scroll, 0);
+    }
+
+    #[test]
+    fn apply_external_editor_outcome_updates_input_on_success() {
+        let mut app = App::new();
+        app.input = "draft".into();
+
+        apply_external_editor_outcome(&mut app, Ok(Some("revised prompt".into())));
+
+        assert_eq!(app.input, "revised prompt");
+        assert_eq!(app.input_cursor, "revised prompt".len());
+        assert_eq!(app.status, "loaded prompt from external editor");
+        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
+    }
+
+    #[test]
+    fn apply_external_editor_outcome_keeps_input_on_cancel() {
+        let mut app = App::new();
+        app.input = "draft".into();
+
+        apply_external_editor_outcome(&mut app, Ok(None));
+
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.status, "external editor cancelled");
+    }
+}
