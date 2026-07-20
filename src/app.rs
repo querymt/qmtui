@@ -1372,7 +1372,7 @@ pub struct App {
     pub hl: Highlighter,
 
     // card cache for incremental rendering
-    pub card_cache: CardCache,
+    pub(crate) card_cache: CardCache,
 
     // auth popup state
     pub auth_providers: Vec<crate::protocol::AuthProviderEntry>,
