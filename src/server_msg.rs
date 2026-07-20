@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::app::*;
 use crate::protocol::*;
+use crate::tool_detail;
 use crate::ui::{
     ELLIPSIS, OUTCOME_BULLET, build_diff_lines, build_sectioned_diff_lines, build_shell_lines,
     build_write_lines,
@@ -1343,8 +1344,12 @@ impl App {
                         return;
                     }
                     let cwd = self.current_session_cwd();
-                    let detail = parse_tool_detail(tool_name, arguments.as_ref(), cwd.as_deref());
-                    if reconcile_tool_call_start(
+                    let detail = tool_detail::parse_tool_detail(
+                        tool_name,
+                        arguments.as_ref(),
+                        cwd.as_deref(),
+                    );
+                    if tool_detail::reconcile_tool_call_start(
                         &mut self.messages,
                         tool_call_id.as_deref(),
                         tool_name,
@@ -1404,14 +1409,14 @@ impl App {
                 } else {
                     let mut updated_existing_tool = false;
                     if let Some(result_str) = result {
-                        updated_existing_tool = update_tool_detail(
+                        updated_existing_tool = tool_detail::update_tool_detail(
                             &mut self.messages,
                             tool_call_id.as_deref(),
                             result_str,
                         );
                     }
                     if is_error.unwrap_or(false) {
-                        if mark_tool_call_failed(
+                        if tool_detail::mark_tool_call_failed(
                             &mut self.messages,
                             tool_call_id.as_deref(),
                             tool_name,
