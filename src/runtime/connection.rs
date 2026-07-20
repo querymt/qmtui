@@ -11,7 +11,7 @@ use crate::{
 
 use super::{ConnectionManagerEvent, ServerChannelMsg};
 
-pub(super) fn reconnect_delay_ms(attempt: u32) -> u64 {
+fn reconnect_delay_ms(attempt: u32) -> u64 {
     let capped = attempt.min(5);
     250 * (1u64 << capped)
 }
@@ -119,5 +119,21 @@ pub(super) async fn connection_manager(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_delay_ms;
+
+    #[test]
+    fn reconnect_delay_caps_after_five_steps() {
+        assert_eq!(reconnect_delay_ms(0), 250);
+        assert_eq!(reconnect_delay_ms(1), 500);
+        assert_eq!(reconnect_delay_ms(2), 1000);
+        assert_eq!(reconnect_delay_ms(3), 2000);
+        assert_eq!(reconnect_delay_ms(4), 4000);
+        assert_eq!(reconnect_delay_ms(5), 8000);
+        assert_eq!(reconnect_delay_ms(8), 8000);
     }
 }

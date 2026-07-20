@@ -19,7 +19,7 @@ use super::{
 
 /// Derive a UI tick from wall-clock elapsed time.
 /// Each tick step is about 80 ms so animations do not depend on event-loop activity.
-pub(super) fn tick_from_elapsed(elapsed: Duration) -> u64 {
+fn tick_from_elapsed(elapsed: Duration) -> u64 {
     (elapsed.as_millis() / 80) as u64
 }
 
@@ -178,5 +178,36 @@ pub(super) async fn run_loop(
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::tick_from_elapsed;
+
+    #[test]
+    fn tick_from_elapsed_zero_is_zero() {
+        assert_eq!(tick_from_elapsed(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn tick_from_elapsed_advances_every_80ms() {
+        assert_eq!(tick_from_elapsed(Duration::from_millis(0)), 0);
+        assert_eq!(tick_from_elapsed(Duration::from_millis(79)), 0);
+        assert_eq!(tick_from_elapsed(Duration::from_millis(80)), 1);
+        assert_eq!(tick_from_elapsed(Duration::from_millis(159)), 1);
+        assert_eq!(tick_from_elapsed(Duration::from_millis(160)), 2);
+    }
+
+    #[test]
+    fn tick_from_elapsed_spinner_frame_changes_every_two_ticks() {
+        let tick_at_0ms = tick_from_elapsed(Duration::from_millis(0));
+        let tick_at_150ms = tick_from_elapsed(Duration::from_millis(150));
+        let tick_at_160ms = tick_from_elapsed(Duration::from_millis(160));
+
+        assert_eq!(tick_at_0ms / 2, tick_at_150ms / 2);
+        assert_ne!(tick_at_0ms / 2, tick_at_160ms / 2);
     }
 }

@@ -172,3 +172,184 @@ pub(super) fn detect_launch_cwd() -> Option<String> {
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use crate::{acp_client::AcpEndpoint, config, server_manager::ServerState};
+
+    use super::{
+        Cli, DEFAULT_ACP_WS_HOST, EndpointSelection, normalize_acp_ws_url, select_acp_endpoint,
+    };
+
+    fn bin() -> String {
+        Cli::command().get_name().to_string()
+    }
+
+    #[test]
+    fn cli_session_short_flag() {
+        let cli = Cli::try_parse_from([bin().as_str(), "-s", "abc123"]).unwrap();
+        assert_eq!(cli.session, Some("abc123".into()));
+    }
+
+    #[test]
+    fn cli_session_long_flag() {
+        let cli = Cli::try_parse_from([bin().as_str(), "--session", "abc123"]).unwrap();
+        assert_eq!(cli.session, Some("abc123".into()));
+    }
+
+    #[test]
+    fn cli_no_session_defaults_to_none() {
+        let cli = Cli::try_parse_from([bin().as_str()]).unwrap();
+        assert_eq!(cli.session, None);
+        assert_eq!(cli.acp_binary, None);
+        assert_eq!(cli.ws, None);
+    }
+
+    #[test]
+    fn cli_ws_flag_defaults_to_localhost() {
+        let cli = Cli::try_parse_from([bin().as_str(), "--ws"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_flag_accepts_address() {
+        let cli = Cli::try_parse_from([bin().as_str(), "--ws=0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_defaults_to_localhost() {
+        let cli = Cli::try_parse_from([bin().as_str(), "-w"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some(DEFAULT_ACP_WS_HOST));
+    }
+
+    #[test]
+    fn cli_ws_short_flag_accepts_address() {
+        let cli = Cli::try_parse_from([bin().as_str(), "-w", "0.0.0.0:42069"]).unwrap();
+        assert_eq!(cli.ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn acp_ws_url_normalization_adds_defaults() {
+        assert_eq!(normalize_acp_ws_url("127.0.0.1"), "ws://127.0.0.1:3030/ws");
+        assert_eq!(
+            normalize_acp_ws_url("127.0.0.1:42069"),
+            "ws://127.0.0.1:42069/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999"),
+            "ws://localhost:9999/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("ws://localhost:9999/custom"),
+            "ws://localhost:9999/custom"
+        );
+    }
+
+    #[test]
+    fn cli_acp_binary_short_flag() {
+        let cli = Cli::try_parse_from([bin().as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn cli_acp_binary_long_flag() {
+        let cli = Cli::try_parse_from([bin().as_str(), "--acp-binary", "/tmp/qmtcode"]).unwrap();
+        assert_eq!(cli.acp_binary, Some("/tmp/qmtcode".into()));
+    }
+
+    #[test]
+    fn explicit_ws_selection_wins_over_default_stdio() {
+        let cli = Cli::try_parse_from([bin().as_str(), "--ws=localhost:42069"]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_binary_selection_wins_over_default_ws_probe() {
+        let cli = Cli::try_parse_from([bin().as_str(), "-b", "/tmp/qmtcode"]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_args = Some(vec!["--acp".into()]);
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: AcpEndpoint::Stdio {
+                    argv: vec!["/tmp/qmtcode".into(), "--acp".into()]
+                },
+                state: ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn configured_websocket_selection_wins_over_default_ws_probe() {
+        let cli = Cli::try_parse_from([bin().as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.websocket_url = Some("localhost:42069".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: AcpEndpoint::WebSocket {
+                    url: "ws://localhost:42069/ws".into()
+                },
+                state: ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_default_ws_selection_records_discovery() {
+        let cli = Cli::try_parse_from([bin().as_str()]).unwrap();
+        let cfg = config::TuiConfig::default();
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, true),
+            EndpointSelection::Endpoint {
+                endpoint: AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: ServerState::Starting,
+                discovered_ws: Some("ws://127.0.0.1:3030/ws".into()),
+                missing_binary_fallback: false,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_binary_missing_retries_default_websocket_forever() {
+        let cli = Cli::try_parse_from([bin().as_str()]).unwrap();
+        let mut cfg = config::TuiConfig::default();
+        cfg.acp.binary_path = Some("/definitely/missing/qmtcode".into());
+
+        assert_eq!(
+            select_acp_endpoint(&cli, &cfg, false),
+            EndpointSelection::Endpoint {
+                endpoint: AcpEndpoint::WebSocket {
+                    url: "ws://127.0.0.1:3030/ws".into()
+                },
+                state: ServerState::Starting,
+                discovered_ws: None,
+                missing_binary_fallback: true,
+            }
+        );
+    }
+}
