@@ -1,5 +1,8 @@
+mod connection;
 mod editor;
 mod endpoint;
+mod event_loop;
+mod terminal;
 
 #[cfg(test)]
 use std::ffi::OsString;
@@ -11,24 +14,21 @@ use crate::{
     app::{self, App, Screen},
     config,
     protocol::ClientMsg,
-    server_manager, theme, ui,
+    server_manager, theme,
 };
 use clap::Parser;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, EventStream},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use editor::{apply_external_editor_outcome, open_external_editor};
+use connection::connection_manager;
 #[cfg(test)]
-use editor::{apply_external_editor_result, editor_command_from_env};
+use editor::{
+    apply_external_editor_outcome, apply_external_editor_result, editor_command_from_env,
+};
 use endpoint::{
     Cli, EndpointSelection, default_acp_ws_url, detect_launch_cwd, select_acp_endpoint,
 };
 #[cfg(test)]
 use endpoint::{DEFAULT_ACP_WS_HOST, normalize_acp_ws_url};
-use futures::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use event_loop::run_loop;
+
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -39,18 +39,6 @@ pub(crate) enum ConnectionManagerEvent {
 #[derive(Debug)]
 pub(crate) enum ServerChannelMsg {
     Acp(AcpAppEvent),
-}
-
-fn reconnect_delay_ms(attempt: u32) -> u64 {
-    let capped = attempt.min(5);
-    250 * (1u64 << capped)
-}
-
-/// Derive a UI tick from wall-clock elapsed time.
-/// Each tick step ≈ 80 ms so spinner animations run at a consistent speed
-/// regardless of how fast or slow the event loop iterates.
-fn tick_from_elapsed(elapsed: Duration) -> u64 {
-    (elapsed.as_millis() / 80) as u64
 }
 
 #[cfg(test)]
@@ -121,36 +109,36 @@ mod tests {
 
     #[test]
     fn reconnect_delay_caps_after_five_steps() {
-        assert_eq!(reconnect_delay_ms(0), 250);
-        assert_eq!(reconnect_delay_ms(1), 500);
-        assert_eq!(reconnect_delay_ms(2), 1000);
-        assert_eq!(reconnect_delay_ms(3), 2000);
-        assert_eq!(reconnect_delay_ms(4), 4000);
-        assert_eq!(reconnect_delay_ms(5), 8000);
-        assert_eq!(reconnect_delay_ms(8), 8000);
+        assert_eq!(connection::reconnect_delay_ms(0), 250);
+        assert_eq!(connection::reconnect_delay_ms(1), 500);
+        assert_eq!(connection::reconnect_delay_ms(2), 1000);
+        assert_eq!(connection::reconnect_delay_ms(3), 2000);
+        assert_eq!(connection::reconnect_delay_ms(4), 4000);
+        assert_eq!(connection::reconnect_delay_ms(5), 8000);
+        assert_eq!(connection::reconnect_delay_ms(8), 8000);
     }
 
     #[test]
     fn tick_from_elapsed_zero_is_zero() {
-        assert_eq!(tick_from_elapsed(Duration::ZERO), 0);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::ZERO), 0);
     }
 
     #[test]
     fn tick_from_elapsed_advances_every_80ms() {
-        assert_eq!(tick_from_elapsed(Duration::from_millis(0)), 0);
-        assert_eq!(tick_from_elapsed(Duration::from_millis(79)), 0);
-        assert_eq!(tick_from_elapsed(Duration::from_millis(80)), 1);
-        assert_eq!(tick_from_elapsed(Duration::from_millis(159)), 1);
-        assert_eq!(tick_from_elapsed(Duration::from_millis(160)), 2);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(0)), 0);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(79)), 0);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(80)), 1);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(159)), 1);
+        assert_eq!(event_loop::tick_from_elapsed(Duration::from_millis(160)), 2);
     }
 
     #[test]
     fn tick_from_elapsed_spinner_frame_changes_every_two_ticks() {
         // spinner uses `(tick / 2) % frames.len()` — one visual frame per 2 ticks.
         // With 80ms per tick, one spinner frame lasts 160ms.
-        let tick_at_0ms = tick_from_elapsed(Duration::from_millis(0));
-        let tick_at_150ms = tick_from_elapsed(Duration::from_millis(150));
-        let tick_at_160ms = tick_from_elapsed(Duration::from_millis(160));
+        let tick_at_0ms = event_loop::tick_from_elapsed(Duration::from_millis(0));
+        let tick_at_150ms = event_loop::tick_from_elapsed(Duration::from_millis(150));
+        let tick_at_160ms = event_loop::tick_from_elapsed(Duration::from_millis(160));
 
         // Same spinner frame within 160ms window
         assert_eq!(tick_at_0ms / 2, tick_at_150ms / 2);
@@ -1540,7 +1528,8 @@ mod external_editor_tests {
     }
 }
 
-use crate::handlers::{AppAction, handle_key, handle_mouse};
+#[cfg(test)]
+use crate::handlers::handle_key;
 
 fn log_server_binary_discovery(
     app: &mut App,
@@ -1566,28 +1555,6 @@ fn log_server_binary_discovery(
     if discovery.binary.is_none() {
         app.push_log(app::LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
-}
-
-fn open_external_editor_with_terminal(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut App,
-) -> anyhow::Result<()> {
-    terminal.show_cursor()?;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    let result = open_external_editor(&app.input);
-
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
-    terminal.autoresize()?;
-    app.card_cache.invalidate();
-    app.streaming_cache.invalidate();
-    apply_external_editor_outcome(app, result);
-    terminal.draw(|f| ui::draw(f, app))?;
-    Ok(())
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -1695,12 +1662,7 @@ pub async fn run() -> anyhow::Result<()> {
         ));
     }
 
-    // setup terminal
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = terminal::enter()?;
 
     app.server_state = initial_server_state;
     let result = run_loop(
@@ -1713,14 +1675,7 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .await;
 
-    // restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    terminal::leave(&mut terminal)?;
 
     if let Some(session_id) = &app.session_id {
         eprintln!("{}", restore_hint(session_id));
@@ -1733,279 +1688,6 @@ fn restore_hint(session_id: &str) -> String {
     use clap::CommandFactory;
     let bin = Cli::command().get_name().to_string();
     format!("{bin} -s {session_id}")
-}
-
-async fn connection_manager(
-    endpoint: acp_client::AcpEndpoint,
-    srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
-    mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
-    conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
-    sup_event_tx: mpsc::UnboundedSender<server_manager::ServerEvent>,
-    launch_cwd: Option<String>,
-) {
-    match endpoint {
-        acp_client::AcpEndpoint::Stdio { argv } => {
-            let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
-            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
-                Ok(agent) => agent,
-                Err(err) => {
-                    let message = format!("invalid ACP stdio command: {err:?}");
-                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
-                        error: message.clone(),
-                    });
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        app::ConnectionEvent::Disconnected { reason: message },
-                    ));
-                    return;
-                }
-            };
-
-            let _ = sup_event_tx.send(server_manager::ServerEvent::Started);
-            let result = acp_client::run_stdio_agent(
-                agent,
-                &mut cmd_rx,
-                srv_tx,
-                conn_tx.clone(),
-                launch_cwd,
-            )
-            .await;
-
-            match result {
-                Ok(()) => {
-                    let reason = "ACP stdio connection ended".to_string();
-                    let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
-                        reason: reason.clone(),
-                    });
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        app::ConnectionEvent::Disconnected { reason },
-                    ));
-                }
-                Err(err) => {
-                    let reason = format!("ACP stdio connection failed: {err:?}");
-                    let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
-                        error: reason.clone(),
-                    });
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        app::ConnectionEvent::Disconnected { reason },
-                    ));
-                }
-            }
-        }
-        acp_client::AcpEndpoint::WebSocket { url } => {
-            let mut attempt = 0u32;
-            loop {
-                if attempt > 0 {
-                    let delay_ms = reconnect_delay_ms(attempt - 1);
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        app::ConnectionEvent::Connecting { attempt, delay_ms },
-                    ));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-
-                let _ = sup_event_tx.send(server_manager::ServerEvent::Starting);
-                let result = acp_client::run_websocket_agent(
-                    url.clone(),
-                    &mut cmd_rx,
-                    srv_tx.clone(),
-                    conn_tx.clone(),
-                    launch_cwd.clone(),
-                )
-                .await;
-
-                match result {
-                    Ok(()) => {
-                        let reason = "ACP WebSocket connection ended".to_string();
-                        let _ = sup_event_tx.send(server_manager::ServerEvent::Stopped {
-                            reason: reason.clone(),
-                        });
-                        let _ = conn_tx.send(ConnectionManagerEvent::State(
-                            app::ConnectionEvent::Disconnected { reason },
-                        ));
-                        return;
-                    }
-                    Err(err) => {
-                        let reason = format!("ACP WebSocket connection failed ({url}): {err:?}");
-                        let _ = sup_event_tx.send(server_manager::ServerEvent::StartFailed {
-                            error: reason.clone(),
-                        });
-                        let _ = conn_tx.send(ConnectionManagerEvent::State(
-                            app::ConnectionEvent::Disconnected { reason },
-                        ));
-                        attempt = attempt.saturating_add(1).max(1);
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    app: &mut App,
-    srv_rx: &mut mpsc::UnboundedReceiver<ServerChannelMsg>,
-    conn_rx: &mut mpsc::UnboundedReceiver<ConnectionManagerEvent>,
-    sup_rx: &mut mpsc::UnboundedReceiver<server_manager::ServerEvent>,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
-) -> anyhow::Result<()> {
-    // Native async terminal event stream — no spawn_blocking overhead per frame.
-    let mut term_events = EventStream::new();
-
-    loop {
-        app.tick = tick_from_elapsed(app.started_at.elapsed());
-        app.clear_expired_cancel_confirm();
-        terminal.draw(|f| ui::draw(f, app))?;
-
-        // poll for terminal events or server messages
-        tokio::select! {
-            biased;
-            Some(event) = conn_rx.recv() => {
-                match event {
-                    ConnectionManagerEvent::State(state) => {
-                        let was_connected = app.conn == app::ConnState::Connected;
-                        app.handle_connection_event(state);
-                        if app.conn == app::ConnState::Connected {
-                            cmd_tx.send(ClientMsg::Init)?;
-                            cmd_tx.send(ClientMsg::list_sessions_browse())?;
-                            cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
-                            if let Some(session_id) = app.session_id.clone() {
-                                if let Some(node_id) = app.session_remote_node_id(&session_id) {
-                                    cmd_tx.send(ClientMsg::AttachRemoteSession {
-                                        node_id: node_id.to_string(),
-                                        session_id,
-                                    })?;
-                                } else if app.is_remote_session_id(&session_id) {
-                                    app.set_status(
-                                        app::LogLevel::Warn,
-                                        "session",
-                                        "remote session is missing node id; reconnect attach skipped",
-                                    );
-                                } else {
-                                    cmd_tx.send(ClientMsg::LoadSession {
-                                        session_id: session_id.clone(),
-                                        cwd: app.current_session_cwd(),
-                                    })?;
-                                    cmd_tx.send(ClientMsg::SubscribeSession {
-                                        session_id,
-                                        agent_id: app.agent_id.clone(),
-                                    })?;
-                                }
-                            }
-                        } else if was_connected && app.conn == app::ConnState::Disconnected {
-                            app.set_status(
-                                app::LogLevel::Warn,
-                                "connection",
-                                "connection lost - reconnecting...",
-                            );
-                        }
-                    }
-                }
-            }
-            // native ACP client events
-            Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
-                for reply in app.handle_acp_event(event) {
-                    // if reloading session, also re-subscribe
-                    if let ClientMsg::LoadSession { ref session_id, .. } = reply {
-                        let sid = session_id.clone();
-                        cmd_tx.send(reply)?;
-                        cmd_tx.send(ClientMsg::SubscribeSession {
-                            session_id: sid,
-                            agent_id: app.agent_id.clone(),
-                        })?;
-                    } else {
-                        cmd_tx.send(reply)?;
-                    }
-                }
-            }
-            // server supervisor events
-            Some(sup_event) = sup_rx.recv() => {
-                use crate::server_manager::{ServerEvent, ServerState};
-                match sup_event {
-                    ServerEvent::Starting => {
-                        app.server_state = ServerState::Starting;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "acp", "starting qmtcode ACP agent...");
-                        }
-                    }
-                    ServerEvent::Started => {
-                        app.server_state = ServerState::Running;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
-                        }
-                    }
-                    ServerEvent::BinaryNotFound => {
-                        app.server_state = ServerState::BinaryNotFound;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                app::LogLevel::Warn,
-                                "acp",
-                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
-                            );
-                        }
-                    }
-                    ServerEvent::StartFailed { error } => {
-                        app.server_state = ServerState::StartFailed { error: error.clone() };
-                        app.set_status(
-                            app::LogLevel::Error,
-                            "acp",
-                            format!("ACP start failed: {error}"),
-                        );
-                    }
-                    ServerEvent::Stopped { reason } => {
-                        app.server_state = ServerState::Restarting { reason: reason.clone() };
-                        app.set_status(
-                            app::LogLevel::Warn,
-                            "acp",
-                            format!("ACP agent stopped ({reason})"),
-                        );
-                    }
-                }
-            }
-            // terminal input — native async, no thread pool overhead
-            Some(event_result) = term_events.next() => {
-                match event_result {
-                    Ok(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        let action = handle_key(app, key, cmd_tx)?;
-                        if matches!(action, AppAction::OpenExternalEditor) {
-                            open_external_editor_with_terminal(terminal, app)?;
-                        }
-                        if app.should_quit {
-                            return Ok(());
-                        }
-                        // Drain any remaining buffered key events before redrawing,
-                        // so fast typing doesn't queue one redraw per keystroke.
-                        while let Ok(true) = event::poll(Duration::from_millis(0)) {
-                            match event::read() {
-                                Ok(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
-                                    let action = handle_key(app, key, cmd_tx)?;
-                                    if matches!(action, AppAction::OpenExternalEditor) {
-                                        open_external_editor_with_terminal(terminal, app)?;
-                                    }
-                                    if app.should_quit {
-                                        return Ok(());
-                                    }
-                                }
-                                Ok(Event::Mouse(mouse)) => {
-                                    handle_mouse(app, mouse);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        handle_mouse(app, mouse);
-                    }
-                    _ => {}
-                }
-            }
-            // Spinner / animation refresh: when no events arrive, redraw
-            // periodically so spinners keep animating (~12.5 fps).
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
-        }
-
-        if app.should_quit {
-            return Ok(());
-        }
-    }
 }
 
 #[cfg(test)]
