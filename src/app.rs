@@ -1298,15 +1298,13 @@ pub struct App {
     pub model_filter: String,
 
     // delegate agent model preferences
-    /// Known agents from the server's `state` message.
-    /// Single-element or empty in single-agent mode.
+    /// Agents for `agents_profile_id`. Index zero is the primary session agent.
     pub agents: Vec<crate::protocol::AgentInfo>,
-    /// Currently selected tab index in the model popup.
-    /// 0 = "Planner" (plan mode), 1 = "Build" (build mode), 2..N = delegate agents.
+    pub agents_profile_id: Option<String>,
+    /// Currently selected tab index: zero is the session, remaining tabs are delegates.
     pub model_popup_agent_tab: usize,
-    /// Per-agent-id model preferences: agent_id → (provider, model).
-    /// Applied automatically when `SessionForked` creates a child for that agent.
-    pub delegate_model_preferences: HashMap<String, (String, String)>,
+    /// Explicit model preferences scoped by profile ID and delegate agent ID.
+    pub delegate_model_preferences: HashMap<String, HashMap<String, DelegateModelPreference>>,
 
     // theme selector
     pub theme_cursor: usize,
@@ -1538,6 +1536,7 @@ impl App {
             model_cursor: 0,
             model_filter: String::new(),
             agents: Vec::new(),
+            agents_profile_id: None,
             model_popup_agent_tab: 0,
             delegate_model_preferences: HashMap::new(),
             theme_cursor: 0,
@@ -2606,23 +2605,85 @@ impl App {
         tab_idx == 0
     }
 
-    pub fn set_delegate_model_preference(&mut self, agent_id: &str, provider: &str, model: &str) {
-        self.delegate_model_preferences.insert(
-            agent_id.to_string(),
-            (provider.to_string(), model.to_string()),
-        );
+    pub fn delegate_preference_profile_id(&self) -> Option<&str> {
+        self.current_session_profile_id()
+            .or(self.active_profile_id.as_deref())
     }
 
-    pub fn get_delegate_model_preference(&self, agent_id: &str) -> Option<(&str, &str)> {
+    pub fn desired_agents_profile_id(&self) -> Option<&str> {
+        self.delegate_preference_profile_id()
+    }
+
+    pub fn set_delegate_model_preference(
+        &mut self,
+        profile_id: &str,
+        agent_id: &str,
+        model: &ModelEntry,
+    ) {
         self.delegate_model_preferences
-            .get(agent_id)
-            .map(|(p, m)| (p.as_str(), m.as_str()))
+            .entry(profile_id.to_string())
+            .or_default()
+            .insert(
+                agent_id.to_string(),
+                DelegateModelPreference {
+                    model_id: model.id.clone(),
+                    provider: model.provider.clone(),
+                    model: model.model.clone(),
+                    node_id: model.node_id.clone(),
+                },
+            );
+    }
+
+    pub fn clear_delegate_model_preference(&mut self, profile_id: &str, agent_id: &str) {
+        if let Some(preferences) = self.delegate_model_preferences.get_mut(profile_id) {
+            preferences.remove(agent_id);
+            if preferences.is_empty() {
+                self.delegate_model_preferences.remove(profile_id);
+            }
+        }
+    }
+
+    pub fn get_delegate_model_preference(
+        &self,
+        profile_id: &str,
+        agent_id: &str,
+    ) -> Option<&DelegateModelPreference> {
+        self.delegate_model_preferences
+            .get(profile_id)
+            .and_then(|preferences| preferences.get(agent_id))
+    }
+
+    pub fn delegate_model_commands_for_session(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+    ) -> Vec<ClientMsg> {
+        let known_agents: HashSet<&str> =
+            self.agents.iter().skip(1).map(|a| a.id.as_str()).collect();
+        self.delegate_model_preferences
+            .get(profile_id)
+            .into_iter()
+            .flat_map(|preferences| preferences.iter())
+            .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
+            .map(|(agent_id, preference)| ClientMsg::SetDelegateModel {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.clone(),
+                model_id: Some(preference.model_id.clone()),
+                node_id: preference.node_id.clone(),
+            })
+            .collect()
     }
 
     /// Cursor position for a delegate agent's preferred model in the popup list.
     pub fn delegate_model_cursor(&self, agent_id: &str) -> usize {
         let items = self.visible_model_popup_items();
-        let Some((provider, model)) = self.get_delegate_model_preference(agent_id) else {
+        let Some(profile_id) = self.delegate_preference_profile_id() else {
+            return items
+                .iter()
+                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
+                .unwrap_or(0);
+        };
+        let Some(preference) = self.get_delegate_model_preference(profile_id, agent_id) else {
             return items
                 .iter()
                 .position(|item| matches!(item, ModelPopupItem::Model { .. }))
@@ -2632,8 +2693,8 @@ impl App {
             .iter()
             .position(|item| match item {
                 ModelPopupItem::Model { model_idx } => {
-                    let m = &self.models[*model_idx];
-                    m.provider == provider && m.model == model
+                    self.models[*model_idx].id == preference.model_id
+                        && self.models[*model_idx].node_id == preference.node_id
                 }
                 _ => false,
             })
@@ -4544,7 +4605,7 @@ mod delegate_entry_tests {
             family: None,
             quant: None,
         }];
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        app.set_delegate_model_preference("profile", "coder", &app.models[0].clone());
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
@@ -10357,6 +10418,8 @@ mod delegate_model_preference_tests {
         AgentInfo {
             id: id.into(),
             name: name.into(),
+            description: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -10442,17 +10505,19 @@ mod delegate_model_preference_tests {
     #[test]
     fn delegate_pref_round_trip() {
         let mut app = App::new();
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        let model = make_model("anthropic", "claude-sonnet");
+        app.set_delegate_model_preference("profile", "coder", &model);
         assert_eq!(
-            app.get_delegate_model_preference("coder"),
-            Some(("anthropic", "claude-sonnet"))
+            app.get_delegate_model_preference("profile", "coder")
+                .map(|preference| preference.model_id.as_str()),
+            Some("anthropic/claude-sonnet")
         );
     }
 
     #[test]
     fn delegate_pref_missing_returns_none() {
         let app = App::new();
-        assert_eq!(app.get_delegate_model_preference("coder"), None);
+        assert_eq!(app.get_delegate_model_preference("profile", "coder"), None);
     }
 
     #[test]
@@ -10462,7 +10527,8 @@ mod delegate_model_preference_tests {
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        app.active_profile_id = Some("profile".into());
+        app.set_delegate_model_preference("profile", "coder", &app.models[1].clone());
         let cursor = app.delegate_model_cursor("coder");
         // Should point to the second item (index 1 in models, but popup items
         // include provider headers — exact index depends on visible_model_popup_items).

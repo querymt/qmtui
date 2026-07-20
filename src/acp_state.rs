@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::acp_client::DelegateModelOverrideInfo;
 use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Popup, Screen, ToolDetail};
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
@@ -88,6 +89,15 @@ pub(crate) enum AcpAppEvent {
         profiles: Vec<ProfileInfo>,
         active_profile_id: Option<String>,
     },
+    ProfileAgents {
+        profile_id: String,
+        agents: Vec<AgentInfo>,
+    },
+    DelegateModelSet {
+        session_id: String,
+        agent_id: String,
+        model: Option<DelegateModelOverrideInfo>,
+    },
     ProviderChanged {
         provider: String,
         model: String,
@@ -160,18 +170,19 @@ impl crate::app::App {
                 agent_mode,
                 reasoning_effort,
             } => {
-                self.profiles = profiles;
-                if let Some(profile_id) = active_profile_id {
-                    self.active_profile_id = Some(profile_id);
-                }
-                if self.profile_cursor >= self.profiles.len() {
-                    self.profile_cursor = self.profiles.len().saturating_sub(1);
+                // ACP initialization sends a placeholder empty catalog before
+                // capability-gated profile discovery completes.
+                if !profiles.is_empty() {
+                    self.apply_profile_catalog(profiles, active_profile_id);
                 }
                 self.agent_id = Some(agent_id.clone());
                 self.agents = vec![AgentInfo {
                     id: agent_id,
                     name: agent_name,
+                    description: None,
+                    capabilities: Vec::new(),
                 }];
+                self.agents_profile_id = None;
                 if let Some(mode) = agent_mode {
                     self.agent_mode = mode;
                     if self.agent_mode != "review" {
@@ -202,14 +213,41 @@ impl crate::app::App {
             AcpAppEvent::Profiles {
                 profiles,
                 active_profile_id,
+            } => self.apply_profile_catalog(profiles, active_profile_id),
+            AcpAppEvent::ProfileAgents { profile_id, agents } => {
+                if self.desired_agents_profile_id() == Some(profile_id.as_str()) {
+                    self.agents = agents;
+                    self.agents_profile_id = Some(profile_id);
+                    self.model_popup_agent_tab = self
+                        .model_popup_agent_tab
+                        .min(self.model_popup_tab_count().saturating_sub(1));
+                    if self.parent_session_id.is_none()
+                        && let (Some(session_id), Some(profile_id)) = (
+                            self.session_id.as_deref(),
+                            self.agents_profile_id.as_deref(),
+                        )
+                    {
+                        return self.delegate_model_commands_for_session(session_id, profile_id);
+                    }
+                }
+                vec![]
+            }
+            AcpAppEvent::DelegateModelSet {
+                session_id,
+                agent_id,
+                model,
             } => {
-                self.profiles = profiles;
-                if let Some(profile_id) = active_profile_id {
-                    self.active_profile_id = Some(profile_id);
-                }
-                if self.profile_cursor >= self.profiles.len() {
-                    self.profile_cursor = self.profiles.len().saturating_sub(1);
-                }
+                self.set_status(
+                    LogLevel::Info,
+                    "model",
+                    match model {
+                        Some(model) => format!(
+                            "delegate model set for {agent_id} in {session_id}: {}",
+                            model.model_id
+                        ),
+                        None => format!("delegate model reset for {agent_id} in {session_id}"),
+                    },
+                );
                 vec![]
             }
             AcpAppEvent::ProviderChanged {
@@ -474,6 +512,42 @@ impl crate::app::App {
         }
     }
 
+    fn apply_profile_catalog(
+        &mut self,
+        profiles: Vec<ProfileInfo>,
+        backend_active_profile_id: Option<String>,
+    ) -> Vec<ClientMsg> {
+        let previous_profile_id = self.active_profile_id.clone();
+        let is_available =
+            |profile_id: &str| profiles.iter().any(|profile| profile.id == profile_id);
+        let selected = self
+            .active_profile_id
+            .take()
+            .filter(|profile_id| is_available(profile_id));
+        let backend_default =
+            backend_active_profile_id.filter(|profile_id| is_available(profile_id));
+        self.active_profile_id = selected
+            .or(backend_default)
+            .or_else(|| profiles.first().map(|profile| profile.id.clone()));
+        self.profiles = profiles;
+        if self.profile_cursor >= self.profiles.len() {
+            self.profile_cursor = self.profiles.len().saturating_sub(1);
+        }
+        let desired_profile_id = self.desired_agents_profile_id().map(str::to_string);
+        if self.active_profile_id != previous_profile_id
+            || self.agents_profile_id.as_deref() != desired_profile_id.as_deref()
+            || self.agents.len() <= 1
+        {
+            self.agents.clear();
+            self.agents_profile_id = None;
+            self.model_popup_agent_tab = 0;
+            return desired_profile_id
+                .map(|profile_id| vec![ClientMsg::ListProfileAgents { profile_id }])
+                .unwrap_or_default();
+        }
+        vec![]
+    }
+
     fn apply_acp_session_list(
         &mut self,
         mut groups: Vec<SessionGroup>,
@@ -576,10 +650,18 @@ impl crate::app::App {
         self.reset_active_session_view();
         self.screen = Screen::Chat;
         self.set_status(LogLevel::Info, "session", "session created");
-        vec![ClientMsg::SubscribeSession {
-            session_id,
+        let mut commands = vec![ClientMsg::SubscribeSession {
+            session_id: session_id.clone(),
             agent_id: self.agent_id.clone(),
-        }]
+        }];
+        if let Some(profile_id) = self.current_session_profile_id().map(str::to_string) {
+            if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
+                commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
+            } else {
+                commands.push(ClientMsg::ListProfileAgents { profile_id });
+            }
+        }
+        commands
     }
 
     fn apply_acp_session_loaded(
@@ -606,9 +688,19 @@ impl crate::app::App {
             Screen::Chat
         };
         self.set_status(LogLevel::Debug, "activity", "ready");
-        vec![ClientMsg::SetAgentMode {
+        let mut commands = vec![ClientMsg::SetAgentMode {
             mode: self.agent_mode.clone(),
-        }]
+        }];
+        if self.parent_session_id.is_none()
+            && let Some(profile_id) = self.current_session_profile_id().map(str::to_string)
+        {
+            if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
+                commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
+            } else {
+                commands.push(ClientMsg::ListProfileAgents { profile_id });
+            }
+        }
+        commands
     }
 
     fn reset_active_session_view(&mut self) {
@@ -1576,7 +1668,7 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, Screen};
-    use crate::protocol::SessionSummary;
+    use crate::protocol::{DelegateModelPreference, SessionSummary};
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -1641,6 +1733,167 @@ mod tests {
             thinking: thinking.map(str::to_string),
             message_id: Some(TEST_ASSISTANT_ID.into()),
         }
+    }
+
+    fn profile(id: &str) -> ProfileInfo {
+        ProfileInfo {
+            id: id.into(),
+            name: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_catalog_preserves_valid_local_selection() {
+        let mut app = App::new();
+        app.active_profile_id = Some("deep".into());
+
+        app.handle_acp_event(AcpAppEvent::Profiles {
+            profiles: vec![profile("fast"), profile("deep")],
+            active_profile_id: Some("fast".into()),
+        });
+
+        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn profile_catalog_falls_back_to_backend_default_then_first_profile() {
+        let mut app = App::new();
+        app.active_profile_id = Some("removed".into());
+
+        app.handle_acp_event(AcpAppEvent::Profiles {
+            profiles: vec![profile("fast"), profile("deep")],
+            active_profile_id: Some("deep".into()),
+        });
+        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+
+        app.active_profile_id = Some("removed-again".into());
+        app.handle_acp_event(AcpAppEvent::Profiles {
+            profiles: vec![profile("fast"), profile("deep")],
+            active_profile_id: Some("missing".into()),
+        });
+        assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn empty_profile_catalog_clears_stale_selection() {
+        let mut app = App::new();
+        app.profiles = vec![profile("fast")];
+        app.active_profile_id = Some("fast".into());
+
+        app.handle_acp_event(AcpAppEvent::Profiles {
+            profiles: Vec::new(),
+            active_profile_id: None,
+        });
+
+        assert!(app.profiles.is_empty());
+        assert!(app.active_profile_id.is_none());
+    }
+
+    #[test]
+    fn loading_session_profile_does_not_replace_new_session_selection() {
+        let mut app = App::new();
+        app.active_profile_id = Some("deep".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "session-1".into(),
+            profile_id: Some("fast".into()),
+        });
+
+        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.current_session_profile_id(), Some("fast"));
+    }
+
+    #[test]
+    fn profile_agents_populate_delegate_tabs_and_ignore_stale_responses() {
+        let mut app = App::new();
+        app.active_profile_id = Some("quorum".into());
+
+        app.handle_acp_event(AcpAppEvent::ProfileAgents {
+            profile_id: "old".into(),
+            agents: vec![AgentInfo {
+                id: "primary".into(),
+                name: "Session".into(),
+                description: None,
+                capabilities: Vec::new(),
+            }],
+        });
+        assert!(app.agents.is_empty());
+
+        app.handle_acp_event(AcpAppEvent::ProfileAgents {
+            profile_id: "quorum".into(),
+            agents: vec![
+                AgentInfo {
+                    id: "primary".into(),
+                    name: "Session".into(),
+                    description: None,
+                    capabilities: Vec::new(),
+                },
+                AgentInfo {
+                    id: "coder".into(),
+                    name: "Coder".into(),
+                    description: Some("Writes code".into()),
+                    capabilities: vec!["coding".into()],
+                },
+            ],
+        });
+        assert_eq!(app.agents_profile_id.as_deref(), Some("quorum"));
+        assert_eq!(app.model_popup_tab_count(), 2);
+        assert_eq!(app.model_popup_tab_agent_id(1), Some("coder"));
+    }
+
+    #[test]
+    fn profile_agents_reapply_profile_scoped_preferences_to_parent_session() {
+        let mut app = App::new();
+        app.session_id = Some("parent".into());
+        app.session_profiles
+            .insert("parent".into(), "quorum".into());
+        app.delegate_model_preferences.insert(
+            "quorum".into(),
+            [(
+                "coder".into(),
+                DelegateModelPreference {
+                    model_id: "openai/gpt-5".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    node_id: Some("node-1".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let commands = app.handle_acp_event(AcpAppEvent::ProfileAgents {
+            profile_id: "quorum".into(),
+            agents: vec![
+                AgentInfo {
+                    id: "primary".into(),
+                    name: "Session".into(),
+                    description: None,
+                    capabilities: Vec::new(),
+                },
+                AgentInfo {
+                    id: "coder".into(),
+                    name: "Coder".into(),
+                    description: None,
+                    capabilities: Vec::new(),
+                },
+            ],
+        });
+
+        assert!(matches!(
+            commands.as_slice(),
+            [ClientMsg::SetDelegateModel {
+                session_id,
+                agent_id,
+                model_id: Some(model_id),
+                node_id: Some(node_id),
+            }] if session_id == "parent"
+                && agent_id == "coder"
+                && model_id == "openai/gpt-5"
+                && node_id == "node-1"
+        ));
     }
 
     #[test]
@@ -1750,8 +2003,12 @@ mod tests {
         assert!(app.messages.is_empty());
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::SubscribeSession { session_id, agent_id }]
-                if session_id == "session-1" && agent_id.as_deref() == Some("agent-1")
+            [
+                ClientMsg::SubscribeSession { session_id, agent_id },
+                ClientMsg::ListProfileAgents { profile_id },
+            ] if session_id == "session-1"
+                && agent_id.as_deref() == Some("agent-1")
+                && profile_id == "code"
         ));
     }
 

@@ -1445,8 +1445,20 @@ pub(crate) fn handle_profile_popup_key(
             }
             if let Some(profile_id) = app.selected_profile().map(|profile| profile.id.clone()) {
                 app.active_profile_id = Some(profile_id.clone());
-                cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
+                if app.current_session_profile_id().is_none() {
+                    app.agents.clear();
+                    app.agents_profile_id = None;
+                    app.model_popup_agent_tab = 0;
+                    cmd_tx.send(ClientMsg::ListProfileAgents {
+                        profile_id: profile_id.clone(),
+                    })?;
+                }
                 app.popup = Popup::None;
+                app.set_status(
+                    app::LogLevel::Info,
+                    "profile",
+                    format!("new sessions will use {profile_id}"),
+                );
                 save_config(app);
             } else {
                 app.set_status(app::LogLevel::Warn, "profile", "no matching profile");
@@ -1984,7 +1996,19 @@ fn try_execute_slash_command(
                 cmd_tx.send(ClientMsg::ListProfiles)?;
             } else if let Some(profile_id) = app.find_profile_id(&arg) {
                 app.active_profile_id = Some(profile_id.clone());
-                cmd_tx.send(ClientMsg::SetActiveProfile { profile_id })?;
+                if app.current_session_profile_id().is_none() {
+                    app.agents.clear();
+                    app.agents_profile_id = None;
+                    app.model_popup_agent_tab = 0;
+                    cmd_tx.send(ClientMsg::ListProfileAgents {
+                        profile_id: profile_id.clone(),
+                    })?;
+                }
+                app.set_status(
+                    app::LogLevel::Info,
+                    "profile",
+                    format!("new sessions will use {profile_id}"),
+                );
                 save_config(app);
             } else {
                 app.set_status(
@@ -2508,14 +2532,51 @@ pub(crate) fn handle_model_popup_key(
                 } else if let Some(agent_id) = app
                     .model_popup_tab_agent_id(app.model_popup_agent_tab)
                     .map(str::to_string)
+                    && let Some(profile_id) =
+                        app.delegate_preference_profile_id().map(str::to_string)
                 {
-                    app.set_delegate_model_preference(&agent_id, &model.provider, &model.model);
+                    app.set_delegate_model_preference(&profile_id, &agent_id, &model);
+                    if app.parent_session_id.is_none()
+                        && let Some(session_id) = app.session_id.clone()
+                    {
+                        cmd_tx.send(ClientMsg::SetDelegateModel {
+                            session_id,
+                            agent_id,
+                            model_id: Some(model.id.clone()),
+                            node_id: model.node_id.clone(),
+                        })?;
+                    }
                     app.set_status(
                         app::LogLevel::Info,
                         "model",
                         format!("{tab_label}: {}", model.label),
                     );
                 }
+                save_config(app);
+            }
+        }
+        KeyCode::Delete if !app.model_popup_is_session_tab(app.model_popup_agent_tab) => {
+            if let Some(agent_id) = app
+                .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                .map(str::to_string)
+                && let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string)
+            {
+                app.clear_delegate_model_preference(&profile_id, &agent_id);
+                if app.parent_session_id.is_none()
+                    && let Some(session_id) = app.session_id.clone()
+                {
+                    cmd_tx.send(ClientMsg::SetDelegateModel {
+                        session_id,
+                        agent_id,
+                        model_id: None,
+                        node_id: None,
+                    })?;
+                }
+                app.set_status(
+                    app::LogLevel::Info,
+                    "model",
+                    "delegate model uses profile default",
+                );
                 save_config(app);
             }
         }
@@ -2725,6 +2786,8 @@ mod model_popup_tests {
         crate::protocol::AgentInfo {
             id: id.into(),
             name: name.into(),
+            description: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -3003,7 +3066,7 @@ mod model_popup_tests {
     }
 
     #[test]
-    fn slash_profile_with_arg_sends_set_active_profile_with_optimistic_update() {
+    fn slash_profile_with_arg_updates_local_new_session_profile() {
         let _guard = TestPersistenceGuard::new("slash-profile");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -3018,13 +3081,13 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::SetActiveProfile { profile_id }) if profile_id == "fast"
+            Ok(ClientMsg::ListProfileAgents { profile_id }) if profile_id == "fast"
         ));
         assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
     }
 
     #[test]
-    fn profile_popup_enter_sends_selected_profile() {
+    fn profile_popup_enter_updates_local_new_session_profile() {
         let _guard = TestPersistenceGuard::new("profile-popup-enter");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
@@ -3038,7 +3101,27 @@ mod model_popup_tests {
         assert!(matches!(app.popup, Popup::None));
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::SetActiveProfile { profile_id }) if profile_id == "deep"
+            Ok(ClientMsg::ListProfileAgents { profile_id }) if profile_id == "deep"
+        ));
+        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn new_session_uses_locally_selected_profile() {
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::NewSession;
+        app.new_session_path = "/repo".into();
+        app.new_session_cursor = app.new_session_path.len();
+        app.active_profile_id = Some("coder-delegate".into());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_new_session_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::NewSession { profile_id: Some(profile_id), .. })
+                if profile_id == "coder-delegate"
         ));
     }
 
@@ -3048,6 +3131,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
+        app.active_profile_id = Some("profile".into());
+        app.session_profiles.insert("s1".into(), "profile".into());
         app.agent_mode = "plan".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
@@ -3071,12 +3156,85 @@ mod model_popup_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetDelegateModel {
+                ref session_id,
+                ref agent_id,
+                ref model_id,
+                node_id: None,
+            }) if session_id == "s1"
+                && agent_id == "coder"
+                && model_id.as_deref() == Some("anthropic/claude-sonnet")
+        ));
         assert_eq!(app.current_provider.as_deref(), Some("openai"));
         assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
         assert_eq!(
-            app.get_delegate_model_preference("coder"),
-            Some(("anthropic", "claude-sonnet"))
+            app.get_delegate_model_preference("profile", "coder")
+                .map(|preference| preference.model_id.as_str()),
+            Some("anthropic/claude-sonnet")
+        );
+    }
+
+    #[test]
+    fn delete_on_delegate_tab_resets_parent_override() {
+        let _guard = TestPersistenceGuard::new("delegate-reset");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("s1".into());
+        app.active_profile_id = Some("profile".into());
+        app.session_profiles.insert("s1".into(), "profile".into());
+        app.agents = vec![
+            make_agent("primary", "Session"),
+            make_agent("coder", "Coder"),
+        ];
+        app.model_popup_agent_tab = 1;
+        let model = make_model("anthropic", "claude-sonnet");
+        app.set_delegate_model_preference("profile", "coder", &model);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Delete), &tx).unwrap();
+
+        assert!(
+            app.get_delegate_model_preference("profile", "coder")
+                .is_none()
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::SetDelegateModel {
+                ref session_id,
+                ref agent_id,
+                model_id: None,
+                node_id: None,
+            }) if session_id == "s1" && agent_id == "coder"
+        ));
+    }
+
+    #[test]
+    fn delegate_child_model_selection_is_saved_without_mutating_child_session() {
+        let _guard = TestPersistenceGuard::new("delegate-child-model");
+        let mut app = App::new();
+        app.popup = Popup::ModelSelect;
+        app.session_id = Some("child".into());
+        app.parent_session_id = Some("parent".into());
+        app.active_profile_id = Some("profile".into());
+        app.session_profiles
+            .insert("child".into(), "profile".into());
+        app.agents = vec![
+            make_agent("primary", "Session"),
+            make_agent("coder", "Coder"),
+        ];
+        app.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.model_popup_agent_tab = 1;
+        app.model_cursor = 1;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.get_delegate_model_preference("profile", "coder")
+                .is_some()
         );
     }
 

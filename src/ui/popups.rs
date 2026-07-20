@@ -83,8 +83,11 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
 
 /// Whether the given model matches a delegate agent's preferred model.
 fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
-    app.get_delegate_model_preference(agent_id)
-        .is_some_and(|(p, m)| App::model_entry_matches_node(model, p, m, None))
+    app.delegate_preference_profile_id()
+        .and_then(|profile_id| app.get_delegate_model_preference(profile_id, agent_id))
+        .is_some_and(|preference| {
+            preference.model_id == model.id && preference.node_id == model.node_id
+        })
 }
 
 // ── Model popup ───────────────────────────────────────────────────────────────
@@ -330,6 +333,10 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     if has_tabs {
         hint_spans.push(Span::styled("  tab ", Theme::status_accent()));
         hint_spans.push(Span::styled("agent", Theme::status()));
+        if !on_session_tab {
+            hint_spans.push(Span::styled("  del ", Theme::status_accent()));
+            hint_spans.push(Span::styled("default", Theme::status()));
+        }
     }
     f.render_widget(
         Paragraph::new(Line::from(hint_spans)).style(Theme::popup_bg()),
