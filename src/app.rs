@@ -1401,6 +1401,12 @@ pub struct App {
     pub pending_commands: Vec<ClientMsg>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
+    pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
+    pub delegate_child_message_ids: HashMap<String, HashSet<String>>,
+    /// Latest lifecycle timestamp and bounded terminal metadata by delegation ID.
+    pub delegation_update_times: HashMap<String, i64>,
+    pub delegation_result_summaries: HashMap<String, String>,
+    pub delegation_errors: HashMap<String, String>,
     /// Parent delegate ToolCallStart records awaiting DelegationRequested linkage.
     pub pending_delegate_tool_calls: Vec<PendingDelegateToolCall>,
     /// While a reverted frontier turn is being suppressed, ignore any
@@ -1596,6 +1602,11 @@ impl App {
             suppress_delegation_result: false,
             pending_commands: Vec::new(),
             pending_delegate_child_states: HashMap::new(),
+            pending_delegate_child_stats: HashMap::new(),
+            delegate_child_message_ids: HashMap::new(),
+            delegation_update_times: HashMap::new(),
+            delegation_result_summaries: HashMap::new(),
+            delegation_errors: HashMap::new(),
             pending_delegate_tool_calls: Vec::new(),
             suppress_turn_output: false,
             status: "connecting...".into(),

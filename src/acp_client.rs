@@ -126,6 +126,41 @@ struct AcpDelegateModelResponse {
     model: Option<DelegateModelOverrideInfo>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DelegationUpdateState {
+    Requested,
+    Forked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DelegationUpdateNotification {
+    pub version: u32,
+    pub session_id: String,
+    pub delegation_id: String,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    pub state: DelegationUpdateState,
+    pub target_agent_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub child_session_id: Option<String>,
+    pub requested_at: i64,
+    #[serde(default)]
+    pub forked_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub result_summary: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 fn normalize_profile_agents_response(
     response: Value,
 ) -> Result<AcpProfileAgentsResponse, serde_json::Error> {
@@ -628,6 +663,9 @@ async fn handle_websocket_text(
                 send_models(srv_tx, &response);
             }
         }
+        "querymt/session/delegationUpdate" | "_querymt/session/delegationUpdate" => {
+            handle_delegation_notification(srv_tx, envelope.params);
+        }
         "querymt/mesh/nodesChanged" | "querymt/mesh/joined" | "querymt/mesh/peerExpired" => {
             if let Ok(nodes_resp) =
                 call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
@@ -640,6 +678,35 @@ async fn handle_websocket_text(
         _ => {}
     }
     Ok(())
+}
+
+fn is_delegation_notification_method(method: &str) -> bool {
+    matches!(
+        method,
+        "querymt/session/delegationUpdate" | "_querymt/session/delegationUpdate"
+    )
+}
+
+fn handle_delegation_notification(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, params: Value) {
+    match serde_json::from_value::<DelegationUpdateNotification>(params) {
+        Ok(update) if update.version == 1 => {
+            send_acp(srv_tx, AcpAppEvent::DelegationUpdate(update));
+        }
+        Ok(update) => send_acp(
+            srv_tx,
+            AcpAppEvent::InfoLog {
+                target: "delegation",
+                message: format!("ignored delegation notification version {}", update.version),
+            },
+        ),
+        Err(err) => send_acp(
+            srv_tx,
+            AcpAppEvent::InfoLog {
+                target: "delegation",
+                message: format!("invalid delegation notification: {err}"),
+            },
+        ),
+    }
 }
 
 async fn handle_ws_elicitation_requested(
@@ -768,6 +835,24 @@ pub async fn run_stdio_agent(
             },
             acp_sdk::on_receive_notification!(),
         )
+        .on_receive_notification(
+            {
+                let srv_tx = srv_tx.clone();
+                async move |notification: UntypedMessage, cx| {
+                    let (method, params) = notification.clone().into_parts();
+                    if is_delegation_notification_method(&method) {
+                        handle_delegation_notification(&srv_tx, params);
+                        Ok(acp_sdk::Handled::Yes)
+                    } else {
+                        Ok(acp_sdk::Handled::No {
+                            message: (notification, cx),
+                            retry: false,
+                        })
+                    }
+                }
+            },
+            acp_sdk::on_receive_notification!(),
+        )
         .on_receive_request(
             async move |request: acp::RequestPermissionRequest, responder, _cx| {
                 let response = permission_response_for(&request);
@@ -883,6 +968,7 @@ async fn handle_client_msg<C: AcpConnection>(
             let snapshot_provider_change =
                 snapshot_provider_change_from_load_value(&response_value);
             let snapshot_updates = snapshot_updates_from_load_value(&response_value);
+            let delegation_updates = delegation_updates_from_load_value(&response_value);
 
             let identity = state.agent_identity().await;
             let profile_id = response
@@ -906,6 +992,15 @@ async fn handle_client_msg<C: AcpConnection>(
                     AcpAppEvent::SessionReplay {
                         session_id: session_id.clone(),
                         updates: history_updates,
+                    },
+                );
+            }
+            if !delegation_updates.is_empty() {
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::DelegationReplay {
+                        session_id: session_id.clone(),
+                        updates: delegation_updates,
                     },
                 );
             }
@@ -1514,9 +1609,15 @@ fn fork_session_meta(message_id: &str) -> serde_json::Map<String, Value> {
 
 const SESSION_LOAD_SNAPSHOT_META_KEY: &str = "querymt/sessionLoadSnapshot.v1";
 
+fn session_load_snapshot_from_load_value(response: &Value) -> Option<&Value> {
+    response
+        .get("_meta")
+        .or_else(|| response.get("meta"))
+        .and_then(|meta| meta.get(SESSION_LOAD_SNAPSHOT_META_KEY))
+}
+
 fn session_load_audit_from_load_value(response: &Value) -> Value {
-    let meta = response.get("_meta").or_else(|| response.get("meta"));
-    let snapshot = meta.and_then(|m| m.get(SESSION_LOAD_SNAPSHOT_META_KEY));
+    let snapshot = session_load_snapshot_from_load_value(response);
     match snapshot {
         Some(snapshot) => snapshot
             .get("audit")
@@ -1524,6 +1625,17 @@ fn session_load_audit_from_load_value(response: &Value) -> Value {
             .unwrap_or_else(|| json!({ "events": [] })),
         None => json!({ "events": [] }),
     }
+}
+
+fn delegation_updates_from_load_value(response: &Value) -> Vec<DelegationUpdateNotification> {
+    session_load_snapshot_from_load_value(response)
+        .and_then(|snapshot| snapshot.get("delegationUpdates"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|update| serde_json::from_value(update.clone()).ok())
+        .filter(|update: &DelegationUpdateNotification| update.version == 1)
+        .collect()
 }
 
 fn snapshot_provider_change_from_load_value(response: &Value) -> Option<SnapshotProviderChange> {
@@ -2907,6 +3019,50 @@ mod tests {
     }
 
     #[test]
+    fn session_load_delegation_updates_parse_latest_snapshots() {
+        let response = json!({
+            "_meta": {
+                "querymt/sessionLoadSnapshot.v1": {
+                    "audit": { "events": [] },
+                    "delegationUpdates": [{
+                        "version": 1,
+                        "sessionId": "parent",
+                        "delegationId": "delegation-1",
+                        "toolCallId": "call-1",
+                        "state": "completed",
+                        "targetAgentId": "coder",
+                        "objective": "Implement it",
+                        "childSessionId": "child-1",
+                        "requestedAt": 100,
+                        "forkedAt": 110,
+                        "finishedAt": 120,
+                        "updatedAt": 120,
+                        "resultSummary": "done",
+                        "error": null
+                    }]
+                }
+            }
+        });
+
+        let updates = delegation_updates_from_load_value(&response);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].state, DelegationUpdateState::Completed);
+        assert_eq!(updates[0].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn delegation_notification_method_accepts_stdio_and_websocket_shapes() {
+        assert!(is_delegation_notification_method(
+            "querymt/session/delegationUpdate"
+        ));
+        assert!(is_delegation_notification_method(
+            "_querymt/session/delegationUpdate"
+        ));
+        assert!(!is_delegation_notification_method("session/update"));
+    }
+
+    #[test]
     fn session_load_audit_missing_snapshot_returns_empty_events() {
         let audit = session_load_audit_from_load_value(&json!({}));
         assert_eq!(
@@ -3353,6 +3509,30 @@ mod tests {
         assert!(empty.profiles.is_empty());
         assert!(empty.active_profile_id.is_none());
         assert!(normalize_profiles_response(json!({})).is_err());
+    }
+
+    #[test]
+    fn delegation_update_payload_uses_camel_case_contract() {
+        let update: DelegationUpdateNotification = serde_json::from_value(json!({
+            "version": 1,
+            "sessionId": "parent",
+            "delegationId": "delegation-1",
+            "toolCallId": "call-1",
+            "state": "forked",
+            "targetAgentId": "coder",
+            "objective": "Implement it",
+            "childSessionId": "child-1",
+            "requestedAt": 100,
+            "forkedAt": 110,
+            "finishedAt": null,
+            "updatedAt": 110,
+            "resultSummary": null,
+            "error": null
+        }))
+        .expect("delegation update");
+
+        assert_eq!(update.state, DelegationUpdateState::Forked);
+        assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
     }
 
     #[test]

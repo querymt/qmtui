@@ -2,8 +2,13 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::acp_client::DelegateModelOverrideInfo;
-use crate::app::{ActivityState, ChatEntry, ElicitationState, LogLevel, Popup, Screen, ToolDetail};
+use crate::acp_client::{
+    DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
+};
+use crate::app::{
+    ActivityState, ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+    ElicitationState, LogLevel, Popup, Screen, ToolDetail,
+};
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
@@ -134,6 +139,11 @@ pub(crate) enum AcpAppEvent {
     SessionReplay {
         session_id: String,
         updates: Vec<AcpSessionUpdate>,
+    },
+    DelegationUpdate(DelegationUpdateNotification),
+    DelegationReplay {
+        session_id: String,
+        updates: Vec<DelegationUpdateNotification>,
     },
     Models {
         models: Vec<ModelEntry>,
@@ -354,7 +364,6 @@ impl crate::app::App {
                         None
                     },
                 );
-
                 if ur.success {
                     self.recent_prompt_text = None;
                     self.streaming_content.clear();
@@ -426,6 +435,21 @@ impl crate::app::App {
                         "fork",
                         fr.message.unwrap_or_else(|| "fork failed".into()),
                     );
+                }
+                vec![]
+            }
+            AcpAppEvent::DelegationUpdate(update) => {
+                self.apply_acp_delegation_update(update);
+                vec![]
+            }
+            AcpAppEvent::DelegationReplay {
+                session_id,
+                updates,
+            } => {
+                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                    for update in updates {
+                        self.apply_acp_delegation_update(update);
+                    }
                 }
                 vec![]
             }
@@ -720,6 +744,11 @@ impl crate::app::App {
         if self.parent_session_id.is_none() {
             self.delegate_entries.clear();
             self.pending_delegate_child_states.clear();
+            self.pending_delegate_child_stats.clear();
+            self.delegate_child_message_ids.clear();
+            self.delegation_update_times.clear();
+            self.delegation_result_summaries.clear();
+            self.delegation_errors.clear();
             self.pending_delegate_tool_calls.clear();
         }
         self.file_index.clear();
@@ -735,6 +764,241 @@ impl crate::app::App {
         self.session_stats = crate::app::SessionStatsLite::default();
     }
 
+    fn upsert_provisional_delegate(
+        &mut self,
+        tool_call_id: Option<&str>,
+        arguments: Option<&Value>,
+    ) {
+        let Some(tool_call_id) = tool_call_id else {
+            return;
+        };
+        if self
+            .delegate_entries
+            .iter()
+            .any(|entry| entry.delegate_tool_call_id.as_deref() == Some(tool_call_id))
+        {
+            return;
+        }
+        let target_agent_id = arguments
+            .and_then(|value| value.get("target_agent_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let objective = arguments
+            .and_then(|value| value.get("objective"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.delegate_entries.push(DelegateEntry {
+            delegation_id: format!("tool:{tool_call_id}"),
+            child_session_id: None,
+            delegate_tool_call_id: Some(tool_call_id.to_string()),
+            target_agent_id,
+            objective,
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+        self.invalidate_delegate_render_cache();
+    }
+
+    fn apply_acp_delegation_update(&mut self, update: DelegationUpdateNotification) {
+        if update.version != 1 || self.session_id.as_deref() != Some(update.session_id.as_str()) {
+            return;
+        }
+        let existing_index = self
+            .delegate_entries
+            .iter()
+            .position(|entry| entry.delegation_id == update.delegation_id);
+        if let Some(existing_timestamp) = self.delegation_update_times.get(&update.delegation_id) {
+            let incoming_rank = delegation_state_rank(update.state);
+            let existing_rank = existing_index
+                .map(|index| delegate_entry_lifecycle_rank(&self.delegate_entries[index]))
+                .unwrap_or(0);
+            if *existing_timestamp > update.updated_at
+                || (*existing_timestamp == update.updated_at && existing_rank > incoming_rank)
+            {
+                return;
+            }
+        }
+        let index = existing_index.or_else(|| {
+            update.tool_call_id.as_deref().and_then(|tool_call_id| {
+                self.delegate_entries
+                    .iter()
+                    .position(|entry| entry.delegate_tool_call_id.as_deref() == Some(tool_call_id))
+            })
+        });
+        let status = match update.state {
+            DelegationUpdateState::Requested | DelegationUpdateState::Forked => {
+                DelegateStatus::InProgress
+            }
+            DelegationUpdateState::Completed => DelegateStatus::Completed,
+            DelegationUpdateState::Failed => DelegateStatus::Failed,
+            DelegationUpdateState::Cancelled => DelegateStatus::Cancelled,
+        };
+        let index = if let Some(index) = index {
+            index
+        } else {
+            self.delegate_entries.push(DelegateEntry {
+                delegation_id: update.delegation_id.clone(),
+                child_session_id: None,
+                delegate_tool_call_id: update.tool_call_id.clone(),
+                target_agent_id: Some(update.target_agent_id.clone()),
+                objective: update.objective.clone(),
+                status,
+                stats: DelegateStats::default(),
+                started_at: Some(update.requested_at),
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            });
+            self.delegate_entries.len() - 1
+        };
+        let entry = &mut self.delegate_entries[index];
+        entry.delegation_id = update.delegation_id.clone();
+        if update.tool_call_id.is_some() {
+            entry.delegate_tool_call_id = update.tool_call_id.clone();
+        }
+        entry.target_agent_id = Some(update.target_agent_id);
+        entry.objective = update.objective;
+        entry.status = status;
+        entry.started_at = Some(update.requested_at);
+        entry.ended_at = update.finished_at;
+        entry.child_session_id = update.child_session_id.clone();
+        if status != DelegateStatus::InProgress {
+            entry.child_state = DelegateChildState::None;
+        }
+        self.delegation_update_times
+            .insert(update.delegation_id.clone(), update.updated_at);
+        match update.result_summary {
+            Some(summary) => {
+                self.delegation_result_summaries
+                    .insert(update.delegation_id.clone(), summary);
+            }
+            None => {
+                self.delegation_result_summaries
+                    .remove(&update.delegation_id);
+            }
+        }
+        match update.error {
+            Some(error) => {
+                self.delegation_errors
+                    .insert(update.delegation_id.clone(), error);
+            }
+            None => {
+                self.delegation_errors.remove(&update.delegation_id);
+            }
+        }
+        if let Some(child_session_id) = update.child_session_id {
+            if let Some(stats) = self.pending_delegate_child_stats.remove(&child_session_id) {
+                self.delegate_entries[index].stats = stats;
+            }
+            if let Some(state) = self.pending_delegate_child_states.remove(&child_session_id) {
+                self.delegate_entries[index].child_state = state;
+            }
+        }
+        self.invalidate_delegate_render_cache();
+    }
+
+    fn apply_acp_delegate_child_update(&mut self, session_id: &str, update: &AcpSessionUpdate) {
+        let index = self
+            .delegate_entries
+            .iter()
+            .position(|entry| entry.child_session_id.as_deref() == Some(session_id));
+        let mut state = index
+            .map(|index| self.delegate_entries[index].child_state.clone())
+            .or_else(|| self.pending_delegate_child_states.get(session_id).cloned())
+            .unwrap_or_default();
+        let mut stats = index
+            .map(|index| self.delegate_entries[index].stats.clone())
+            .or_else(|| self.pending_delegate_child_stats.get(session_id).cloned())
+            .unwrap_or_default();
+        match update {
+            AcpSessionUpdate::ToolCallStart { .. } => {
+                stats.tool_calls = stats.tool_calls.saturating_add(1);
+                state = DelegateChildState::OtherProgress;
+            }
+            AcpSessionUpdate::AssistantMessage { message_id, .. } => {
+                let should_increment = message_id.as_ref().is_none_or(|message_id| {
+                    self.delegate_child_message_ids
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .insert(message_id.clone())
+                });
+                if should_increment {
+                    stats.messages = stats.messages.saturating_add(1);
+                }
+                state = DelegateChildState::AssistantMessage;
+            }
+            AcpSessionUpdate::AssistantContentDelta { message_id, .. } => {
+                let should_increment = message_id.as_ref().is_some_and(|message_id| {
+                    self.delegate_child_message_ids
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .insert(message_id.clone())
+                });
+                if should_increment {
+                    stats.messages = stats.messages.saturating_add(1);
+                }
+                state = DelegateChildState::AssistantMessage;
+            }
+            AcpSessionUpdate::AssistantThinkingDelta { .. } | AcpSessionUpdate::TurnStarted => {
+                state = DelegateChildState::OtherProgress;
+            }
+            AcpSessionUpdate::UserMessage { .. } => state = DelegateChildState::UserMessage,
+            AcpSessionUpdate::UsageUpdate {
+                used,
+                size,
+                cost_usd,
+            } => {
+                if *used > 0 {
+                    stats.context_tokens = *used;
+                }
+                if *size > 0 {
+                    stats.context_limit = *size;
+                }
+                if let Some(cost) = cost_usd {
+                    stats.cost_usd = *cost;
+                }
+            }
+            AcpSessionUpdate::ElicitationRequested {
+                elicitation_id,
+                message,
+                requested_schema,
+                source,
+                ..
+            } => {
+                state = DelegateChildState::PendingElicitation {
+                    elicitation_id: elicitation_id.clone(),
+                    message: message.clone(),
+                    requested_schema: requested_schema.clone(),
+                    source: source.clone(),
+                };
+            }
+            AcpSessionUpdate::ToolCallEnd { name, .. } if name == "question" => {
+                state = DelegateChildState::QuestionToolFinished;
+            }
+            AcpSessionUpdate::ToolCallEnd { .. }
+            | AcpSessionUpdate::TimingUpdate { .. }
+            | AcpSessionUpdate::Cancelled
+            | AcpSessionUpdate::Finished { .. } => {}
+        }
+        if let Some(index) = index {
+            if self.delegate_entries[index].stats != stats
+                || self.delegate_entries[index].child_state != state
+            {
+                self.delegate_entries[index].stats = stats;
+                self.delegate_entries[index].child_state = state;
+                self.invalidate_delegate_render_cache();
+            }
+        } else if state != DelegateChildState::None || stats != DelegateStats::default() {
+            self.pending_delegate_child_states
+                .insert(session_id.to_string(), state);
+            self.pending_delegate_child_stats
+                .insert(session_id.to_string(), stats);
+        }
+    }
+
     fn apply_acp_session_update(
         &mut self,
         session_id: &str,
@@ -743,6 +1007,7 @@ impl crate::app::App {
     ) {
         if self.session_id.as_deref() != Some(session_id) {
             self.note_session_activity(session_id);
+            self.apply_acp_delegate_child_update(session_id, &update);
             return;
         }
         self.note_session_activity(session_id);
@@ -822,6 +1087,9 @@ impl crate::app::App {
                 self.activity = ActivityState::RunningTool { name: name.clone() };
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
                 self.finalize_streaming_segment();
+                if name == "delegate" {
+                    self.upsert_provisional_delegate(tool_call_id.as_deref(), arguments.as_ref());
+                }
                 if name != "question" {
                     let cwd = self.current_session_cwd();
                     let detail =
@@ -1652,6 +1920,24 @@ fn message_id_matches(left: Option<&String>, right: Option<&String>) -> bool {
     }
 }
 
+fn delegation_state_rank(state: DelegationUpdateState) -> u8 {
+    match state {
+        DelegationUpdateState::Requested => 1,
+        DelegationUpdateState::Forked => 2,
+        DelegationUpdateState::Completed
+        | DelegationUpdateState::Failed
+        | DelegationUpdateState::Cancelled => 3,
+    }
+}
+
+fn delegate_entry_lifecycle_rank(entry: &DelegateEntry) -> u8 {
+    match entry.status {
+        DelegateStatus::Completed | DelegateStatus::Failed | DelegateStatus::Cancelled => 3,
+        DelegateStatus::InProgress if entry.child_session_id.is_some() => 2,
+        DelegateStatus::InProgress => 1,
+    }
+}
+
 fn acp_content_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -1672,6 +1958,34 @@ mod tests {
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
+
+    fn delegation_update(
+        state: DelegationUpdateState,
+        updated_at: i64,
+    ) -> DelegationUpdateNotification {
+        DelegationUpdateNotification {
+            version: 1,
+            session_id: TEST_SESSION_ID.into(),
+            delegation_id: "delegation-1".into(),
+            tool_call_id: Some("call-1".into()),
+            state,
+            target_agent_id: "coder".into(),
+            objective: "Implement the feature".into(),
+            child_session_id: (state != DelegationUpdateState::Requested).then(|| "child-1".into()),
+            requested_at: 100,
+            forked_at: (state != DelegationUpdateState::Requested).then_some(110),
+            finished_at: matches!(
+                state,
+                DelegationUpdateState::Completed
+                    | DelegationUpdateState::Failed
+                    | DelegationUpdateState::Cancelled
+            )
+            .then_some(120),
+            updated_at,
+            result_summary: (state == DelegationUpdateState::Completed).then(|| "done".into()),
+            error: (state == DelegationUpdateState::Failed).then(|| "boom".into()),
+        }
+    }
 
     fn app_with_active_session() -> App {
         let mut app = App::new();
@@ -1803,6 +2117,107 @@ mod tests {
 
         assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
         assert_eq!(app.current_session_profile_id(), Some("fast"));
+    }
+
+    #[test]
+    fn native_delegate_tool_start_creates_provisional_entry() {
+        let mut app = app_with_active_session();
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: TEST_SESSION_ID.into(),
+            update: AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("call-1".into()),
+                name: "delegate".into(),
+                arguments: Some(serde_json::json!({
+                    "target_agent_id": "coder",
+                    "objective": "Implement the feature"
+                })),
+            },
+            is_replay: false,
+        });
+
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert_eq!(app.delegate_entries[0].delegation_id, "tool:call-1");
+        assert_eq!(
+            app.delegate_entries[0].target_agent_id.as_deref(),
+            Some("coder")
+        );
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::InProgress);
+    }
+
+    #[test]
+    fn delegation_snapshots_reconcile_by_tool_id_and_ignore_stale_updates() {
+        let mut app = app_with_active_session();
+        app.upsert_provisional_delegate(
+            Some("call-1"),
+            Some(&serde_json::json!({
+                "target_agent_id": "coder",
+                "objective": "Implement the feature"
+            })),
+        );
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationUpdateState::Completed,
+            120,
+        )));
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationUpdateState::Forked,
+            110,
+        )));
+
+        assert_eq!(app.delegate_entries.len(), 1);
+        let entry = &app.delegate_entries[0];
+        assert_eq!(entry.delegation_id, "delegation-1");
+        assert_eq!(entry.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(entry.status, DelegateStatus::Completed);
+        assert_eq!(app.delegation_result_summaries["delegation-1"], "done");
+    }
+
+    #[test]
+    fn child_updates_before_fork_are_applied_when_lifecycle_links_child() {
+        let mut app = app_with_active_session();
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "child-1".into(),
+            update: AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("child-tool".into()),
+                name: "read_tool".into(),
+                arguments: None,
+            },
+            is_replay: false,
+        });
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: "child-1".into(),
+            update: AcpSessionUpdate::AssistantContentDelta {
+                content: "working".into(),
+                message_id: Some("child-message".into()),
+            },
+            is_replay: false,
+        });
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationUpdateState::Forked,
+            110,
+        )));
+
+        let entry = &app.delegate_entries[0];
+        assert_eq!(entry.stats.tool_calls, 1);
+        assert_eq!(entry.stats.messages, 1);
+        assert_eq!(entry.child_state, DelegateChildState::AssistantMessage);
+    }
+
+    #[test]
+    fn delegation_completion_does_not_interrupt_parent_streaming() {
+        let mut app = app_with_active_session();
+        app.streaming_content = "partial".into();
+        app.activity = ActivityState::Streaming;
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationUpdateState::Completed,
+            120,
+        )));
+
+        assert_eq!(app.streaming_content, "partial");
+        assert_eq!(app.activity, ActivityState::Streaming);
     }
 
     #[test]
