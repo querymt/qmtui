@@ -3301,11 +3301,10 @@ mod reasoning_effort_integration_tests {
     }
 
     #[test]
-    fn server_push_updates_reasoning_effort() {
+    fn native_reasoning_effort_event_updates_state() {
         let mut app = App::new();
-        app.handle_server_msg(crate::protocol::RawServerMsg {
-            msg_type: "reasoning_effort".into(),
-            data: Some(serde_json::json!({ "reasoning_effort": "medium" })),
+        app.handle_acp_event(AcpAppEvent::ReasoningEffort {
+            reasoning_effort: Some("medium".into()),
         });
         assert_eq!(app.reasoning_effort, Some("medium".into()));
     }
@@ -3777,39 +3776,18 @@ mod auth_tests {
         ));
     }
 
-    // ── Server message handling tests ─────────────────────────────────────────
+    // ── Native ACP event handling tests ───────────────────────────────────────
 
     #[test]
-    fn server_msg_auth_providers_populates_list() {
+    fn native_auth_providers_event_populates_list() {
         let mut app = App::new();
-        let raw = RawServerMsg {
-            msg_type: "auth_providers".into(),
-            data: Some(serde_json::json!({
-                "providers": [
-                    {
-                        "provider": "openai",
-                        "display_name": "OpenAI",
-                        "oauth_status": "not_authenticated",
-                        "has_stored_api_key": false,
-                        "has_env_api_key": true,
-                        "env_var_name": "OPENAI_API_KEY",
-                        "supports_oauth": true,
-                        "preferred_method": null
-                    },
-                    {
-                        "provider": "groq",
-                        "display_name": "Groq",
-                        "oauth_status": null,
-                        "has_stored_api_key": true,
-                        "has_env_api_key": false,
-                        "env_var_name": "GROQ_API_KEY",
-                        "supports_oauth": false,
-                        "preferred_method": null
-                    }
-                ]
-            })),
-        };
-        let cmds = app.handle_server_msg(raw);
+        let mut openai = make_provider("OpenAI");
+        openai.has_env_api_key = true;
+        let mut groq = make_api_key_only("Groq");
+        groq.has_stored_api_key = true;
+
+        let cmds = app.handle_acp_event(AcpAppEvent::AuthProviders(vec![openai, groq]));
+
         assert!(cmds.is_empty());
         assert_eq!(app.auth_providers.len(), 2);
         assert_eq!(app.auth_providers[0].provider, "openai");
@@ -3819,19 +3797,17 @@ mod auth_tests {
     }
 
     #[test]
-    fn server_msg_oauth_flow_started_sets_flow_state() {
+    fn native_oauth_flow_started_event_sets_flow_state() {
         let mut app = App::new();
         app.popup = app::Popup::ProviderAuth;
-        let raw = RawServerMsg {
-            msg_type: "oauth_flow_started".into(),
-            data: Some(serde_json::json!({
-                "flow_id": "flow-123",
-                "provider": "openai",
-                "authorization_url": "https://auth.example.com/authorize",
-                "flow_kind": "redirect_code"
-            })),
-        };
-        let cmds = app.handle_server_msg(raw);
+
+        let cmds = app.handle_acp_event(AcpAppEvent::OAuthFlowStarted(OAuthFlowData {
+            flow_id: "flow-123".into(),
+            provider: "openai".into(),
+            authorization_url: "https://auth.example.com/authorize".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        }));
+
         assert!(cmds.is_empty());
         assert!(app.auth_oauth_flow.is_some());
         let flow = app.auth_oauth_flow.unwrap();
@@ -3842,7 +3818,7 @@ mod auth_tests {
     }
 
     #[test]
-    fn server_msg_oauth_result_success_clears_flow() {
+    fn native_oauth_result_success_clears_flow() {
         let mut app = App::new();
         app.auth_oauth_flow = Some(OAuthFlowData {
             flow_id: "f1".into(),
@@ -3851,16 +3827,13 @@ mod auth_tests {
             flow_kind: OAuthFlowKind::RedirectCode,
         });
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        let raw = RawServerMsg {
-            msg_type: "oauth_result".into(),
-            data: Some(serde_json::json!({
-                "provider": "openai",
-                "success": true,
-                "message": "Connected successfully"
-            })),
-        };
-        let cmds = app.handle_server_msg(raw);
-        // Should request refreshed provider list
+
+        let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResultData {
+            provider: "openai".into(),
+            success: true,
+            message: "Connected successfully".into(),
+        }));
+
         assert!(
             cmds.iter()
                 .any(|c| matches!(c, ClientMsg::ListAuthProviders))

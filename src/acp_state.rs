@@ -1743,6 +1743,27 @@ mod tests {
     }
 
     #[test]
+    fn native_initial_session_list_does_not_autofill() {
+        let mut app = App::new();
+        let mut group = session_group("/repo", &["s1"]);
+        group.next_cursor = Some("cursor-1".into());
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionList {
+            groups: vec![group],
+            next_cursor: None,
+            total_count: Some(20),
+        });
+
+        assert!(replies.is_empty());
+        assert_eq!(app.session_groups.len(), 1);
+        assert_eq!(app.session_groups[0].sessions.len(), 1);
+        assert_eq!(
+            app.session_groups[0].next_cursor.as_deref(),
+            Some("cursor-1")
+        );
+    }
+
+    #[test]
     fn acp_group_session_page_merges_group_and_dedupes() {
         let mut app = App::new();
         app.session_groups = vec![session_group("/repo", &["s1"])];
