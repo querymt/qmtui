@@ -2331,6 +2331,102 @@ fn failed_tool_call_exists(
 // ── scroll_tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod tool_call_replay_tests {
+    use super::*;
+
+    #[test]
+    fn session_loaded_replay_audit_preserves_full_utf8_shell_command() {
+        let command = "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## Critical / High";
+        let mut app = App::new();
+
+        app.handle_server_msg(RawServerMsg {
+            msg_type: "session_loaded".into(),
+            data: Some(serde_json::json!({
+                "session_id": "sess-utf8",
+                "agent_id": "coder",
+                "audit": {
+                    "events": [{
+                        "kind": { "type": "tool_call_start", "data": {
+                            "tool_call_id": "tool-utf8",
+                            "tool_name": "shell",
+                            "arguments": { "command": command }
+                        }},
+                        "timestamp": null
+                    }]
+                },
+                "undo_stack": []
+            })),
+        });
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { command: got, .. },
+                ..
+            }] if got == command
+        ));
+    }
+
+    #[test]
+    fn repeated_failed_tool_end_adds_one_fallback_card() {
+        let mut app = App::new();
+        let failed_end = EventKind::ToolCallEnd {
+            tool_call_id: Some("missing-start".into()),
+            tool_name: "ls".into(),
+            is_error: Some(true),
+            result: None,
+        };
+
+        app.handle_event_kind(&failed_end, true, None);
+        app.handle_event_kind(&failed_end, true, None);
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                tool_call_id: Some(id),
+                name,
+                is_error: true,
+                detail: ToolDetail::None,
+            }] if id == "missing-start" && name == "ls (failed)"
+        ));
+    }
+
+    #[test]
+    fn late_tool_start_reconciles_failed_fallback_in_place() {
+        let mut app = App::new();
+        app.handle_event_kind(
+            &EventKind::ToolCallEnd {
+                tool_call_id: Some("missing-start".into()),
+                tool_name: "shell".into(),
+                is_error: Some(true),
+                result: None,
+            },
+            true,
+            None,
+        );
+        app.handle_event_kind(
+            &EventKind::ToolCallStart {
+                tool_call_id: Some("missing-start".into()),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "cargo test" })),
+            },
+            true,
+            None,
+        );
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::ToolCall {
+                tool_call_id: Some(id),
+                name,
+                is_error: true,
+                detail: ToolDetail::Shell { command, .. },
+            }] if id == "missing-start" && name == "shell" && command == "cargo test"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod fork_result_tests {
     use super::*;
 
