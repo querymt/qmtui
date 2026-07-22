@@ -6,10 +6,11 @@
 //! compatibility tests and as a reference while old event-shaped behavior is
 //! ported to native ACP state.
 
-use crate::app::*;
+use crate::app::{
+    accumulate_delegate_stats, backfill_elicitation_outcomes, update_delegate_child_state, *,
+};
 use crate::protocol::*;
 use crate::tool_detail;
-use crate::ui::OUTCOME_BULLET;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -2100,140 +2101,6 @@ fn tool_names_suffix(tools: &[ToolInfo]) -> String {
         return String::new();
     }
     format!(" ({})", names.join(", "))
-}
-
-/// Update per-delegation stats from a single event arriving on a child session.
-pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventKind) {
-    match kind {
-        EventKind::ToolCallStart { .. } => {
-            stats.tool_calls = stats.tool_calls.saturating_add(1);
-        }
-        EventKind::AssistantMessageStored { .. } => {
-            stats.messages = stats.messages.saturating_add(1);
-        }
-        EventKind::LlmRequestEnd {
-            cost_usd,
-            context_tokens,
-            ..
-        } => {
-            if let Some(c) = cost_usd {
-                stats.cost_usd += c;
-            }
-            if let Some(ctx) = context_tokens {
-                stats.context_tokens = *ctx;
-            }
-        }
-        EventKind::ProviderChanged {
-            context_limit: Some(limit),
-            ..
-        } => {
-            stats.context_limit = *limit;
-        }
-        EventKind::LlmRequestStart { .. }
-        | EventKind::SnapshotStart { .. }
-        | EventKind::SnapshotEnd { .. }
-        | EventKind::ProgressRecorded { .. }
-        | EventKind::ArtifactRecorded { .. }
-        | EventKind::SessionQueued { .. }
-        | EventKind::SessionConfigured { .. }
-        | EventKind::ToolsAvailable { .. }
-        | EventKind::SessionCreated
-        | EventKind::Unknown => {}
-        _ => {}
-    }
-}
-
-pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: &EventKind) {
-    match kind {
-        EventKind::ElicitationRequested {
-            elicitation_id,
-            message,
-            source,
-            requested_schema,
-            ..
-        } => {
-            *state = DelegateChildState::PendingElicitation {
-                elicitation_id: elicitation_id.clone(),
-                message: message.clone(),
-                requested_schema: requested_schema.clone(),
-                source: source.clone(),
-            };
-        }
-        EventKind::ToolCallEnd { tool_name, .. } if tool_name == "question" => {
-            *state = DelegateChildState::QuestionToolFinished;
-        }
-        EventKind::AssistantMessageStored { .. } => {
-            *state = DelegateChildState::AssistantMessage;
-        }
-        EventKind::UserMessageStored { .. } => {
-            *state = DelegateChildState::UserMessage;
-        }
-        EventKind::ToolCallStart { .. }
-        | EventKind::AssistantContentDelta { .. }
-        | EventKind::AssistantThinkingDelta { .. }
-        | EventKind::PromptReceived { .. }
-        | EventKind::LlmRequestStart { .. }
-        | EventKind::LlmRequestEnd { .. }
-        | EventKind::CompactionStart { .. }
-        | EventKind::CompactionEnd { .. }
-        | EventKind::SnapshotStart { .. }
-        | EventKind::SnapshotEnd { .. }
-        | EventKind::ProgressRecorded { .. }
-        | EventKind::ArtifactRecorded { .. }
-        | EventKind::SessionQueued { .. }
-        | EventKind::ProviderChanged { .. }
-        | EventKind::Error { .. }
-        | EventKind::Cancelled => {
-            *state = DelegateChildState::OtherProgress;
-        }
-        EventKind::TurnStarted
-        | EventKind::SessionModeChanged { .. }
-        | EventKind::SessionConfigured { .. }
-        | EventKind::ToolsAvailable { .. }
-        | EventKind::SessionCreated
-        | EventKind::DelegationRequested { .. }
-        | EventKind::DelegationCompleted { .. }
-        | EventKind::DelegationFailed { .. }
-        | EventKind::DelegationCancelled { .. }
-        | EventKind::SessionForked { .. }
-        | EventKind::Unknown => {}
-        EventKind::ToolCallEnd { .. } => {
-            *state = DelegateChildState::OtherProgress;
-        }
-    }
-}
-
-pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_str: &str) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) else {
-        return;
-    };
-    let Some(answers) = val.get("answers").and_then(|a| a.as_array()) else {
-        return;
-    };
-
-    let mut answer_iter = answers.iter();
-    for entry in messages.iter_mut() {
-        let ChatEntry::Elicitation { outcome, .. } = entry else {
-            continue;
-        };
-        if outcome.as_deref() != Some("responded") {
-            continue;
-        }
-        let Some(answer_entry) = answer_iter.next() else {
-            break;
-        };
-        let labels: Vec<String> = answer_entry
-            .get("answers")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("{OUTCOME_BULLET}{s}"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        *outcome = Some(labels.join("\n"));
-    }
 }
 
 fn content_to_string(value: &serde_json::Value) -> String {
