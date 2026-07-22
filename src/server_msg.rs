@@ -2336,7 +2336,8 @@ mod tool_call_replay_tests {
 
     #[test]
     fn session_loaded_replay_audit_preserves_full_utf8_shell_command() {
-        let command = "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## Critical / High";
+        let command =
+            "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
         let mut app = App::new();
 
         app.handle_server_msg(RawServerMsg {
