@@ -1128,11 +1128,14 @@ impl crate::app::App {
                 content,
                 message_id,
             } => {
+                // `Finished` clears non-durable streaming thinking, so only an unterminated
+                // replay can be present here for a second identical application.
                 if is_replay
                     && message_id.as_deref().is_some_and(|incoming| {
                         self.messages.iter().any(|entry| {
                             matches!(entry, ChatEntry::Thinking { message_id: Some(existing), .. } if existing == incoming)
-                        })
+                        }) || (self.streaming_thinking_message_id.as_deref() == Some(incoming)
+                            && self.streaming_thinking == content)
                     })
                 {
                     return;
@@ -2875,6 +2878,50 @@ mod tests {
             ] if content == "Let me check." && message_id == "assistant-1" && tool_call_id == "tool-1"
         ));
         assert!(app.streaming_content.is_empty());
+    }
+
+    #[test]
+    fn repeated_terminal_replay_thinking_delta_is_idempotent() {
+        let mut app = app_with_active_session();
+        let updates = vec![AcpSessionUpdate::AssistantThinkingDelta {
+            content: "inspect files".into(),
+            message_id: Some("assistant-1".into()),
+        }];
+
+        for _ in 0..2 {
+            app.handle_acp_event(AcpAppEvent::SessionReplay {
+                session_id: TEST_SESSION_ID.into(),
+                updates: updates.clone(),
+            });
+        }
+
+        assert_eq!(app.streaming_thinking, "inspect files");
+        assert_eq!(
+            app.streaming_thinking_message_id.as_deref(),
+            Some("assistant-1")
+        );
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn replay_thinking_chunks_with_matching_id_are_not_suppressed() {
+        let mut app = app_with_active_session();
+
+        for content in ["hel", "lo"] {
+            app.handle_acp_event(AcpAppEvent::SessionReplay {
+                session_id: TEST_SESSION_ID.into(),
+                updates: vec![AcpSessionUpdate::AssistantThinkingDelta {
+                    content: content.into(),
+                    message_id: Some("assistant-1".into()),
+                }],
+            });
+        }
+
+        assert_eq!(app.streaming_thinking, "hello");
+        assert_eq!(
+            app.streaming_thinking_message_id.as_deref(),
+            Some("assistant-1")
+        );
     }
 
     #[test]
