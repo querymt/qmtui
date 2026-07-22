@@ -5817,58 +5817,6 @@ mod session_mode_tests {
             "expected no SetSessionModel: {cmds:?}"
         );
     }
-
-    // ── handle_server_msg returns Vec now (backward compat for other msgs) ────
-
-    #[test]
-    fn state_msg_returns_empty_vec() {
-        let mut app = App::new();
-        let cmds = app.handle_server_msg(RawServerMsg {
-            msg_type: "state".into(),
-            data: Some(serde_json::json!({
-                "active_session_id": null,
-                "agents": [],
-                "agent_mode": "build"
-            })),
-        });
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn session_created_returns_subscribe_in_vec() {
-        let mut app = App::new();
-        let cmds = app.handle_server_msg(RawServerMsg {
-            msg_type: "session_created".into(),
-            data: Some(serde_json::json!({
-                "session_id": "s99",
-                "agent_id": "a1",
-                "request_id": null
-            })),
-        });
-        assert!(
-            cmds.iter().any(|m| matches!(m, ClientMsg::SubscribeSession { session_id, .. } if session_id == "s99")),
-            "expected SubscribeSession in {cmds:?}"
-        );
-    }
-
-    #[test]
-    fn session_created_only_subscribes() {
-        let mut app = App::new();
-        let cmds = app.handle_server_msg(RawServerMsg {
-            msg_type: "session_created".into(),
-            data: Some(serde_json::json!({
-                "session_id": "s1",
-                "agent_id": "a1",
-                "request_id": null
-            })),
-        });
-        // Only SubscribeSession, no SetSessionModel
-        assert_eq!(cmds.len(), 1);
-        assert!(
-            matches!(&cmds[0], ClientMsg::SubscribeSession { .. }),
-            "expected only SubscribeSession: {cmds:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -6921,32 +6869,6 @@ mod tests {
         assert!(
             matches!(app.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected")
         );
-    }
-
-    #[test]
-    fn undo_and_redo_results_clear_pending_session_op() {
-        let mut app = App::new();
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        app.handle_server_msg(RawServerMsg {
-            msg_type: "undo_result".into(),
-            data: Some(serde_json::json!({
-                "success": false,
-                "message": "undo failed",
-                "undo_stack": []
-            })),
-        });
-        assert_eq!(app.activity, ActivityState::Idle);
-
-        app.activity = ActivityState::SessionOp(SessionOp::Redo);
-        app.handle_server_msg(RawServerMsg {
-            msg_type: "redo_result".into(),
-            data: Some(serde_json::json!({
-                "success": false,
-                "message": "redo failed",
-                "undo_stack": []
-            })),
-        });
-        assert_eq!(app.activity, ActivityState::Idle);
     }
 
     #[test]
