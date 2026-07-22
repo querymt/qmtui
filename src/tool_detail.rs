@@ -175,10 +175,13 @@ pub(crate) fn reconcile_tool_call_start(
             if existing != id {
                 continue;
             }
-            if name == &fallback_name {
+            let is_failed_fallback = name == &fallback_name;
+            if is_failed_fallback {
                 *name = tool_name.to_string();
             }
-            if matches!(detail, ToolDetail::None) && !matches!(start_detail, ToolDetail::None) {
+            if (is_failed_fallback || matches!(detail, ToolDetail::None))
+                && !matches!(start_detail, ToolDetail::None)
+            {
                 *detail = start_detail;
             }
             return true;
@@ -278,6 +281,7 @@ pub(crate) fn mark_tool_call_failed(
     tool_name: &str,
 ) -> bool {
     let Some(id) = tool_call_id else { return false };
+    let fallback_name = format!("{tool_name} (failed)");
     for entry in messages.iter_mut().rev() {
         if let ChatEntry::ToolCall {
             tool_call_id: Some(existing),
@@ -286,8 +290,7 @@ pub(crate) fn mark_tool_call_failed(
             ..
         } = entry
             && existing == id
-            && name == tool_name
-            && !*is_error
+            && (name == tool_name || name == &fallback_name)
         {
             *is_error = true;
             return true;
