@@ -8,6 +8,8 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::DelegateModelPreference;
+
 // ── path overrides for tests ─────────────────────────────────────────────────
 
 static CONFIG_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -94,9 +96,11 @@ pub struct TuiConfig {
     pub theme: Option<String>,
     pub show_thinking: Option<bool>,
     pub acp: AcpConfig,
-    /// Per-agent-id model preferences: agent_id → "provider/model".
+    /// Legacy per-agent model preferences. Read for migration, no longer written.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub delegate_models: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub profile_delegate_models: HashMap<String, HashMap<String, DelegateModelPreference>>,
     pub profile: ProfileConfig,
 }
 
@@ -152,12 +156,15 @@ impl TuiConfig {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
         merged.show_thinking = Some(app.show_thinking);
-        merged.delegate_models = app
-            .delegate_model_preferences
-            .iter()
-            .map(|(id, (p, m))| (id.clone(), format!("{p}/{m}")))
-            .collect();
+        merged.profile_delegate_models = app.delegate_model_preferences.clone();
         merged.profile.id = app.active_profile_id.clone();
+        if let Some(profile_id) = app.active_profile_id.as_deref()
+            && let Some(preferences) = app.delegate_model_preferences.get(profile_id)
+        {
+            merged
+                .delegate_models
+                .retain(|agent_id, _| !preferences.contains_key(agent_id));
+        }
         merged
     }
 
@@ -366,20 +373,42 @@ mod tests {
     fn config_round_trip_with_delegate_models() {
         let _guard = TestPathGuard::new("delegate-models-rt");
         let mut app = App::new();
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
-        app.set_delegate_model_preference("planner", "openai", "gpt-4o");
+        let coder = crate::protocol::ModelEntry {
+            id: "anthropic/claude-sonnet".into(),
+            label: "Claude Sonnet".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet".into(),
+            node_id: None,
+            node_label: None,
+            family: None,
+            quant: None,
+        };
+        let planner = crate::protocol::ModelEntry {
+            id: "openai/gpt-4o".into(),
+            label: "GPT-4o".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            node_id: None,
+            node_label: None,
+            family: None,
+            quant: None,
+        };
+        app.active_profile_id = Some("quorum".into());
+        app.set_delegate_model_preference("quorum", "coder", &coder);
+        app.set_delegate_model_preference("quorum", "planner", &planner);
 
         let cfg = TuiConfig::load().with_app_settings(&app);
         cfg.save();
         let loaded = TuiConfig::load();
 
+        assert!(loaded.delegate_models.is_empty());
         assert_eq!(
-            loaded.delegate_models.get("coder").map(String::as_str),
-            Some("anthropic/claude-sonnet")
+            loaded.profile_delegate_models["quorum"]["coder"].model_id,
+            "anthropic/claude-sonnet"
         );
         assert_eq!(
-            loaded.delegate_models.get("planner").map(String::as_str),
-            Some("openai/gpt-4o")
+            loaded.profile_delegate_models["quorum"]["planner"].model_id,
+            "openai/gpt-4o"
         );
     }
 
@@ -388,6 +417,39 @@ mod tests {
         let app = App::new();
         let cfg = TuiConfig::default().with_app_settings(&app);
         assert!(cfg.delegate_models.is_empty());
+        assert!(cfg.profile_delegate_models.is_empty());
+    }
+
+    #[test]
+    fn config_with_app_settings_preserves_unscoped_legacy_preferences() {
+        let cfg = TuiConfig {
+            delegate_models: [("coder".into(), "anthropic/claude-sonnet".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let merged = cfg.with_app_settings(&App::new());
+
+        assert_eq!(
+            merged.delegate_models.get("coder").map(String::as_str),
+            Some("anthropic/claude-sonnet")
+        );
+    }
+
+    #[test]
+    fn config_profile_delegate_models_preserves_remote_identity() {
+        let toml_str = r#"
+[profile_delegate_models.quorum.coder]
+model_id = "openai/gpt-5"
+provider = "openai"
+model = "gpt-5"
+node_id = "node-1"
+"#;
+        let cfg: TuiConfig = toml::from_str(toml_str).unwrap();
+        let preference = &cfg.profile_delegate_models["quorum"]["coder"];
+        assert_eq!(preference.model_id, "openai/gpt-5");
+        assert_eq!(preference.node_id.as_deref(), Some("node-1"));
     }
 
     #[test]

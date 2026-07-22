@@ -68,8 +68,14 @@ pub enum ClientMsg {
         reasoning_effort: String,
     },
     ListProfiles,
-    SetActiveProfile {
+    ListProfileAgents {
         profile_id: String,
+    },
+    SetDelegateModel {
+        session_id: String,
+        agent_id: String,
+        model_id: Option<String>,
+        node_id: Option<String>,
     },
     NewSession {
         cwd: Option<String>,
@@ -333,19 +339,42 @@ mod client_msg_tests {
     }
 
     #[test]
-    fn profile_messages_serialize() {
+    fn list_profiles_serializes() {
         let list = serde_json::to_value(ClientMsg::ListProfiles).unwrap();
         assert_eq!(list, json!({ "type": "list_profiles" }));
+    }
 
-        let set = serde_json::to_value(ClientMsg::SetActiveProfile {
-            profile_id: "fast".to_string(),
+    #[test]
+    fn delegate_profile_messages_serialize() {
+        let agents = serde_json::to_value(ClientMsg::ListProfileAgents {
+            profile_id: "quorum".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            agents,
+            json!({
+                "type": "list_profile_agents",
+                "data": { "profile_id": "quorum" }
+            })
+        );
+
+        let set = serde_json::to_value(ClientMsg::SetDelegateModel {
+            session_id: "parent".into(),
+            agent_id: "coder".into(),
+            model_id: Some("openai/gpt-5".into()),
+            node_id: Some("node-1".into()),
         })
         .unwrap();
         assert_eq!(
             set,
             json!({
-                "type": "set_active_profile",
-                "data": { "profile_id": "fast" }
+                "type": "set_delegate_model",
+                "data": {
+                    "session_id": "parent",
+                    "agent_id": "coder",
+                    "model_id": "openai/gpt-5",
+                    "node_id": "node-1"
+                }
             })
         );
     }
@@ -459,12 +488,27 @@ pub struct ProfileInfo {
     pub source: Option<String>,
     #[serde(default)]
     pub config_kind: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateModelPreference {
+    pub model_id: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
