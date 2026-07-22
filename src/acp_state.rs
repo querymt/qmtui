@@ -1128,6 +1128,15 @@ impl crate::app::App {
                 content,
                 message_id,
             } => {
+                if is_replay
+                    && message_id.as_deref().is_some_and(|incoming| {
+                        self.messages.iter().any(|entry| {
+                            matches!(entry, ChatEntry::Thinking { message_id: Some(existing), .. } if existing == incoming)
+                        })
+                    })
+                {
+                    return;
+                }
                 let active_message_id = self
                     .streaming_content_message_id
                     .as_deref()
@@ -1531,6 +1540,20 @@ impl crate::app::App {
         allow_custom: bool,
         is_replay: bool,
     ) {
+        // An elicitation ID is the durable identity across live delivery and replay.
+        // Keep an existing card (and any recorded outcome) rather than reopening it.
+        if self.messages.iter().any(|entry| {
+            matches!(
+                entry,
+                ChatEntry::Elicitation {
+                    elicitation_id: existing_id,
+                    ..
+                } if existing_id == elicitation_id
+            )
+        }) {
+            return;
+        }
+
         self.finalize_streaming_segment();
         let fields = ElicitationState::parse_schema(requested_schema);
         if fields.is_empty() {
@@ -2855,6 +2878,41 @@ mod tests {
     }
 
     #[test]
+    fn repeated_replay_thinking_deltas_preserve_tool_boundaries() {
+        let mut app = app_with_active_session();
+        let updates = vec![
+            AcpSessionUpdate::AssistantThinkingDelta {
+                content: "inspect ".into(),
+                message_id: Some("assistant-1".into()),
+            },
+            AcpSessionUpdate::AssistantThinkingDelta {
+                content: "files".into(),
+                message_id: Some("assistant-1".into()),
+            },
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "pwd" })),
+            },
+        ];
+
+        for _ in 0..2 {
+            app.handle_acp_event(AcpAppEvent::SessionReplay {
+                session_id: TEST_SESSION_ID.into(),
+                updates: updates.clone(),
+            });
+        }
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::Thinking { content, message_id: Some(message_id) },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. },
+            ] if content == "inspect files" && message_id == "assistant-1" && tool_call_id == "tool-1"
+        ));
+    }
+
+    #[test]
     fn final_assistant_replaces_matching_thinking_without_crossing_tool() {
         let mut app = app_with_active_session();
         app.messages.push(ChatEntry::Thinking {
@@ -3662,6 +3720,103 @@ mod tests {
             app.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, message, outcome: None, .. }]
                 if elicitation_id == "elic-1" && message == "Choose a target"
+        ));
+    }
+
+    #[test]
+    fn native_repeated_replay_elicitation_preserves_existing_outcome() {
+        let mut app = app_with_active_session();
+        let updates = vec![AcpSessionUpdate::ElicitationRequested {
+            elicitation_id: "elic-1".into(),
+            message: "Choose a target".into(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "target": { "type": "string", "enum": ["staging"] } },
+                "required": ["target"]
+            }),
+            source: "builtin:question".into(),
+            allow_custom: true,
+        }];
+
+        for _ in 0..2 {
+            app.handle_acp_event(AcpAppEvent::SessionReplay {
+                session_id: TEST_SESSION_ID.into(),
+                updates: updates.clone(),
+            });
+        }
+        app.resolve_elicitation("elic-1", "staging");
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates,
+        });
+
+        assert!(app.elicitation.is_none());
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
+                if elicitation_id == "elic-1" && outcome == "staging"
+        ));
+    }
+
+    #[test]
+    fn native_live_elicitation_is_not_reopened_by_replay_and_distinct_ids_append() {
+        let mut app = app_with_active_session();
+        let elicitation = |id: &str| AcpSessionUpdate::ElicitationRequested {
+            elicitation_id: id.into(),
+            message: "Choose a target".into(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "target": { "type": "string", "enum": ["staging"] } },
+                "required": ["target"]
+            }),
+            source: "builtin:question".into(),
+            allow_custom: true,
+        };
+
+        apply_live_update(&mut app, elicitation("elic-live"));
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: vec![elicitation("elic-live"), elicitation("elic-replayed")],
+        });
+
+        assert_eq!(
+            app.elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-live")
+        );
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::Elicitation { elicitation_id: first, .. },
+                ChatEntry::Elicitation { elicitation_id: second, .. },
+            ] if first == "elic-live" && second == "elic-replayed"
+        ));
+    }
+
+    #[test]
+    fn native_unsupported_replay_elicitation_is_idempotent() {
+        let mut app = app_with_active_session();
+        let updates = vec![AcpSessionUpdate::ElicitationRequested {
+            elicitation_id: "elic-unsupported".into(),
+            message: "Upload a file".into(),
+            requested_schema: serde_json::json!({ "type": "array" }),
+            source: "extension:file-picker".into(),
+            allow_custom: false,
+        }];
+
+        for _ in 0..2 {
+            app.handle_acp_event(AcpAppEvent::SessionReplay {
+                session_id: TEST_SESSION_ID.into(),
+                updates: updates.clone(),
+            });
+        }
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
+                if elicitation_id == "elic-unsupported"
+                    && outcome == "unsupported schema - cannot answer in TUI"
         ));
     }
 

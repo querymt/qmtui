@@ -2136,7 +2136,10 @@ fn fallback_failed_tool_name(tool_name: &str) -> String {
 }
 
 fn is_same_tool_call(existing_id: &Option<String>, tool_call_id: Option<&str>) -> bool {
-    existing_id.as_deref() == tool_call_id
+    matches!(
+        (existing_id.as_deref(), tool_call_id),
+        (Some(existing_id), Some(tool_call_id)) if existing_id == tool_call_id
+    )
 }
 
 fn push_error_message(messages: &mut Vec<ChatEntry>, message: &str) -> bool {
@@ -2256,6 +2259,28 @@ mod tool_call_replay_tests {
                 is_error: true,
                 detail: ToolDetail::None,
             }] if id == "missing-start" && name == "ls (failed)"
+        ));
+    }
+
+    #[test]
+    fn missing_id_failed_tool_ends_create_distinct_fallback_cards() {
+        let mut app = App::new();
+        let failed_end = EventKind::ToolCallEnd {
+            tool_call_id: None,
+            tool_name: "ls".into(),
+            is_error: Some(true),
+            result: None,
+        };
+
+        app.handle_event_kind(&failed_end, true, None);
+        app.handle_event_kind(&failed_end, true, None);
+
+        assert!(matches!(
+            app.messages.as_slice(),
+            [
+                ChatEntry::ToolCall { tool_call_id: None, name: first, is_error: true, .. },
+                ChatEntry::ToolCall { tool_call_id: None, name: second, is_error: true, .. },
+            ] if first == "ls (failed)" && second == "ls (failed)"
         ));
     }
 
