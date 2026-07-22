@@ -640,7 +640,7 @@ mod tests {
         let detail = parse_tool_detail(
             "read_tool",
             Some(&serde_json::json!({
-                "path": "src/server_msg.rs",
+                "path": "src/acp_state.rs",
                 "offset": 2134,
                 "limit": 71,
             })),
@@ -653,7 +653,7 @@ mod tests {
                 start_line,
                 end_line,
             } => {
-                assert_eq!(path, "src/server_msg.rs");
+                assert_eq!(path, "src/acp_state.rs");
                 assert_eq!(start_line, Some(2135));
                 assert_eq!(end_line, Some(2205));
             }

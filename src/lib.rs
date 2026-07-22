@@ -12,8 +12,6 @@ mod mesh;
 mod protocol;
 pub mod runtime;
 mod server_manager;
-#[cfg(test)]
-mod server_msg;
 mod session;
 mod slash;
 mod theme;

@@ -99,15 +99,6 @@ mod tests {
         }])
     }
 
-    #[test]
-    fn raw_server_msg_missing_data_parses_as_none() {
-        let raw = serde_json::from_str::<crate::protocol::RawServerMsg>(r#"{"type":"heartbeat"}"#)
-            .unwrap();
-
-        assert_eq!(raw.msg_type, "heartbeat");
-        assert!(raw.data.is_none());
-    }
-
     // ── Elicitation key handling ──────────────────────────────────────────────
 
     #[test]
@@ -3844,54 +3835,6 @@ mod auth_tests {
             app.auth_result_message,
             Some((true, "Connected successfully".into()))
         );
-    }
-
-    #[test]
-    fn server_msg_api_token_result_success_clears_input() {
-        let mut app = App::new();
-        app.auth_api_key_input = "sk-secret".into();
-        app.auth_api_key_cursor = 9;
-        let raw = RawServerMsg {
-            msg_type: "api_token_result".into(),
-            data: Some(serde_json::json!({
-                "provider": "groq",
-                "success": true,
-                "message": "API key saved"
-            })),
-        };
-        let cmds = app.handle_server_msg(raw);
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
-        );
-        assert!(app.auth_api_key_input.is_empty());
-        assert_eq!(app.auth_api_key_cursor, 0);
-        assert_eq!(
-            app.auth_result_message,
-            Some((true, "API key saved".into()))
-        );
-    }
-
-    #[test]
-    fn server_msg_api_token_result_failure_keeps_input() {
-        let mut app = App::new();
-        app.auth_api_key_input = "bad-key".into();
-        app.auth_api_key_cursor = 7;
-        let raw = RawServerMsg {
-            msg_type: "api_token_result".into(),
-            data: Some(serde_json::json!({
-                "provider": "groq",
-                "success": false,
-                "message": "Invalid key"
-            })),
-        };
-        let cmds = app.handle_server_msg(raw);
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
-        );
-        assert_eq!(app.auth_api_key_input, "bad-key"); // preserved
-        assert_eq!(app.auth_result_message, Some((false, "Invalid key".into())));
     }
 
     // ── Disconnect / clear credential tests (C-d in List panel) ─────────────
