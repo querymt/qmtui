@@ -1536,7 +1536,7 @@ pub struct App {
     /// UserMessageStored to suppress the noisy batch-result message.
     pub suppress_delegation_result: bool,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
-    /// Drained by native ACP and legacy reducers after each event/replay batch.
+    /// Drained by native ACP after each event/replay batch.
     pub pending_commands: Vec<ClientMsg>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
