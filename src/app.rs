@@ -3375,6 +3375,58 @@ mod delegate_entry_tests {
     }
 
     #[test]
+    fn child_state_tracks_pending_elicitation_and_terminal_progress() {
+        let mut state = DelegateChildState::None;
+        update_delegate_child_state(
+            &mut state,
+            &EventKind::ElicitationRequested {
+                elicitation_id: "elic-1".into(),
+                session_id: "child-1".into(),
+                message: "Choose".into(),
+                requested_schema: serde_json::json!({"type":"string"}),
+                source: "builtin:question".into(),
+            },
+        );
+        assert!(matches!(
+            state,
+            DelegateChildState::PendingElicitation { ref elicitation_id, ref message, .. }
+                if elicitation_id == "elic-1" && message == "Choose"
+        ));
+
+        update_delegate_child_state(
+            &mut state,
+            &EventKind::AssistantMessageStored {
+                content: "answer".into(),
+                thinking: None,
+                message_id: None,
+            },
+        );
+        assert_eq!(state, DelegateChildState::AssistantMessage);
+
+        update_delegate_child_state(
+            &mut state,
+            &EventKind::ToolCallEnd {
+                tool_call_id: None,
+                tool_name: "question".into(),
+                result: None,
+                is_error: Some(false),
+            },
+        );
+        assert_eq!(state, DelegateChildState::QuestionToolFinished);
+
+        update_delegate_child_state(
+            &mut state,
+            &EventKind::ToolCallEnd {
+                tool_call_id: None,
+                tool_name: "read_tool".into(),
+                result: None,
+                is_error: Some(false),
+            },
+        );
+        assert_eq!(state, DelegateChildState::OtherProgress);
+    }
+
+    #[test]
     fn stats_context_pct_computes_correctly() {
         let stats = DelegateStats {
             context_tokens: 50_000,
