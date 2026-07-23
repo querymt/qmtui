@@ -87,6 +87,11 @@ impl App {
             .find_map(|group| find(&group.sessions, session_id))
     }
 
+    pub fn session_parent_id(&self, session_id: &str) -> Option<&str> {
+        self.session_summary_by_id(session_id)
+            .and_then(|session| session.parent_session_id.as_deref())
+    }
+
     pub fn remember_remote_session_node(&mut self, session_id: &str, node_id: &str) {
         self.remote_session_nodes
             .insert(session_id.to_string(), node_id.to_string());
@@ -705,5 +710,116 @@ impl App {
                     && self.session_id.as_deref() != Some(session_id.as_str())
             })
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_parent_id_finds_explicit_parent_at_any_depth() {
+        let mut app = App::new();
+        let mut grandchild = session("grandchild");
+        grandchild.parent_session_id = Some("child".into());
+        let mut child = session("child");
+        child.parent_session_id = Some("parent".into());
+        child.children = vec![grandchild];
+        let mut parent = session("parent");
+        parent.children = vec![child];
+        app.session_groups = vec![
+            SessionGroup {
+                cwd: Some("/unrelated".into()),
+                sessions: vec![session("unrelated")],
+                ..Default::default()
+            },
+            SessionGroup {
+                cwd: Some("/repo".into()),
+                sessions: vec![parent],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(app.session_parent_id("child"), Some("parent"));
+        assert_eq!(app.session_parent_id("grandchild"), Some("child"));
+        assert_eq!(app.session_parent_id("unrelated"), None);
+        assert_eq!(app.session_parent_id("missing"), None);
+    }
+
+    #[test]
+    fn merge_session_children_replaces_then_appends_filtered_nested_children() {
+        let mut app = App::new();
+        let mut parent = session("parent");
+        parent.children = vec![session("stale")];
+        let mut root = session("root");
+        root.children = vec![parent];
+        app.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: vec![root],
+            ..Default::default()
+        }];
+        app.pending_session_child_loads.insert("parent".into());
+
+        let mut remote = session("remote-child");
+        remote.node_id = Some("node-1".into());
+        let mut delegated = session("delegated-child");
+        delegated.fork_origin = Some("delegation".into());
+        app.merge_session_children(SessionChildrenData {
+            parent_session_id: "parent".into(),
+            sessions: vec![session("child-1"), remote, delegated, session("child-1")],
+            next_cursor: Some("cursor-2".into()),
+            total_count: Some(3),
+        });
+
+        let parent = app.session_summary_by_id("parent").unwrap();
+        assert_eq!(
+            parent
+                .children
+                .iter()
+                .map(|child| child.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-1", "remote-child"]
+        );
+        assert_eq!(parent.children_next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(parent.children_total_count, Some(3));
+        assert_eq!(parent.fork_count, 3);
+        assert!(parent.has_children);
+        assert_eq!(app.session_remote_node_id("remote-child"), Some("node-1"));
+        assert!(app.pending_session_child_loads.is_empty());
+
+        app.pending_session_child_loads.insert("parent".into());
+        app.merge_session_children(SessionChildrenData {
+            parent_session_id: "parent".into(),
+            sessions: vec![session("remote-child"), session("child-2")],
+            next_cursor: None,
+            total_count: Some(3),
+        });
+
+        let parent = app.session_summary_by_id("parent").unwrap();
+        assert_eq!(
+            parent
+                .children
+                .iter()
+                .map(|child| child.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-1", "remote-child", "child-2"]
+        );
+        assert_eq!(parent.children_next_cursor, None);
+        assert!(app.pending_session_child_loads.is_empty());
+
+        app.pending_session_child_loads
+            .insert("missing-parent".into());
+        app.merge_session_children(SessionChildrenData {
+            parent_session_id: "missing-parent".into(),
+            ..Default::default()
+        });
+        assert!(app.pending_session_child_loads.is_empty());
     }
 }

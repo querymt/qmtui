@@ -385,7 +385,6 @@ mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::{App, ChatEntry, DiffPreviewSection, Screen, ShellOutputTail, ToolDetail};
-    use crate::protocol::EventKind;
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -1385,7 +1384,7 @@ mod tests {
             name: "read_tool".into(),
             is_error: false,
             detail: ToolDetail::ReadTool {
-                path: "src/server_msg.rs".into(),
+                path: "src/acp_state.rs".into(),
                 start_line: Some(2135),
                 end_line: Some(2205),
             },
@@ -1403,7 +1402,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "> read_tool src/server_msg.rs:2135-2205"
+            "> read_tool src/acp_state.rs:2135-2205"
         );
         assert_eq!(line.spans.len(), 4);
         assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
@@ -4009,62 +4008,6 @@ mod tests {
         assert_eq!(incremental_kinds, vec![CardKind::Tool { compact: false }]);
         assert_eq!(incremental_tool_lines, 2);
         assert_eq!(full_tool_lines, 2);
-    }
-
-    #[test]
-    fn thinking_entry_between_tools_breaks_tool_card_batching() {
-        let mut app = App::new();
-        app.handle_event_kind(
-            &EventKind::AssistantMessageStored {
-                content: String::new(),
-                thinking: Some("Thinking before first tool.".into()),
-                message_id: Some("think-1".into()),
-            },
-            true,
-            None,
-        );
-        app.handle_event_kind(
-            &EventKind::ToolCallStart {
-                tool_call_id: Some("tool-1".into()),
-                tool_name: "glob".into(),
-                arguments: None,
-            },
-            true,
-            None,
-        );
-        app.handle_event_kind(
-            &EventKind::AssistantMessageStored {
-                content: String::new(),
-                thinking: Some("Thinking before second tool.".into()),
-                message_id: Some("think-2".into()),
-            },
-            true,
-            None,
-        );
-        app.handle_event_kind(
-            &EventKind::ToolCallStart {
-                tool_call_id: Some("tool-2".into()),
-                tool_name: "read_tool".into(),
-                arguments: None,
-            },
-            true,
-            None,
-        );
-
-        let cards = build_message_cards(&mut app);
-        assert_eq!(cards.len(), 4);
-        assert_eq!(cards[0].kind, CardKind::Thinking);
-        assert_eq!(cards[1].kind, CardKind::Tool { compact: true });
-        assert_eq!(cards[2].kind, CardKind::Thinking);
-        assert_eq!(cards[3].kind, CardKind::Tool { compact: true });
-
-        let thinking_text: String = cards[2]
-            .lines_for(80)
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-            .collect();
-        assert!(thinking_text.contains('\u{25CF}'));
-        assert!(thinking_text.contains("Thinking before second tool."));
     }
 
     // ── scroll_input tests ────────────────────────────────────────────────────

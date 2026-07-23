@@ -389,58 +389,6 @@ pub enum PromptBlock {
     ResourceLink { name: String, uri: String },
 }
 
-// --- Server → Client messages ---
-// We use a loose approach: parse the "type" tag, then decode known fields.
-
-#[derive(Debug, Deserialize)]
-pub struct RawServerMsg {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    #[serde(default)]
-    pub data: Option<serde_json::Value>,
-}
-
-// Structured types we extract from RawServerMsg.data
-
-#[derive(Debug, Deserialize)]
-pub struct StateData {
-    pub active_session_id: Option<String>,
-    #[serde(default)]
-    pub profiles: Vec<ProfileInfo>,
-    #[serde(default)]
-    pub active_profile_id: Option<String>,
-    pub agents: Vec<AgentInfo>,
-    pub agent_mode: Option<String>,
-    /// Current reasoning effort level. `None` means "auto". Absent key means
-    /// the server did not report it — callers should leave existing state intact.
-    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
-    pub reasoning_effort: ReasoningEffortField,
-}
-
-/// Three-state field for `reasoning_effort` in the `state` message:
-/// - `Absent` — key was not present in JSON (leave existing TUI state alone)
-/// - `Auto`   — key was `null` or `"auto"` (set to None / auto)
-/// - `Set(s)` — key was a non-auto string like `"low"`, `"high"`, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ReasoningEffortField {
-    #[default]
-    Absent,
-    Auto,
-    Set(String),
-}
-
-fn deserialize_reasoning_effort<'de, D>(d: D) -> Result<ReasoningEffortField, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    let v = Option::<String>::deserialize(d)?;
-    Ok(match v.as_deref() {
-        None | Some("auto") => ReasoningEffortField::Auto,
-        Some(s) => ReasoningEffortField::Set(s.to_string()),
-    })
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ReasoningEffortData {
     /// `None` or `"auto"` both map to the "auto" (no effort override) state.
@@ -908,32 +856,6 @@ pub struct DelegationData {
     pub objective: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AudioCapabilitiesData {
-    #[serde(default)]
-    pub stt_models: Vec<AudioModelInfo>,
-    #[serde(default)]
-    pub tts_models: Vec<AudioModelInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AudioModelInfo {
-    pub provider: String,
-    pub model: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ProviderCapabilitiesData {
-    #[serde(default)]
-    pub providers: Vec<ProviderCapabilityEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ProviderCapabilityEntry {
-    pub provider: String,
-    pub supports_custom_models: bool,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -1219,13 +1141,6 @@ pub struct OAuthFlowData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OAuthResultData {
-    pub provider: String,
-    pub success: bool,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ApiTokenResultData {
     pub provider: String,
     pub success: bool,
     pub message: String,
