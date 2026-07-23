@@ -2669,6 +2669,14 @@ mod tests {
     fn native_session_created_resets_view_and_subscribes() {
         let mut app = App::new();
         app.messages.push(ChatEntry::Error("stale".into()));
+        app.streaming_content = "stale stream".into();
+        app.scroll_offset = 3;
+        app.undo_state = Some(crate::app::UndoState {
+            stack: Vec::new(),
+            frontier_message_id: Some("undo-1".into()),
+        });
+        app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.session_stats.total_tool_calls = 1;
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionCreated {
             agent_id: "agent-1".into(),
@@ -2680,6 +2688,11 @@ mod tests {
         assert_eq!(app.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(app.screen, Screen::Chat);
         assert!(app.messages.is_empty());
+        assert!(app.streaming_content.is_empty());
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.undo_state.is_none());
+        assert!(app.elicitation.is_none());
+        assert_eq!(app.session_stats.total_tool_calls, 0);
         assert!(matches!(
             replies.as_slice(),
             [
@@ -2689,6 +2702,152 @@ mod tests {
                 && agent_id.as_deref() == Some("agent-1")
                 && profile_id == "code"
         ));
+    }
+
+    #[test]
+    fn native_session_loaded_discovers_parent_preserves_delegate_state_and_resets_view() {
+        let mut app = App::new();
+        app.agent_mode = "plan".into();
+        app.session_groups = vec![session_group("/repo", &["parent", "child"])];
+        app.session_groups[0].sessions[1].parent_session_id = Some("parent".into());
+        app.messages.push(ChatEntry::Error("stale".into()));
+        app.streaming_content = "stale stream".into();
+        app.streaming_content_message_id = Some("stream-1".into());
+        app.streaming_thinking = "stale thinking".into();
+        app.streaming_thinking_message_id = Some("thinking-1".into());
+        app.scroll_offset = 4;
+        app.undo_state = Some(crate::app::UndoState {
+            stack: Vec::new(),
+            frontier_message_id: Some("undo-1".into()),
+        });
+        app.recent_prompt_text = Some("stale prompt".into());
+        app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.session_stats.total_tool_calls = 2;
+        app.delegate_entries.push(crate::app::DelegateEntry {
+            delegation_id: "delegate-1".into(),
+            child_session_id: Some("child".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: None,
+            objective: "keep".into(),
+            status: crate::app::DelegateStatus::InProgress,
+            stats: crate::app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: crate::app::DelegateChildState::None,
+        });
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "child".into(),
+            profile_id: None,
+        });
+
+        assert_eq!(app.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(app.screen, Screen::Delegate);
+        assert!(app.messages.is_empty());
+        assert!(app.streaming_content.is_empty());
+        assert_eq!(app.streaming_content_message_id, None);
+        assert!(app.streaming_thinking.is_empty());
+        assert_eq!(app.streaming_thinking_message_id, None);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.undo_state.is_none());
+        assert!(app.undoable_turns.is_empty());
+        assert!(app.recent_prompt_text.is_none());
+        assert!(app.elicitation.is_none());
+        assert_eq!(app.session_stats.total_tool_calls, 0);
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert!(matches!(
+            replies.as_slice(),
+            [ClientMsg::SetAgentMode { mode }] if mode == "plan"
+        ));
+    }
+
+    #[test]
+    fn native_session_loaded_root_clears_delegate_state() {
+        let mut app = App::new();
+        app.parent_session_id = Some("old-parent".into());
+        app.delegate_entries.push(crate::app::DelegateEntry {
+            delegation_id: "delegate-1".into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: None,
+            objective: "clear".into(),
+            status: crate::app::DelegateStatus::InProgress,
+            stats: crate::app::DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: crate::app::DelegateChildState::None,
+        });
+        app.pending_delegate_child_states.insert(
+            "child".into(),
+            crate::app::DelegateChildState::OtherProgress,
+        );
+        app.pending_delegate_tool_calls
+            .push(crate::app::PendingDelegateToolCall {
+                tool_call_id: "tool-1".into(),
+                target_agent_id: None,
+                objective: "clear".into(),
+            });
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "root".into(),
+            profile_id: None,
+        });
+
+        assert_eq!(app.parent_session_id, None);
+        assert_eq!(app.screen, Screen::Chat);
+        assert!(app.delegate_entries.is_empty());
+        assert!(app.pending_delegate_child_states.is_empty());
+        assert!(app.pending_delegate_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn native_provider_changed_updates_selection_and_preserves_limit_when_absent() {
+        let mut app = App::new();
+        app.context_limit = 4_096;
+
+        app.handle_acp_event(AcpAppEvent::ProviderChanged {
+            provider: "remote-provider".into(),
+            model: "model-1".into(),
+            context_limit: Some(128_000),
+            provider_node_id: Some("node-1".into()),
+        });
+        assert_eq!(app.current_provider.as_deref(), Some("remote-provider"));
+        assert_eq!(app.current_model.as_deref(), Some("model-1"));
+        assert_eq!(app.context_limit, 128_000);
+        assert_eq!(app.current_model_node_id.as_deref(), Some("node-1"));
+
+        app.handle_acp_event(AcpAppEvent::ProviderChanged {
+            provider: "local-provider".into(),
+            model: "model-2".into(),
+            context_limit: None,
+            provider_node_id: None,
+        });
+        assert_eq!(app.current_provider.as_deref(), Some("local-provider"));
+        assert_eq!(app.current_model.as_deref(), Some("model-2"));
+        assert_eq!(app.context_limit, 128_000);
+        assert_eq!(app.current_model_node_id, None);
+    }
+
+    #[test]
+    fn native_agent_mode_updates_mode_and_clears_review_return_state() {
+        let mut app = App::new();
+        app.agent_mode = "review".into();
+        app.mode_before_review = Some("plan".into());
+
+        app.handle_acp_event(AcpAppEvent::AgentMode {
+            mode: "build".into(),
+        });
+        assert_eq!(app.agent_mode, "build");
+        assert_eq!(app.mode_before_review, None);
+
+        app.mode_before_review = Some("plan".into());
+        app.handle_acp_event(AcpAppEvent::AgentMode {
+            mode: "review".into(),
+        });
+        assert_eq!(app.agent_mode, "review");
+        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
     }
 
     #[test]
