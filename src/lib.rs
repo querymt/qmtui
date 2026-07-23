@@ -4,6 +4,7 @@ mod acp_client;
 mod acp_state;
 mod app;
 mod config;
+mod domain;
 mod handlers;
 mod highlight;
 mod input;

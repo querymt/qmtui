@@ -6,6 +6,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::app::*;
+use crate::domain::activity::{DelegateEntry, SessionActivity};
 use crate::protocol::*;
 
 /// Returns indices of sessions in `group` whose title or ID matches `q`.

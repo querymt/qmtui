@@ -5,10 +5,11 @@ use serde_json::Value;
 use crate::acp_client::{
     DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
 };
-use crate::app::{
-    ActivityState, ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
-    ElicitationState, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen, ToolDetail,
+use crate::app::{ChatEntry, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen, ToolDetail};
+use crate::domain::activity::{
+    ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
+use crate::domain::elicitation::ElicitationState;
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
@@ -828,10 +829,11 @@ impl crate::app::App {
         self.mention_state = None;
         self.last_compaction_token_estimate = None;
         self.elicitation = None;
+        self.elicitation_ui = None;
         self.clear_cancel_confirm();
         self.mode_before_review = None;
         self.cumulative_cost = None;
-        self.session_stats = crate::app::SessionStatsLite::default();
+        self.session_stats = crate::domain::activity::SessionStatsLite::default();
     }
 
     fn upsert_provisional_delegate(
@@ -1577,18 +1579,12 @@ impl crate::app::App {
                     message: message.to_string(),
                     source: source.to_string(),
                     fields,
-                    field_cursor: 0,
-                    option_cursor: 0,
                     selected: std::collections::HashMap::new(),
                     text_input: String::new(),
-                    text_cursor: 0,
-                    allow_custom,
-                    custom_active: false,
                     custom_input: String::new(),
-                    custom_cursor: 0,
-                    custom_line_width: 1,
-                    custom_scroll: 0,
+                    allow_custom,
                 });
+                self.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
             }
             self.messages.push(ChatEntry::Elicitation {
                 elicitation_id: elicitation_id.to_string(),
@@ -2673,6 +2669,7 @@ mod tests {
             frontier_message_id: Some("undo-1".into()),
         });
         app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app.session_stats.total_tool_calls = 1;
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionCreated {
@@ -2737,6 +2734,7 @@ mod tests {
         });
         app.recent_prompt_text = Some("stale prompt".into());
         app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app.session_stats.total_tool_calls = 2;
         app.delegate_entries.push(crate::app::DelegateEntry {
             delegation_id: "delegate-1".into(),

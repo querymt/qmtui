@@ -86,6 +86,7 @@ mod tests {
             outcome: None,
         });
         app.elicitation = Some(state);
+        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app
     }
 
@@ -106,7 +107,7 @@ mod tests {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        assert_eq!(app.elicitation.as_ref().unwrap().option_cursor, 1);
+        assert_eq!(app.elicitation_ui.as_ref().unwrap().option_cursor, 1);
     }
 
     #[test]
@@ -114,7 +115,7 @@ mod tests {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Up), &tx).unwrap();
-        assert_eq!(app.elicitation.as_ref().unwrap().option_cursor, 0);
+        assert_eq!(app.elicitation_ui.as_ref().unwrap().option_cursor, 0);
     }
 
     #[test]
@@ -150,9 +151,9 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert!(
-            app.elicitation
+            app.elicitation_ui
                 .as_ref()
-                .is_some_and(|state| state.custom_active)
+                .is_some_and(|ui| ui.custom_active)
         );
 
         for c in "custom".chars() {
@@ -187,9 +188,9 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
 
         assert!(
-            app.elicitation
+            app.elicitation_ui
                 .as_ref()
-                .is_some_and(|state| !state.custom_active)
+                .is_some_and(|ui| !ui.custom_active)
         );
         assert!(rx.try_recv().is_err());
 
@@ -283,7 +284,7 @@ mod tests {
                 kind: ElicitationFieldKind::TextInput,
             }]));
         app.elicitation.as_mut().unwrap().text_input = "Hi".into();
-        app.elicitation.as_mut().unwrap().text_cursor = 2;
+        app.elicitation_ui.as_mut().unwrap().text_cursor = 2;
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
         assert_eq!(app.elicitation.as_ref().unwrap().text_input, "H");
