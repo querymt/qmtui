@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, ActivityState, App, CommandPaletteAction, LogLevel, Popup, Screen};
+use crate::app::{self, App, CommandPaletteAction, LogLevel, Popup, Screen};
+use crate::domain::activity::{ActivityState, SessionOp};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -39,129 +40,181 @@ pub(crate) fn handle_elicitation_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
-    use app::ElicitationFieldKind;
+    use crate::domain::elicitation::ElicitationFieldKind;
+    use crate::ui::OUTCOME_BULLET;
 
-    let Some(state) = app.elicitation.as_mut() else {
+    let (Some(state), Some(ui)) = (app.elicitation.as_mut(), app.elicitation_ui.as_mut()) else {
+        return Ok(());
+    };
+    let Some(field_index) = ui.current_field_index(state.fields.len()) else {
         return Ok(());
     };
 
-    if state.custom_active {
-        match key.code {
-            KeyCode::Esc => state.deactivate_custom(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                state.custom_insert('\n');
+    let selected_display = |state: &crate::domain::elicitation::ElicitationState,
+                            custom_active: bool| {
+        let field = &state.fields[field_index];
+        if custom_active {
+            return format!("{OUTCOME_BULLET}{}", state.custom_input.trim());
+        }
+        match &field.kind {
+            ElicitationFieldKind::SingleSelect { options } => options
+                .iter()
+                .find(|option| state.selected.get(&field.name) == Some(&option.value))
+                .map(|option| format!("{OUTCOME_BULLET}{}", option.label))
+                .unwrap_or_default(),
+            ElicitationFieldKind::MultiSelect { options } => state
+                .selected
+                .get(&field.name)
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    options
+                        .iter()
+                        .filter(|option| values.contains(&option.value))
+                        .map(|option| format!("{OUTCOME_BULLET}{}", option.label))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
+                state.text_input.clone()
             }
-            KeyCode::Enter if state.is_valid() => {
-                let eid = state.elicitation_id.clone();
-                let content = state.build_accept_content();
-                let display = state.selected_display();
+            ElicitationFieldKind::BooleanToggle => match state
+                .selected
+                .get(&field.name)
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(true) => "Yes".into(),
+                Some(false) => "No".into(),
+                None => String::new(),
+            },
+        }
+    };
+
+    if ui.custom_active {
+        match key.code {
+            KeyCode::Esc => {
+                ui.custom_active = false;
+                ui.custom_scroll = 0;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                ui.custom_insert(&mut state.custom_input, '\n');
+            }
+            KeyCode::Enter if state.is_valid(Some(&state.custom_input)) => {
+                let elicitation_id = state.elicitation_id.clone();
+                let content = state.build_accept_content(Some(&state.custom_input));
+                let display = selected_display(state, true);
                 cmd_tx.send(ClientMsg::ElicitationResponse {
-                    elicitation_id: eid.clone(),
+                    elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
                 })?;
-                app.resolve_elicitation(&eid, &display);
+                app.resolve_elicitation(&elicitation_id, &display);
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.custom_insert(c);
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.custom_insert(&mut state.custom_input, character);
             }
-            KeyCode::Backspace => state.custom_backspace(),
-            KeyCode::Delete => state.custom_delete(),
-            KeyCode::Left => state.custom_left(),
-            KeyCode::Right => state.custom_right(),
-            KeyCode::Home => state.custom_home(),
-            KeyCode::End => state.custom_end(),
-            KeyCode::Up => state.custom_move_visual(-1),
-            KeyCode::Down => state.custom_move_visual(1),
+            KeyCode::Backspace => ui.custom_backspace(&mut state.custom_input),
+            KeyCode::Delete => ui.custom_delete(&mut state.custom_input),
+            KeyCode::Left => ui.custom_left(&state.custom_input),
+            KeyCode::Right => ui.custom_right(&state.custom_input),
+            KeyCode::Home => ui.custom_home(&state.custom_input),
+            KeyCode::End => ui.custom_end(&state.custom_input),
+            KeyCode::Up => ui.custom_move_visual(&state.custom_input, -1),
+            KeyCode::Down => ui.custom_move_visual(&state.custom_input, 1),
             _ => {}
         }
         return Ok(());
     }
 
+    let field = &state.fields[field_index];
+    let option_count = match &field.kind {
+        ElicitationFieldKind::SingleSelect { options }
+        | ElicitationFieldKind::MultiSelect { options } => options.len(),
+        _ => 0,
+    };
+    let custom_available = state.allow_custom && option_count > 0;
+    let custom_option_selected = custom_available && ui.option_cursor == option_count;
+
     match key.code {
         KeyCode::Esc => {
-            let eid = state.elicitation_id.clone();
+            let elicitation_id = state.elicitation_id.clone();
             cmd_tx.send(ClientMsg::ElicitationResponse {
-                elicitation_id: eid.clone(),
+                elicitation_id: elicitation_id.clone(),
                 action: "decline".into(),
                 content: None,
             })?;
-            app.resolve_elicitation(&eid, "declined");
+            app.resolve_elicitation(&elicitation_id, "declined");
         }
-        KeyCode::Down => state.move_cursor(1),
-        KeyCode::Up => state.move_cursor(-1),
+        KeyCode::Down => {
+            let max = option_count + usize::from(custom_available);
+            ui.option_cursor = (ui.option_cursor + 1).min(max.saturating_sub(1));
+        }
+        KeyCode::Up => ui.option_cursor = ui.option_cursor.saturating_sub(1),
         KeyCode::Char(' ') => {
-            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
-                return Ok(());
-            };
             if matches!(
-                kind,
+                field.kind,
                 ElicitationFieldKind::MultiSelect { .. } | ElicitationFieldKind::BooleanToggle
             ) {
-                state.toggle_current_option();
+                state.toggle_option(field_index, ui.option_cursor);
             }
         }
         KeyCode::Enter => {
-            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
-                return Ok(());
-            };
-            match kind {
-                ElicitationFieldKind::SingleSelect { .. } => {
-                    state.select_current_option();
-                    if state.custom_active {
-                        return Ok(());
-                    }
-                }
-                ElicitationFieldKind::MultiSelect { .. } if state.custom_option_selected() => {
-                    state.activate_custom();
+            match field.kind {
+                ElicitationFieldKind::SingleSelect { .. } if custom_option_selected => {
+                    ui.custom_active = true;
+                    ui.custom_cursor = state.custom_input.len();
+                    state.clear_selection(field_index);
                     return Ok(());
                 }
-                ElicitationFieldKind::TextInput
+                ElicitationFieldKind::SingleSelect { .. } => {
+                    state.select_option(field_index, ui.option_cursor);
+                }
+                ElicitationFieldKind::MultiSelect { .. } if custom_option_selected => {
+                    ui.custom_active = true;
+                    ui.custom_cursor = state.custom_input.len();
+                    state.clear_selection(field_index);
+                    return Ok(());
+                }
+                ElicitationFieldKind::MultiSelect { .. }
+                | ElicitationFieldKind::TextInput
                 | ElicitationFieldKind::NumberInput { .. }
-                | ElicitationFieldKind::BooleanToggle
-                | ElicitationFieldKind::MultiSelect { .. } => {}
+                | ElicitationFieldKind::BooleanToggle => {}
             }
 
-            if state.is_valid() {
-                let eid = state.elicitation_id.clone();
-                let content = state.build_accept_content();
-                let display = state.selected_display();
+            if state.is_valid(None) {
+                let elicitation_id = state.elicitation_id.clone();
+                let content = state.build_accept_content(None);
+                let display = selected_display(state, false);
                 cmd_tx.send(ClientMsg::ElicitationResponse {
-                    elicitation_id: eid.clone(),
+                    elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
                 })?;
-                app.resolve_elicitation(&eid, &display);
+                app.resolve_elicitation(&elicitation_id, &display);
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
-                return Ok(());
-            };
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if matches!(
-                kind,
+                field.kind,
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
             ) {
-                let cursor = state.text_cursor;
-                state.text_input.insert(cursor, c);
-                state.text_cursor += c.len_utf8();
+                state.text_input.insert(ui.text_cursor, character);
+                ui.text_cursor += character.len_utf8();
             }
         }
-        KeyCode::Backspace => {
-            let Some(kind) = state.current_field().map(|field| field.kind.clone()) else {
-                return Ok(());
-            };
+        KeyCode::Backspace
             if matches!(
-                kind,
+                field.kind,
                 ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
-            ) && state.text_cursor > 0
-            {
-                let cursor = state.text_cursor;
-                let ch = state.text_input[..cursor].chars().next_back().unwrap();
-                let ch_len = ch.len_utf8();
-                state.text_input.remove(cursor - ch_len);
-                state.text_cursor -= ch_len;
-            }
+            ) && ui.text_cursor > 0 =>
+        {
+            let previous = state.text_input[..ui.text_cursor]
+                .char_indices()
+                .last()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            state.text_input.drain(previous..ui.text_cursor);
+            ui.text_cursor = previous;
         }
         _ => {}
     }
@@ -772,7 +825,7 @@ pub(crate) fn handle_chord(
                     app.input_scroll = 0;
                 }
                 app.push_pending_undo(&turn);
-                app.activity = ActivityState::SessionOp(app::SessionOp::Undo);
+                app.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(app::LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(ClientMsg::Undo {
                     message_id: turn.message_id,
@@ -794,7 +847,7 @@ pub(crate) fn handle_chord(
             } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.set_status(app::LogLevel::Warn, "session", "undo already pending");
             } else if app.can_redo() {
-                app.activity = ActivityState::SessionOp(app::SessionOp::Redo);
+                app.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(app::LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(ClientMsg::Redo)?;
             } else {
@@ -2101,7 +2154,7 @@ fn try_execute_slash_command(
                     app.input_scroll = 0;
                 }
                 app.push_pending_undo(&turn);
-                app.activity = app::ActivityState::SessionOp(app::SessionOp::Undo);
+                app.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(app::LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(ClientMsg::Undo {
                     message_id: turn.message_id,
@@ -2124,7 +2177,7 @@ fn try_execute_slash_command(
             } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.set_status(app::LogLevel::Warn, "session", "redo already pending");
             } else if app.can_redo() {
-                app.activity = app::ActivityState::SessionOp(app::SessionOp::Redo);
+                app.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(app::LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(ClientMsg::Redo)?;
             } else {

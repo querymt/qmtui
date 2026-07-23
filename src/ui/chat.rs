@@ -8,10 +8,8 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{
-    ActivityState, App, ChatEntry, DelegateEntry, DiffPreviewSection, SessionOp, ShellOutputTail,
-    ToolDetail,
-};
+use crate::app::{App, ChatEntry, DiffPreviewSection, ShellOutputTail, ToolDetail};
+use crate::domain::activity::{ActivityState, DelegateEntry, SessionOp};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
@@ -739,7 +737,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
     }
 
     if !app.delegate_entries.is_empty() {
-        use crate::app::DelegateStatus;
+        use crate::domain::activity::DelegateStatus;
         let (mut done, mut has_failed, mut has_running, mut awaiting_input) =
             (0usize, false, false, false);
         for e in &app.delegate_entries {
@@ -990,12 +988,16 @@ fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
 }
 
 fn elicitation_option_rows(app: &App, width: u16) -> u16 {
-    use crate::app::ElicitationFieldKind;
+    use crate::domain::elicitation::ElicitationFieldKind;
 
-    let Some(state) = &app.elicitation else {
+    let (Some(state), Some(ui)) = (&app.elicitation, &app.elicitation_ui) else {
         return 0;
     };
-    let schema_rows = match state.current_field().map(|field| &field.kind) {
+    let schema_rows = match ui
+        .current_field_index(state.fields.len())
+        .and_then(|index| state.fields.get(index))
+        .map(|field| &field.kind)
+    {
         Some(ElicitationFieldKind::SingleSelect { options })
         | Some(ElicitationFieldKind::MultiSelect { options }) => options
             .iter()
@@ -1008,25 +1010,34 @@ fn elicitation_option_rows(app: &App, width: u16) -> u16 {
             .sum(),
         _ => 1,
     };
-    schema_rows + u16::from(state.custom_available())
+    let option_count = match ui
+        .current_field_index(state.fields.len())
+        .and_then(|index| state.fields.get(index))
+        .map(|field| &field.kind)
+    {
+        Some(ElicitationFieldKind::SingleSelect { options })
+        | Some(ElicitationFieldKind::MultiSelect { options }) => options.len(),
+        _ => 0,
+    };
+    schema_rows + u16::from(state.allow_custom && option_count > 0)
 }
 
 fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
-    if let Some(state) = &app.elicitation {
+    if let (Some(state), Some(ui)) = (&app.elicitation, &app.elicitation_ui) {
         let message_width = area.width.saturating_sub(4).max(1);
         let message_rows = wrapped_text_rows(&state.message, message_width);
         let option_width = area.width.saturating_sub(6).max(1);
         let option_rows = elicitation_option_rows(app, option_width);
-        let custom_rows = if state.custom_active {
+        let custom_rows = if ui.custom_active {
             let width = area.width.saturating_sub(4) as usize;
-            build_input_visual_layout(&state.custom_input, state.custom_cursor, width.max(1), 2)
+            build_input_visual_layout(&state.custom_input, ui.custom_cursor, width.max(1), 2)
                 .total_rows() as u16
         } else {
             0
         };
         // Top padding, title, wrapped message, choices/input, and hint, each separated as needed.
         let content_rows = option_rows.max(1) + custom_rows.min(5);
-        let custom_spacing = u16::from(state.custom_active);
+        let custom_spacing = u16::from(ui.custom_active);
         (7 + message_rows.max(1) + content_rows + custom_spacing).min(area.height.saturating_sub(3))
     } else {
         0
@@ -1141,12 +1152,12 @@ fn draw_input_panel(
 // ── Elicitation popup ─────────────────────────────────────────────────────────
 
 fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::app::ElicitationFieldKind;
+    use crate::domain::elicitation::ElicitationFieldKind;
 
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let Some(state) = app.elicitation.as_mut() else {
+    let (Some(state), Some(ui)) = (app.elicitation.as_mut(), app.elicitation_ui.as_mut()) else {
         return;
     };
 
@@ -1203,7 +1214,11 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
     // Keep the choices visually separate from the question text.
     row = row.saturating_add(1).min(max_y);
 
-    let Some(field) = state.current_field().cloned() else {
+    let Some(field) = ui
+        .current_field_index(state.fields.len())
+        .and_then(|index| state.fields.get(index))
+        .cloned()
+    else {
         return;
     };
     match &field.kind {
@@ -1215,7 +1230,7 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 if row >= max_y {
                     break;
                 }
-                let highlighted = !state.custom_active && idx == state.option_cursor;
+                let highlighted = !ui.custom_active && idx == ui.option_cursor;
                 let is_chosen = if is_multi {
                     matches!(selected_vals, Some(serde_json::Value::Array(arr)) if arr.contains(&opt.value))
                 } else {
@@ -1264,15 +1279,15 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 row += option_rows;
             }
 
-            if state.custom_available() && row < max_y {
-                let highlighted = state.custom_option_selected();
-                let style = if highlighted || state.custom_active {
+            if state.allow_custom && !options.is_empty() && row < max_y {
+                let highlighted = ui.option_cursor == options.len();
+                let style = if highlighted || ui.custom_active {
                     Theme::status_accent()
                 } else {
                     Theme::status()
                 };
                 let bullet = if is_multi {
-                    if state.custom_active {
+                    if ui.custom_active {
                         CHECK_CHECKED
                     } else {
                         CHECK_UNCHECKED
@@ -1293,27 +1308,26 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 row += 1;
             }
 
-            if state.custom_active && row < max_y {
+            if ui.custom_active && row < max_y {
                 // Keep the custom editor visually separate from the choices.
                 row = row.saturating_add(1).min(max_y);
-                let line_width = inner.width.saturating_sub(2) as usize;
-                state.custom_line_width = line_width.max(1);
+                ui.custom_line_width = (inner.width.saturating_sub(2) as usize).max(1);
                 let layout = build_input_visual_layout(
                     &state.custom_input,
-                    state.custom_cursor,
-                    state.custom_line_width,
+                    ui.custom_cursor,
+                    ui.custom_line_width,
                     2,
                 );
                 let total_rows = layout.total_rows() as u16;
                 // Reserve a spacer, the help row, and bottom padding below the editor.
                 let visible = total_rows.min(max_y.saturating_sub(row + 3)).min(5);
-                if layout.cursor_row as u16 >= state.custom_scroll + visible {
-                    state.custom_scroll = layout.cursor_row as u16 - visible + 1;
+                if layout.cursor_row as u16 >= ui.custom_scroll + visible {
+                    ui.custom_scroll = layout.cursor_row as u16 - visible + 1;
                 }
-                if (layout.cursor_row as u16) < state.custom_scroll {
-                    state.custom_scroll = layout.cursor_row as u16;
+                if (layout.cursor_row as u16) < ui.custom_scroll {
+                    ui.custom_scroll = layout.cursor_row as u16;
                 }
-                state.custom_scroll = state.custom_scroll.min(total_rows.saturating_sub(visible));
+                ui.custom_scroll = ui.custom_scroll.min(total_rows.saturating_sub(visible));
 
                 let lines: Vec<Line<'static>> = layout
                     .rows
@@ -1333,10 +1347,10 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 f.render_widget(
                     Paragraph::new(lines)
                         .style(Theme::popup_bg())
-                        .scroll((state.custom_scroll, 0)),
+                        .scroll((ui.custom_scroll, 0)),
                     Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), visible),
                 );
-                let cursor_row = (layout.cursor_row as u16).saturating_sub(state.custom_scroll);
+                let cursor_row = (layout.cursor_row as u16).saturating_sub(ui.custom_scroll);
                 if cursor_row < visible {
                     f.set_cursor_position((
                         inner.x + 2 + layout.cursor_col as u16,
@@ -1395,7 +1409,7 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
     // Keep controls visually separate from the answer area.
     row = row.saturating_add(1).min(max_y);
     if row < max_y {
-        let hint = if state.custom_active {
+        let hint = if ui.custom_active {
             " type answer  Shift+Enter newline  Enter submit  Esc back".to_string()
         } else {
             match field.kind {

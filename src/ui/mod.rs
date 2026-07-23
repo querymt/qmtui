@@ -41,6 +41,95 @@ use unicode_width::UnicodeWidthChar;
 use crate::app::{App, ConnState, Popup, Screen};
 use crate::theme::Theme;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ElicitationUiState {
+    pub(crate) field_cursor: usize,
+    pub(crate) option_cursor: usize,
+    pub(crate) text_cursor: usize,
+    pub(crate) custom_active: bool,
+    pub(crate) custom_cursor: usize,
+    pub(crate) custom_line_width: usize,
+    pub(crate) custom_scroll: u16,
+}
+
+impl ElicitationUiState {
+    pub(crate) fn current_field_index(&self, field_count: usize) -> Option<usize> {
+        (field_count > 0).then(|| self.field_cursor.min(field_count - 1))
+    }
+
+    pub(crate) fn custom_insert(&mut self, input: &mut String, character: char) {
+        input.insert(self.custom_cursor, character);
+        self.custom_cursor += character.len_utf8();
+    }
+
+    pub(crate) fn custom_backspace(&mut self, input: &mut String) {
+        if self.custom_cursor == 0 {
+            return;
+        }
+        let previous = input[..self.custom_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        input.drain(previous..self.custom_cursor);
+        self.custom_cursor = previous;
+    }
+
+    pub(crate) fn custom_delete(&mut self, input: &mut String) {
+        if self.custom_cursor >= input.len() {
+            return;
+        }
+        let next = input[self.custom_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.custom_cursor + index)
+            .unwrap_or(input.len());
+        input.drain(self.custom_cursor..next);
+    }
+
+    pub(crate) fn custom_left(&mut self, input: &str) {
+        if self.custom_cursor > 0 {
+            self.custom_cursor = input[..self.custom_cursor]
+                .char_indices()
+                .last()
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+        }
+    }
+
+    pub(crate) fn custom_right(&mut self, input: &str) {
+        if self.custom_cursor < input.len() {
+            self.custom_cursor = input[self.custom_cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(index, _)| self.custom_cursor + index)
+                .unwrap_or(input.len());
+        }
+    }
+
+    pub(crate) fn custom_home(&mut self, input: &str) {
+        self.custom_cursor = input[..self.custom_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+    }
+
+    pub(crate) fn custom_end(&mut self, input: &str) {
+        self.custom_cursor = input[self.custom_cursor..]
+            .find('\n')
+            .map(|index| self.custom_cursor + index)
+            .unwrap_or(input.len());
+    }
+
+    pub(crate) fn custom_move_visual(&mut self, input: &str, delta: i32) {
+        let layout =
+            build_input_visual_layout(input, self.custom_cursor, self.custom_line_width.max(1), 2);
+        let row = (layout.cursor_row as i32 + delta)
+            .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
+        self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputVisualRow {
     pub(crate) text: String,
@@ -1498,11 +1587,42 @@ mod tests {
     }
 
     #[test]
+    fn custom_editor_visual_movement_crosses_wrapped_rows() {
+        let mut ui = ElicitationUiState {
+            custom_cursor: 5,
+            custom_line_width: 5,
+            ..Default::default()
+        };
+        let input = "abcdefghij";
+
+        ui.custom_move_visual(input, 1);
+        assert_eq!(ui.custom_cursor, 10);
+        ui.custom_move_visual(input, -1);
+        assert_eq!(ui.custom_cursor, 5);
+    }
+
+    #[test]
+    fn custom_editor_visual_movement_crosses_explicit_newline() {
+        let mut ui = ElicitationUiState {
+            custom_cursor: 2,
+            custom_line_width: 20,
+            ..Default::default()
+        };
+        let input = "ab\ncdef";
+
+        ui.custom_move_visual(input, 1);
+        assert_eq!(ui.custom_cursor, 5);
+        ui.custom_move_visual(input, -1);
+        assert_eq!(ui.custom_cursor, 2);
+    }
+
+    #[test]
     fn draw_chat_does_not_panic_with_empty_elicitation_fields() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.elicitation = Some(crate::app::ElicitationState::new_for_test(vec![]));
+        app.elicitation_ui = Some(ElicitationUiState::default());
 
         let _buffer = render_chat_buffer(&mut app, 80, 12);
     }
@@ -1529,11 +1649,15 @@ mod tests {
                 }],
             },
         }]);
-        state.option_cursor = 1;
-        state.activate_custom();
         state.custom_input = "a deliberately long custom response that wraps\nsecond line".into();
-        state.custom_cursor = state.custom_input.len();
+        let ui = ElicitationUiState {
+            option_cursor: 1,
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+            ..Default::default()
+        };
         app.elicitation = Some(state);
+        app.elicitation_ui = Some(ui);
 
         let buffer = render_chat_buffer(&mut app, 40, 21);
         let rendered = buffer
@@ -1571,6 +1695,7 @@ mod tests {
         }]);
         state.message = "When designing a new system-level tool, which approach best describes how you balance rapid prototyping and maintainability?".into();
         app.elicitation = Some(state);
+        app.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_chat_buffer(&mut app, 50, 21);
         let first =
@@ -1604,6 +1729,7 @@ mod tests {
                 }],
             },
         }]));
+        app.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_chat_buffer(&mut app, 50, 21);
         let first = find_buffer_text(&buffer, "Keep the validated").expect("missing answer row");
@@ -1649,6 +1775,7 @@ mod tests {
                 ],
             },
         }]));
+        app.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_delegate_buffer(&mut app, 100, 17);
         let rendered = buffer_text(&buffer);
@@ -2876,6 +3003,7 @@ mod tests {
         }]);
         state.message = "Need approval".into();
         app.elicitation = Some(state);
+        app.elicitation_ui = Some(ElicitationUiState::default());
         let rendered = buffer_text(&render_delegate_buffer(&mut app, 100, 16));
         assert!(rendered.contains("Question"));
         assert!(rendered.contains("Need approval"));
