@@ -8,6 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AuthPanel, LogLevel, session_group_count_text};
+use crate::domain::activity::DelegateStats;
 use crate::protocol::{OAuthStatus, ProfileInfo};
 use crate::theme::Theme;
 
@@ -607,7 +608,7 @@ struct DelegateRowData {
     is_current: bool,
 }
 
-fn format_delegate_tools(stats: &crate::app::DelegateStats) -> String {
+fn format_delegate_tools(stats: &DelegateStats) -> String {
     if stats.tool_calls > 0 {
         format!("{DELEGATE_ICON_TOOLS}{}", stats.tool_calls)
     } else {
@@ -615,7 +616,7 @@ fn format_delegate_tools(stats: &crate::app::DelegateStats) -> String {
     }
 }
 
-fn format_delegate_messages(stats: &crate::app::DelegateStats) -> String {
+fn format_delegate_messages(stats: &DelegateStats) -> String {
     if stats.messages > 0 {
         format!("{DELEGATE_ICON_MSG}{}", stats.messages)
     } else {
@@ -623,7 +624,7 @@ fn format_delegate_messages(stats: &crate::app::DelegateStats) -> String {
     }
 }
 
-fn format_delegate_context(stats: &crate::app::DelegateStats) -> String {
+fn format_delegate_context(stats: &DelegateStats) -> String {
     if let Some(pct) = stats.context_pct() {
         format!("{DELEGATE_ICON_CONTEXT}{pct}%")
     } else if stats.context_tokens > 0 {
@@ -638,7 +639,7 @@ fn format_delegate_context(stats: &crate::app::DelegateStats) -> String {
     }
 }
 
-fn format_delegate_cost(stats: &crate::app::DelegateStats) -> String {
+fn format_delegate_cost(stats: &DelegateStats) -> String {
     if stats.cost_usd > 0.0 {
         format!("${:.2}", stats.cost_usd)
     } else {
@@ -651,7 +652,7 @@ fn delegate_display_width(text: &str) -> u16 {
 }
 
 fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
-    use crate::app::DelegateStatus;
+    use crate::domain::activity::DelegateStatus;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
