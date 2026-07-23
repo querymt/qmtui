@@ -589,13 +589,10 @@ impl crate::app::App {
         profile_id: Option<String>,
     ) -> Vec<ClientMsg> {
         self.activity = ActivityState::Idle;
-        self.parent_session_id = self.pending_parent_session_id.take().or_else(|| {
-            self.session_groups
-                .iter()
-                .flat_map(|g| &g.sessions)
-                .find(|s| s.session_id == session_id)
-                .and_then(|s| s.parent_session_id.clone())
-        });
+        self.parent_session_id = self
+            .pending_parent_session_id
+            .take()
+            .or_else(|| self.session_parent_id(&session_id).map(str::to_owned));
         self.apply_session_profile_binding(&session_id, profile_id);
         self.session_id = Some(session_id.clone());
         self.agent_id = Some(agent_id);
@@ -1832,8 +1829,26 @@ mod tests {
     fn native_session_loaded_discovers_parent_preserves_delegate_state_and_resets_view() {
         let mut app = App::new();
         app.agent_mode = "plan".into();
-        app.session_groups = vec![session_group("/repo", &["parent", "child"])];
-        app.session_groups[0].sessions[1].parent_session_id = Some("parent".into());
+        let mut child = SessionSummary {
+            session_id: "child".into(),
+            parent_session_id: Some("parent".into()),
+            ..Default::default()
+        };
+        child.children = vec![SessionSummary {
+            session_id: "grandchild".into(),
+            parent_session_id: Some("child".into()),
+            ..Default::default()
+        }];
+        let mut parent = SessionSummary {
+            session_id: "parent".into(),
+            ..Default::default()
+        };
+        parent.children = vec![child];
+        app.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: vec![parent],
+            ..Default::default()
+        }];
         app.messages.push(ChatEntry::Error("stale".into()));
         app.streaming_content = "stale stream".into();
         app.streaming_content_message_id = Some("stream-1".into());

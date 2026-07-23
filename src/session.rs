@@ -87,6 +87,11 @@ impl App {
             .find_map(|group| find(&group.sessions, session_id))
     }
 
+    pub fn session_parent_id(&self, session_id: &str) -> Option<&str> {
+        self.session_summary_by_id(session_id)
+            .and_then(|session| session.parent_session_id.as_deref())
+    }
+
     pub fn remember_remote_session_node(&mut self, session_id: &str, node_id: &str) {
         self.remote_session_nodes
             .insert(session_id.to_string(), node_id.to_string());
@@ -717,6 +722,35 @@ mod tests {
             session_id: id.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn session_parent_id_finds_explicit_parent_at_any_depth() {
+        let mut app = App::new();
+        let mut grandchild = session("grandchild");
+        grandchild.parent_session_id = Some("child".into());
+        let mut child = session("child");
+        child.parent_session_id = Some("parent".into());
+        child.children = vec![grandchild];
+        let mut parent = session("parent");
+        parent.children = vec![child];
+        app.session_groups = vec![
+            SessionGroup {
+                cwd: Some("/unrelated".into()),
+                sessions: vec![session("unrelated")],
+                ..Default::default()
+            },
+            SessionGroup {
+                cwd: Some("/repo".into()),
+                sessions: vec![parent],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(app.session_parent_id("child"), Some("parent"));
+        assert_eq!(app.session_parent_id("grandchild"), Some("child"));
+        assert_eq!(app.session_parent_id("unrelated"), None);
+        assert_eq!(app.session_parent_id("missing"), None);
     }
 
     #[test]
