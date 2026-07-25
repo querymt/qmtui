@@ -1119,9 +1119,8 @@ pub enum StartPageItem {
 
 /// Maximum number of recent sessions shown per group on the start page.
 pub const MAX_RECENT_SESSIONS: usize = 3;
-/// Target visible sessions per group when auto-filling the sessions popup.
+/// Maximum discovery-preview sessions retained before the workspace page arrives.
 pub const POPUP_SESSION_PAGE_TARGET: usize = 10;
-pub const SESSION_GROUP_PAGE_LIMIT: u32 = 10;
 pub const SESSION_CHILD_PAGE_LIMIT: u32 = 10;
 
 /// Maximum number of workspace groups shown on the start page.
@@ -1214,8 +1213,14 @@ pub struct App {
     /// Groups whose header has been collapsed by the user in the session popup.
     /// Separate from `collapsed_groups` so start-page and popup states are independent.
     pub popup_collapsed_groups: HashSet<String>,
-    /// CWDs with an outstanding group-page session request.
+    /// Whether global ACP session discovery has another request in flight.
+    pub session_discovery_in_progress: bool,
+    /// Opaque global cursors already queued during the current discovery pass.
+    pub session_discovery_cursors: HashSet<String>,
+    /// CWDs with an outstanding first-page or continuation request.
     pub pending_session_group_loads: HashSet<Option<String>>,
+    /// CWDs whose authoritative first workspace page has been loaded.
+    pub hydrated_session_groups: HashSet<String>,
     /// Root session IDs expanded to show fork children.
     pub expanded_session_children: HashSet<String>,
     /// Parent session IDs with an outstanding child-page request.
@@ -1443,16 +1448,26 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 }
 
 impl App {
+    pub fn begin_session_discovery(&mut self) -> Option<ClientMsg> {
+        if self.session_discovery_in_progress || !self.pending_session_group_loads.is_empty() {
+            return None;
+        }
+        self.session_groups.clear();
+        self.session_discovery_cursors.clear();
+        self.pending_session_group_loads.clear();
+        self.hydrated_session_groups.clear();
+        self.session_discovery_in_progress = true;
+        Some(ClientMsg::list_sessions_browse())
+    }
+
     pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<ClientMsg> {
         let group = self.session_groups.get(group_idx)?;
         let cursor = group.next_cursor.clone()?;
-        let cwd = group.cwd.clone();
-        self.pending_session_group_loads.insert(cwd.clone());
-        Some(ClientMsg::list_sessions_group(
-            cwd,
-            cursor,
-            SESSION_GROUP_PAGE_LIMIT,
-        ))
+        let cwd = group.cwd.clone()?;
+        if !self.pending_session_group_loads.insert(Some(cwd.clone())) {
+            return None;
+        }
+        Some(ClientMsg::list_sessions_group(cwd, cursor))
     }
 
     pub fn session_child_page_request(
@@ -1485,7 +1500,10 @@ impl App {
             session_popup_tab: 0,
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
+            session_discovery_in_progress: false,
+            session_discovery_cursors: HashSet::new(),
             pending_session_group_loads: HashSet::new(),
+            hydrated_session_groups: HashSet::new(),
             expanded_session_children: HashSet::new(),
             pending_session_child_loads: HashSet::new(),
             start_page_scroll: 0,
@@ -2393,6 +2411,8 @@ impl App {
             ConnectionEvent::Disconnected { reason } => {
                 self.conn = ConnState::Disconnected;
                 self.reconnect_delay_ms = None;
+                self.session_discovery_in_progress = false;
+                self.pending_session_group_loads.clear();
                 self.set_status(
                     LogLevel::Warn,
                     "connection",
@@ -10006,6 +10026,20 @@ mod popup_item_tests {
     }
 
     // ── no MAX_VISIBLE_GROUPS cap ─────────────────────────────────────────────
+
+    #[test]
+    fn popup_items_hide_group_load_more_while_request_is_pending() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/workspace/project"), &["s1"]);
+        group.next_cursor = Some("opaque-workspace-2".to_string());
+        app.session_groups = vec![group];
+        app.pending_session_group_loads
+            .insert(Some("/workspace/project".to_string()));
+
+        assert!(!app.visible_popup_items().iter().any(
+            |item| matches!(item, PopupItem::LoadMore { parent_path, .. } if parent_path.is_empty())
+        ));
+    }
 
     #[test]
     fn popup_items_shows_all_groups_beyond_cap() {

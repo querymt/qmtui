@@ -7,12 +7,13 @@ use crate::acp_client::{
 };
 use crate::app::{
     ActivityState, ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
-    ElicitationState, LogLevel, Popup, Screen, ToolDetail,
+    ElicitationState, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen, ToolDetail,
 };
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
-    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, UndoResultData, UndoStackFrame,
+    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, SessionListRequest,
+    UndoResultData, UndoStackFrame,
 };
 use crate::tool_detail;
 
@@ -117,9 +118,13 @@ pub(crate) enum AcpAppEvent {
     RemoteSessions(RemoteSessionListInfo),
     RemoteSessionAttached(RemoteSessionAttachInfo),
     SessionList {
+        request: SessionListRequest,
         groups: Vec<SessionGroup>,
         next_cursor: Option<String>,
-        total_count: Option<u64>,
+    },
+    SessionListFailed {
+        request: SessionListRequest,
+        message: String,
     },
     SessionCreated {
         agent_id: String,
@@ -305,11 +310,14 @@ impl crate::app::App {
                 attached.attached,
             ),
             AcpAppEvent::SessionList {
+                request,
                 groups,
                 next_cursor,
-                total_count,
-            } => {
-                self.apply_acp_session_list(groups, next_cursor, total_count);
+            } => self.apply_acp_session_list(request, groups, next_cursor),
+            AcpAppEvent::SessionListFailed { request, message } => {
+                self.apply_acp_session_list_failure(&request);
+                self.push_acp_error(&message);
+                self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
                 vec![]
             }
             AcpAppEvent::SessionCreated {
@@ -574,91 +582,156 @@ impl crate::app::App {
 
     fn apply_acp_session_list(
         &mut self,
+        request: SessionListRequest,
         mut groups: Vec<SessionGroup>,
-        _next_cursor: Option<String>,
-        total_count: Option<u64>,
-    ) {
-        let response_cwd = if groups.len() == 1 {
-            groups.first().and_then(|group| group.cwd.clone())
-        } else {
-            None
-        };
-        let is_group_page = response_cwd
-            .as_ref()
-            .map(|cwd| self.pending_session_group_loads.remove(&Some(cwd.clone())))
-            .unwrap_or_else(|| self.pending_session_group_loads.remove(&None));
-
-        groups.retain(|group| is_group_page || !group.sessions.is_empty());
+        next_cursor: Option<String>,
+    ) -> Vec<ClientMsg> {
         for group in &mut groups {
+            group.total_count = None;
             for session in &group.sessions {
                 if let Some(node_id) = session.node_id.as_deref() {
                     self.remember_remote_session_node(&session.session_id, node_id);
                 }
             }
-            group
+            group.sessions.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| b.session_id.cmp(&a.session_id))
+            });
+            group.latest_activity = group
                 .sessions
-                .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                .first()
+                .and_then(|session| session.updated_at.clone());
         }
 
-        if is_group_page {
-            for group in groups {
-                if let Some(existing) = self
+        let mut commands = Vec::new();
+        match request {
+            SessionListRequest::Discovery => {
+                self.session_discovery_in_progress = false;
+                for mut group in groups {
+                    group.next_cursor = None;
+                    match group.cwd.clone() {
+                        Some(cwd) => {
+                            let hydrated = self.hydrated_session_groups.contains(&cwd);
+                            if let Some(existing) = self
+                                .session_groups
+                                .iter_mut()
+                                .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
+                            {
+                                if !hydrated {
+                                    merge_session_page(
+                                        existing,
+                                        group.sessions,
+                                        Some(POPUP_SESSION_PAGE_TARGET),
+                                    );
+                                }
+                            } else {
+                                group.sessions.truncate(POPUP_SESSION_PAGE_TARGET);
+                                self.session_groups.push(group);
+                            }
+
+                            if !hydrated
+                                && self.pending_session_group_loads.insert(Some(cwd.clone()))
+                            {
+                                commands.push(ClientMsg::list_sessions_workspace(cwd));
+                            }
+                        }
+                        None => {
+                            if let Some(existing) = self
+                                .session_groups
+                                .iter_mut()
+                                .find(|existing| existing.cwd.is_none())
+                            {
+                                merge_session_page(
+                                    existing,
+                                    group.sessions,
+                                    Some(POPUP_SESSION_PAGE_TARGET),
+                                );
+                            } else {
+                                group.sessions.truncate(POPUP_SESSION_PAGE_TARGET);
+                                self.session_groups.push(group);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(cursor) = next_cursor
+                    && self.session_discovery_cursors.insert(cursor.clone())
+                {
+                    self.session_discovery_in_progress = true;
+                    commands.push(ClientMsg::list_sessions_discovery(Some(cursor)));
+                }
+            }
+            SessionListRequest::WorkspaceFirstPage { cwd } => {
+                self.pending_session_group_loads.remove(&Some(cwd.clone()));
+                self.hydrated_session_groups.insert(cwd.clone());
+                let mut group = groups
+                    .into_iter()
+                    .find(|group| group.cwd.as_deref() == Some(cwd.as_str()))
+                    .unwrap_or_else(|| SessionGroup {
+                        cwd: Some(cwd.clone()),
+                        ..SessionGroup::default()
+                    });
+                group.cwd = Some(cwd.clone());
+                group.total_count = None;
+
+                if group.sessions.is_empty() {
+                    self.session_groups
+                        .retain(|existing| existing.cwd.as_deref() != Some(cwd.as_str()));
+                } else if let Some(existing) = self
                     .session_groups
                     .iter_mut()
-                    .find(|existing| existing.cwd == group.cwd)
+                    .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
                 {
-                    let mut seen = existing
-                        .sessions
-                        .iter()
-                        .map(|session| session.session_id.clone())
-                        .collect::<std::collections::HashSet<_>>();
-                    existing.sessions.extend(
-                        group
-                            .sessions
-                            .into_iter()
-                            .filter(|session| seen.insert(session.session_id.clone())),
-                    );
-                    existing
-                        .sessions
-                        .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-                    existing.latest_activity = existing
-                        .sessions
-                        .first()
-                        .and_then(|session| session.updated_at.clone())
-                        .or(group.latest_activity);
-                    existing.total_count = group.total_count;
-                    existing.next_cursor = group.next_cursor;
-                } else if !group.sessions.is_empty() {
+                    *existing = group;
+                } else {
                     self.session_groups.push(group);
                 }
             }
-        } else {
-            groups.sort_by(|a, b| {
-                let a_latest = a.sessions.first().and_then(|s| s.updated_at.as_deref());
-                let b_latest = b.sessions.first().and_then(|s| s.updated_at.as_deref());
-                b_latest.cmp(&a_latest)
-            });
-            self.session_groups = groups;
+            SessionListRequest::WorkspaceContinuation { cwd } => {
+                self.pending_session_group_loads.remove(&Some(cwd.clone()));
+                let page = groups
+                    .into_iter()
+                    .find(|group| group.cwd.as_deref() == Some(cwd.as_str()))
+                    .unwrap_or_else(|| SessionGroup {
+                        cwd: Some(cwd.clone()),
+                        ..SessionGroup::default()
+                    });
+                if let Some(existing) = self
+                    .session_groups
+                    .iter_mut()
+                    .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
+                {
+                    existing.next_cursor = page.next_cursor.clone();
+                    merge_session_page(existing, page.sessions, None);
+                } else if !page.sessions.is_empty() {
+                    self.session_groups.push(page);
+                }
+            }
         }
 
+        self.session_groups
+            .retain(|group| !group.sessions.is_empty());
         self.session_groups.sort_by(|a, b| {
-            let a_latest = a.sessions.first().and_then(|s| s.updated_at.as_deref());
-            let b_latest = b.sessions.first().and_then(|s| s.updated_at.as_deref());
-            b_latest.cmp(&a_latest)
+            b.latest_activity
+                .cmp(&a.latest_activity)
+                .then_with(|| a.cwd.cmp(&b.cwd))
         });
-
-        let total: usize = self.session_groups.iter().map(|g| g.sessions.len()).sum();
-        if !is_group_page && let Some(root_total) = total_count {
-            self.push_log(
-                LogLevel::Info,
-                "session",
-                format!("session list: total root sessions={root_total}, loaded={total}"),
-            );
-        }
 
         let visible_len = self.visible_start_items().len();
         if self.session_cursor >= visible_len && visible_len > 0 {
             self.session_cursor = visible_len - 1;
+        }
+        commands
+    }
+
+    fn apply_acp_session_list_failure(&mut self, request: &SessionListRequest) {
+        match request {
+            SessionListRequest::Discovery => self.session_discovery_in_progress = false,
+            SessionListRequest::WorkspaceFirstPage { cwd }
+            | SessionListRequest::WorkspaceContinuation { cwd } => {
+                self.pending_session_group_loads.remove(&Some(cwd.clone()));
+            }
         }
     }
 
@@ -1610,6 +1683,36 @@ impl crate::app::App {
     }
 }
 
+fn merge_session_page(
+    group: &mut SessionGroup,
+    sessions: Vec<crate::protocol::SessionSummary>,
+    cap: Option<usize>,
+) {
+    let mut seen = group
+        .sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect::<HashSet<_>>();
+    group.sessions.extend(
+        sessions
+            .into_iter()
+            .filter(|session| seen.insert(session.session_id.clone())),
+    );
+    group.sessions.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.session_id.cmp(&a.session_id))
+    });
+    if let Some(cap) = cap {
+        group.sessions.truncate(cap);
+    }
+    group.latest_activity = group
+        .sessions
+        .first()
+        .and_then(|session| session.updated_at.clone());
+    group.total_count = None;
+}
+
 fn normalize_replay_updates(updates: Vec<AcpSessionUpdate>) -> Vec<AcpSessionUpdate> {
     let finalized_messages = finalized_assistant_messages(&updates);
     let mut normalized = Vec::with_capacity(updates.len());
@@ -2372,6 +2475,111 @@ mod tests {
     }
 
     #[test]
+    fn acp_discovery_hydrates_workspaces_and_replays_root_cursor() {
+        let mut app = App::new();
+        app.session_discovery_in_progress = true;
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionList {
+            request: SessionListRequest::Discovery,
+            groups: vec![session_group("/repo", &["s1", "s2"])],
+            next_cursor: Some("opaque-root-2".into()),
+        });
+
+        assert!(app.session_discovery_in_progress);
+        assert!(
+            app.pending_session_group_loads
+                .contains(&Some("/repo".into()))
+        );
+        assert_eq!(app.session_groups[0].next_cursor, None);
+        assert!(replies.iter().any(|reply| matches!(
+            reply,
+            ClientMsg::ListSessions {
+                request: SessionListRequest::WorkspaceFirstPage { cwd },
+                cursor: None,
+                ..
+            } if cwd == "/repo"
+        )));
+        assert!(replies.iter().any(|reply| matches!(
+            reply,
+            ClientMsg::ListSessions {
+                request: SessionListRequest::Discovery,
+                cursor: Some(cursor),
+                cwd: None,
+                ..
+            } if cursor == "opaque-root-2"
+        )));
+    }
+
+    #[test]
+    fn acp_workspace_first_page_replaces_discovery_preview() {
+        let mut app = App::new();
+        app.session_groups = vec![session_group("/repo", &["preview"])];
+        app.pending_session_group_loads.insert(Some("/repo".into()));
+        let mut page = session_group("/repo", &["new-1", "new-2"]);
+        page.next_cursor = Some("opaque-workspace-2".into());
+
+        app.handle_acp_event(AcpAppEvent::SessionList {
+            request: SessionListRequest::WorkspaceFirstPage {
+                cwd: "/repo".into(),
+            },
+            groups: vec![page],
+            next_cursor: Some("opaque-workspace-2".into()),
+        });
+
+        assert!(app.hydrated_session_groups.contains("/repo"));
+        assert!(app.pending_session_group_loads.is_empty());
+        assert_eq!(app.session_groups[0].total_count, None);
+        assert_eq!(
+            app.session_groups[0]
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new-2", "new-1"]
+        );
+        assert_eq!(
+            app.session_groups[0].next_cursor.as_deref(),
+            Some("opaque-workspace-2")
+        );
+    }
+
+    #[test]
+    fn acp_discovery_merges_later_workspaces_without_overwriting_hydrated_groups() {
+        let mut app = App::new();
+        app.session_discovery_in_progress = true;
+        app.hydrated_session_groups.insert("/repo".into());
+        app.session_groups = vec![session_group("/repo", &["authoritative"])];
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionList {
+            request: SessionListRequest::Discovery,
+            groups: vec![
+                session_group("/repo", &["stale-discovery"]),
+                session_group("/later", &["later-1"]),
+            ],
+            next_cursor: None,
+        });
+
+        let repo = app
+            .session_groups
+            .iter()
+            .find(|group| group.cwd.as_deref() == Some("/repo"))
+            .unwrap();
+        assert_eq!(repo.sessions[0].session_id, "authoritative");
+        assert!(
+            app.session_groups
+                .iter()
+                .any(|group| group.cwd.as_deref() == Some("/later"))
+        );
+        assert!(replies.iter().any(|reply| matches!(
+            reply,
+            ClientMsg::ListSessions {
+                request: SessionListRequest::WorkspaceFirstPage { cwd },
+                ..
+            } if cwd == "/later"
+        )));
+    }
+
+    #[test]
     fn acp_group_session_page_merges_group_and_dedupes() {
         let mut app = App::new();
         app.session_groups = vec![session_group("/repo", &["s1"])];
@@ -2380,9 +2588,11 @@ mod tests {
         let mut group = session_group("/repo", &["s1", "s2"]);
         group.next_cursor = Some("cursor-2".into());
         app.handle_acp_event(AcpAppEvent::SessionList {
+            request: SessionListRequest::WorkspaceContinuation {
+                cwd: "/repo".into(),
+            },
             groups: vec![group],
-            next_cursor: None,
-            total_count: None,
+            next_cursor: Some("cursor-2".into()),
         });
 
         assert!(app.pending_session_group_loads.is_empty());
@@ -2397,8 +2607,23 @@ mod tests {
                 .iter()
                 .map(|session| session.session_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["s1", "s2"]
+            vec!["s2", "s1"]
         );
+    }
+
+    #[test]
+    fn acp_session_list_failure_clears_scoped_pending_state() {
+        let mut app = App::new();
+        app.pending_session_group_loads.insert(Some("/repo".into()));
+
+        app.handle_acp_event(AcpAppEvent::SessionListFailed {
+            request: SessionListRequest::WorkspaceContinuation {
+                cwd: "/repo".into(),
+            },
+            message: "failed".into(),
+        });
+
+        assert!(app.pending_session_group_loads.is_empty());
     }
 
     #[test]
