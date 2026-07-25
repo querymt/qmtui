@@ -2164,7 +2164,9 @@ async fn run_loop(
                         app.handle_connection_event(state);
                         if app.conn == app::ConnState::Connected {
                             cmd_tx.send(ClientMsg::Init)?;
-                            cmd_tx.send(ClientMsg::list_sessions_browse())?;
+                            if let Some(request) = app.begin_session_discovery() {
+                                cmd_tx.send(request)?;
+                            }
                             cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
                             if let Some(session_id) = app.session_id.clone() {
                                 if let Some(node_id) = app.session_remote_node_id(&session_id) {

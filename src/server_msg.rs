@@ -4148,6 +4148,7 @@ mod session_list_pagination_tests {
                 ..
             }
         ));
+        assert!(app.session_group_page_request(0).is_none());
 
         let replies = app.handle_server_msg(list_msg(
             vec![

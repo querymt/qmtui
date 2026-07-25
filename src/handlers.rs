@@ -202,7 +202,9 @@ fn open_session_popup(
     app.session_popup_tab = 0;
     app.session_cursor = 0;
     app.session_filter.clear();
-    cmd_tx.send(ClientMsg::list_sessions_browse())?;
+    if let Some(request) = app.begin_session_discovery() {
+        cmd_tx.send(request)?;
+    }
     Ok(())
 }
 
@@ -2027,7 +2029,9 @@ fn try_execute_slash_command(
             app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
-            cmd_tx.send(ClientMsg::list_sessions_browse())?;
+            if let Some(request) = app.begin_session_discovery() {
+                cmd_tx.send(request)?;
+            }
         }
         "delegates" => {
             app.take_input();
