@@ -281,7 +281,6 @@ pub(crate) fn build_input_visual_layout(
 }
 
 // ── Symbols shared across sub-modules ──────────────────────────────────────────
-pub(crate) const OUTCOME_BULLET: &str = "\u{25B8} "; // ▸ prefix for each selected option in resolved card
 pub(super) const COLOR_SWATCH: &str = "\u{25A0}"; // ■ black square  – theme palette colour preview
 pub(crate) const ELLIPSIS: &str = "\u{2026}"; // … horizontal ellipsis – truncation marker
 pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
@@ -471,7 +470,8 @@ fn draw_header(
 mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
-    use crate::app::{App, ChatEntry, Screen};
+    use crate::app::{App, Screen};
+    use crate::domain::chat::ChatEntry;
     use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn delegate_tool_call_label_uses_accent_color() {
-        use crate::app::{ChatEntry, DelegateEntry, DelegateStats, DelegateStatus};
+        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus};
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -1501,9 +1501,7 @@ mod tests {
 
     #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
-        use crate::app::{
-            ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
-        };
+        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
 
         let mut app = App::new();
         app.screen = Screen::Chat;

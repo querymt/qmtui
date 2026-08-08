@@ -8,8 +8,9 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{App, ChatEntry};
+use crate::app::App;
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
+use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
 use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -17,9 +18,7 @@ use crate::markdown;
 use crate::theme::Theme;
 
 use super::start::short_cwd;
-use super::{
-    INPUT_OVERLINE, InputVisualLayout, OUTCOME_BULLET, build_input_visual_layout, draw_header,
-};
+use super::{INPUT_OVERLINE, InputVisualLayout, build_input_visual_layout, draw_header};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 

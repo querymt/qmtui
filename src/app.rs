@@ -9,6 +9,7 @@ pub(crate) use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     PendingDelegateToolCall, SessionActivity, SessionOp, SessionStatsLite,
 };
+use crate::domain::chat::{ChatEntry, format_outcome_labels};
 #[allow(unused_imports)]
 pub(crate) use crate::domain::elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
@@ -17,12 +18,11 @@ use crate::domain::session::{
     ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoState,
     UndoableTurn,
 };
-use crate::domain::tool::ToolDetail;
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
 use crate::protocol::*;
-use crate::ui::{CardCache, ElicitationUiState, OUTCOME_BULLET};
+use crate::ui::{CardCache, ElicitationUiState};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
 /// Invalidated when `streaming_content` grows or is cleared.
@@ -359,46 +359,6 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ChatEntry {
-    User {
-        text: String,
-        message_id: Option<String>,
-    },
-    Assistant {
-        content: String,
-        thinking: Option<String>,
-        message_id: Option<String>,
-    },
-    Thinking {
-        content: String,
-        message_id: Option<String>,
-    },
-    ToolCall {
-        tool_call_id: Option<String>,
-        name: String,
-        is_error: bool,
-        detail: ToolDetail,
-    },
-    CompactionStart {
-        token_estimate: u32,
-    },
-    CompactionEnd {
-        token_estimate: Option<u32>,
-        summary: String,
-        summary_len: u32,
-    },
-    Info(String),
-    Error(String),
-    Elicitation {
-        elicitation_id: String,
-        message: String,
-        source: String,
-        /// None = pending; Some = responded with this outcome label.
-        outcome: Option<String>,
-    },
-}
-
 pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_str: &str) {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) else {
         return;
@@ -418,17 +378,13 @@ pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_s
         let Some(answer_entry) = answer_iter.next() else {
             break;
         };
-        let labels: Vec<String> = answer_entry
+        let labels = answer_entry
             .get("answers")
             .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("{OUTCOME_BULLET}{s}"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        *outcome = Some(labels.join("\n"));
+            .map(|answers| answers.iter().filter_map(|answer| answer.as_str()))
+            .into_iter()
+            .flatten();
+        *outcome = Some(format_outcome_labels(labels));
     }
 }
 
@@ -2891,6 +2847,7 @@ mod session_mode_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::chat::OUTCOME_BULLET;
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {

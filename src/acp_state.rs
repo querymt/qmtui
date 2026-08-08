@@ -5,10 +5,11 @@ use serde_json::Value;
 use crate::acp_client::{
     DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
 };
-use crate::app::{ChatEntry, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
+use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
+use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
 use crate::domain::tool::ToolDetail;
@@ -2077,7 +2078,7 @@ fn acp_content_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ChatEntry, Screen};
+    use crate::app::{App, Screen};
     use crate::domain::session::UndoState;
     use crate::protocol::DelegateModelPreference;
 

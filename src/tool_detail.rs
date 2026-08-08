@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::app::ChatEntry;
+use crate::domain::chat::ChatEntry;
 use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
 
 const DEFAULT_READ_TOOL_LIMIT: u64 = 2000;
