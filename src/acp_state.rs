@@ -10,11 +10,12 @@ use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
 use crate::domain::elicitation::ElicitationState;
+use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
-    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, SessionListRequest,
-    UndoResultData, UndoStackFrame,
+    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionListRequest, UndoResultData,
+    UndoStackFrame,
 };
 use crate::tool_detail;
 
@@ -1426,7 +1427,7 @@ impl crate::app::App {
             .iter()
             .any(|turn| turn.message_id == message_id)
         {
-            self.undoable_turns.push(crate::app::UndoableTurn {
+            self.undoable_turns.push(UndoableTurn {
                 turn_id: message_id.clone(),
                 message_id,
                 text,
@@ -1706,11 +1707,7 @@ impl crate::app::App {
     }
 }
 
-fn merge_session_page(
-    group: &mut SessionGroup,
-    sessions: Vec<crate::protocol::SessionSummary>,
-    cap: Option<usize>,
-) {
+fn merge_session_page(group: &mut SessionGroup, sessions: Vec<SessionSummary>, cap: Option<usize>) {
     let mut seen = group
         .sessions
         .iter()
@@ -2080,7 +2077,8 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::{App, ChatEntry, Screen};
-    use crate::protocol::{DelegateModelPreference, SessionSummary};
+    use crate::domain::session::UndoState;
+    use crate::protocol::DelegateModelPreference;
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -2664,7 +2662,7 @@ mod tests {
         app.messages.push(ChatEntry::Error("stale".into()));
         app.streaming_content = "stale stream".into();
         app.scroll_offset = 3;
-        app.undo_state = Some(crate::app::UndoState {
+        app.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
         });
@@ -2728,7 +2726,7 @@ mod tests {
         app.streaming_thinking = "stale thinking".into();
         app.streaming_thinking_message_id = Some("thinking-1".into());
         app.scroll_offset = 4;
-        app.undo_state = Some(crate::app::UndoState {
+        app.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
         });
@@ -3521,7 +3519,7 @@ mod tests {
         let mut app = App::new();
         app.session_id = Some("session-1".into());
         app.activity = ActivityState::SessionOp(crate::app::SessionOp::Undo);
-        app.undoable_turns.push(crate::app::UndoableTurn {
+        app.undoable_turns.push(UndoableTurn {
             turn_id: "u1".into(),
             message_id: "u1".into(),
             text: "change".into(),
