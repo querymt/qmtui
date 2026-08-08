@@ -36,12 +36,10 @@ pub(crate) enum ServerChannelMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{
-        ChatEntry, ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-    };
+    use crate::app::{ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState};
+    use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
     use crate::domain::tool::ToolDetail;
     use crate::handlers::*;
-    use crate::ui::OUTCOME_BULLET;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -481,8 +479,9 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
-    use crate::app::{ActivityState, App, ChatEntry};
+    use crate::app::{ActivityState, App};
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
+    use crate::domain::chat::ChatEntry;
     use crate::handlers::*;
     use crate::protocol::PromptBlock;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1097,16 +1096,16 @@ mod external_editor_tests {
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.messages = vec![
-            app::ChatEntry::User {
+            ChatEntry::User {
                 text: "alpha prompt".into(),
                 message_id: Some("user-1".into()),
             },
-            app::ChatEntry::Assistant {
+            ChatEntry::Assistant {
                 content: "alpha reply".into(),
                 thinking: None,
                 message_id: Some("asst-1".into()),
             },
-            app::ChatEntry::User {
+            ChatEntry::User {
                 text: "beta prompt".into(),
                 message_id: Some("user-2".into()),
             },

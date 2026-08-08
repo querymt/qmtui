@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::app::{self, App, CommandPaletteAction, LogLevel, Popup, Screen};
 use crate::domain::activity::{ActivityState, SessionOp};
+use crate::domain::chat::{ChatEntry, format_outcome_labels};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -40,7 +41,6 @@ pub(crate) fn handle_elicitation_key(
     cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
 ) -> anyhow::Result<()> {
     use crate::domain::elicitation::ElicitationFieldKind;
-    use crate::ui::OUTCOME_BULLET;
 
     let (Some(state), Some(ui)) = (app.elicitation.as_mut(), app.elicitation_ui.as_mut()) else {
         return Ok(());
@@ -53,25 +53,25 @@ pub(crate) fn handle_elicitation_key(
                             custom_active: bool| {
         let field = &state.fields[field_index];
         if custom_active {
-            return format!("{OUTCOME_BULLET}{}", state.custom_input.trim());
+            return format_outcome_labels([state.custom_input.trim()]);
         }
         match &field.kind {
             ElicitationFieldKind::SingleSelect { options } => options
                 .iter()
                 .find(|option| state.selected.get(&field.name) == Some(&option.value))
-                .map(|option| format!("{OUTCOME_BULLET}{}", option.label))
+                .map(|option| format_outcome_labels([option.label.as_str()]))
                 .unwrap_or_default(),
             ElicitationFieldKind::MultiSelect { options } => state
                 .selected
                 .get(&field.name)
                 .and_then(serde_json::Value::as_array)
                 .map(|values| {
-                    options
-                        .iter()
-                        .filter(|option| values.contains(&option.value))
-                        .map(|option| format!("{OUTCOME_BULLET}{}", option.label))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    format_outcome_labels(
+                        options
+                            .iter()
+                            .filter(|option| values.contains(&option.value))
+                            .map(|option| option.label.as_str()),
+                    )
                 })
                 .unwrap_or_default(),
             ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
@@ -1729,7 +1729,7 @@ pub(crate) fn handle_chat_key(
                     app.messages.retain(|entry| {
                         !matches!(
                             entry,
-                            crate::app::ChatEntry::User {
+                            ChatEntry::User {
                                 message_id: Some(message_id),
                                 ..
                             } if message_id == &local_id
