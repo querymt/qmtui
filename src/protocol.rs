@@ -1,10 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// Temporary compatibility bridges for protocol-path consumers.
-#[allow(unused_imports)]
-pub(crate) use crate::domain::model::{DelegateModelPreference, ModelEntry};
-#[allow(unused_imports)]
-pub(crate) use crate::domain::profile::{AgentInfo, ProfileInfo};
 pub(crate) use crate::domain::session::{SessionGroup, SessionSummary};
 
 // --- Client → Server messages ---
