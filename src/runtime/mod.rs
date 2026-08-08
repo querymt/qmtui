@@ -1461,9 +1461,28 @@ pub async fn run() -> anyhow::Result<()> {
     app.launch_cwd = detect_launch_cwd();
     app.active_profile_id = cfg.profile.id.clone();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
-    for (agent_id, model_key) in &cfg.delegate_models {
-        if let Some((provider, model)) = model_key.split_once('/') {
-            app.set_delegate_model_preference(agent_id, provider, model);
+    app.delegate_model_preferences = cfg.profile_delegate_models.clone();
+    if let Some(profile_id) = cfg.profile.id.as_deref() {
+        let legacy_preferences = app
+            .delegate_model_preferences
+            .entry(profile_id.to_string())
+            .or_default();
+        for (agent_id, model_key) in &cfg.delegate_models {
+            if legacy_preferences.contains_key(agent_id) {
+                continue;
+            }
+            let Some((provider, model)) = model_key.split_once('/') else {
+                continue;
+            };
+            legacy_preferences.insert(
+                agent_id.clone(),
+                crate::protocol::DelegateModelPreference {
+                    model_id: model_key.clone(),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    node_id: None,
+                },
+            );
         }
     }
     if let Some(session_id) = cli.session.clone() {

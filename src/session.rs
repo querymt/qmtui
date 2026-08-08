@@ -408,7 +408,9 @@ impl App {
                         }
                     }
                 }
-                if group.next_cursor.is_some() {
+                if group.next_cursor.is_some()
+                    && !self.pending_session_group_loads.contains(&group.cwd)
+                {
                     items.push(PopupItem::LoadMore {
                         group_idx,
                         parent_path: Vec::new(),
