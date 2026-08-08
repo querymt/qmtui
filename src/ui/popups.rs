@@ -9,7 +9,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AuthPanel, LogLevel, session_group_count_text};
 use crate::domain::activity::DelegateStats;
-use crate::protocol::{OAuthStatus, ProfileInfo};
+use crate::domain::model::ModelEntry;
+use crate::domain::profile::ProfileInfo;
+use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
 use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
@@ -83,7 +85,7 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
 }
 
 /// Whether the given model matches a delegate agent's preferred model.
-fn popup_delegate_marker(app: &App, model: &crate::protocol::ModelEntry, agent_id: &str) -> bool {
+fn popup_delegate_marker(app: &App, model: &ModelEntry, agent_id: &str) -> bool {
     app.delegate_preference_profile_id()
         .and_then(|profile_id| app.get_delegate_model_preference(profile_id, agent_id))
         .is_some_and(|preference| {
@@ -2989,7 +2991,7 @@ fn draw_auth_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ProfileInfo;
+    use crate::domain::profile::ProfileInfo;
 
     fn profile(id: &str, name: &str) -> ProfileInfo {
         ProfileInfo {

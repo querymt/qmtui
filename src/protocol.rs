@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+// Temporary compatibility bridges for protocol-path consumers.
+#[allow(unused_imports)]
+pub(crate) use crate::domain::model::{DelegateModelPreference, ModelEntry};
+#[allow(unused_imports)]
+pub(crate) use crate::domain::profile::{AgentInfo, ProfileInfo};
 pub(crate) use crate::domain::session::{SessionGroup, SessionSummary};
 
 // --- Client → Server messages ---
@@ -500,41 +505,6 @@ pub struct ReasoningEffortData {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ProfileInfo {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub config_kind: Option<String>,
-    #[serde(default)]
-    pub fingerprint: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentInfo {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegateModelPreference {
-    pub model_id: String,
-    pub provider: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SessionCreatedData {
     pub agent_id: String,
@@ -917,19 +887,6 @@ pub struct DelegationData {
     pub target_agent_id: Option<String>,
     #[serde(default)]
     pub objective: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModelEntry {
-    pub id: String,
-    pub label: String,
-    pub provider: String,
-    pub model: String,
-    pub node_id: Option<String>,
-    #[serde(default)]
-    pub node_label: Option<String>,
-    pub family: Option<String>,
-    pub quant: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

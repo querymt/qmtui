@@ -472,6 +472,7 @@ mod tests {
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::{App, Screen};
     use crate::domain::chat::ChatEntry;
+    use crate::domain::model::ModelEntry;
     use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -1926,7 +1927,7 @@ mod tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.models = vec![
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
                 label: "Claude Sonnet".into(),
                 provider: "anthropic".into(),
@@ -1936,7 +1937,7 @@ mod tests {
                 family: None,
                 quant: None,
             },
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "openai/gpt-4o".into(),
                 label: "GPT-4o".into(),
                 provider: "openai".into(),
@@ -2004,7 +2005,7 @@ mod tests {
         app.current_provider = Some("anthropic".into());
         app.current_model = Some("claude-sonnet".into());
         app.models = vec![
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
                 label: "Claude Sonnet".into(),
                 provider: "anthropic".into(),
@@ -2014,7 +2015,7 @@ mod tests {
                 family: None,
                 quant: None,
             },
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "openai/gpt-4o".into(),
                 label: "GPT-4o".into(),
                 provider: "openai".into(),
@@ -2054,7 +2055,7 @@ mod tests {
         app.current_model = Some("gpt-5".into());
         app.current_model_node_id = Some("node-1".into());
         app.models = vec![
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "codex/gpt-5".into(),
                 label: "gpt-5".into(),
                 provider: "codex".into(),
@@ -2064,7 +2065,7 @@ mod tests {
                 family: None,
                 quant: None,
             },
-            crate::protocol::ModelEntry {
+            ModelEntry {
                 id: "codex@node-1/gpt-5".into(),
                 label: "gpt-5".into(),
                 provider: "codex".into(),
@@ -2234,7 +2235,7 @@ mod tests {
         app.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
         app.models = (0..12)
-            .map(|i| crate::protocol::ModelEntry {
+            .map(|i| ModelEntry {
                 id: format!("anthropic/model-{i}"),
                 label: format!("Model {i}"),
                 provider: "anthropic".into(),
