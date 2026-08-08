@@ -8,8 +8,9 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{App, ChatEntry, DiffPreviewSection, ShellOutputTail, ToolDetail};
+use crate::app::{App, ChatEntry};
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
+use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
@@ -404,42 +405,40 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 let tool_style = style;
                 match detail {
                     ToolDetail::Edit {
-                        file, cached_lines, ..
+                        file,
+                        old,
+                        new,
+                        start_line,
                     } => {
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(short_path(file).to_string(), Theme::diff_file()),
                         ]));
-                        pending_tools.extend(cached_lines.iter().cloned());
+                        pending_tools.extend(build_diff_lines(old, new, *start_line));
                     }
                     ToolDetail::MultiEdit {
                         file,
                         edit_count,
-                        cached_lines,
-                        ..
+                        sections,
                     } => {
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(short_path(file).to_string(), Theme::diff_file()),
                             Span::styled(format!(" ({edit_count} edits)"), Theme::status_accent()),
                         ]));
-                        pending_tools.extend(cached_lines.iter().cloned());
+                        pending_tools.extend(build_sectioned_diff_lines(sections, 6));
                     }
-                    ToolDetail::ReplaceSymbol {
-                        title,
-                        cached_lines,
-                        ..
-                    } => {
+                    ToolDetail::ReplaceSymbol { title, sections } => {
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(title.clone(), Theme::diff_file()),
                         ]));
-                        pending_tools.extend(cached_lines.iter().cloned());
+                        pending_tools.extend(build_sectioned_diff_lines(sections, 4));
                     }
                     ToolDetail::Shell {
+                        command,
                         workdir,
-                        cached_lines,
-                        ..
+                        output_tail,
                     } => {
                         let mut spans = vec![Span::styled(format!("{sym} {name}"), style)];
                         if let Some(workdir) = workdir.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -447,7 +446,11 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             spans.push(Span::styled(workdir.to_string(), Theme::diff_file()));
                         }
                         pending_tools.push(Line::from(spans));
-                        pending_tools.extend(cached_lines.iter().cloned());
+                        pending_tools.extend(build_shell_lines(
+                            command,
+                            workdir.as_deref(),
+                            output_tail.as_ref(),
+                        ));
                     }
                     ToolDetail::ReadTool {
                         path,
@@ -468,14 +471,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         }
                         pending_tools.push(Line::from(spans));
                     }
-                    ToolDetail::WriteFile {
-                        path, cached_lines, ..
-                    } => {
+                    ToolDetail::WriteFile { path, content } => {
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(short_path(path).to_string(), Theme::diff_file()),
                         ]));
-                        pending_tools.extend(cached_lines.iter().cloned());
+                        pending_tools.extend(build_write_lines(content));
                     }
                     ToolDetail::SummaryWithOutput { header, output } => {
                         pending_tools.push(Line::from(vec![

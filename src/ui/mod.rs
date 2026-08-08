@@ -2,9 +2,7 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::{
-    CardCache, build_diff_lines, build_sectioned_diff_lines, build_shell_lines, build_write_lines,
-};
+pub(crate) use chat::CardCache;
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
@@ -473,7 +471,8 @@ fn draw_header(
 mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
-    use crate::app::{App, ChatEntry, DiffPreviewSection, Screen, ShellOutputTail, ToolDetail};
+    use crate::app::{App, ChatEntry, Screen};
+    use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -1364,7 +1363,7 @@ mod tests {
 
     #[test]
     fn delegate_tool_call_label_uses_accent_color() {
-        use crate::app::{ChatEntry, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail};
+        use crate::app::{ChatEntry, DelegateEntry, DelegateStats, DelegateStatus};
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -1503,7 +1502,7 @@ mod tests {
     #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         use crate::app::{
-            ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, ToolDetail,
+            ChatEntry, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
         };
 
         let mut app = App::new();
@@ -2796,6 +2795,114 @@ mod tests {
     }
 
     #[test]
+    fn warm_shell_tool_card_rebuilds_with_output_tail_after_native_end_update() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-warm-cache".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "cargo test" })),
+            },
+        );
+
+        let warm_lines = rendered_card_lines(&mut app);
+        assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
+        assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("shell-warm-cache".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some("tail sentinel".into()),
+            },
+        );
+
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "tool detail update should be in place"
+        );
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "semantic update should invalidate the warm card"
+        );
+        let rebuilt_lines = rendered_card_lines(&mut app);
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("output tail:"))
+        );
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("tail sentinel")),
+            "rebuilt card returned stale shell detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
+    fn warm_edit_tool_card_rebuilds_with_start_line_after_native_end_update() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("edit-warm-cache".into()),
+                name: "edit".into(),
+                arguments: Some(serde_json::json!({
+                    "filePath": "src/lib.rs",
+                    "oldString": "before\n",
+                    "newString": "after\n"
+                })),
+            },
+        );
+
+        let warm_lines = rendered_card_lines(&mut app);
+        assert!(
+            warm_lines
+                .iter()
+                .any(|line| line.contains("  1 ") && line.contains("- before"))
+        );
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("edit-warm-cache".into()),
+                name: "edit".into(),
+                is_error: false,
+                result: Some(r#"{"startLineOld":42}"#.into()),
+            },
+        );
+
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "tool detail update should be in place"
+        );
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "semantic update should invalidate the warm card"
+        );
+        let rebuilt_lines = rendered_card_lines(&mut app);
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("  42 ") && line.contains("- before")),
+            "rebuilt card returned stale edit detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
     fn failed_tool_end_before_start_reconciles_badge_without_stale_bottom_entry() {
         let mut app = App::new();
         app.session_id = Some("test-session".into());
@@ -3121,41 +3228,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_detail_edit_carries_precomputed_diff_lines() {
-        let detail = ToolDetail::Edit {
-            file: "src/main.rs".into(),
-            old: "hello".into(),
-            new: "world".into(),
-            start_line: None,
-            cached_lines: build_diff_lines("hello", "world", None),
-        };
-        match &detail {
-            ToolDetail::Edit { cached_lines, .. } => {
-                assert!(
-                    !cached_lines.is_empty(),
-                    "diff lines should be pre-computed"
-                );
-            }
-            _ => panic!("expected Edit"),
-        }
-    }
-
-    #[test]
-    fn tool_detail_write_carries_precomputed_lines() {
-        let detail = ToolDetail::WriteFile {
-            path: "out.txt".into(),
-            content: "line1\nline2\n".into(),
-            cached_lines: build_write_lines("line1\nline2\n"),
-        };
-        match &detail {
-            ToolDetail::WriteFile { cached_lines, .. } => {
-                assert_eq!(cached_lines.len(), 2);
-            }
-            _ => panic!("expected WriteFile"),
-        }
-    }
-
-    #[test]
     fn message_cards_edit_tool_includes_diff_lines() {
         let mut app = App::new();
         let old = "aaa\nbbb\n";
@@ -3169,7 +3241,6 @@ mod tests {
                 old: old.into(),
                 new: new.into(),
                 start_line: Some(1),
-                cached_lines: build_diff_lines(old, new, Some(1)),
             },
         });
 
@@ -3194,7 +3265,6 @@ mod tests {
             detail: ToolDetail::WriteFile {
                 path: "out.rs".into(),
                 content: content.into(),
-                cached_lines: build_write_lines(content),
             },
         });
 
@@ -3228,7 +3298,6 @@ mod tests {
             detail: ToolDetail::MultiEdit {
                 file: "src/lib.rs".into(),
                 edit_count: sections.len(),
-                cached_lines: build_sectioned_diff_lines(&sections, 6),
                 sections,
             },
         });
@@ -3288,7 +3357,6 @@ mod tests {
             is_error: false,
             detail: ToolDetail::ReplaceSymbol {
                 title: "src/ui/chat.rs build_message_cards".into(),
-                cached_lines: build_sectioned_diff_lines(&sections, 4),
                 sections,
             },
         });
@@ -3356,8 +3424,7 @@ mod tests {
             detail: ToolDetail::Shell {
                 command: command.into(),
                 workdir: Some("/repo".into()),
-                output_tail: Some(output_tail.clone()),
-                cached_lines: build_shell_lines(command, Some("/repo"), Some(&output_tail)),
+                output_tail: Some(output_tail),
             },
         });
 
