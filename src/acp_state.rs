@@ -5,12 +5,13 @@ use serde_json::Value;
 use crate::acp_client::{
     DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
 };
-use crate::app::{ChatEntry, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen, ToolDetail};
+use crate::app::{ChatEntry, LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
+use crate::domain::tool::ToolDetail;
 use crate::protocol::{
     AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,

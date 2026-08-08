@@ -1,9 +1,7 @@
 use serde_json::Value;
 
-use crate::app::{ChatEntry, DiffPreviewSection, ShellOutputTail, ToolDetail};
-use crate::ui::{
-    build_diff_lines, build_sectioned_diff_lines, build_shell_lines, build_write_lines,
-};
+use crate::app::ChatEntry;
+use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
 
 const DEFAULT_READ_TOOL_LIMIT: u64 = 2000;
 
@@ -18,17 +16,11 @@ pub(crate) fn parse_tool_detail(
     let obj = normalize_args(args);
 
     match tool_name {
-        "shell" => {
-            let command = shell_command_display(&obj);
-            let workdir = string_field(&obj, "workdir");
-            let cached_lines = build_shell_lines(&command, workdir.as_deref(), None);
-            ToolDetail::Shell {
-                command,
-                workdir,
-                output_tail: None,
-                cached_lines,
-            }
-        }
+        "shell" => ToolDetail::Shell {
+            command: shell_command_display(&obj),
+            workdir: string_field(&obj, "workdir"),
+            output_tail: None,
+        },
         "read_tool" => {
             let path = string_field(&obj, "path").unwrap_or_default();
             let offset = obj.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -46,11 +38,7 @@ pub(crate) fn parse_tool_detail(
         "write_file" => {
             let path = string_field(&obj, "path").unwrap_or_default();
             let content = string_field(&obj, "content").unwrap_or_default();
-            ToolDetail::WriteFile {
-                path,
-                cached_lines: build_write_lines(&content),
-                content,
-            }
+            ToolDetail::WriteFile { path, content }
         }
         "edit" => {
             let file = string_field(&obj, "filePath")
@@ -64,7 +52,6 @@ pub(crate) fn parse_tool_detail(
                 .unwrap_or_default();
             ToolDetail::Edit {
                 file,
-                cached_lines: build_diff_lines(&old, &new, None),
                 old,
                 new,
                 start_line: None,
@@ -109,7 +96,6 @@ pub(crate) fn parse_tool_detail(
             ToolDetail::MultiEdit {
                 file,
                 edit_count: sections.len(),
-                cached_lines: build_sectioned_diff_lines(&sections, 6),
                 sections,
             }
         }
@@ -214,16 +200,9 @@ pub(crate) fn update_tool_detail(
         }
 
         match detail {
-            ToolDetail::Shell {
-                command,
-                workdir,
-                output_tail,
-                cached_lines,
-            } if name.starts_with("shell") => {
+            ToolDetail::Shell { output_tail, .. } if name.starts_with("shell") => {
                 if let Some(tail) = shell_output_tail_from_result(parsed.as_ref(), result) {
                     *output_tail = Some(tail);
-                    *cached_lines =
-                        build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
                 }
             }
             ToolDetail::ReadTool {
@@ -236,13 +215,7 @@ pub(crate) fn update_tool_detail(
                     *end_line = Some(last);
                 }
             }
-            ToolDetail::Edit {
-                old,
-                new,
-                start_line,
-                cached_lines,
-                ..
-            } => {
+            ToolDetail::Edit { start_line, .. } => {
                 let json_start = parsed
                     .as_ref()
                     .and_then(|value| value.get("startLineOld"))
@@ -252,20 +225,14 @@ pub(crate) fn update_tool_detail(
                     .or_else(|| compact_receipt_old_starts(&result_text).into_iter().next())
                 {
                     *start_line = Some(start);
-                    *cached_lines = build_diff_lines(old, new, Some(start));
                 }
             }
-            ToolDetail::MultiEdit {
-                sections,
-                cached_lines,
-                ..
-            } => {
+            ToolDetail::MultiEdit { sections, .. } => {
                 let starts = compact_receipt_old_starts(&result_text);
                 if !starts.is_empty() {
                     for (section, start) in sections.iter_mut().zip(starts) {
                         section.start_line = Some(start);
                     }
-                    *cached_lines = build_sectioned_diff_lines(sections, 6);
                 }
             }
             _ => {}
@@ -757,19 +724,12 @@ mod tests {
                 detail:
                     ToolDetail::Shell {
                         output_tail: Some(tail),
-                        cached_lines,
                         ..
                     },
                 ..
             } => {
                 assert_eq!(tail.hidden_line_count, 3);
                 assert_eq!(tail.lines, ["out4", "out5", "out6", "err1", "err2"]);
-                let rendered = cached_lines
-                    .iter()
-                    .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
-                    .collect::<String>();
-                assert!(rendered.contains("output tail:"));
-                assert!(rendered.contains("err2"));
             }
             other => panic!("expected shell tail, got: {other:?}"),
         }
