@@ -14,6 +14,8 @@ use crate::domain::chat::{ChatEntry, format_outcome_labels};
 pub(crate) use crate::domain::elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
 };
+use crate::domain::model::{DelegateModelPreference, ModelEntry};
+use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
     ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoState,
     UndoableTurn,
@@ -660,7 +662,7 @@ pub struct App {
 
     // delegate agent model preferences
     /// Agents for `agents_profile_id`. Index zero is the primary session agent.
-    pub agents: Vec<crate::protocol::AgentInfo>,
+    pub agents: Vec<AgentInfo>,
     pub agents_profile_id: Option<String>,
     /// Currently selected tab index: zero is the session, remaining tabs are delegates.
     pub model_popup_agent_tab: usize,
@@ -4764,7 +4766,8 @@ mod popup_item_tests {
 #[cfg(test)]
 mod delegate_model_preference_tests {
     use super::*;
-    use crate::protocol::{AgentInfo, ModelEntry};
+    use crate::domain::model::ModelEntry;
+    use crate::domain::profile::AgentInfo;
 
     fn make_agent(id: &str, name: &str) -> AgentInfo {
         AgentInfo {

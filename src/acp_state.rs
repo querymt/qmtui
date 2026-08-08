@@ -11,13 +11,14 @@ use crate::domain::activity::{
 };
 use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
+use crate::domain::model::ModelEntry;
+use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
 use crate::domain::tool::ToolDetail;
 use crate::protocol::{
-    AgentInfo, AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
-    MeshStatusInfo, ModelEntry, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
-    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionListRequest, UndoResultData,
-    UndoStackFrame,
+    AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
+    MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
+    RemoteSessionListInfo, SessionListRequest, UndoResultData, UndoStackFrame,
 };
 use crate::tool_detail;
 
@@ -2079,8 +2080,8 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::{App, Screen};
+    use crate::domain::model::DelegateModelPreference;
     use crate::domain::session::UndoState;
-    use crate::protocol::DelegateModelPreference;
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";

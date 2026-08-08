@@ -4,12 +4,13 @@ use tokio::sync::mpsc;
 use crate::app::{self, App, CommandPaletteAction, LogLevel, Popup, Screen};
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
+use crate::domain::model::ModelEntry;
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
 }
 use crate::config;
-use crate::protocol::{self, ClientMsg, PromptBlock};
+use crate::protocol::{ClientMsg, PromptBlock};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2498,7 +2499,7 @@ pub(crate) fn handle_model_popup_key(
             app.model_cursor = (app.model_cursor + 1).min(max);
         }
         KeyCode::Enter => {
-            let selected: Option<protocol::ModelEntry> = app
+            let selected: Option<ModelEntry> = app
                 .visible_model_popup_items()
                 .get(app.model_cursor)
                 .and_then(|item| match item {
@@ -2764,7 +2765,9 @@ mod model_popup_tests {
     use super::*;
     use crate::app::{App, Popup};
     use crate::config::TestPersistenceGuard;
-    use crate::protocol::{ModelEntry, ProfileInfo};
+    use crate::domain::model::ModelEntry;
+    use crate::domain::profile::{AgentInfo, ProfileInfo};
+    use crate::protocol;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -2785,8 +2788,8 @@ mod model_popup_tests {
         }
     }
 
-    fn make_agent(id: &str, name: &str) -> crate::protocol::AgentInfo {
-        crate::protocol::AgentInfo {
+    fn make_agent(id: &str, name: &str) -> AgentInfo {
+        AgentInfo {
             id: id.into(),
             name: name.into(),
             description: None,
