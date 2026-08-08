@@ -10,7 +10,6 @@ fn popup_page_step(visible_rows: usize) -> usize {
 use crate::config;
 use crate::protocol::{self, ClientMsg, PromptBlock};
 use crate::theme;
-use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppAction {
@@ -1590,63 +1589,10 @@ pub(crate) fn handle_new_session_popup_key(
 
 /// Invalidate every theme-dependent cache in `app` so that the next render
 /// frame rebuilds styled lines with the current palette.
-///
-/// Covers:
-/// - `card_cache` (finalized message cards)
-/// - `streaming_cache` / `streaming_thinking_cache`
-/// - cached tool preview lines (`edit`, `multiedit`, `replace_symbol`, `shell`, `write_file`)
 pub(crate) fn invalidate_theme_caches(app: &mut App) {
     app.card_cache.invalidate();
     app.streaming_cache.invalidate();
     app.streaming_thinking_cache.invalidate();
-
-    // Re-generate diff/write preview lines baked into ToolCall entries.
-    for entry in &mut app.messages {
-        if let app::ChatEntry::ToolCall { detail, .. } = entry {
-            match detail {
-                app::ToolDetail::Edit {
-                    old,
-                    new,
-                    start_line,
-                    cached_lines,
-                    ..
-                } => {
-                    *cached_lines = ui::build_diff_lines(old, new, *start_line);
-                }
-                app::ToolDetail::MultiEdit {
-                    sections,
-                    cached_lines,
-                    ..
-                } => {
-                    *cached_lines = ui::build_sectioned_diff_lines(sections, 6);
-                }
-                app::ToolDetail::ReplaceSymbol {
-                    sections,
-                    cached_lines,
-                    ..
-                } => {
-                    *cached_lines = ui::build_sectioned_diff_lines(sections, 4);
-                }
-                app::ToolDetail::Shell {
-                    command,
-                    workdir,
-                    output_tail,
-                    cached_lines,
-                } => {
-                    *cached_lines =
-                        ui::build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
-                }
-                app::ToolDetail::WriteFile {
-                    content,
-                    cached_lines,
-                    ..
-                } => {
-                    *cached_lines = ui::build_write_lines(content);
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {

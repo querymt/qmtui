@@ -39,6 +39,7 @@ mod tests {
     use crate::app::{
         ChatEntry, ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
+    use crate::domain::tool::ToolDetail;
     use crate::handlers::*;
     use crate::ui::OUTCOME_BULLET;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -377,9 +378,7 @@ mod tests {
     #[test]
     fn invalidate_theme_caches_clears_all_render_caches() {
         use crate::theme::Theme;
-        use crate::ui::build_diff_lines;
 
-        // Build cached_lines under theme 0
         Theme::set_by_index(0);
         Theme::begin_frame();
 
@@ -406,19 +405,15 @@ mod tests {
             ))],
         );
 
-        // Populate a ToolCall with cached_lines baked under theme 0
-        let old_lines = build_diff_lines("aaa", "bbb", None);
-        assert!(!old_lines.is_empty());
         app.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "edit".into(),
             is_error: false,
-            detail: app::ToolDetail::Edit {
+            detail: ToolDetail::Edit {
                 file: "f.rs".into(),
                 old: "aaa".into(),
                 new: "bbb".into(),
                 start_line: None,
-                cached_lines: old_lines.clone(),
             },
         });
 
@@ -447,24 +442,13 @@ mod tests {
             "streaming_thinking_cache should be invalidated"
         );
 
-        // Tool cached_lines rebuilt with the NEW theme's styles
-        if let ChatEntry::ToolCall {
-            detail: app::ToolDetail::Edit { cached_lines, .. },
-            ..
-        } = &app.messages[1]
-        {
-            assert!(
-                !cached_lines.is_empty(),
-                "tool cached_lines should be rebuilt"
-            );
-            // Lines must differ from the old theme — styles are theme-dependent
-            assert_ne!(
-                *cached_lines, old_lines,
-                "cached_lines should use the new theme's styles, not the old"
-            );
-        } else {
-            panic!("expected ToolCall with Edit detail");
-        }
+        assert!(matches!(
+            &app.messages[1],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Edit { old, new, .. },
+                ..
+            } if old == "aaa" && new == "bbb"
+        ));
 
         // Reset
         Theme::set_by_index(0);

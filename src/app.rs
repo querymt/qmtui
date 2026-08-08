@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use ratatui::text::Line;
 
 #[allow(unused_imports)]
 pub(crate) use crate::domain::activity::{
@@ -18,6 +17,7 @@ use crate::domain::session::{
     ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoState,
     UndoableTurn,
 };
+use crate::domain::tool::ToolDetail;
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
@@ -459,71 +459,6 @@ pub struct PathCompletionState {
     pub query: String,
     pub selected_index: usize,
     pub results: Vec<FileIndexEntryLite>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiffPreviewSection {
-    pub header: String,
-    pub old: String,
-    pub new: String,
-    pub start_line: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ShellOutputTail {
-    pub lines: Vec<String>,
-    pub hidden_line_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub enum ToolDetail {
-    None,
-    /// Compact one-liner info for display after tool name
-    Summary(String),
-    /// One-liner header + indented output lines below
-    SummaryWithOutput {
-        header: String,
-        output: String,
-    },
-    Edit {
-        file: String,
-        old: String,
-        new: String,
-        start_line: Option<usize>,
-        /// Pre-computed diff lines (avoids re-running TextDiff on every render).
-        cached_lines: Vec<Line<'static>>,
-    },
-    MultiEdit {
-        file: String,
-        edit_count: usize,
-        sections: Vec<DiffPreviewSection>,
-        /// Pre-computed sectioned diff lines for all requested edits.
-        cached_lines: Vec<Line<'static>>,
-    },
-    ReplaceSymbol {
-        title: String,
-        sections: Vec<DiffPreviewSection>,
-        /// Pre-computed best-effort symbol body diff lines.
-        cached_lines: Vec<Line<'static>>,
-    },
-    Shell {
-        command: String,
-        workdir: Option<String>,
-        output_tail: Option<ShellOutputTail>,
-        /// Pre-computed command and output-tail lines.
-        cached_lines: Vec<Line<'static>>,
-    },
-    ReadTool {
-        path: String,
-        start_line: Option<u64>,
-        end_line: Option<u64>,
-    },
-    WriteFile {
-        path: String,
-        content: String,
-        /// Pre-computed write preview lines.
-        cached_lines: Vec<Line<'static>>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
