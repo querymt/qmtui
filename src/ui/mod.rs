@@ -2824,13 +2824,21 @@ mod tests {
             },
         );
 
-        assert_eq!(app.messages.len(), 1, "tool detail update should be in place");
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "tool detail update should be in place"
+        );
         assert_eq!(
             app.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
         );
         let rebuilt_lines = rendered_card_lines(&mut app);
-        assert!(rebuilt_lines.iter().any(|line| line.contains("output tail:")));
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("output tail:"))
+        );
         assert!(
             rebuilt_lines
                 .iter()
@@ -2876,7 +2884,11 @@ mod tests {
             },
         );
 
-        assert_eq!(app.messages.len(), 1, "tool detail update should be in place");
+        assert_eq!(
+            app.messages.len(),
+            1,
+            "tool detail update should be in place"
+        );
         assert_eq!(
             app.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
