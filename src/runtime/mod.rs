@@ -383,15 +383,34 @@ mod tests {
         Theme::begin_frame();
 
         let mut app = App::new();
-
-        // Populate card_cache
         app.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
-        app.card_cache.processed_messages = 1;
+        app.messages.push(ChatEntry::ToolCall {
+            tool_call_id: None,
+            name: "edit".into(),
+            is_error: false,
+            detail: ToolDetail::Edit {
+                file: "f.rs".into(),
+                old: "aaa".into(),
+                new: "bbb".into(),
+                start_line: None,
+            },
+        });
 
-        // Populate streaming caches
+        let old_preview_fg = crate::ui::build_message_cards(&mut app)
+            .iter()
+            .find_map(|card| {
+                let lines = card.lines_for(120);
+                lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .find(|span| span.content.as_ref() == "f.rs")
+                    .and_then(|span| span.style.fg)
+            })
+            .expect("edit preview should contain a styled file span");
+
         app.streaming_cache.store(
             5,
             vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
@@ -405,30 +424,21 @@ mod tests {
             ))],
         );
 
-        app.messages.push(ChatEntry::ToolCall {
-            tool_call_id: None,
-            name: "edit".into(),
-            is_error: false,
-            detail: ToolDetail::Edit {
-                file: "f.rs".into(),
-                old: "aaa".into(),
-                new: "bbb".into(),
-                start_line: None,
-            },
-        });
-
-        // Confirm caches are populated
         assert!(app.streaming_cache.get(5).is_some());
         assert!(app.streaming_thinking_cache.get(3).is_some());
-        assert_eq!(app.card_cache.processed_messages, 1);
+        assert_eq!(
+            app.card_cache.processed_messages,
+            app.messages.len(),
+            "card_cache should be populated"
+        );
 
-        // Switch to a different theme and update the frame snapshot
-        // before invalidating — just as handle_theme_popup_key does.
+        // Match the production order: snapshot the selected theme, then clear styled caches.
         Theme::set_by_index(2);
         Theme::begin_frame();
+        let current_preview_fg = Theme::diff_file().fg.expect("diff_file should define fg");
+        assert_ne!(old_preview_fg, current_preview_fg);
         invalidate_theme_caches(&mut app);
 
-        // All caches cleared
         assert_eq!(
             app.card_cache.processed_messages, 0,
             "card_cache should be invalidated"
@@ -441,7 +451,6 @@ mod tests {
             app.streaming_thinking_cache.get(3).is_none(),
             "streaming_thinking_cache should be invalidated"
         );
-
         assert!(matches!(
             &app.messages[1],
             ChatEntry::ToolCall {
@@ -450,7 +459,20 @@ mod tests {
             } if old == "aaa" && new == "bbb"
         ));
 
-        // Reset
+        let rebuilt_preview_fg = crate::ui::build_message_cards(&mut app)
+            .iter()
+            .find_map(|card| {
+                let lines = card.lines_for(120);
+                lines
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .find(|span| span.content.as_ref() == "f.rs")
+                    .and_then(|span| span.style.fg)
+            })
+            .expect("rebuilt edit preview should contain a styled file span");
+        assert_eq!(rebuilt_preview_fg, current_preview_fg);
+        assert_ne!(rebuilt_preview_fg, old_preview_fg);
+
         Theme::set_by_index(0);
         Theme::begin_frame();
     }

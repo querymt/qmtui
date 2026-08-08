@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::app::ChatEntry;
@@ -137,7 +139,19 @@ pub(crate) fn parse_tool_detail(
         }
         "question" => ToolDetail::Summary("asking...".into()),
         "apply_patch" => ToolDetail::Summary("patch".into()),
-        "replace_symbol" => ToolDetail::Summary(replace_symbol_title(&obj, cwd)),
+        "replace_symbol" => {
+            let Some(replacements) = obj.get("replacements").and_then(Value::as_array) else {
+                return ToolDetail::Summary("symbols".into());
+            };
+            if replacements.is_empty() {
+                return ToolDetail::Summary("symbols".into());
+            }
+            let root = string_field(&obj, "root");
+            ToolDetail::ReplaceSymbol {
+                title: replace_symbol_title(replacements, cwd),
+                sections: build_replace_symbol_sections(replacements, root.as_deref(), cwd),
+            }
+        }
         _ => ToolDetail::None,
     }
 }
@@ -448,10 +462,7 @@ fn delegate_summary(obj: &Value) -> ToolDetail {
     }
 }
 
-fn replace_symbol_title(obj: &Value, cwd: Option<&str>) -> String {
-    let Some(replacements) = obj.get("replacements").and_then(Value::as_array) else {
-        return "symbols".into();
-    };
+fn replace_symbol_title(replacements: &[Value], cwd: Option<&str>) -> String {
     let mut files = replacements
         .iter()
         .filter_map(|replacement| string_field(replacement, "path"))
@@ -464,6 +475,151 @@ fn replace_symbol_title(obj: &Value, cwd: Option<&str>) -> String {
         [one] => short_path(one).to_string(),
         [first, ..] => format!("{} (+{})", short_path(first), files.len() - 1),
     }
+}
+
+fn build_replace_symbol_sections(
+    replacements: &[Value],
+    root: Option<&str>,
+    cwd: Option<&str>,
+) -> Vec<DiffPreviewSection> {
+    replacements
+        .iter()
+        .filter_map(|replacement| {
+            let path = string_field(replacement, "path")?;
+            let symbol = string_field(replacement, "symbol")?;
+            let new = string_field(replacement, "newText")
+                .or_else(|| string_field(replacement, "new_text"))?;
+            let kind = string_field(replacement, "kind");
+            let occurrence = replacement
+                .get("occurrence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let resolved_path = resolve_preview_path(&path, root, cwd);
+            let preview = extract_symbol_body(&resolved_path, &symbol, kind.as_deref(), occurrence);
+            let display_path = strip_cwd(&path, cwd);
+            let mut header = if replacements.len() == 1 {
+                symbol.clone()
+            } else {
+                format!("{} {symbol}", short_path(&display_path))
+            };
+            if let Some(kind) = kind.filter(|kind| !kind.is_empty() && kind != "any") {
+                header.push_str(&format!(" ({kind})"));
+            }
+            Some(DiffPreviewSection {
+                header,
+                old: preview
+                    .as_ref()
+                    .map(|(old, _)| old.clone())
+                    .unwrap_or_default(),
+                new,
+                start_line: preview.map(|(_, start_line)| start_line),
+            })
+        })
+        .collect()
+}
+
+fn resolve_preview_path(path: &str, root: Option<&str>, cwd: Option<&str>) -> PathBuf {
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_absolute() {
+        return path_buf;
+    }
+
+    let base = root
+        .filter(|root| !root.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
+    let base = if base.is_absolute() {
+        base
+    } else if let Some(cwd) = cwd {
+        Path::new(cwd).join(base)
+    } else {
+        base
+    };
+
+    base.join(path_buf)
+}
+
+fn extract_symbol_body(
+    path: &Path,
+    symbol: &str,
+    kind: Option<&str>,
+    occurrence: usize,
+) -> Option<(String, usize)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines = content.lines().collect::<Vec<_>>();
+    let leaf = symbol
+        .rsplit("::")
+        .next()
+        .unwrap_or(symbol)
+        .rsplit('.')
+        .next()
+        .unwrap_or(symbol);
+    let start = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| symbol_line_matches(line.trim_start(), leaf, kind).then_some(idx))
+        .nth(occurrence)?;
+    let end = symbol_block_end(&lines, start);
+
+    Some((lines[start..=end].join("\n"), start + 1))
+}
+
+fn symbol_line_matches(line: &str, name: &str, kind: Option<&str>) -> bool {
+    let function = || {
+        line.contains(&format!("fn {name}"))
+            || line.contains(&format!("function {name}"))
+            || line.starts_with(&format!("def {name}"))
+            || line.starts_with(&format!("async def {name}"))
+            || line.starts_with(&format!("{name}("))
+            || line.contains(&format!(" {name}("))
+    };
+    let matches = |keyword| line.contains(&format!("{keyword} {name}"));
+    match kind.unwrap_or("any") {
+        "function" | "method" | "test" => function(),
+        "struct" => matches("struct"),
+        "enum" => matches("enum"),
+        "trait" => matches("trait"),
+        "class" => matches("class"),
+        "type" => matches("type"),
+        "const" => matches("const"),
+        "impl" => matches("impl"),
+        "module" => matches("mod") || matches("module"),
+        _ => {
+            function()
+                || matches("struct")
+                || matches("enum")
+                || matches("trait")
+                || matches("class")
+                || matches("type")
+                || matches("const")
+                || matches("impl")
+                || matches("mod")
+                || matches("module")
+        }
+    }
+}
+
+fn symbol_block_end(lines: &[&str], start: usize) -> usize {
+    let mut seen_brace = false;
+    let mut balance = 0isize;
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    seen_brace = true;
+                    balance += 1;
+                }
+                '}' if seen_brace => {
+                    balance -= 1;
+                    if balance <= 0 {
+                        return idx;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    lines.len().saturating_sub(1)
 }
 fn strip_cwd(path: &str, cwd: Option<&str>) -> String {
     cwd.and_then(|cwd| path.strip_prefix(cwd))
@@ -904,19 +1060,70 @@ mod tests {
     }
 
     #[test]
-    fn replace_symbol_summary_uses_replacement_paths_without_previewing_files() {
+    fn replace_symbol_builds_semantic_preview_sections() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("src/tool_detail.rs")
+            .display()
+            .to_string();
+        let detail = parse_tool_detail(
+            "replace_symbol",
+            Some(&serde_json::json!({
+                "replacements": [{
+                    "path": path,
+                    "symbol": "parse_tool_detail",
+                    "kind": "function",
+                    "newText": "fn replacement() {}"
+                }]
+            })),
+            None,
+        );
+
+        match detail {
+            ToolDetail::ReplaceSymbol { title, sections } => {
+                assert_eq!(title, "src/tool_detail.rs");
+                assert_eq!(sections.len(), 1);
+                assert!(sections[0].header.contains("parse_tool_detail"));
+                assert!(sections[0].old.contains("fn parse_tool_detail"));
+                assert_eq!(sections[0].new, "fn replacement() {}");
+                assert!(sections[0].start_line.is_some());
+            }
+            other => panic!("expected ReplaceSymbol, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_symbol_uses_path_title_and_sections_without_preview_files() {
         let detail = parse_tool_detail(
             "replace_symbol",
             Some(&serde_json::json!({
                 "replacements": [
-                    { "path": "/workspace/src/one.rs", "symbol": "one" },
-                    { "path": "/workspace/src/two.rs", "symbol": "two" }
+                    {
+                        "path": "/workspace/src/one.rs",
+                        "symbol": "one",
+                        "newText": "fn one() {}"
+                    },
+                    {
+                        "path": "/workspace/src/two.rs",
+                        "symbol": "two",
+                        "newText": "fn two() {}"
+                    }
                 ]
             })),
             Some("/workspace"),
         );
 
-        assert!(matches!(detail, ToolDetail::Summary(summary) if summary == "src/one.rs (+1)"));
+        match detail {
+            ToolDetail::ReplaceSymbol { title, sections } => {
+                assert_eq!(title, "src/one.rs (+1)");
+                assert_eq!(sections.len(), 2);
+                assert_eq!(sections[0].old, "");
+                assert_eq!(sections[0].start_line, None);
+                assert_eq!(sections[1].old, "");
+                assert_eq!(sections[1].start_line, None);
+            }
+            other => panic!("expected ReplaceSymbol, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -995,5 +1202,57 @@ mod tests {
             other => panic!("expected ToolCall, got: {other:?}"),
         }
         assert!(matches!(messages[1], ChatEntry::Assistant { .. }));
+    }
+
+    #[test]
+    fn tool_start_reconciles_failed_fallback_in_place() {
+        let mut messages = vec![
+            ChatEntry::Assistant {
+                content: "before".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("missing-start".into()),
+                name: "shell (failed)".into(),
+                is_error: true,
+                detail: ToolDetail::None,
+            },
+        ];
+        let detail = parse_tool_detail(
+            "shell",
+            Some(&serde_json::json!({
+                "command": "cargo test tool_detail_tests"
+            })),
+            None,
+        );
+
+        assert!(reconcile_tool_call_start(
+            &mut messages,
+            Some("missing-start"),
+            "shell",
+            detail
+        ));
+        assert_eq!(
+            messages.len(),
+            2,
+            "start must not append a second tool entry"
+        );
+        match &messages[1] {
+            ChatEntry::ToolCall {
+                name,
+                is_error,
+                detail,
+                ..
+            } => {
+                assert_eq!(name, "shell");
+                assert!(*is_error);
+                assert!(matches!(
+                    detail,
+                    ToolDetail::Shell { command, .. } if command == "cargo test tool_detail_tests"
+                ));
+            }
+            other => panic!("expected ToolCall, got: {other:?}"),
+        }
     }
 }
