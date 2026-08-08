@@ -524,16 +524,18 @@ fn resolve_preview_path(path: &str, root: Option<&str>, cwd: Option<&str>) -> Pa
         return path_buf;
     }
 
-    let base = root
-        .filter(|root| !root.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")));
-    let base = if base.is_absolute() {
-        base
-    } else if let Some(cwd) = cwd {
-        Path::new(cwd).join(base)
-    } else {
-        base
+    let base = match root.filter(|root| !root.trim().is_empty()) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            if root.is_absolute() {
+                root
+            } else if let Some(cwd) = cwd {
+                Path::new(cwd).join(root)
+            } else {
+                root
+            }
+        }
+        None => cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
     };
 
     base.join(path_buf)
@@ -600,6 +602,10 @@ fn symbol_line_matches(line: &str, name: &str, kind: Option<&str>) -> bool {
 }
 
 fn symbol_block_end(lines: &[&str], start: usize) -> usize {
+    if lines[start].contains(';') && !lines[start].contains('{') {
+        return start;
+    }
+
     let mut seen_brace = false;
     let mut balance = 0isize;
     for (idx, line) in lines.iter().enumerate().skip(start) {
@@ -619,11 +625,17 @@ fn symbol_block_end(lines: &[&str], start: usize) -> usize {
             }
         }
     }
-    lines.len().saturating_sub(1)
+
+    if seen_brace {
+        lines.len().saturating_sub(1)
+    } else {
+        start
+    }
 }
+
 fn strip_cwd(path: &str, cwd: Option<&str>) -> String {
-    cwd.and_then(|cwd| path.strip_prefix(cwd))
-        .map(|path| path.trim_start_matches('/').to_string())
+    cwd.and_then(|cwd| Path::new(path).strip_prefix(cwd).ok())
+        .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
 }
 
@@ -654,6 +666,19 @@ fn truncate_summary(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)]
+    mod replace_symbol_preview_fixtures {
+        fn target() -> &'static str {
+            "first"
+        }
+
+        mod nested {
+            fn target() -> &'static str {
+                "second"
+            }
+        }
+    }
 
     #[test]
     fn delegate_tool_shows_agent_and_objective() {
@@ -1061,8 +1086,7 @@ mod tests {
 
     #[test]
     fn replace_symbol_builds_semantic_preview_sections() {
-        let path = std::env::current_dir()
-            .unwrap()
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/tool_detail.rs")
             .display()
             .to_string();
@@ -1090,6 +1114,79 @@ mod tests {
             }
             other => panic!("expected ReplaceSymbol, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn replace_symbol_supports_snake_case_root_occurrence_and_qualified_leaf() {
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let detail = parse_tool_detail(
+            "replace_symbol",
+            Some(&serde_json::json!({
+                "root": ".",
+                "replacements": [{
+                    "path": "src/tool_detail.rs",
+                    "symbol": "replace_symbol_preview_fixtures::nested::target",
+                    "kind": "function",
+                    "occurrence": 1,
+                    "new_text": "fn target() -> &'static str { \"replacement\" }"
+                }]
+            })),
+            cwd.to_str(),
+        );
+
+        match detail {
+            ToolDetail::ReplaceSymbol { title, sections } => {
+                assert_eq!(title, "src/tool_detail.rs");
+                assert_eq!(sections.len(), 1);
+                assert_eq!(
+                    sections[0].header,
+                    "replace_symbol_preview_fixtures::nested::target (function)"
+                );
+                assert!(sections[0].old.contains("\"second\""));
+                assert_eq!(
+                    sections[0].new,
+                    "fn target() -> &'static str { \"replacement\" }"
+                );
+                assert!(sections[0].start_line.is_some());
+            }
+            other => panic!("expected ReplaceSymbol, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_symbol_preview_path_resolution_uses_root_and_cwd_once() {
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cwd_str = cwd.to_str().unwrap();
+        let relative_path = "src/tool_detail.rs";
+        let expected = cwd.join(relative_path);
+
+        assert_eq!(
+            resolve_preview_path(relative_path, Some(cwd_str), Some(cwd_str)),
+            expected
+        );
+        assert_eq!(
+            resolve_preview_path(relative_path, Some("."), Some(cwd_str)),
+            expected
+        );
+        assert_eq!(
+            resolve_preview_path(expected.to_str().unwrap(), Some("ignored"), Some(cwd_str)),
+            expected
+        );
+        assert_eq!(
+            resolve_preview_path(relative_path, None, Some("relative-cwd")),
+            Path::new("relative-cwd").join(relative_path)
+        );
+        assert_eq!(
+            strip_cwd("/workspace-other/src/lib.rs", Some("/workspace")),
+            "/workspace-other/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn symbol_preview_without_braces_does_not_consume_the_rest_of_the_file() {
+        let lines = ["const VALUE: usize = 1;", "fn unrelated() {}"];
+
+        assert_eq!(symbol_block_end(&lines, 0), 0);
     }
 
     #[test]
