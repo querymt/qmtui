@@ -620,9 +620,8 @@ pub enum StartPageItem {
 
 /// Maximum number of recent sessions shown per group on the start page.
 pub const MAX_RECENT_SESSIONS: usize = 3;
-/// Target visible sessions per group when auto-filling the sessions popup.
+/// Maximum discovery-preview sessions retained before the workspace page arrives.
 pub const POPUP_SESSION_PAGE_TARGET: usize = 10;
-pub const SESSION_GROUP_PAGE_LIMIT: u32 = 10;
 pub const SESSION_CHILD_PAGE_LIMIT: u32 = 10;
 
 /// Maximum number of workspace groups shown on the start page.
@@ -715,8 +714,14 @@ pub struct App {
     /// Groups whose header has been collapsed by the user in the session popup.
     /// Separate from `collapsed_groups` so start-page and popup states are independent.
     pub popup_collapsed_groups: HashSet<String>,
-    /// CWDs with an outstanding group-page session request.
+    /// Whether global ACP session discovery has another request in flight.
+    pub session_discovery_in_progress: bool,
+    /// Opaque global cursors already queued during the current discovery pass.
+    pub session_discovery_cursors: HashSet<String>,
+    /// CWDs with an outstanding first-page or continuation request.
     pub pending_session_group_loads: HashSet<Option<String>>,
+    /// CWDs whose authoritative first workspace page has been loaded.
+    pub hydrated_session_groups: HashSet<String>,
     /// Root session IDs expanded to show fork children.
     pub expanded_session_children: HashSet<String>,
     /// Parent session IDs with an outstanding child-page request.
@@ -801,15 +806,13 @@ pub struct App {
     pub model_filter: String,
 
     // delegate agent model preferences
-    /// Known agents from the server's `state` message.
-    /// Single-element or empty in single-agent mode.
+    /// Agents for `agents_profile_id`. Index zero is the primary session agent.
     pub agents: Vec<crate::protocol::AgentInfo>,
-    /// Currently selected tab index in the model popup.
-    /// 0 = "Planner" (plan mode), 1 = "Build" (build mode), 2..N = delegate agents.
+    pub agents_profile_id: Option<String>,
+    /// Currently selected tab index: zero is the session, remaining tabs are delegates.
     pub model_popup_agent_tab: usize,
-    /// Per-agent-id model preferences: agent_id → (provider, model).
-    /// Applied automatically when `SessionForked` creates a child for that agent.
-    pub delegate_model_preferences: HashMap<String, (String, String)>,
+    /// Explicit model preferences scoped by profile ID and delegate agent ID.
+    pub delegate_model_preferences: HashMap<String, HashMap<String, DelegateModelPreference>>,
 
     // theme selector
     pub theme_cursor: usize,
@@ -906,6 +909,12 @@ pub struct App {
     pub pending_commands: Vec<ClientMsg>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
+    pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
+    pub delegate_child_message_ids: HashMap<String, HashSet<String>>,
+    /// Latest lifecycle timestamp and bounded terminal metadata by delegation ID.
+    pub delegation_update_times: HashMap<String, i64>,
+    pub delegation_result_summaries: HashMap<String, String>,
+    pub delegation_errors: HashMap<String, String>,
     /// Parent delegate ToolCallStart records awaiting DelegationRequested linkage.
     pub pending_delegate_tool_calls: Vec<PendingDelegateToolCall>,
     /// While a reverted frontier turn is being suppressed, ignore any
@@ -942,16 +951,26 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 }
 
 impl App {
+    pub fn begin_session_discovery(&mut self) -> Option<ClientMsg> {
+        if self.session_discovery_in_progress || !self.pending_session_group_loads.is_empty() {
+            return None;
+        }
+        self.session_groups.clear();
+        self.session_discovery_cursors.clear();
+        self.pending_session_group_loads.clear();
+        self.hydrated_session_groups.clear();
+        self.session_discovery_in_progress = true;
+        Some(ClientMsg::list_sessions_browse())
+    }
+
     pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<ClientMsg> {
         let group = self.session_groups.get(group_idx)?;
         let cursor = group.next_cursor.clone()?;
-        let cwd = group.cwd.clone();
-        self.pending_session_group_loads.insert(cwd.clone());
-        Some(ClientMsg::list_sessions_group(
-            cwd,
-            cursor,
-            SESSION_GROUP_PAGE_LIMIT,
-        ))
+        let cwd = group.cwd.clone()?;
+        if !self.pending_session_group_loads.insert(Some(cwd.clone())) {
+            return None;
+        }
+        Some(ClientMsg::list_sessions_group(cwd, cursor))
     }
 
     pub fn session_child_page_request(
@@ -984,7 +1003,10 @@ impl App {
             session_popup_tab: 0,
             collapsed_groups: HashSet::new(),
             popup_collapsed_groups: HashSet::new(),
+            session_discovery_in_progress: false,
+            session_discovery_cursors: HashSet::new(),
             pending_session_group_loads: HashSet::new(),
+            hydrated_session_groups: HashSet::new(),
             expanded_session_children: HashSet::new(),
             pending_session_child_loads: HashSet::new(),
             start_page_scroll: 0,
@@ -1042,6 +1064,7 @@ impl App {
             model_cursor: 0,
             model_filter: String::new(),
             agents: Vec::new(),
+            agents_profile_id: None,
             model_popup_agent_tab: 0,
             delegate_model_preferences: HashMap::new(),
             theme_cursor: 0,
@@ -1101,6 +1124,11 @@ impl App {
             suppress_delegation_result: false,
             pending_commands: Vec::new(),
             pending_delegate_child_states: HashMap::new(),
+            pending_delegate_child_stats: HashMap::new(),
+            delegate_child_message_ids: HashMap::new(),
+            delegation_update_times: HashMap::new(),
+            delegation_result_summaries: HashMap::new(),
+            delegation_errors: HashMap::new(),
             pending_delegate_tool_calls: Vec::new(),
             suppress_turn_output: false,
             status: "connecting...".into(),
@@ -1887,6 +1915,8 @@ impl App {
             ConnectionEvent::Disconnected { reason } => {
                 self.conn = ConnState::Disconnected;
                 self.reconnect_delay_ms = None;
+                self.session_discovery_in_progress = false;
+                self.pending_session_group_loads.clear();
                 self.set_status(
                     LogLevel::Warn,
                     "connection",
@@ -2111,23 +2141,85 @@ impl App {
         tab_idx == 0
     }
 
-    pub fn set_delegate_model_preference(&mut self, agent_id: &str, provider: &str, model: &str) {
-        self.delegate_model_preferences.insert(
-            agent_id.to_string(),
-            (provider.to_string(), model.to_string()),
-        );
+    pub fn delegate_preference_profile_id(&self) -> Option<&str> {
+        self.current_session_profile_id()
+            .or(self.active_profile_id.as_deref())
     }
 
-    pub fn get_delegate_model_preference(&self, agent_id: &str) -> Option<(&str, &str)> {
+    pub fn desired_agents_profile_id(&self) -> Option<&str> {
+        self.delegate_preference_profile_id()
+    }
+
+    pub fn set_delegate_model_preference(
+        &mut self,
+        profile_id: &str,
+        agent_id: &str,
+        model: &ModelEntry,
+    ) {
         self.delegate_model_preferences
-            .get(agent_id)
-            .map(|(p, m)| (p.as_str(), m.as_str()))
+            .entry(profile_id.to_string())
+            .or_default()
+            .insert(
+                agent_id.to_string(),
+                DelegateModelPreference {
+                    model_id: model.id.clone(),
+                    provider: model.provider.clone(),
+                    model: model.model.clone(),
+                    node_id: model.node_id.clone(),
+                },
+            );
+    }
+
+    pub fn clear_delegate_model_preference(&mut self, profile_id: &str, agent_id: &str) {
+        if let Some(preferences) = self.delegate_model_preferences.get_mut(profile_id) {
+            preferences.remove(agent_id);
+            if preferences.is_empty() {
+                self.delegate_model_preferences.remove(profile_id);
+            }
+        }
+    }
+
+    pub fn get_delegate_model_preference(
+        &self,
+        profile_id: &str,
+        agent_id: &str,
+    ) -> Option<&DelegateModelPreference> {
+        self.delegate_model_preferences
+            .get(profile_id)
+            .and_then(|preferences| preferences.get(agent_id))
+    }
+
+    pub fn delegate_model_commands_for_session(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+    ) -> Vec<ClientMsg> {
+        let known_agents: HashSet<&str> =
+            self.agents.iter().skip(1).map(|a| a.id.as_str()).collect();
+        self.delegate_model_preferences
+            .get(profile_id)
+            .into_iter()
+            .flat_map(|preferences| preferences.iter())
+            .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
+            .map(|(agent_id, preference)| ClientMsg::SetDelegateModel {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.clone(),
+                model_id: Some(preference.model_id.clone()),
+                node_id: preference.node_id.clone(),
+            })
+            .collect()
     }
 
     /// Cursor position for a delegate agent's preferred model in the popup list.
     pub fn delegate_model_cursor(&self, agent_id: &str) -> usize {
         let items = self.visible_model_popup_items();
-        let Some((provider, model)) = self.get_delegate_model_preference(agent_id) else {
+        let Some(profile_id) = self.delegate_preference_profile_id() else {
+            return items
+                .iter()
+                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
+                .unwrap_or(0);
+        };
+        let Some(preference) = self.get_delegate_model_preference(profile_id, agent_id) else {
             return items
                 .iter()
                 .position(|item| matches!(item, ModelPopupItem::Model { .. }))
@@ -2137,8 +2229,8 @@ impl App {
             .iter()
             .position(|item| match item {
                 ModelPopupItem::Model { model_idx } => {
-                    let m = &self.models[*model_idx];
-                    m.provider == provider && m.model == model
+                    self.models[*model_idx].id == preference.model_id
+                        && self.models[*model_idx].node_id == preference.node_id
                 }
                 _ => false,
             })
@@ -2820,7 +2912,6 @@ mod delegate_entry_tests {
     // ── child session event routing ───────────────────────────────────────────
 
     // ── subscribe on SessionForked ────────────────────────────────────────────
-
     // ── delegation view (parent tracking, Screen::Delegate) ──────────────────
 
     // ── delegation result suppression ────────────────────────────────────────
@@ -4387,6 +4478,21 @@ mod popup_item_tests {
     // ── no MAX_VISIBLE_GROUPS cap ─────────────────────────────────────────────
 
     #[test]
+    fn popup_items_hide_group_load_more_while_request_is_pending() {
+        let mut app = App::new();
+        let mut group = make_group(Some("/workspace/project"), &["s1"]);
+        group.next_cursor = Some("opaque-workspace-2".to_string());
+        app.session_groups = vec![group];
+        app.pending_session_group_loads
+            .insert(Some("/workspace/project".to_string()));
+
+        assert!(app.session_group_page_request(0).is_none());
+        assert!(!app.visible_popup_items().iter().any(
+            |item| matches!(item, PopupItem::LoadMore { parent_path, .. } if parent_path.is_empty())
+        ));
+    }
+
+    #[test]
     fn popup_items_shows_all_groups_beyond_cap() {
         let mut app = App::new();
         app.session_groups = vec![
@@ -4808,6 +4914,8 @@ mod delegate_model_preference_tests {
         AgentInfo {
             id: id.into(),
             name: name.into(),
+            description: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -4893,17 +5001,19 @@ mod delegate_model_preference_tests {
     #[test]
     fn delegate_pref_round_trip() {
         let mut app = App::new();
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        let model = make_model("anthropic", "claude-sonnet");
+        app.set_delegate_model_preference("profile", "coder", &model);
         assert_eq!(
-            app.get_delegate_model_preference("coder"),
-            Some(("anthropic", "claude-sonnet"))
+            app.get_delegate_model_preference("profile", "coder")
+                .map(|preference| preference.model_id.as_str()),
+            Some("anthropic/claude-sonnet")
         );
     }
 
     #[test]
     fn delegate_pref_missing_returns_none() {
         let app = App::new();
-        assert_eq!(app.get_delegate_model_preference("coder"), None);
+        assert_eq!(app.get_delegate_model_preference("profile", "coder"), None);
     }
 
     #[test]
@@ -4913,7 +5023,8 @@ mod delegate_model_preference_tests {
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.set_delegate_model_preference("coder", "anthropic", "claude-sonnet");
+        app.active_profile_id = Some("profile".into());
+        app.set_delegate_model_preference("profile", "coder", &app.models[1].clone());
         let cursor = app.delegate_model_cursor("coder");
         // Should point to the second item (index 1 in models, but popup items
         // include provider headers — exact index depends on visible_model_popup_items).

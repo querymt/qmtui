@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ChatEntry, DiffPreviewSection, ShellOutputTail, ToolDetail};
-use crate::domain::activity::{ActivityState, DelegateEntry, SessionOp};
+use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
@@ -376,15 +376,21 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 };
                 let sym = if *is_error { "x" } else { ">" };
 
-                // For delegate tool calls, compute duration and state from delegate_entries.
-                let (delegate_duration, delegate_awaiting_input) = if name == "delegate" {
+                // For delegate tool calls, compute duration and lifecycle from delegate entries.
+                let delegate_entry = if name == "delegate" {
                     let entry = delegate_entry_for_tool(tool_call_id.as_ref(), delegate_idx);
-                    let dur = entry.and_then(|e| {
-                        let start = e.started_at?;
-                        let end = e.ended_at.unwrap_or_else(|| {
+                    delegate_idx += 1;
+                    entry
+                } else {
+                    None
+                };
+                let delegate_duration = delegate_entry
+                    .and_then(|entry| {
+                        let start = entry.started_at?;
+                        let end = entry.ended_at.unwrap_or_else(|| {
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
+                                .map(|duration| duration.as_secs() as i64)
                                 .unwrap_or(start)
                         });
                         let secs = (end - start).max(0) as u64;
@@ -393,14 +399,8 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         } else {
                             format!(":{}m{}s", secs / 60, secs % 60)
                         })
-                    });
-                    let awaiting_input = entry.is_some_and(|e| e.awaiting_input());
-                    delegate_idx += 1;
-                    (dur.unwrap_or_default(), awaiting_input)
-                } else {
-                    (String::new(), false)
-                };
-
+                    })
+                    .unwrap_or_default();
                 let tool_style = style;
                 match detail {
                     ToolDetail::Edit {
@@ -501,14 +501,26 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             } else {
                                 format!("({label_inner}{delegate_duration})")
                             };
+                            let (delegate_status, delegate_status_style) = match delegate_entry {
+                                Some(entry) if entry.awaiting_input() => {
+                                    ("awaiting input", Theme::mode_badge("plan"))
+                                }
+                                Some(entry) => match entry.status {
+                                    DelegateStatus::InProgress => {
+                                        ("running", Theme::status_accent())
+                                    }
+                                    DelegateStatus::Completed => ("done", Theme::status()),
+                                    DelegateStatus::Failed => ("failed", Theme::tool_error()),
+                                    DelegateStatus::Cancelled => ("cancelled", Theme::status()),
+                                },
+                                None => ("queued", Theme::status()),
+                            };
                             let mut spans = vec![Span::styled(format!("{sym} {name} "), style)];
                             spans.push(Span::styled(format!("{label} "), Theme::status_accent()));
-                            if delegate_awaiting_input {
-                                spans.push(Span::styled(
-                                    "awaiting input ",
-                                    Theme::mode_badge("plan"),
-                                ));
-                            }
+                            spans.push(Span::styled(
+                                format!("{delegate_status} "),
+                                delegate_status_style,
+                            ));
                             if !objective.is_empty() {
                                 spans.push(Span::styled(objective.to_string(), Theme::diff_file()));
                             }

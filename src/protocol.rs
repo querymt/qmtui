@@ -9,11 +9,29 @@ pub enum SessionScope {
     Forks,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionListRequest {
+    Discovery,
+    WorkspaceFirstPage { cwd: String },
+    WorkspaceContinuation { cwd: String },
+}
+
+impl SessionListRequest {
+    pub fn cwd(&self) -> Option<&str> {
+        match self {
+            Self::Discovery => None,
+            Self::WorkspaceFirstPage { cwd } | Self::WorkspaceContinuation { cwd } => Some(cwd),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ClientMsg {
     Init,
     ListSessions {
+        #[serde(skip)]
+        request: SessionListRequest,
         #[serde(skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,8 +86,14 @@ pub enum ClientMsg {
         reasoning_effort: String,
     },
     ListProfiles,
-    SetActiveProfile {
+    ListProfileAgents {
         profile_id: String,
+    },
+    SetDelegateModel {
+        session_id: String,
+        agent_id: String,
+        model_id: Option<String>,
+        node_id: Option<String>,
     },
     NewSession {
         cwd: Option<String>,
@@ -149,9 +173,14 @@ pub enum ClientMsg {
 
 impl ClientMsg {
     pub fn list_sessions_browse() -> Self {
+        Self::list_sessions_discovery(None)
+    }
+
+    pub fn list_sessions_discovery(cursor: Option<String>) -> Self {
         Self::ListSessions {
+            request: SessionListRequest::Discovery,
             mode: None,
-            cursor: None,
+            cursor,
             limit: None,
             cwd: None,
             query: None,
@@ -160,12 +189,26 @@ impl ClientMsg {
         }
     }
 
-    pub fn list_sessions_group(cwd: Option<String>, cursor: String, limit: u32) -> Self {
+    pub fn list_sessions_workspace(cwd: String) -> Self {
         Self::ListSessions {
+            request: SessionListRequest::WorkspaceFirstPage { cwd: cwd.clone() },
+            mode: Some("group".to_string()),
+            cursor: None,
+            limit: Some(10),
+            cwd: Some(cwd),
+            query: None,
+            include_remote: None,
+            session_scope: SessionScope::Root,
+        }
+    }
+
+    pub fn list_sessions_group(cwd: String, cursor: String) -> Self {
+        Self::ListSessions {
+            request: SessionListRequest::WorkspaceContinuation { cwd: cwd.clone() },
             mode: Some("group".to_string()),
             cursor: Some(cursor),
-            limit: Some(limit),
-            cwd: Some(cwd.unwrap_or_else(|| "__none__".to_string())),
+            limit: Some(10),
+            cwd: Some(cwd),
             query: None,
             include_remote: None,
             session_scope: SessionScope::Root,
@@ -207,14 +250,52 @@ mod client_msg_tests {
     }
 
     #[test]
+    fn list_sessions_workspace_serializes_cwd_without_cursor() {
+        let value = serde_json::to_value(ClientMsg::list_sessions_workspace(
+            "/workspace/project".to_string(),
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "list_sessions",
+                "data": {
+                    "mode": "group",
+                    "limit": 10,
+                    "cwd": "/workspace/project",
+                    "session_scope": "root"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn list_sessions_group_omits_include_remote_for_pagination() {
         let value = serde_json::to_value(ClientMsg::list_sessions_group(
-            Some("/workspace/project".to_string()),
+            "/workspace/project".to_string(),
             "cursor-1".to_string(),
-            10,
         ))
         .unwrap();
         assert!(value["data"].get("include_remote").is_none());
+    }
+
+    #[test]
+    fn list_sessions_discovery_serializes_opaque_cursor() {
+        let value = serde_json::to_value(ClientMsg::list_sessions_discovery(Some(
+            "opaque-root-2".to_string(),
+        )))
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "list_sessions",
+                "data": {
+                    "cursor": "opaque-root-2",
+                    "include_remote": true,
+                    "session_scope": "root"
+                }
+            })
+        );
     }
 
     #[test]
@@ -273,9 +354,8 @@ mod client_msg_tests {
     #[test]
     fn list_sessions_group_serializes_backend_pagination_fields() {
         let value = serde_json::to_value(ClientMsg::list_sessions_group(
-            Some("/workspace/project".to_string()),
+            "/workspace/project".to_string(),
             "cursor-1".to_string(),
-            10,
         ))
         .unwrap();
         assert_eq!(
@@ -333,19 +413,42 @@ mod client_msg_tests {
     }
 
     #[test]
-    fn profile_messages_serialize() {
+    fn list_profiles_serializes() {
         let list = serde_json::to_value(ClientMsg::ListProfiles).unwrap();
         assert_eq!(list, json!({ "type": "list_profiles" }));
+    }
 
-        let set = serde_json::to_value(ClientMsg::SetActiveProfile {
-            profile_id: "fast".to_string(),
+    #[test]
+    fn delegate_profile_messages_serialize() {
+        let agents = serde_json::to_value(ClientMsg::ListProfileAgents {
+            profile_id: "quorum".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            agents,
+            json!({
+                "type": "list_profile_agents",
+                "data": { "profile_id": "quorum" }
+            })
+        );
+
+        let set = serde_json::to_value(ClientMsg::SetDelegateModel {
+            session_id: "parent".into(),
+            agent_id: "coder".into(),
+            model_id: Some("openai/gpt-5".into()),
+            node_id: Some("node-1".into()),
         })
         .unwrap();
         assert_eq!(
             set,
             json!({
-                "type": "set_active_profile",
-                "data": { "profile_id": "fast" }
+                "type": "set_delegate_model",
+                "data": {
+                    "session_id": "parent",
+                    "agent_id": "coder",
+                    "model_id": "openai/gpt-5",
+                    "node_id": "node-1"
+                }
             })
         );
     }
@@ -407,12 +510,27 @@ pub struct ProfileInfo {
     pub source: Option<String>,
     #[serde(default)]
     pub config_kind: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateModelPreference {
+    pub model_id: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
