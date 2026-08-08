@@ -2795,6 +2795,102 @@ mod tests {
     }
 
     #[test]
+    fn warm_shell_tool_card_rebuilds_with_output_tail_after_native_end_update() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-warm-cache".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "cargo test" })),
+            },
+        );
+
+        let warm_lines = rendered_card_lines(&mut app);
+        assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
+        assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("shell-warm-cache".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some("tail sentinel".into()),
+            },
+        );
+
+        assert_eq!(app.messages.len(), 1, "tool detail update should be in place");
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "semantic update should invalidate the warm card"
+        );
+        let rebuilt_lines = rendered_card_lines(&mut app);
+        assert!(rebuilt_lines.iter().any(|line| line.contains("output tail:")));
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("tail sentinel")),
+            "rebuilt card returned stale shell detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
+    fn warm_edit_tool_card_rebuilds_with_start_line_after_native_end_update() {
+        let mut app = App::new();
+        app.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("edit-warm-cache".into()),
+                name: "edit".into(),
+                arguments: Some(serde_json::json!({
+                    "filePath": "src/lib.rs",
+                    "oldString": "before\n",
+                    "newString": "after\n"
+                })),
+            },
+        );
+
+        let warm_lines = rendered_card_lines(&mut app);
+        assert!(
+            warm_lines
+                .iter()
+                .any(|line| line.contains("  1 ") && line.contains("- before"))
+        );
+        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("edit-warm-cache".into()),
+                name: "edit".into(),
+                is_error: false,
+                result: Some(r#"{"startLineOld":42}"#.into()),
+            },
+        );
+
+        assert_eq!(app.messages.len(), 1, "tool detail update should be in place");
+        assert_eq!(
+            app.card_cache.processed_messages, 0,
+            "semantic update should invalidate the warm card"
+        );
+        let rebuilt_lines = rendered_card_lines(&mut app);
+        assert!(
+            rebuilt_lines
+                .iter()
+                .any(|line| line.contains("  42 ") && line.contains("- before")),
+            "rebuilt card returned stale edit detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
     fn failed_tool_end_before_start_reconciles_badge_without_stale_bottom_entry() {
         let mut app = App::new();
         app.session_id = Some("test-session".into());
