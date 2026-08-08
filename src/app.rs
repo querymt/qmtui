@@ -14,6 +14,10 @@ pub(crate) use crate::domain::activity::{
 pub(crate) use crate::domain::elicitation::{
     ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
 };
+use crate::domain::session::{
+    ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoState,
+    UndoableTurn,
+};
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
@@ -426,48 +430,6 @@ pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_s
             .unwrap_or_default();
         *outcome = Some(labels.join("\n"));
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UndoableTurn {
-    pub turn_id: String,
-    pub message_id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkBoundaryKind {
-    Assistant,
-    User,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkTurnItem {
-    pub turn_index: usize,
-    pub message_id: String,
-    pub boundary_kind: ForkBoundaryKind,
-    pub user_preview: String,
-    pub assistant_preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UndoFrameStatus {
-    Pending,
-    Confirmed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UndoFrame {
-    pub turn_id: String,
-    pub message_id: String,
-    pub status: UndoFrameStatus,
-    pub reverted_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UndoState {
-    pub stack: Vec<UndoFrame>,
-    pub frontier_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3797,6 +3759,7 @@ mod tests {
 #[cfg(test)]
 mod start_page_tests {
     use super::*;
+    use crate::domain::session::SessionSummary;
 
     fn make_group(cwd: Option<&str>, ids: &[(&str, Option<&str>)]) -> SessionGroup {
         SessionGroup {
@@ -4395,6 +4358,7 @@ mod start_page_tests {
 #[cfg(test)]
 mod popup_item_tests {
     use super::*;
+    use crate::domain::session::SessionSummary;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
