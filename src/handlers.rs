@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::app::{self, App, CommandPaletteAction, LogLevel, Popup, Screen};
 use crate::domain::activity::{ActivityState, SessionOp};
+use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::model::ModelEntry;
 
@@ -2229,7 +2230,7 @@ pub(crate) fn handle_auth_popup_key(
                         app.auth_api_key_input.clear();
                         app.auth_api_key_cursor = 0;
                     } else if provider.is_oauth_only()
-                        && provider.oauth_status != Some(crate::protocol::OAuthStatus::Connected)
+                        && provider.oauth_status != Some(OAuthStatus::Connected)
                     {
                         app.auth_selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
@@ -2246,7 +2247,7 @@ pub(crate) fn handle_auth_popup_key(
                 // Ctrl+D: disconnect/clear credential for selected provider
                 if let Some(idx) = app.auth_selected {
                     let provider = &app.auth_providers[idx];
-                    if provider.oauth_status == Some(crate::protocol::OAuthStatus::Connected) {
+                    if provider.oauth_status == Some(OAuthStatus::Connected) {
                         let provider_id = provider.provider.clone();
                         cmd_tx.send(ClientMsg::DisconnectOAuth {
                             provider: provider_id,
@@ -2370,8 +2371,7 @@ pub(crate) fn handle_auth_popup_key(
             KeyCode::Enter => {
                 if let Some(ref flow) = app.auth_oauth_flow {
                     let flow_id = flow.flow_id.clone();
-                    let is_device_poll =
-                        flow.flow_kind == crate::protocol::OAuthFlowKind::DevicePoll;
+                    let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
                     let response = if is_device_poll {
                         String::new()
                     } else {

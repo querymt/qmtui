@@ -8,6 +8,7 @@ use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
     SessionActivity, SessionOp, SessionStatsLite,
 };
+use crate::domain::auth::AuthProviderEntry;
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
@@ -732,7 +733,7 @@ pub struct App {
     pub(crate) card_cache: CardCache,
 
     // auth popup state
-    pub auth_providers: Vec<crate::protocol::AuthProviderEntry>,
+    pub auth_providers: Vec<AuthProviderEntry>,
     pub auth_cursor: usize,
     pub auth_filter: String,
     pub auth_selected: Option<usize>,
@@ -1107,7 +1108,7 @@ impl App {
     }
 
     /// Filtered auth providers matching the current `auth_filter`.
-    pub fn filtered_auth_providers(&self) -> Vec<(usize, &crate::protocol::AuthProviderEntry)> {
+    pub fn filtered_auth_providers(&self) -> Vec<(usize, &AuthProviderEntry)> {
         if self.auth_filter.is_empty() {
             self.auth_providers.iter().enumerate().collect()
         } else {
