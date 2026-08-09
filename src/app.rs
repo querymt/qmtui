@@ -767,9 +767,6 @@ pub struct App {
     /// Set after DelegationCompleted/DelegationFailed; consumed by the next
     /// UserMessageStored to suppress the noisy batch-result message.
     pub suppress_delegation_result: bool,
-    /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
-    /// Drained by native ACP after each event/replay batch.
-    pub pending_commands: Vec<Command>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
     pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
@@ -814,10 +811,6 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 }
 
 impl App {
-    pub(crate) fn drain_pending_commands(&mut self) -> Vec<Command> {
-        std::mem::take(&mut self.pending_commands)
-    }
-
     pub fn begin_session_discovery(&mut self) -> Option<Command> {
         if self.session_discovery_in_progress || !self.pending_session_group_loads.is_empty() {
             return None;
@@ -990,7 +983,6 @@ impl App {
             parent_session_id: None,
             pending_parent_session_id: None,
             suppress_delegation_result: false,
-            pending_commands: Vec::new(),
             pending_delegate_child_states: HashMap::new(),
             pending_delegate_child_stats: HashMap::new(),
             delegate_child_message_ids: HashMap::new(),
