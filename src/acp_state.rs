@@ -9,6 +9,7 @@ use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
+use crate::domain::auth::AuthProviderEntry;
 use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::ModelEntry;
@@ -16,9 +17,9 @@ use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
 use crate::domain::tool::ToolDetail;
 use crate::protocol::{
-    AuthProviderEntry, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
-    MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
-    RemoteSessionListInfo, SessionListRequest, UndoResultData, UndoStackFrame,
+    ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, OAuthFlowData,
+    OAuthResultData, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo,
+    SessionListRequest, UndoResultData, UndoStackFrame,
 };
 use crate::tool_detail;
 

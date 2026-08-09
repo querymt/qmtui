@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::auth::{AuthMethod, AuthProviderEntry, OAuthFlowKind};
 use crate::domain::session::{SessionGroup, SessionSummary};
 
 // --- Client → Server messages ---
@@ -233,7 +234,8 @@ impl ClientMsg {
 
 #[cfg(test)]
 mod client_msg_tests {
-    use super::*;
+    use super::ClientMsg;
+    use crate::domain::auth::AuthMethod;
     use serde_json::json;
 
     #[test]
@@ -418,6 +420,116 @@ mod client_msg_tests {
     fn list_profiles_serializes() {
         let list = serde_json::to_value(ClientMsg::ListProfiles).unwrap();
         assert_eq!(list, json!({ "type": "list_profiles" }));
+    }
+
+    #[test]
+    fn list_auth_providers_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::ListAuthProviders).unwrap(),
+            json!({ "type": "list_auth_providers" })
+        );
+    }
+
+    #[test]
+    fn start_oauth_login_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::StartOAuthLogin {
+                provider: "codex".into(),
+            })
+            .unwrap(),
+            json!({
+                "type": "start_oauth_login",
+                "data": { "provider": "codex" }
+            })
+        );
+    }
+
+    #[test]
+    fn complete_oauth_login_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::CompleteOAuthLogin {
+                flow_id: "flow-1".into(),
+                response: "code-123".into(),
+            })
+            .unwrap(),
+            json!({
+                "type": "complete_oauth_login",
+                "data": { "flow_id": "flow-1", "response": "code-123" }
+            })
+        );
+    }
+
+    #[test]
+    fn disconnect_oauth_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::DisconnectOAuth {
+                provider: "openai".into(),
+            })
+            .unwrap(),
+            json!({
+                "type": "disconnect_oauth",
+                "data": { "provider": "openai" }
+            })
+        );
+    }
+
+    #[test]
+    fn set_api_token_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::SetApiToken {
+                provider: "openai".into(),
+                api_key: "sk-123".into(),
+            })
+            .unwrap(),
+            json!({
+                "type": "set_api_token",
+                "data": { "provider": "openai", "api_key": "sk-123" }
+            })
+        );
+    }
+
+    #[test]
+    fn clear_api_token_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::ClearApiToken {
+                provider: "openai".into(),
+            })
+            .unwrap(),
+            json!({
+                "type": "clear_api_token",
+                "data": { "provider": "openai" }
+            })
+        );
+    }
+
+    #[test]
+    fn set_auth_method_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::SetAuthMethod {
+                provider: "openai".into(),
+                method: AuthMethod::ApiKey,
+            })
+            .unwrap(),
+            json!({
+                "type": "set_auth_method",
+                "data": { "provider": "openai", "method": "api_key" }
+            })
+        );
+    }
+
+    #[test]
+    fn set_oauth_auth_method_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::SetAuthMethod {
+                provider: "openai".into(),
+                method: AuthMethod::OAuth,
+            })
+            .unwrap(),
+            json!({
+                "type": "set_auth_method",
+                "data": { "provider": "openai", "method": "oauth" }
+            })
+        );
     }
 
     #[test]
@@ -1019,133 +1131,6 @@ pub struct ErrorData {
 
 // ── Auth / token types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthMethod {
-    #[serde(rename = "oauth")]
-    OAuth,
-    ApiKey,
-    EnvVar,
-}
-
-impl std::fmt::Display for AuthMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OAuth => write!(f, "OAuth"),
-            Self::ApiKey => write!(f, "API Key"),
-            Self::EnvVar => write!(f, "Env"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OAuthStatus {
-    Connected,
-    Expired,
-    NotAuthenticated,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct AuthProviderEntry {
-    pub provider: String,
-    pub display_name: String,
-    pub oauth_status: Option<OAuthStatus>,
-    pub has_stored_api_key: bool,
-    pub has_env_api_key: bool,
-    pub env_var_name: Option<String>,
-    pub supports_oauth: bool,
-    pub preferred_method: Option<AuthMethod>,
-}
-
-impl AuthProviderEntry {
-    /// Provider supports only OAuth (no API key env var).
-    pub fn is_oauth_only(&self) -> bool {
-        self.supports_oauth && self.env_var_name.is_none()
-    }
-
-    /// Provider supports only API key (no OAuth).
-    pub fn is_api_key_only(&self) -> bool {
-        !self.supports_oauth && self.env_var_name.is_some()
-    }
-
-    /// Provider supports multiple auth methods (both OAuth and API key).
-    pub fn has_multiple_auth_methods(&self) -> bool {
-        self.supports_oauth && self.env_var_name.is_some()
-    }
-
-    /// Provider requires OAuth but the build doesn't include it.
-    pub fn is_unconfigurable(&self) -> bool {
-        !self.supports_oauth && self.env_var_name.is_none()
-    }
-
-    /// Resolve which auth method is effectively active.
-    pub fn effective_auth(&self) -> Option<AuthMethod> {
-        let pref = self.preferred_method;
-        let order: &[AuthMethod] = if let Some(p) = pref {
-            // Preferred first, then defaults
-            match p {
-                AuthMethod::OAuth => &[AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar],
-                AuthMethod::ApiKey => &[AuthMethod::ApiKey, AuthMethod::OAuth, AuthMethod::EnvVar],
-                AuthMethod::EnvVar => &[AuthMethod::EnvVar, AuthMethod::OAuth, AuthMethod::ApiKey],
-            }
-        } else if self.supports_oauth {
-            &[AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar]
-        } else {
-            &[AuthMethod::ApiKey, AuthMethod::EnvVar]
-        };
-
-        for method in order {
-            match method {
-                AuthMethod::OAuth => {
-                    if self.oauth_status == Some(OAuthStatus::Connected) {
-                        return Some(AuthMethod::OAuth);
-                    }
-                }
-                AuthMethod::ApiKey => {
-                    if self.has_stored_api_key {
-                        return Some(AuthMethod::ApiKey);
-                    }
-                }
-                AuthMethod::EnvVar => {
-                    if self.has_env_api_key {
-                        return Some(AuthMethod::EnvVar);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Badge label for current auth state.
-    pub fn auth_badge_label(&self) -> &'static str {
-        if self.is_unconfigurable() {
-            return "OAuth required";
-        }
-        if self.oauth_status == Some(OAuthStatus::Expired) {
-            return "Expired";
-        }
-        match self.effective_auth() {
-            Some(AuthMethod::OAuth) => "OAuth",
-            Some(AuthMethod::ApiKey) => "API Key",
-            Some(AuthMethod::EnvVar) => "Env",
-            None => "Not configured",
-        }
-    }
-
-    /// Whether the badge indicates a successful/active auth.
-    pub fn is_auth_active(&self) -> bool {
-        self.effective_auth().is_some()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OAuthFlowKind {
-    RedirectCode,
-    DevicePoll,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OAuthFlowData {
     pub flow_id: String,
@@ -1164,4 +1149,59 @@ pub struct OAuthResultData {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthProvidersData {
     pub providers: Vec<AuthProviderEntry>,
+}
+
+#[cfg(test)]
+mod auth_data_tests {
+    use super::AuthProvidersData;
+    use crate::domain::auth::{AuthMethod, OAuthStatus};
+    use serde_json::json;
+
+    #[test]
+    fn auth_providers_data_deserializes_mixed_providers() {
+        let data: AuthProvidersData = serde_json::from_value(json!({
+            "providers": [
+                {
+                    "provider": "openai",
+                    "display_name": "OpenAI",
+                    "oauth_status": "not_authenticated",
+                    "has_stored_api_key": false,
+                    "has_env_api_key": true,
+                    "env_var_name": "OPENAI_API_KEY",
+                    "supports_oauth": true,
+                    "preferred_method": "oauth"
+                },
+                {
+                    "provider": "groq",
+                    "display_name": "Groq",
+                    "oauth_status": null,
+                    "has_stored_api_key": true,
+                    "has_env_api_key": false,
+                    "env_var_name": "GROQ_API_KEY",
+                    "supports_oauth": false,
+                    "preferred_method": "api_key"
+                },
+                {
+                    "provider": "local",
+                    "display_name": "Local",
+                    "oauth_status": null,
+                    "has_stored_api_key": false,
+                    "has_env_api_key": false,
+                    "env_var_name": null,
+                    "supports_oauth": false,
+                    "preferred_method": null
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(data.providers.len(), 3);
+        assert_eq!(
+            data.providers[0].oauth_status,
+            Some(OAuthStatus::NotAuthenticated)
+        );
+        assert_eq!(data.providers[0].preferred_method, Some(AuthMethod::OAuth));
+        assert_eq!(data.providers[1].preferred_method, Some(AuthMethod::ApiKey));
+        assert_eq!(data.providers[2].preferred_method, None);
+    }
 }
