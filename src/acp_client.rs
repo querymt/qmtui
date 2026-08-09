@@ -21,11 +21,12 @@ use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
-use crate::domain::session::{SessionGroup, SessionSummary};
+use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionListPage, SessionSummary};
 use crate::protocol::{
     AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
-    RemoteSessionListInfo, SessionListRequest, UndoResultData, UndoStackFrame,
+    RemoteSessionListInfo, SessionChildrenData, SessionGroupData, SessionListData,
+    SessionListRequest, SessionSummaryData, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2467,11 +2468,76 @@ fn flatten_select_entries(option: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn send_session_list(
-    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
-    request: SessionListRequest,
+fn session_summary_from_wire(data: SessionSummaryData) -> SessionSummary {
+    SessionSummary {
+        session_id: data.session_id,
+        name: data.name,
+        title: data.title,
+        cwd: data.cwd,
+        created_at: data.created_at,
+        updated_at: data.updated_at,
+        parent_session_id: data.parent_session_id,
+        fork_origin: data.fork_origin,
+        session_kind: data.session_kind,
+        has_children: data.has_children,
+        fork_count: data.fork_count,
+        children: data
+            .children
+            .into_iter()
+            .map(session_summary_from_wire)
+            .collect(),
+        children_next_cursor: data.children_next_cursor,
+        children_total_count: data.children_total_count,
+        node: data.node,
+        node_id: data.node_id,
+        attached: data.attached,
+        runtime_state: data.runtime_state,
+    }
+}
+
+fn session_group_from_wire(data: SessionGroupData) -> SessionGroup {
+    SessionGroup {
+        cwd: data.cwd,
+        sessions: data
+            .sessions
+            .into_iter()
+            .map(session_summary_from_wire)
+            .collect(),
+        latest_activity: data.latest_activity,
+        total_count: data.total_count,
+        next_cursor: data.next_cursor,
+    }
+}
+
+fn session_list_page_from_wire(data: SessionListData) -> SessionListPage {
+    SessionListPage {
+        groups: data
+            .groups
+            .into_iter()
+            .map(session_group_from_wire)
+            .collect(),
+        next_cursor: data.next_cursor,
+        total_count: data.total_count,
+    }
+}
+
+fn session_children_page_from_wire(data: SessionChildrenData) -> SessionChildrenPage {
+    SessionChildrenPage {
+        parent_session_id: data.parent_session_id,
+        sessions: data
+            .sessions
+            .into_iter()
+            .map(session_summary_from_wire)
+            .collect(),
+        next_cursor: data.next_cursor,
+        total_count: data.total_count,
+    }
+}
+
+fn session_list_page_from_acp(
+    request: &SessionListRequest,
     response: acp::ListSessionsResponse,
-) {
+) -> SessionListPage {
     let mut groups: BTreeMap<Option<String>, Vec<SessionSummary>> = BTreeMap::new();
     let response_cursor = response.next_cursor.map(|cursor| cursor.to_string());
 
@@ -2525,14 +2591,20 @@ fn send_session_list(
         })
         .collect::<Vec<_>>();
 
-    send_acp(
-        srv_tx,
-        AcpAppEvent::SessionList {
-            request,
-            groups,
-            next_cursor: response_cursor,
-        },
-    );
+    SessionListPage {
+        groups,
+        next_cursor: response_cursor,
+        total_count: None,
+    }
+}
+
+fn send_session_list(
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    request: SessionListRequest,
+    response: acp::ListSessionsResponse,
+) {
+    let page = session_list_page_from_acp(&request, response);
+    send_acp(srv_tx, AcpAppEvent::SessionList { request, page });
 }
 
 fn send_state(
@@ -2885,8 +2957,95 @@ mod tests {
     }
 
     #[test]
+    fn wire_session_pages_map_recursively_to_domain() {
+        let list = session_list_page_from_wire(SessionListData {
+            groups: vec![SessionGroupData {
+                cwd: Some("/repo".into()),
+                latest_activity: Some("2024-02-01T00:00:00Z".into()),
+                total_count: Some(2),
+                next_cursor: Some("group-next".into()),
+                sessions: vec![SessionSummaryData {
+                    session_id: "root".into(),
+                    name: Some("Root name".into()),
+                    title: Some("Root title".into()),
+                    cwd: Some("/repo".into()),
+                    created_at: Some("2024-01-01T00:00:00Z".into()),
+                    updated_at: Some("2024-02-01T00:00:00Z".into()),
+                    parent_session_id: None,
+                    fork_origin: Some("manual".into()),
+                    session_kind: Some("interactive".into()),
+                    has_children: true,
+                    fork_count: 1,
+                    children: vec![SessionSummaryData {
+                        session_id: "child".into(),
+                        parent_session_id: Some("root".into()),
+                        node_id: Some("node-child".into()),
+                        ..Default::default()
+                    }],
+                    children_next_cursor: Some("child-next".into()),
+                    children_total_count: Some(1),
+                    node: Some("remote".into()),
+                    node_id: Some("node-root".into()),
+                    attached: Some(true),
+                    runtime_state: Some("running".into()),
+                }],
+            }],
+            next_cursor: Some("list-next".into()),
+            total_count: Some(7),
+        });
+
+        assert_eq!(list.next_cursor.as_deref(), Some("list-next"));
+        assert_eq!(list.total_count, Some(7));
+        let group = &list.groups[0];
+        assert_eq!(group.cwd.as_deref(), Some("/repo"));
+        assert_eq!(
+            group.latest_activity.as_deref(),
+            Some("2024-02-01T00:00:00Z")
+        );
+        assert_eq!(group.total_count, Some(2));
+        assert_eq!(group.next_cursor.as_deref(), Some("group-next"));
+        let root = &group.sessions[0];
+        assert_eq!(root.name.as_deref(), Some("Root name"));
+        assert_eq!(root.title.as_deref(), Some("Root title"));
+        assert_eq!(root.cwd.as_deref(), Some("/repo"));
+        assert_eq!(root.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(root.updated_at.as_deref(), Some("2024-02-01T00:00:00Z"));
+        assert_eq!(root.parent_session_id, None);
+        assert_eq!(root.fork_origin.as_deref(), Some("manual"));
+        assert_eq!(root.session_kind.as_deref(), Some("interactive"));
+        assert!(root.has_children);
+        assert_eq!(root.fork_count, 1);
+        assert_eq!(root.children[0].session_id, "child");
+        assert_eq!(root.children[0].parent_session_id.as_deref(), Some("root"));
+        assert_eq!(root.children[0].node_id.as_deref(), Some("node-child"));
+        assert_eq!(root.children_next_cursor.as_deref(), Some("child-next"));
+        assert_eq!(root.children_total_count, Some(1));
+        assert_eq!(root.node.as_deref(), Some("remote"));
+        assert_eq!(root.node_id.as_deref(), Some("node-root"));
+        assert_eq!(root.attached, Some(true));
+        assert_eq!(root.runtime_state.as_deref(), Some("running"));
+
+        let children = session_children_page_from_wire(SessionChildrenData {
+            parent_session_id: "root".into(),
+            sessions: vec![SessionSummaryData {
+                session_id: "child".into(),
+                children: vec![SessionSummaryData {
+                    session_id: "grandchild".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            next_cursor: Some("children-next".into()),
+            total_count: Some(3),
+        });
+        assert_eq!(children.parent_session_id, "root");
+        assert_eq!(children.sessions[0].children[0].session_id, "grandchild");
+        assert_eq!(children.next_cursor.as_deref(), Some("children-next"));
+        assert_eq!(children.total_count, Some(3));
+    }
+
+    #[test]
     fn acp_root_session_list_preserves_only_the_global_cursor() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let response = acp::ListSessionsResponse::new(vec![
             acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo")),
             acp::SessionInfo::new(acp::SessionId::from("s2"), Path::new("/repo")),
@@ -2894,53 +3053,37 @@ mod tests {
         ])
         .next_cursor(Some("100".to_string()));
 
-        send_session_list(&tx, SessionListRequest::Discovery, response);
+        let page = session_list_page_from_acp(&SessionListRequest::Discovery, response);
 
-        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
-        assert!(matches!(
-            event,
-            AcpAppEvent::SessionList {
-                request: SessionListRequest::Discovery,
-                groups,
-                next_cursor: Some(cursor),
-            } if cursor == "100"
-                && groups.len() == 2
-                && groups.iter().all(|group| group.next_cursor.is_none())
-        ));
+        assert_eq!(page.next_cursor.as_deref(), Some("100"));
+        assert_eq!(page.total_count, None);
+        assert_eq!(page.groups.len(), 2);
+        assert!(page.groups.iter().all(|group| group.next_cursor.is_none()));
     }
 
     #[test]
     fn acp_cwd_session_list_maps_next_cursor_to_group_cursor() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let response = acp::ListSessionsResponse::new(vec![
-            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo"))
+            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/from-response"))
                 .title(Some("One".to_string()))
                 .updated_at(Some("2024-01-01T00:00:00Z".to_string())),
         ])
         .next_cursor(Some("cursor-2".to_string()));
+        let request = SessionListRequest::WorkspaceContinuation {
+            cwd: "/repo".to_string(),
+        };
 
-        send_session_list(
-            &tx,
-            SessionListRequest::WorkspaceContinuation {
-                cwd: "/repo".to_string(),
-            },
-            response,
+        let page = session_list_page_from_acp(&request, response);
+
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.groups[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(page.groups[0].next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(page.groups[0].sessions[0].session_id, "s1");
+        assert_eq!(
+            page.groups[0].sessions[0].cwd.as_deref(),
+            Some("/from-response")
         );
-
-        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
-        assert!(matches!(
-            event,
-            AcpAppEvent::SessionList {
-                request: SessionListRequest::WorkspaceContinuation { cwd },
-                groups,
-                next_cursor: Some(root_cursor),
-            } if cwd == "/repo"
-                && root_cursor == "cursor-2"
-                && groups.len() == 1
-                && groups[0].cwd.as_deref() == Some("/repo")
-                && groups[0].next_cursor.as_deref() == Some("cursor-2")
-                && groups[0].sessions[0].session_id == "s1"
-        ));
     }
 
     #[test]
