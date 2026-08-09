@@ -6,6 +6,7 @@ use crate::acp_client::{
     DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
 };
 use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
+use crate::command::{Command, SessionListRequest};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
@@ -20,8 +21,8 @@ use crate::domain::session::{
 };
 use crate::domain::tool::ToolDetail;
 use crate::protocol::{
-    ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
-    RemoteSessionListInfo, SessionListRequest,
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
+    RemoteSessionListInfo,
 };
 use crate::tool_detail;
 
@@ -182,7 +183,7 @@ pub(crate) enum AcpAppEvent {
 }
 
 impl crate::app::App {
-    pub(crate) fn handle_acp_event(&mut self, event: AcpAppEvent) -> Vec<ClientMsg> {
+    pub(crate) fn handle_acp_event(&mut self, event: AcpAppEvent) -> Vec<Command> {
         match event {
             AcpAppEvent::Initialized {
                 agent_id,
@@ -342,7 +343,7 @@ impl crate::app::App {
                 is_replay,
             } => {
                 self.apply_acp_session_update(&session_id, update, is_replay);
-                std::mem::take(&mut self.pending_commands)
+                self.drain_pending_commands()
             }
             AcpAppEvent::SessionReplay {
                 session_id,
@@ -357,7 +358,7 @@ impl crate::app::App {
                 for update in updates {
                     self.apply_acp_session_update(&session_id, update, true);
                 }
-                std::mem::take(&mut self.pending_commands)
+                self.drain_pending_commands()
             }
             AcpAppEvent::UndoStack(undo_stack) => {
                 self.undo_state = self.build_undo_state_from_server_stack(&undo_stack, None, None);
@@ -385,7 +386,7 @@ impl crate::app::App {
                         self.streaming_cache.invalidate();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.session_id {
-                            return vec![ClientMsg::LoadSession {
+                            return vec![Command::LoadSession {
                                 session_id: sid.clone(),
                                 cwd: self.current_session_cwd(),
                             }];
@@ -420,7 +421,7 @@ impl crate::app::App {
                             self.build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(LogLevel::Info, "session", "redone - reloading session");
                         if let Some(ref sid) = self.session_id {
-                            return vec![ClientMsg::LoadSession {
+                            return vec![Command::LoadSession {
                                 session_id: sid.clone(),
                                 cwd: self.current_session_cwd(),
                             }];
@@ -449,11 +450,11 @@ impl crate::app::App {
                         self.popup = Popup::None;
                         self.set_status(LogLevel::Info, "fork", "forked - loading session");
                         return vec![
-                            ClientMsg::LoadSession {
+                            Command::LoadSession {
                                 session_id: forked_session_id.clone(),
                                 cwd: self.current_session_cwd(),
                             },
-                            ClientMsg::SubscribeSession {
+                            Command::SubscribeSession {
                                 session_id: forked_session_id,
                                 agent_id: self.agent_id.clone(),
                             },
@@ -549,7 +550,7 @@ impl crate::app::App {
                     self.auth_oauth_flow = None;
                     self.auth_panel = crate::app::AuthPanel::List;
                 }
-                vec![ClientMsg::ListAuthProviders]
+                vec![Command::ListAuthProviders]
             }
             AcpAppEvent::InfoLog { target, message } => {
                 self.push_log(LogLevel::Info, target, message);
@@ -584,7 +585,7 @@ impl crate::app::App {
         &mut self,
         profiles: Vec<ProfileInfo>,
         backend_active_profile_id: Option<String>,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         let previous_profile_id = self.active_profile_id.clone();
         let is_available =
             |profile_id: &str| profiles.iter().any(|profile| profile.id == profile_id);
@@ -610,7 +611,7 @@ impl crate::app::App {
             self.agents_profile_id = None;
             self.model_popup_agent_tab = 0;
             return desired_profile_id
-                .map(|profile_id| vec![ClientMsg::ListProfileAgents { profile_id }])
+                .map(|profile_id| vec![Command::ListProfileAgents { profile_id }])
                 .unwrap_or_default();
         }
         vec![]
@@ -620,7 +621,7 @@ impl crate::app::App {
         &mut self,
         request: SessionListRequest,
         page: SessionListPage,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         let SessionListPage {
             mut groups,
             next_cursor,
@@ -673,7 +674,7 @@ impl crate::app::App {
                             if !hydrated
                                 && self.pending_session_group_loads.insert(Some(cwd.clone()))
                             {
-                                commands.push(ClientMsg::list_sessions_workspace(cwd));
+                                commands.push(Command::list_sessions_workspace(cwd));
                             }
                         }
                         None => {
@@ -699,7 +700,7 @@ impl crate::app::App {
                     && self.session_discovery_cursors.insert(cursor.clone())
                 {
                     self.session_discovery_in_progress = true;
-                    commands.push(ClientMsg::list_sessions_discovery(Some(cursor)));
+                    commands.push(Command::list_sessions_discovery(Some(cursor)));
                 }
             }
             SessionListRequest::WorkspaceFirstPage { cwd } => {
@@ -780,14 +781,14 @@ impl crate::app::App {
         agent_id: String,
         session_id: String,
         profile_id: Option<String>,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         self.session_id = Some(session_id.clone());
         self.apply_session_profile_binding(&session_id, profile_id);
         self.agent_id = Some(agent_id);
         self.reset_active_session_view();
         self.screen = Screen::Chat;
         self.set_status(LogLevel::Info, "session", "session created");
-        let mut commands = vec![ClientMsg::SubscribeSession {
+        let mut commands = vec![Command::SubscribeSession {
             session_id: session_id.clone(),
             agent_id: self.agent_id.clone(),
         }];
@@ -795,7 +796,7 @@ impl crate::app::App {
             if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
                 commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
             } else {
-                commands.push(ClientMsg::ListProfileAgents { profile_id });
+                commands.push(Command::ListProfileAgents { profile_id });
             }
         }
         commands
@@ -806,7 +807,7 @@ impl crate::app::App {
         agent_id: String,
         session_id: String,
         profile_id: Option<String>,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         self.activity = ActivityState::Idle;
         self.parent_session_id = self
             .pending_parent_session_id
@@ -822,7 +823,7 @@ impl crate::app::App {
             Screen::Chat
         };
         self.set_status(LogLevel::Debug, "activity", "ready");
-        let mut commands = vec![ClientMsg::SetAgentMode {
+        let mut commands = vec![Command::SetAgentMode {
             mode: self.agent_mode.clone(),
         }];
         if self.parent_session_id.is_none()
@@ -831,7 +832,7 @@ impl crate::app::App {
             if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
                 commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
             } else {
-                commands.push(ClientMsg::ListProfileAgents { profile_id });
+                commands.push(Command::ListProfileAgents { profile_id });
             }
         }
         commands
@@ -2479,7 +2480,7 @@ mod tests {
 
         assert!(matches!(
             commands.as_slice(),
-            [ClientMsg::SetDelegateModel {
+            [Command::SetDelegateModel {
                 session_id,
                 agent_id,
                 model_id: Some(model_id),
@@ -2508,7 +2509,7 @@ mod tests {
         assert_eq!(app.selected_mesh_node_id(), Some("node-1"));
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::ListRemoteSessions { node_id, offset: Some(0), limit: Some(50) }]
+            [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
                 if node_id == "node-1"
         ));
     }
@@ -2547,7 +2548,7 @@ mod tests {
         assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::LoadSession { session_id, .. }] if session_id == "remote-1"
+            [Command::LoadSession { session_id, .. }] if session_id == "remote-1"
         ));
     }
 
@@ -2572,7 +2573,7 @@ mod tests {
         assert_eq!(app.session_groups[0].next_cursor, None);
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            ClientMsg::ListSessions {
+            Command::ListSessions {
                 request: SessionListRequest::WorkspaceFirstPage { cwd },
                 cursor: None,
                 ..
@@ -2580,11 +2581,9 @@ mod tests {
         )));
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            ClientMsg::ListSessions {
+            Command::ListSessions {
                 request: SessionListRequest::Discovery,
                 cursor: Some(cursor),
-                cwd: None,
-                ..
             } if cursor == "opaque-root-2"
         )));
     }
@@ -2652,7 +2651,7 @@ mod tests {
         );
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            ClientMsg::ListSessions {
+            Command::ListSessions {
                 request: SessionListRequest::WorkspaceFirstPage { cwd },
                 ..
             } if cwd == "/later"
@@ -2737,8 +2736,8 @@ mod tests {
         assert!(matches!(
             replies.as_slice(),
             [
-                ClientMsg::SubscribeSession { session_id, agent_id },
-                ClientMsg::ListProfileAgents { profile_id },
+                Command::SubscribeSession { session_id, agent_id },
+                Command::ListProfileAgents { profile_id },
             ] if session_id == "session-1"
                 && agent_id.as_deref() == Some("agent-1")
                 && profile_id == "code"
@@ -2818,7 +2817,7 @@ mod tests {
         assert_eq!(app.delegate_entries.len(), 1);
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::SetAgentMode { mode }] if mode == "plan"
+            [Command::SetAgentMode { mode }] if mode == "plan"
         ));
     }
 
@@ -3590,7 +3589,7 @@ mod tests {
         );
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
+            [Command::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
         ));
     }
 
@@ -3700,7 +3699,7 @@ mod tests {
         assert!(app.can_redo());
         assert!(matches!(
             replies.as_slice(),
-            [ClientMsg::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
+            [Command::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
         ));
     }
 
@@ -3745,8 +3744,8 @@ mod tests {
         assert!(matches!(
             replies.as_slice(),
             [
-                ClientMsg::LoadSession { session_id: load_id, .. },
-                ClientMsg::SubscribeSession { session_id: subscribe_id, agent_id }
+                Command::LoadSession { session_id: load_id, .. },
+                Command::SubscribeSession { session_id: subscribe_id, agent_id }
             ] if load_id == "fork-1" && subscribe_id == "fork-1" && agent_id.as_deref() == Some("agent-1")
         ));
     }
@@ -3795,6 +3794,39 @@ mod tests {
         }));
 
         assert!(app.can_redo());
+    }
+
+    #[test]
+    fn session_update_and_replay_drain_pending_commands() {
+        let mut app = app_with_active_session();
+        app.pending_commands.push(Command::SubscribeSession {
+            session_id: "child-1".into(),
+            agent_id: Some("agent-1".into()),
+        });
+
+        let update_commands = app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: TEST_SESSION_ID.into(),
+            is_replay: false,
+            update: AcpSessionUpdate::TurnStarted,
+        });
+
+        assert_eq!(
+            update_commands,
+            vec![Command::SubscribeSession {
+                session_id: "child-1".into(),
+                agent_id: Some("agent-1".into()),
+            }]
+        );
+        assert!(app.pending_commands.is_empty());
+
+        app.pending_commands.push(Command::GetFileIndex);
+        let replay_commands = app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: Vec::new(),
+        });
+
+        assert_eq!(replay_commands, vec![Command::GetFileIndex]);
+        assert!(app.pending_commands.is_empty());
     }
 
     #[test]

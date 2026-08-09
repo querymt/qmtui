@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     app::{self, App},
+    command::Command,
     handlers::{AppAction, handle_key, handle_mouse},
     protocol::ClientMsg,
     server_manager::{self, ServerEvent, ServerState},
@@ -83,16 +84,16 @@ pub(super) async fn run_loop(
                 }
             }
             Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
-                for reply in app.handle_acp_event(event) {
-                    if let ClientMsg::LoadSession { ref session_id, .. } = reply {
+                for command in app.handle_acp_event(event) {
+                    if let Command::LoadSession { ref session_id, .. } = command {
                         let sid = session_id.clone();
-                        cmd_tx.send(reply)?;
+                        cmd_tx.send(command.into())?;
                         cmd_tx.send(ClientMsg::SubscribeSession {
                             session_id: sid,
                             agent_id: app.agent_id.clone(),
                         })?;
                     } else {
-                        cmd_tx.send(reply)?;
+                        cmd_tx.send(command.into())?;
                     }
                 }
             }

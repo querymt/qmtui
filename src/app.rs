@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
+use crate::command::Command;
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
     SessionActivity, SessionOp, SessionStatsLite,
@@ -21,7 +22,7 @@ use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
 use crate::protocol::{
-    ClientMsg, EventKind, MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
+    EventKind, MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
 };
 use crate::ui::{CardCache, ElicitationUiState};
 
@@ -768,7 +769,7 @@ pub struct App {
     pub suppress_delegation_result: bool,
     /// Commands queued by event handlers (e.g. SubscribeSession for child sessions).
     /// Drained by native ACP after each event/replay batch.
-    pub pending_commands: Vec<ClientMsg>,
+    pub pending_commands: Vec<Command>,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
     pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
@@ -813,7 +814,11 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 }
 
 impl App {
-    pub fn begin_session_discovery(&mut self) -> Option<ClientMsg> {
+    pub(crate) fn drain_pending_commands(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.pending_commands)
+    }
+
+    pub fn begin_session_discovery(&mut self) -> Option<Command> {
         if self.session_discovery_in_progress || !self.pending_session_group_loads.is_empty() {
             return None;
         }
@@ -822,30 +827,30 @@ impl App {
         self.pending_session_group_loads.clear();
         self.hydrated_session_groups.clear();
         self.session_discovery_in_progress = true;
-        Some(ClientMsg::list_sessions_browse())
+        Some(Command::list_sessions_browse())
     }
 
-    pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<ClientMsg> {
+    pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<Command> {
         let group = self.session_groups.get(group_idx)?;
         let cursor = group.next_cursor.clone()?;
         let cwd = group.cwd.clone()?;
         if !self.pending_session_group_loads.insert(Some(cwd.clone())) {
             return None;
         }
-        Some(ClientMsg::list_sessions_group(cwd, cursor))
+        Some(Command::list_sessions_group(cwd, cursor))
     }
 
     pub fn session_child_page_request(
         &mut self,
         group_idx: usize,
         parent_path: &[usize],
-    ) -> Option<ClientMsg> {
+    ) -> Option<Command> {
         let parent = self.session_by_path(group_idx, parent_path)?;
         let parent_session_id = parent.session_id.clone();
         let cursor = parent.children_next_cursor.clone();
         self.pending_session_child_loads
             .insert(parent_session_id.clone());
-        Some(ClientMsg::list_session_children(
+        Some(Command::list_session_children(
             parent_session_id,
             cursor,
             SESSION_CHILD_PAGE_LIMIT,
@@ -1072,13 +1077,13 @@ impl App {
     /// Cycle through `[auto, low, medium, high, max]` (wraps around).
     /// Updates `self.reasoning_effort` optimistically, saves the new value as
     /// the preference for the current `(mode, provider, model)` context, and
-    /// returns the [`ClientMsg`] to forward to the server.
+    /// returns the [`Command`] to forward to the server.
     ///
     /// Returns `None` if the current value is not a recognized level; in that
     /// case the state is left unchanged and no message is emitted (the caller
     /// should surface a warning to the user instead of silently coercing the
     /// unknown value to `low`).
-    pub fn cycle_reasoning_effort(&mut self) -> Option<ClientMsg> {
+    pub fn cycle_reasoning_effort(&mut self) -> Option<Command> {
         const LEVELS: &[Option<&str>] =
             &[None, Some("low"), Some("medium"), Some("high"), Some("max")];
         let current = self.reasoning_effort.as_deref();
@@ -1096,9 +1101,9 @@ impl App {
 
     /// Set the reasoning effort to a specific level.
     /// `None` or `Some("auto")` both map to the "auto" (no override) state.
-    /// Updates `self.reasoning_effort` and returns the [`ClientMsg`] to forward to the server.
+    /// Updates `self.reasoning_effort` and returns the [`Command`] to forward to the server.
     /// Returns `None` if the level is invalid (state is unchanged).
-    pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> Option<ClientMsg> {
+    pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> Option<Command> {
         match validate_reasoning_effort(level) {
             Some(normalized) => {
                 self.reasoning_effort = normalized;
@@ -1107,7 +1112,7 @@ impl App {
                     .as_deref()
                     .unwrap_or("auto")
                     .to_string();
-                Some(ClientMsg::SetReasoningEffort {
+                Some(Command::SetReasoningEffort {
                     reasoning_effort: effort_str,
                 })
             }
@@ -2074,7 +2079,7 @@ impl App {
         &self,
         session_id: &str,
         profile_id: &str,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         let known_agents: HashSet<&str> =
             self.agents.iter().skip(1).map(|a| a.id.as_str()).collect();
         self.delegate_model_preferences
@@ -2082,7 +2087,7 @@ impl App {
             .into_iter()
             .flat_map(|preferences| preferences.iter())
             .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
-            .map(|(agent_id, preference)| ClientMsg::SetDelegateModel {
+            .map(|(agent_id, preference)| Command::SetDelegateModel {
                 session_id: session_id.to_string(),
                 agent_id: agent_id.clone(),
                 model_id: Some(preference.model_id.clone()),
@@ -2239,12 +2244,12 @@ mod reasoning_effort_tests {
     }
 
     #[test]
-    fn cycle_returns_correct_client_msg() {
+    fn cycle_returns_correct_command() {
         let mut app = App::new(); // starts at auto
         let msg = app.cycle_reasoning_effort().expect("auto is a valid level");
         // auto → low: should send "low"
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "low");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -2258,7 +2263,7 @@ mod reasoning_effort_tests {
         let msg = app.cycle_reasoning_effort().expect("max is a valid level");
         // max → auto: server expects "auto" string (not null)
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -2273,7 +2278,7 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(Some("high"));
         assert_eq!(app.reasoning_effort, Some("high".into()));
         match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+            Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "high");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -2287,7 +2292,7 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(Some("auto"));
         assert_eq!(app.reasoning_effort, None);
         match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+            Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
@@ -2301,7 +2306,7 @@ mod reasoning_effort_tests {
         let msg = app.set_reasoning_effort(None);
         assert_eq!(app.reasoning_effort, None);
         match msg {
-            Some(ClientMsg::SetReasoningEffort { reasoning_effort }) => {
+            Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("expected SetReasoningEffort, got {other:?}"),
