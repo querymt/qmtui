@@ -3555,10 +3555,22 @@ mod auth_tests {
     fn auth_list_esc_clears_selection_when_selected() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
         app.auth_selected = Some(0);
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "old result".into(),
+        });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
         assert_eq!(app.popup, app::Popup::ProviderAuth);
         assert!(app.auth_selected.is_none());
+        assert!(app.auth_last_result.is_none());
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
