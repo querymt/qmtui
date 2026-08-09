@@ -3604,20 +3604,32 @@ mod auth_tests {
     #[test]
     fn auth_list_enter_on_oauth_only_starts_flow() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("codex".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert_eq!(app.auth_selected, Some(0));
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "codex"));
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
     fn auth_list_enter_on_multi_method_selects_provider() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert_eq!(app.auth_selected, Some(0));
         assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
@@ -3641,19 +3653,31 @@ mod auth_tests {
     #[test]
     fn auth_list_ctrl_k_opens_api_key_panel() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, ctrl('k'), &tx).unwrap();
         assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
         assert_eq!(app.auth_selected, Some(0));
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
     fn auth_list_ctrl_o_starts_oauth() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, ctrl('o'), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "openai"));
+        assert!(app.auth_ui_notice.is_none());
     }
 
     // ── Key handler tests: API Key panel ──────────────────────────────────────
