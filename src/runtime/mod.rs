@@ -10,9 +10,9 @@ use crate::{
     acp_client,
     acp_state::AcpAppEvent,
     app::{self, App, Screen},
+    command::Command,
     config,
     domain::model::DelegateModelPreference,
-    protocol::ClientMsg,
     server_manager, theme,
 };
 use clap::Parser;
@@ -134,7 +134,7 @@ mod tests {
         // Accept response sent
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
-            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["choice"] == "b"
         ));
 
@@ -174,7 +174,7 @@ mod tests {
 
         assert!(app.elicitation.is_none());
         assert!(matches!(rx.try_recv().expect("message sent"),
-            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["choice"] == "custom\nanswer"
         ));
     }
@@ -199,7 +199,7 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
         assert!(app.elicitation.is_none());
         assert!(matches!(rx.try_recv().expect("decline sent"),
-            ClientMsg::ElicitationResponse { action, .. } if action == "decline"
+            Command::ElicitationResponse { action, .. } if action == "decline"
         ));
     }
 
@@ -227,7 +227,7 @@ mod tests {
         assert!(app.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
-            ClientMsg::ElicitationResponse { action, .. } if action == "decline"
+            Command::ElicitationResponse { action, .. } if action == "decline"
         ));
         assert!(app.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if o == "declined"
@@ -251,7 +251,7 @@ mod tests {
         assert!(app.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
-            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["name"] == "Alice"
         ));
         assert!(app.messages.iter().any(|m| matches!(m,
@@ -326,7 +326,7 @@ mod tests {
         assert!(app.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
-            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == true
         ));
         assert!(app.messages.iter().any(|m| matches!(m,
@@ -353,7 +353,7 @@ mod tests {
         assert!(app.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
-            ClientMsg::ElicitationResponse { action, content: Some(ref c), .. }
+            Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == false
         ));
         assert!(app.messages.iter().any(|m| matches!(m,
@@ -483,11 +483,11 @@ mod tests {
 mod external_editor_tests {
     use super::*;
     use crate::app::App;
+    use crate::command::PromptBlock;
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::domain::activity::{ActivityState, SessionOp};
     use crate::domain::chat::ChatEntry;
     use crate::handlers::*;
-    use crate::protocol::PromptBlock;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
 
@@ -501,7 +501,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_up_down_navigate_wrapped_input_without_scrolling_history() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "abcdef".into();
@@ -530,7 +530,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_pageup_pagedown_still_scroll_history() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.scroll_offset = 3;
@@ -554,7 +554,7 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_e_returns_open_editor_action_in_chat() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "draft".into();
@@ -572,7 +572,7 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_e_outside_chat_stays_in_tui() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Sessions;
         assert_eq!(
@@ -589,7 +589,7 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_m_outside_chat_does_not_open_model_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Sessions;
         assert_eq!(
@@ -637,7 +637,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_input_accepts_typing_and_submit_while_turn_active() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -660,7 +660,7 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("prompt sent"),
-            ClientMsg::Prompt { prompt, local_id }
+            Command::Prompt { prompt, local_id }
                 if local_id.starts_with("local:pending:")
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
         ));
@@ -674,7 +674,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_submit_normalizes_prompt_before_sending_and_rendering() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -690,7 +690,7 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("prompt sent"),
-            ClientMsg::Prompt { prompt, .. }
+            Command::Prompt { prompt, .. }
                 if matches!(prompt.as_slice(), [PromptBlock::Text { text }]
                     if text == "first line\nsecond line")
         ));
@@ -702,7 +702,7 @@ mod external_editor_tests {
 
     #[test]
     fn whitespace_only_chat_submit_does_not_send_or_render_prompt() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -725,7 +725,7 @@ mod external_editor_tests {
 
     #[test]
     fn left_arrow_with_slash_input_does_not_crash() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/model".into();
@@ -748,7 +748,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_esc_clears_slash_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/mo".into();
@@ -768,7 +768,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_enter_opens_help_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/help".into();
@@ -788,7 +788,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_enter_with_partial_completion_executes_command() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/hel".into();
@@ -810,7 +810,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_tab_completes_command_name_without_executing() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/hel".into();
@@ -832,7 +832,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_down_up_navigates_selection() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/".into();
@@ -864,7 +864,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_mode_no_arg_cycles_mode() {
         let _guard = TestPersistenceGuard::new("slash-mode-cycle");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -885,7 +885,7 @@ mod external_editor_tests {
         // SetAgentMode should have been sent
         assert!(matches!(
             rx.try_recv().expect("SetAgentMode sent"),
-            ClientMsg::SetAgentMode { mode } if mode == "plan"
+            Command::SetAgentMode { mode } if mode == "plan"
         ));
     }
 
@@ -893,7 +893,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_mode_plan_switches_to_plan() {
         let _guard = TestPersistenceGuard::new("slash-mode-plan");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -912,13 +912,13 @@ mod external_editor_tests {
         assert_eq!(app.agent_mode, "plan");
         assert!(matches!(
             rx.try_recv().expect("SetAgentMode sent"),
-            ClientMsg::SetAgentMode { mode } if mode == "plan"
+            Command::SetAgentMode { mode } if mode == "plan"
         ));
     }
 
     #[test]
     fn slash_mode_same_is_idempotent() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -940,7 +940,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_mode_unknown_shows_error() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -962,7 +962,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_high_sets_level() {
         let _guard = TestPersistenceGuard::new("slash-thinking-high");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -980,7 +980,7 @@ mod external_editor_tests {
         assert_eq!(app.reasoning_effort, Some("high".into()));
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
-            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
+            Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
         ));
     }
 
@@ -988,7 +988,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_auto_clears_level() {
         let _guard = TestPersistenceGuard::new("slash-thinking-auto");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1007,7 +1007,7 @@ mod external_editor_tests {
         assert_eq!(app.reasoning_effort, None);
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
-            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto"
+            Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto"
         ));
     }
 
@@ -1015,7 +1015,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_med_alias_sets_medium() {
         let _guard = TestPersistenceGuard::new("slash-thinking-med");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1033,13 +1033,13 @@ mod external_editor_tests {
         assert_eq!(app.reasoning_effort, Some("medium".into()));
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
-            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "medium"
+            Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "medium"
         ));
     }
 
     #[test]
     fn slash_thinking_no_arg_shows_current() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.reasoning_effort = Some("high".into());
@@ -1058,7 +1058,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_thinking_unknown_shows_error() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.input = "/thinking xyz".into();
@@ -1076,7 +1076,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_thinking_when_disconnected_does_not_change_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.reasoning_effort = Some("high".into());
@@ -1119,7 +1119,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_fork_sends_latest_boundary() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.input = "/fork".into();
         app.input_cursor = "/fork".len();
@@ -1133,14 +1133,14 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("ForkSession sent"),
-            ClientMsg::ForkSession { message_id } if message_id == "user-2"
+            Command::ForkSession { message_id } if message_id == "user-2"
         ));
         assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
     }
 
     #[test]
     fn ctrl_x_f_opens_fork_popup_and_filter_captures_text() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
 
         handle_key(&mut app, ctrl_x(), &tx).unwrap();
@@ -1155,7 +1155,7 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_f_in_delegate_view_does_not_open_fork_popup() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.screen = Screen::Delegate;
 
@@ -1170,7 +1170,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_fork_in_delegate_view_sends_nothing() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.screen = Screen::Delegate;
         app.input = "/fork".into();
@@ -1191,7 +1191,7 @@ mod external_editor_tests {
 
     #[test]
     fn fork_popup_enter_sends_selected_turn() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.open_fork_turn_popup();
         app.fork_filter = "alpha".into();
@@ -1205,14 +1205,14 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("ForkSession sent"),
-            ClientMsg::ForkSession { message_id } if message_id == "asst-1"
+            Command::ForkSession { message_id } if message_id == "asst-1"
         ));
         assert_eq!(app.pending_fork_message_id.as_deref(), Some("asst-1"));
     }
 
     #[test]
     fn fork_popup_enter_with_default_cursor_sends_latest_visible_turn() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.open_fork_turn_popup();
 
@@ -1225,14 +1225,14 @@ mod external_editor_tests {
 
         assert!(matches!(
             rx.try_recv().expect("ForkSession sent"),
-            ClientMsg::ForkSession { message_id } if message_id == "user-2"
+            Command::ForkSession { message_id } if message_id == "user-2"
         ));
         assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
     }
 
     #[test]
     fn fork_popup_enter_with_no_eligible_turns_sends_nothing() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1251,7 +1251,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_model_with_arg_prefilters_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1273,7 +1273,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_model_no_arg_opens_popup_unfiltered() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1294,7 +1294,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_double_esc_cancels_running_tool_phase() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.activity = ActivityState::RunningTool {
@@ -1317,7 +1317,7 @@ mod external_editor_tests {
         .unwrap();
         assert!(matches!(
             rx.try_recv().expect("cancel sent"),
-            ClientMsg::CancelSession
+            Command::CancelSession
         ));
         assert_eq!(app.status, "stopping...");
         assert!(matches!(
@@ -1328,7 +1328,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_input_is_blocked_while_undo_is_pending() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1372,7 +1372,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_input_is_blocked_while_cancel_confirm_is_active() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -1417,7 +1417,7 @@ mod external_editor_tests {
         assert_eq!(app.status, "stopping...");
         assert!(matches!(
             rx.try_recv().expect("cancel sent"),
-            ClientMsg::CancelSession
+            Command::CancelSession
         ));
     }
 }
@@ -1463,7 +1463,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // channels for the event loop
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerChannelMsg>();
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnectionManagerEvent>();
 
     let mut app = App::new();
@@ -1616,9 +1616,9 @@ impl PersistenceGuard {
 #[cfg(test)]
 mod sessions_key_tests {
     use super::*;
+    use crate::command::Command;
     use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
-    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -1717,19 +1717,32 @@ mod sessions_key_tests {
     // ── Enter on Session loads it ─────────────────────────────────────────────
 
     #[test]
-    fn enter_on_session_returns_load_action() {
+    fn enter_on_session_emits_one_load_and_one_subscribe() {
         let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.agent_id = Some("agent-1".into());
         app.session_groups = vec![make_group(Some("/a"), &["abc12345"])];
-        app.session_cursor = 1; // Session row
-        let action = apply_sessions_key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            SessionKeyAction::LoadSession {
-                session_id: "abc12345".to_string(),
-                agent_id: None,
-                cwd: Some("/a".to_string()),
-            }
-        );
+        app.session_cursor = 1;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::LoadSession { session_id, cwd: Some(cwd) })
+                if session_id == "abc12345" && cwd == "/a"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::SubscribeSession { session_id, agent_id })
+                if session_id == "abc12345" && agent_id.as_deref() == Some("agent-1")
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1820,7 +1833,7 @@ mod sessions_key_tests {
         assert!(app.expanded_session_children.contains("root"));
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(ClientMsg::ListSessionChildren {
+            Ok(Command::ListSessionChildren {
                 parent_session_id,
                 ..
             }) if parent_session_id == "root"
@@ -2055,9 +2068,9 @@ mod sessions_key_tests {
 mod session_popup_key_tests {
     use super::*;
     use crate::app::Popup;
+    use crate::command::Command;
     use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
-    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2325,7 +2338,7 @@ mod session_popup_key_tests {
         assert_eq!(app.popup, Popup::SessionSelect);
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(ClientMsg::ListSessionChildren {
+            Ok(Command::ListSessionChildren {
                 parent_session_id,
                 ..
             }) if parent_session_id == "root"
@@ -2661,9 +2674,8 @@ mod session_popup_key_tests {
         assert_eq!(app.popup, Popup::None);
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::NewSession {
+            Ok(Command::NewSession {
                 cwd: Some(ref cwd),
-                request_id: None,
                 profile_id: None
             }) if cwd == "/launch"
         ));
@@ -2688,9 +2700,8 @@ mod session_popup_key_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::NewSession {
+            Ok(Command::NewSession {
                 cwd: Some(ref cwd),
-                request_id: None,
                 profile_id: None
             }) if cwd == "/launch/proj/subdir"
         ));
@@ -3028,7 +3039,7 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_cycles_effort_and_sends_msg() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         assert_eq!(app.reasoning_effort, None);
@@ -3038,7 +3049,7 @@ mod chord_reasoning_effort_tests {
         assert_eq!(app.reasoning_effort, Some("low".into()));
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "low");
             }
             other => panic!("unexpected message: {other:?}"),
@@ -3049,7 +3060,7 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_full_cycle_sends_auto_on_wrap() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.reasoning_effort = Some("max".into());
@@ -3059,7 +3070,7 @@ mod chord_reasoning_effort_tests {
         assert_eq!(app.reasoning_effort, None);
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
         match msg {
-            ClientMsg::SetReasoningEffort { reasoning_effort } => {
+            Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "auto");
             }
             other => panic!("unexpected message: {other:?}"),
@@ -3070,7 +3081,7 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_status_updated() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
@@ -3084,7 +3095,7 @@ mod chord_reasoning_effort_tests {
 
     #[test]
     fn ctrl_t_when_disconnected_does_not_change_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.reasoning_effort = Some("high".into());
 
@@ -3129,7 +3140,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn ctrl_t_cycles_reasoning_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
 
@@ -3143,7 +3154,7 @@ mod reasoning_effort_integration_tests {
         assert_eq!(app.reasoning_effort, Some("low".into()));
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
+            Ok(Command::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
         ));
     }
 
@@ -3151,7 +3162,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn tab_switches_mode_without_changing_model_or_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
@@ -3169,13 +3180,13 @@ mod reasoning_effort_integration_tests {
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, ClientMsg::SetAgentMode { mode } if mode == "plan")),
+                .any(|m| matches!(m, Command::SetAgentMode { mode } if mode == "plan")),
             "expected SetAgentMode(plan): {msgs:?}"
         );
         assert!(
             !msgs
                 .iter()
-                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+                .any(|m| matches!(m, Command::SetReasoningEffort { .. })),
             "no effort restore on mode switch: {msgs:?}"
         );
     }
@@ -3184,7 +3195,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn tab_no_cache_entry_leaves_model_and_effort_unchanged() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
@@ -3204,7 +3215,7 @@ mod reasoning_effort_integration_tests {
         assert!(
             !msgs
                 .iter()
-                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+                .any(|m| matches!(m, Command::SetReasoningEffort { .. })),
             "no SetReasoningEffort expected: {msgs:?}"
         );
     }
@@ -3215,7 +3226,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn ctrl_x_m_opens_model_popup_at_current_mode_model() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
@@ -3252,7 +3263,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn model_select_drops_effort_to_auto() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
@@ -3282,7 +3293,7 @@ mod reasoning_effort_integration_tests {
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
-                ClientMsg::SetReasoningEffort { reasoning_effort }
+                Command::SetReasoningEffort { reasoning_effort }
                 if reasoning_effort == "auto"
             )),
             "expected SetReasoningEffort(auto): {msgs:?}"
@@ -3293,7 +3304,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn model_select_no_effort_msg_when_already_auto() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
@@ -3321,7 +3332,7 @@ mod reasoning_effort_integration_tests {
         assert!(
             !msgs
                 .iter()
-                .any(|m| matches!(m, ClientMsg::SetReasoningEffort { .. })),
+                .any(|m| matches!(m, Command::SetReasoningEffort { .. })),
             "no SetReasoningEffort when already auto: {msgs:?}"
         );
     }
@@ -3357,7 +3368,6 @@ mod auth_tests {
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
     use crate::handlers::*;
-    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3626,7 +3636,7 @@ mod auth_tests {
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert_eq!(app.auth_selected, Some(0));
         let msg = rx.try_recv().expect("message sent");
-        assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "codex"));
+        assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "codex"));
         assert!(app.auth_ui_notice.is_none());
     }
 
@@ -3689,7 +3699,7 @@ mod auth_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, ctrl('o'), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
-        assert!(matches!(msg, ClientMsg::StartOAuthLogin { provider } if provider == "openai"));
+        assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "openai"));
         assert!(app.auth_ui_notice.is_none());
     }
 
@@ -3711,7 +3721,7 @@ mod auth_tests {
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(
             msg,
-            ClientMsg::SetApiToken { provider, api_key }
+            Command::SetApiToken { provider, api_key }
             if provider == "groq" && api_key == "sk"
         ));
     }
@@ -3766,7 +3776,7 @@ mod auth_tests {
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
-        assert!(matches!(msg, ClientMsg::ClearApiToken { provider } if provider == "groq"));
+        assert!(matches!(msg, Command::ClearApiToken { provider } if provider == "groq"));
     }
 
     #[test]
@@ -3823,7 +3833,7 @@ mod auth_tests {
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(
             msg,
-            ClientMsg::CompleteOAuthLogin { flow_id, response }
+            Command::CompleteOAuthLogin { flow_id, response }
             if flow_id == "f1" && response == "code"
         ));
     }
@@ -3845,7 +3855,7 @@ mod auth_tests {
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(
             msg,
-            ClientMsg::CompleteOAuthLogin { flow_id, response }
+            Command::CompleteOAuthLogin { flow_id, response }
             if flow_id == "f1" && response.is_empty()
         ));
     }
@@ -4015,7 +4025,7 @@ mod auth_tests {
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(
             msg,
-            ClientMsg::DisconnectOAuth { provider } if provider == "openai"
+            Command::DisconnectOAuth { provider } if provider == "openai"
         ));
     }
 
@@ -4031,7 +4041,7 @@ mod auth_tests {
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(
             msg,
-            ClientMsg::ClearApiToken { provider } if provider == "groq"
+            Command::ClearApiToken { provider } if provider == "groq"
         ));
     }
 
@@ -4071,7 +4081,7 @@ mod auth_tests {
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
         // Should disconnect OAuth first, not clear API key
-        assert!(matches!(msg, ClientMsg::DisconnectOAuth { .. }));
+        assert!(matches!(msg, Command::DisconnectOAuth { .. }));
     }
 
     // ── Clipboard copy tests ────────────────────────────────────────────────
@@ -4139,6 +4149,6 @@ mod auth_tests {
         assert!(!app.chord);
 
         let msg = rx.try_recv().expect("message sent");
-        assert!(matches!(msg, ClientMsg::ListAuthProviders));
+        assert!(matches!(msg, Command::ListAuthProviders));
     }
 }

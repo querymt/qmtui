@@ -197,10 +197,12 @@ impl App {
         if attached {
             self.popup = Popup::None;
             self.set_status(LogLevel::Info, "mesh", "remote session attached");
-            vec![Command::LoadSession {
-                session_id: session_id.to_string(),
-                cwd: self.current_session_cwd(),
-            }]
+            Command::load_session_commands(
+                session_id.to_string(),
+                self.current_session_cwd(),
+                self.agent_id.clone(),
+            )
+            .into()
         } else {
             self.set_status(LogLevel::Info, "mesh", "remote session created");
             vec![Command::ListRemoteSessions {

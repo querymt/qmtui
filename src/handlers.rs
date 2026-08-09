@@ -10,8 +10,8 @@ use crate::domain::model::ModelEntry;
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
 }
+use crate::command::{Command, PromptBlock};
 use crate::config;
-use crate::protocol::{ClientMsg, PromptBlock};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,18 @@ pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
     }
 }
 
+fn send_load_session_commands(
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    session_id: String,
+    cwd: Option<String>,
+    agent_id: Option<String>,
+) -> anyhow::Result<()> {
+    for command in Command::load_session_commands(session_id, cwd, agent_id) {
+        cmd_tx.send(command)?;
+    }
+    Ok(())
+}
+
 /// Handle all keyboard input while an elicitation popup is active.
 ///
 /// Returns `Ok(())` in all cases; the caller should return immediately after
@@ -40,7 +52,7 @@ pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
 pub(crate) fn handle_elicitation_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     use crate::domain::elicitation::ElicitationFieldKind;
 
@@ -104,7 +116,7 @@ pub(crate) fn handle_elicitation_key(
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(Some(&state.custom_input));
                 let display = selected_display(state, true);
-                cmd_tx.send(ClientMsg::ElicitationResponse {
+                cmd_tx.send(Command::ElicitationResponse {
                     elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
@@ -139,7 +151,7 @@ pub(crate) fn handle_elicitation_key(
     match key.code {
         KeyCode::Esc => {
             let elicitation_id = state.elicitation_id.clone();
-            cmd_tx.send(ClientMsg::ElicitationResponse {
+            cmd_tx.send(Command::ElicitationResponse {
                 elicitation_id: elicitation_id.clone(),
                 action: "decline".into(),
                 content: None,
@@ -186,7 +198,7 @@ pub(crate) fn handle_elicitation_key(
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(None);
                 let display = selected_display(state, false);
-                cmd_tx.send(ClientMsg::ElicitationResponse {
+                cmd_tx.send(Command::ElicitationResponse {
                     elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
@@ -222,10 +234,7 @@ pub(crate) fn handle_elicitation_key(
     Ok(())
 }
 
-fn open_model_popup(
-    app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
-) -> anyhow::Result<()> {
+fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> anyhow::Result<()> {
     if app.screen != Screen::Chat {
         app.set_status(
             app::LogLevel::Warn,
@@ -241,13 +250,13 @@ fn open_model_popup(
     app.model_filter.clear();
     app.model_popup_agent_tab = 0;
     app.model_cursor = app.model_popup_open_cursor();
-    cmd_tx.send(ClientMsg::ListAllModels { refresh: true })?;
+    cmd_tx.send(Command::ListAllModels { refresh: true })?;
     Ok(())
 }
 
 fn open_session_popup(
     app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     if !can_send_server_commands(app) {
         return Ok(());
@@ -257,7 +266,7 @@ fn open_session_popup(
     app.session_cursor = 0;
     app.session_filter.clear();
     if let Some(request) = app.begin_session_discovery() {
-        cmd_tx.send(request.into())?;
+        cmd_tx.send(request)?;
     }
     Ok(())
 }
@@ -271,7 +280,7 @@ fn open_log_popup(app: &mut App) {
 fn execute_command_palette_action(
     app: &mut App,
     action: CommandPaletteAction,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match action {
         CommandPaletteAction::OpenMesh | CommandPaletteAction::AttachRemoteSession => {
@@ -279,14 +288,14 @@ fn execute_command_palette_action(
                 return Ok(());
             }
             app.open_mesh_popup();
-            cmd_tx.send(ClientMsg::ListRemoteNodes)?;
+            cmd_tx.send(Command::ListRemoteNodes)?;
         }
         CommandPaletteAction::CreateRemoteSession => {
             if !can_send_server_commands(app) {
                 return Ok(());
             }
             app.open_mesh_popup();
-            cmd_tx.send(ClientMsg::ListRemoteNodes)?;
+            cmd_tx.send(Command::ListRemoteNodes)?;
         }
         CommandPaletteAction::CreateMeshInvite => {
             if !can_send_server_commands(app) {
@@ -323,7 +332,7 @@ fn execute_command_palette_action(
                 return Ok(());
             }
             app.open_auth_popup();
-            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+            cmd_tx.send(Command::ListAuthProviders)?;
         }
         CommandPaletteAction::ForkTurnSelect => {
             app.open_fork_turn_popup();
@@ -333,7 +342,7 @@ fn execute_command_palette_action(
                 return Ok(());
             }
             app.open_profile_popup();
-            cmd_tx.send(ClientMsg::ListProfiles)?;
+            cmd_tx.send(Command::ListProfiles)?;
         }
     }
     Ok(())
@@ -342,7 +351,7 @@ fn execute_command_palette_action(
 pub(crate) fn handle_mesh_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => app.popup = Popup::None,
@@ -355,7 +364,7 @@ pub(crate) fn handle_mesh_popup_key(
         KeyCode::Up => match app.mesh_focus {
             crate::mesh::MeshFocus::Nodes => {
                 if let Some(msg) = app.move_mesh_node_cursor(-1) {
-                    cmd_tx.send(msg.into())?;
+                    cmd_tx.send(msg)?;
                 }
             }
             crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(-1),
@@ -363,26 +372,26 @@ pub(crate) fn handle_mesh_popup_key(
         KeyCode::Down => match app.mesh_focus {
             crate::mesh::MeshFocus::Nodes => {
                 if let Some(msg) = app.move_mesh_node_cursor(1) {
-                    cmd_tx.send(msg.into())?;
+                    cmd_tx.send(msg)?;
                 }
             }
             crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(1),
         },
-        KeyCode::Char('r') => cmd_tx.send(ClientMsg::ListRemoteNodes)?,
+        KeyCode::Char('r') => cmd_tx.send(Command::ListRemoteNodes)?,
         KeyCode::Enter => match app.mesh_focus {
             crate::mesh::MeshFocus::Nodes => {
                 app.mesh_focus = crate::mesh::MeshFocus::Sessions;
                 if let Some(node_id) = app.selected_mesh_node_id() {
-                    cmd_tx.send(ClientMsg::ListRemoteSessions {
+                    cmd_tx.send(Command::ListRemoteSessions {
                         node_id: node_id.to_string(),
-                        offset: Some(0),
-                        limit: Some(50),
+                        offset: 0,
+                        limit: 50,
                     })?;
                 }
             }
             crate::mesh::MeshFocus::Sessions => {
                 if let Some(session) = app.selected_remote_session() {
-                    cmd_tx.send(ClientMsg::AttachRemoteSession {
+                    cmd_tx.send(Command::AttachRemoteSession {
                         node_id: session.node_id.clone(),
                         session_id: session.id.clone(),
                     })?;
@@ -391,10 +400,9 @@ pub(crate) fn handle_mesh_popup_key(
         },
         KeyCode::Char('n') => {
             if let Some(node_id) = app.selected_mesh_node_id() {
-                cmd_tx.send(ClientMsg::CreateRemoteSession {
+                cmd_tx.send(Command::CreateRemoteSession {
                     node_id: node_id.to_string(),
                     cwd: app.current_session_cwd(),
-                    request_id: None,
                 })?;
             }
         }
@@ -406,7 +414,7 @@ pub(crate) fn handle_mesh_popup_key(
 pub(crate) fn handle_mesh_invite_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     if app.mesh_clipboard_fallback.is_some() {
         app.mesh_clipboard_fallback = None;
@@ -446,7 +454,7 @@ pub(crate) fn handle_mesh_invite_popup_key(
         },
         KeyCode::Enter => {
             if let Some(msg) = app.mesh_invite_form_command() {
-                cmd_tx.send(msg.into())?;
+                cmd_tx.send(msg)?;
                 app.set_status(app::LogLevel::Info, "mesh", "creating invite...");
             }
         }
@@ -495,7 +503,7 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> a
 pub(crate) fn handle_command_palette_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => app.popup = Popup::None,
@@ -518,7 +526,7 @@ pub(crate) fn handle_command_palette_key(
 pub(crate) fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<AppAction> {
     if key.code != KeyCode::Esc && app.pending_cancel_confirm_until.is_some() {
         app.clear_cancel_confirm();
@@ -578,7 +586,7 @@ pub(crate) fn handle_key(
         }
         match app.cycle_reasoning_effort() {
             Some(msg) => {
-                cmd_tx.send(msg.into())?;
+                cmd_tx.send(msg)?;
                 app.set_status(
                     app::LogLevel::Info,
                     "model",
@@ -723,7 +731,7 @@ pub(crate) fn save_config(app: &App) {
 pub(crate) fn handle_chord(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Char('m') => {
@@ -759,7 +767,7 @@ pub(crate) fn handle_chord(
                 return Ok(());
             }
             app.open_auth_popup();
-            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+            cmd_tx.send(Command::ListAuthProviders)?;
         }
 
         KeyCode::Char('p') => {
@@ -767,7 +775,7 @@ pub(crate) fn handle_chord(
                 return Ok(());
             }
             app.open_profile_popup();
-            cmd_tx.send(ClientMsg::ListProfiles)?;
+            cmd_tx.send(Command::ListProfiles)?;
         }
         KeyCode::Char('j') => {
             if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
@@ -782,14 +790,12 @@ pub(crate) fn handle_chord(
                 return Ok(());
             }
             if let Some(parent_sid) = app.parent_session_id.clone() {
-                cmd_tx.send(ClientMsg::LoadSession {
-                    session_id: parent_sid.clone(),
-                    cwd: app.current_session_cwd(),
-                })?;
-                cmd_tx.send(ClientMsg::SubscribeSession {
-                    session_id: parent_sid,
-                    agent_id: app.agent_id.clone(),
-                })?;
+                send_load_session_commands(
+                    cmd_tx,
+                    parent_sid,
+                    app.current_session_cwd(),
+                    app.agent_id.clone(),
+                )?;
             } else {
                 app.set_status(app::LogLevel::Info, "session", "no parent session");
             }
@@ -830,7 +836,7 @@ pub(crate) fn handle_chord(
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(app::LogLevel::Info, "session", "undoing...");
-                cmd_tx.send(ClientMsg::Undo {
+                cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
                 })?;
             } else {
@@ -852,7 +858,7 @@ pub(crate) fn handle_chord(
             } else if app.can_redo() {
                 app.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(app::LogLevel::Info, "session", "redoing...");
-                cmd_tx.send(ClientMsg::Redo)?;
+                cmd_tx.send(Command::Redo)?;
             } else {
                 app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
             }
@@ -867,7 +873,7 @@ pub(crate) fn handle_chord(
 pub(crate) fn handle_sessions_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
@@ -884,7 +890,7 @@ pub(crate) fn handle_sessions_key(
                 parent_path,
             } => {
                 if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request.into())?;
+                    cmd_tx.send(request)?;
                 }
             }
             SessionKeyAction::None => {}
@@ -906,29 +912,27 @@ pub(crate) fn handle_sessions_key(
             agent_id,
             cwd,
         } => {
-            cmd_tx.send(ClientMsg::LoadSession {
-                session_id: session_id.clone(),
-                cwd,
-            })?;
-            cmd_tx.send(ClientMsg::SubscribeSession {
+            send_load_session_commands(
+                cmd_tx,
                 session_id,
-                agent_id: agent_id.or_else(|| app.agent_id.clone()),
-            })?;
+                cwd,
+                agent_id.or_else(|| app.agent_id.clone()),
+            )?;
         }
         SessionKeyAction::AttachRemoteSession {
             node_id,
             session_id,
         } => {
-            cmd_tx.send(ClientMsg::AttachRemoteSession {
+            cmd_tx.send(Command::AttachRemoteSession {
                 node_id,
                 session_id,
             })?;
         }
         SessionKeyAction::DeleteSession { session_id } => {
-            cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+            cmd_tx.send(Command::DeleteSession { session_id })?;
         }
         SessionKeyAction::DismissRemoteSession { session_id } => {
-            cmd_tx.send(ClientMsg::DismissRemoteSession { session_id })?;
+            cmd_tx.send(Command::DismissRemoteSession { session_id })?;
         }
         SessionKeyAction::NewSession => {
             app.open_new_session_popup();
@@ -943,7 +947,7 @@ pub(crate) fn handle_sessions_key(
                 app.session_child_page_request(group_idx, &parent_path)
             };
             if let Some(request) = request {
-                cmd_tx.send(request.into())?;
+                cmd_tx.send(request)?;
             }
         }
         SessionKeyAction::None => {}
@@ -954,7 +958,7 @@ pub(crate) fn handle_sessions_key(
 pub(crate) fn handle_session_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     // Tab / BackTab: switch between sessions and delegates tabs
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -983,7 +987,7 @@ pub(crate) fn handle_session_popup_key(
                 parent_path,
             } => {
                 if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request.into())?;
+                    cmd_tx.send(request)?;
                 }
             }
             SessionKeyAction::None => {}
@@ -1005,29 +1009,27 @@ pub(crate) fn handle_session_popup_key(
             agent_id,
             cwd,
         } => {
-            cmd_tx.send(ClientMsg::LoadSession {
-                session_id: session_id.clone(),
-                cwd,
-            })?;
-            cmd_tx.send(ClientMsg::SubscribeSession {
+            send_load_session_commands(
+                cmd_tx,
                 session_id,
-                agent_id: agent_id.or_else(|| app.agent_id.clone()),
-            })?;
+                cwd,
+                agent_id.or_else(|| app.agent_id.clone()),
+            )?;
         }
         SessionKeyAction::AttachRemoteSession {
             node_id,
             session_id,
         } => {
-            cmd_tx.send(ClientMsg::AttachRemoteSession {
+            cmd_tx.send(Command::AttachRemoteSession {
                 node_id,
                 session_id,
             })?;
         }
         SessionKeyAction::DeleteSession { session_id } => {
-            cmd_tx.send(ClientMsg::DeleteSession { session_id })?;
+            cmd_tx.send(Command::DeleteSession { session_id })?;
         }
         SessionKeyAction::DismissRemoteSession { session_id } => {
-            cmd_tx.send(ClientMsg::DismissRemoteSession { session_id })?;
+            cmd_tx.send(Command::DismissRemoteSession { session_id })?;
         }
         SessionKeyAction::LoadMoreSessions {
             group_idx,
@@ -1039,7 +1041,7 @@ pub(crate) fn handle_session_popup_key(
                 app.session_child_page_request(group_idx, &parent_path)
             };
             if let Some(request) = request {
-                cmd_tx.send(request.into())?;
+                cmd_tx.send(request)?;
             }
         }
         SessionKeyAction::NewSession | SessionKeyAction::None => {}
@@ -1228,7 +1230,7 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
 fn handle_delegate_view_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<AppAction> {
     match key.code {
         KeyCode::Up => {
@@ -1253,14 +1255,12 @@ fn handle_delegate_view_key(
         KeyCode::Esc => {
             // Go back to parent session.
             if let Some(parent_sid) = app.parent_session_id.clone() {
-                cmd_tx.send(ClientMsg::LoadSession {
-                    session_id: parent_sid.clone(),
-                    cwd: app.current_session_cwd(),
-                })?;
-                cmd_tx.send(ClientMsg::SubscribeSession {
-                    session_id: parent_sid,
-                    agent_id: app.agent_id.clone(),
-                })?;
+                send_load_session_commands(
+                    cmd_tx,
+                    parent_sid,
+                    app.current_session_cwd(),
+                    app.agent_id.clone(),
+                )?;
             }
         }
         _ => {}
@@ -1273,7 +1273,7 @@ fn handle_delegate_view_key(
 pub(crate) fn handle_delegate_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match apply_delegate_popup_key(
         app,
@@ -1288,14 +1288,12 @@ pub(crate) fn handle_delegate_popup_key(
             agent_id,
             cwd,
         } => {
-            cmd_tx.send(ClientMsg::LoadSession {
-                session_id: session_id.clone(),
-                cwd,
-            })?;
-            cmd_tx.send(ClientMsg::SubscribeSession {
+            send_load_session_commands(
+                cmd_tx,
                 session_id,
-                agent_id: agent_id.or_else(|| app.agent_id.clone()),
-            })?;
+                cwd,
+                agent_id.or_else(|| app.agent_id.clone()),
+            )?;
         }
         SessionKeyAction::NewSession
         | SessionKeyAction::AttachRemoteSession { .. }
@@ -1384,7 +1382,7 @@ pub(crate) fn apply_delegate_popup_key(
 fn begin_fork_session(
     app: &mut App,
     message_id: String,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     if app.pending_fork_message_id.is_some() {
         app.set_status(LogLevel::Warn, "fork", "fork already pending");
@@ -1405,14 +1403,14 @@ fn begin_fork_session(
 
     app.pending_fork_message_id = Some(message_id.clone());
     app.set_status(LogLevel::Info, "fork", "forking session...");
-    cmd_tx.send(ClientMsg::ForkSession { message_id })?;
+    cmd_tx.send(Command::ForkSession { message_id })?;
     Ok(())
 }
 
 pub(crate) fn handle_fork_turn_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => app.popup = Popup::None,
@@ -1479,7 +1477,7 @@ pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Resu
 pub(crate) fn handle_profile_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
@@ -1505,7 +1503,7 @@ pub(crate) fn handle_profile_popup_key(
                     app.agents.clear();
                     app.agents_profile_id = None;
                     app.model_popup_agent_tab = 0;
-                    cmd_tx.send(ClientMsg::ListProfileAgents {
+                    cmd_tx.send(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
                     })?;
                 }
@@ -1528,7 +1526,7 @@ pub(crate) fn handle_profile_popup_key(
 pub(crate) fn handle_new_session_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
@@ -1578,9 +1576,8 @@ pub(crate) fn handle_new_session_popup_key(
             }
             let cwd = app.normalize_new_session_path(&app.new_session_path);
             app.popup = Popup::None;
-            cmd_tx.send(ClientMsg::NewSession {
+            cmd_tx.send(Command::NewSession {
                 cwd,
-                request_id: None,
                 profile_id: app.active_profile_id.clone(),
             })?;
         }
@@ -1660,7 +1657,7 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Re
 pub(crate) fn handle_chat_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<AppAction> {
     if app.input_line_width == 0 {
         app.input_line_width = 1;
@@ -1677,7 +1674,7 @@ pub(crate) fn handle_chat_key(
                 if app.cancel_confirm_active() {
                     app.clear_cancel_confirm();
                     app.set_status(app::LogLevel::Warn, "activity", "stopping...");
-                    cmd_tx.send(ClientMsg::CancelSession)?;
+                    cmd_tx.send(Command::CancelSession)?;
                 } else {
                     app.arm_cancel_confirm();
                 }
@@ -1701,7 +1698,7 @@ pub(crate) fn handle_chat_key(
             // 3. Accept mention completion.
             if app.mention_state.is_some() && app.accept_selected_mention() {
                 if let Some(msg) = app.request_file_index_if_needed() {
-                    cmd_tx.send(msg.into())?;
+                    cmd_tx.send(msg)?;
                 }
                 return Ok(AppAction::None);
             }
@@ -1724,7 +1721,7 @@ pub(crate) fn handle_chat_key(
                     });
                 }
                 let local_id = app.push_pending_prompt(text);
-                if let Err(error) = cmd_tx.send(ClientMsg::Prompt {
+                if let Err(error) = cmd_tx.send(Command::Prompt {
                     prompt,
                     local_id: local_id.clone(),
                 }) {
@@ -1749,13 +1746,13 @@ pub(crate) fn handle_chat_key(
                 && app.accept_selected_mention()
                 && let Some(msg) = app.request_file_index_if_needed()
             {
-                cmd_tx.send(msg.into())?;
+                cmd_tx.send(msg)?;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
             app.input_insert(c);
             if let Some(msg) = app.request_file_index_if_needed() {
-                cmd_tx.send(msg.into())?;
+                cmd_tx.send(msg)?;
             }
         }
         KeyCode::Up => {
@@ -1824,10 +1821,10 @@ pub(crate) fn handle_chat_key(
 /// for the target mode, and persists config/cache.
 fn switch_mode(
     app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
     target: &str,
 ) -> anyhow::Result<()> {
-    cmd_tx.send(ClientMsg::SetAgentMode {
+    cmd_tx.send(Command::SetAgentMode {
         mode: target.to_string(),
     })?;
 
@@ -1865,7 +1862,7 @@ enum SlashResult {
 /// (this allows `/undo` to optionally restore the previous turn text).
 fn try_execute_slash_command(
     app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<SlashResult> {
     // Extract the command name (first word after '/') and optional argument.
     let after_slash = app.input.trim_start_matches('/');
@@ -1974,7 +1971,7 @@ fn try_execute_slash_command(
                         return Ok(SlashResult::Handled);
                     }
                     let msg = app.set_reasoning_effort(Some(&level)).unwrap();
-                    cmd_tx.send(msg.into())?;
+                    cmd_tx.send(msg)?;
                     app.set_status(
                         app::LogLevel::Info,
                         "model",
@@ -1996,14 +1993,14 @@ fn try_execute_slash_command(
             }
             if arg.is_empty() {
                 app.open_profile_popup();
-                cmd_tx.send(ClientMsg::ListProfiles)?;
+                cmd_tx.send(Command::ListProfiles)?;
             } else if let Some(profile_id) = app.find_profile_id(&arg) {
                 app.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
                     app.agents.clear();
                     app.agents_profile_id = None;
                     app.model_popup_agent_tab = 0;
-                    cmd_tx.send(ClientMsg::ListProfileAgents {
+                    cmd_tx.send(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
                     })?;
                 }
@@ -2031,7 +2028,7 @@ fn try_execute_slash_command(
             app.session_cursor = 0;
             app.session_filter.clear();
             if let Some(request) = app.begin_session_discovery() {
-                cmd_tx.send(request.into())?;
+                cmd_tx.send(request)?;
             }
         }
         "delegates" => {
@@ -2073,7 +2070,7 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.open_auth_popup();
-            cmd_tx.send(ClientMsg::ListAuthProviders)?;
+            cmd_tx.send(Command::ListAuthProviders)?;
         }
         "fork" => {
             app.take_input();
@@ -2132,7 +2129,7 @@ fn try_execute_slash_command(
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(app::LogLevel::Info, "session", "undoing...");
-                cmd_tx.send(ClientMsg::Undo {
+                cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
                 })?;
             } else {
@@ -2155,7 +2152,7 @@ fn try_execute_slash_command(
             } else if app.can_redo() {
                 app.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(app::LogLevel::Info, "session", "redoing...");
-                cmd_tx.send(ClientMsg::Redo)?;
+                cmd_tx.send(Command::Redo)?;
             } else {
                 app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
             }
@@ -2169,7 +2166,7 @@ fn try_execute_slash_command(
             if app.has_cancellable_activity() {
                 app.clear_cancel_confirm();
                 app.set_status(app::LogLevel::Warn, "activity", "stopping...");
-                cmd_tx.send(ClientMsg::CancelSession)?;
+                cmd_tx.send(Command::CancelSession)?;
             } else {
                 app.set_status(app::LogLevel::Warn, "activity", "nothing to cancel");
             }
@@ -2189,7 +2186,7 @@ fn try_execute_slash_command(
 pub(crate) fn handle_auth_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     use crate::app::AuthPanel;
 
@@ -2235,7 +2232,7 @@ pub(crate) fn handle_auth_popup_key(
                     {
                         app.auth_selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
-                        cmd_tx.send(ClientMsg::StartOAuthLogin {
+                        cmd_tx.send(Command::StartOAuthLogin {
                             provider: provider_id,
                         })?;
                     } else {
@@ -2250,12 +2247,12 @@ pub(crate) fn handle_auth_popup_key(
                     let provider = &app.auth_providers[idx];
                     if provider.oauth_status == Some(OAuthStatus::Connected) {
                         let provider_id = provider.provider.clone();
-                        cmd_tx.send(ClientMsg::DisconnectOAuth {
+                        cmd_tx.send(Command::DisconnectOAuth {
                             provider: provider_id,
                         })?;
                     } else if provider.has_stored_api_key {
                         let provider_id = provider.provider.clone();
-                        cmd_tx.send(ClientMsg::ClearApiToken {
+                        cmd_tx.send(Command::ClearApiToken {
                             provider: provider_id,
                         })?;
                     }
@@ -2284,7 +2281,7 @@ pub(crate) fn handle_auth_popup_key(
                         app.auth_ui_notice = None;
                         app.auth_selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
-                        cmd_tx.send(ClientMsg::StartOAuthLogin {
+                        cmd_tx.send(Command::StartOAuthLogin {
                             provider: provider_id,
                         })?;
                     }
@@ -2311,7 +2308,7 @@ pub(crate) fn handle_auth_popup_key(
                     let trimmed = app.auth_api_key_input.trim().to_string();
                     if !trimmed.is_empty() {
                         let provider = app.auth_providers[idx].provider.clone();
-                        cmd_tx.send(ClientMsg::SetApiToken {
+                        cmd_tx.send(Command::SetApiToken {
                             provider,
                             api_key: trimmed,
                         })?;
@@ -2325,7 +2322,7 @@ pub(crate) fn handle_auth_popup_key(
                 // Clear stored key
                 if let Some(idx) = app.auth_selected {
                     let provider = app.auth_providers[idx].provider.clone();
-                    cmd_tx.send(ClientMsg::ClearApiToken { provider })?;
+                    cmd_tx.send(Command::ClearApiToken { provider })?;
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2382,7 +2379,7 @@ pub(crate) fn handle_auth_popup_key(
                         app.auth_oauth_response.trim().to_string()
                     };
                     if is_device_poll || !response.is_empty() {
-                        cmd_tx.send(ClientMsg::CompleteOAuthLogin { flow_id, response })?;
+                        cmd_tx.send(Command::CompleteOAuthLogin { flow_id, response })?;
                     }
                 }
             }
@@ -2470,7 +2467,7 @@ fn try_copy_to_clipboard(app: &mut App, provider: &str, text: &str) {
 pub(crate) fn handle_model_popup_key(
     app: &mut App,
     key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
@@ -2525,7 +2522,7 @@ pub(crate) fn handle_model_popup_key(
                 if app.model_popup_is_session_tab(app.model_popup_agent_tab) {
                     if !app.current_session_is_remote() {
                         if let Some(sid) = app.session_id.clone() {
-                            cmd_tx.send(ClientMsg::SetSessionModel {
+                            cmd_tx.send(Command::SetSessionModel {
                                 session_id: sid,
                                 model_id: model.id.clone(),
                                 node_id: model.node_id.clone(),
@@ -2534,7 +2531,7 @@ pub(crate) fn handle_model_popup_key(
                         app.apply_model_selection_from_entry(&model);
                         if app.reasoning_effort.is_some() {
                             app.reasoning_effort = None;
-                            cmd_tx.send(ClientMsg::SetReasoningEffort {
+                            cmd_tx.send(Command::SetReasoningEffort {
                                 reasoning_effort: "auto".into(),
                             })?;
                         }
@@ -2554,7 +2551,7 @@ pub(crate) fn handle_model_popup_key(
                     if app.parent_session_id.is_none()
                         && let Some(session_id) = app.session_id.clone()
                     {
-                        cmd_tx.send(ClientMsg::SetDelegateModel {
+                        cmd_tx.send(Command::SetDelegateModel {
                             session_id,
                             agent_id,
                             model_id: Some(model.id.clone()),
@@ -2580,7 +2577,7 @@ pub(crate) fn handle_model_popup_key(
                 if app.parent_session_id.is_none()
                     && let Some(session_id) = app.session_id.clone()
                 {
-                    cmd_tx.send(ClientMsg::SetDelegateModel {
+                    cmd_tx.send(Command::SetDelegateModel {
                         session_id,
                         agent_id,
                         model_id: None,
@@ -2610,7 +2607,7 @@ pub(crate) fn handle_model_popup_key(
 
 // ── Pure key logic for the sessions screen ────────────────────────────────────
 //
-// `apply_sessions_key` returns the `ClientMsg`(s) that should be sent to the
+// `apply_sessions_key` returns the `Command`(s) that should be sent to the
 // server (if any).  Keeping the mutation separate from the channel send makes
 // it fully unit-testable without a real channel.
 
@@ -2909,7 +2906,7 @@ mod model_popup_tests {
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(app.popup, Popup::Mesh));
-        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListRemoteNodes)));
+        assert!(matches!(rx.try_recv(), Ok(Command::ListRemoteNodes)));
     }
 
     #[test]
@@ -2937,7 +2934,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::AttachRemoteSession { node_id, session_id })
+            Ok(Command::AttachRemoteSession { node_id, session_id })
                 if node_id == "node-1" && session_id == "remote-1"
         ));
     }
@@ -3028,7 +3025,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::CreateMeshInvite { mesh_name, ttl, max_uses })
+            Ok(Command::CreateMeshInvite { mesh_name, ttl, max_uses })
                 if mesh_name.as_deref() == Some("Team Mesh")
                     && ttl.as_deref() == Some("1d3h5m")
                     && max_uses == Some(1)
@@ -3063,7 +3060,7 @@ mod model_popup_tests {
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(app.popup, Popup::ProfileSelect));
-        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListProfiles)));
+        assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
     }
 
     #[test]
@@ -3079,7 +3076,7 @@ mod model_popup_tests {
 
         assert!(matches!(action, AppAction::None));
         assert!(matches!(app.popup, Popup::ProfileSelect));
-        assert!(matches!(rx.try_recv(), Ok(ClientMsg::ListProfiles)));
+        assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
     }
 
     #[test]
@@ -3098,7 +3095,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::ListProfileAgents { profile_id }) if profile_id == "fast"
+            Ok(Command::ListProfileAgents { profile_id }) if profile_id == "fast"
         ));
         assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
     }
@@ -3118,7 +3115,7 @@ mod model_popup_tests {
         assert!(matches!(app.popup, Popup::None));
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::ListProfileAgents { profile_id }) if profile_id == "deep"
+            Ok(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
         ));
         assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
     }
@@ -3137,7 +3134,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::NewSession { profile_id: Some(profile_id), .. })
+            Ok(Command::NewSession { profile_id: Some(profile_id), .. })
                 if profile_id == "coder-delegate"
         ));
     }
@@ -3175,7 +3172,7 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::SetDelegateModel {
+            Ok(Command::SetDelegateModel {
                 ref session_id,
                 ref agent_id,
                 ref model_id,
@@ -3218,7 +3215,7 @@ mod model_popup_tests {
         );
         assert!(matches!(
             rx.try_recv(),
-            Ok(ClientMsg::SetDelegateModel {
+            Ok(Command::SetDelegateModel {
                 ref session_id,
                 ref agent_id,
                 model_id: None,
@@ -3286,10 +3283,10 @@ mod model_popup_tests {
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         let msg1 = rx.try_recv().expect("expected SetSessionModel");
-        assert!(matches!(msg1, ClientMsg::SetSessionModel { .. }));
+        assert!(matches!(msg1, Command::SetSessionModel { .. }));
         let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
         assert!(
-            matches!(msg2, ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
+            matches!(msg2, Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
         );
         assert!(rx.try_recv().is_err());
 
@@ -3336,7 +3333,7 @@ mod model_popup_tests {
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         match rx.try_recv().expect("SetSessionModel") {
-            ClientMsg::SetSessionModel {
+            Command::SetSessionModel {
                 node_id, model_id, ..
             } => {
                 assert_eq!(node_id.as_deref(), Some("node-a"));
@@ -3434,7 +3431,7 @@ mod model_popup_tests {
         assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
         assert!(matches!(
             rx.try_recv().expect("expected SetAgentMode(review)"),
-            ClientMsg::SetAgentMode { mode } if mode == "review"
+            Command::SetAgentMode { mode } if mode == "review"
         ));
         assert!(rx.try_recv().is_err());
 
@@ -3443,7 +3440,7 @@ mod model_popup_tests {
         assert_eq!(app.mode_before_review, None);
         assert!(matches!(
             rx.try_recv().expect("expected SetAgentMode(plan)"),
-            ClientMsg::SetAgentMode { mode } if mode == "plan"
+            Command::SetAgentMode { mode } if mode == "plan"
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -3476,11 +3473,11 @@ mod model_popup_tests {
 
         assert!(matches!(
             rx.try_recv().expect("expected LoadSession"),
-            ClientMsg::LoadSession { session_id, .. } if session_id == "child-1"
+            Command::LoadSession { session_id, .. } if session_id == "child-1"
         ));
         assert!(matches!(
             rx.try_recv().expect("expected SubscribeSession"),
-            ClientMsg::SubscribeSession { session_id, agent_id }
+            Command::SubscribeSession { session_id, agent_id }
                 if session_id == "child-1" && agent_id.as_deref() == Some("coder")
         ));
         assert!(rx.try_recv().is_err());
