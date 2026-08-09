@@ -343,7 +343,7 @@ impl crate::app::App {
                 is_replay,
             } => {
                 self.apply_acp_session_update(&session_id, update, is_replay);
-                self.drain_pending_commands()
+                vec![]
             }
             AcpAppEvent::SessionReplay {
                 session_id,
@@ -358,7 +358,7 @@ impl crate::app::App {
                 for update in updates {
                     self.apply_acp_session_update(&session_id, update, true);
                 }
-                self.drain_pending_commands()
+                vec![]
             }
             AcpAppEvent::UndoStack(undo_stack) => {
                 self.undo_state = self.build_undo_state_from_server_stack(&undo_stack, None, None);
@@ -3815,39 +3815,6 @@ mod tests {
         }));
 
         assert!(app.can_redo());
-    }
-
-    #[test]
-    fn session_update_and_replay_drain_pending_commands() {
-        let mut app = app_with_active_session();
-        app.pending_commands.push(Command::SubscribeSession {
-            session_id: "child-1".into(),
-            agent_id: Some("agent-1".into()),
-        });
-
-        let update_commands = app.handle_acp_event(AcpAppEvent::SessionUpdate {
-            session_id: TEST_SESSION_ID.into(),
-            is_replay: false,
-            update: AcpSessionUpdate::TurnStarted,
-        });
-
-        assert_eq!(
-            update_commands,
-            vec![Command::SubscribeSession {
-                session_id: "child-1".into(),
-                agent_id: Some("agent-1".into()),
-            }]
-        );
-        assert!(app.pending_commands.is_empty());
-
-        app.pending_commands.push(Command::GetFileIndex);
-        let replay_commands = app.handle_acp_event(AcpAppEvent::SessionReplay {
-            session_id: TEST_SESSION_ID.into(),
-            updates: Vec::new(),
-        });
-
-        assert_eq!(replay_commands, vec![Command::GetFileIndex]);
-        assert!(app.pending_commands.is_empty());
     }
 
     #[test]
