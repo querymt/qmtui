@@ -14,15 +14,14 @@ use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
-    ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoState,
-    UndoableTurn,
+    ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoStackSnapshot,
+    UndoState, UndoableTurn,
 };
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
 use crate::protocol::{
     ClientMsg, EventKind, MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
-    UndoStackFrame,
 };
 use crate::ui::{CardCache, ElicitationUiState};
 
@@ -1850,11 +1849,11 @@ impl App {
 
     pub fn build_undo_state_from_server_stack(
         &self,
-        undo_stack: &[UndoStackFrame],
+        undo_stack: &UndoStackSnapshot,
         preferred_frontier_message_id: Option<&str>,
         reverted_files: Option<&[String]>,
     ) -> Option<UndoState> {
-        if undo_stack.is_empty() {
+        if undo_stack.message_ids.is_empty() {
             return None;
         }
 
@@ -1867,32 +1866,32 @@ impl App {
         }
 
         let stack: Vec<UndoFrame> = undo_stack
+            .message_ids
             .iter()
-            .map(|frame| {
-                let previous = previous_by_message_id.get(&frame.message_id);
-                let reverted_files =
-                    if preferred_frontier_message_id == Some(frame.message_id.as_str()) {
-                        reverted_files
-                            .map(|files| files.to_vec())
-                            .or_else(|| previous.map(|frame| frame.reverted_files.clone()))
-                            .unwrap_or_default()
-                    } else {
-                        previous
-                            .map(|frame| frame.reverted_files.clone())
-                            .unwrap_or_default()
-                    };
+            .map(|message_id| {
+                let previous = previous_by_message_id.get(message_id);
+                let reverted_files = if preferred_frontier_message_id == Some(message_id.as_str()) {
+                    reverted_files
+                        .map(|files| files.to_vec())
+                        .or_else(|| previous.map(|frame| frame.reverted_files.clone()))
+                        .unwrap_or_default()
+                } else {
+                    previous
+                        .map(|frame| frame.reverted_files.clone())
+                        .unwrap_or_default()
+                };
                 let turn_id = previous
                     .map(|frame| frame.turn_id.clone())
                     .or_else(|| {
                         self.undoable_turns
                             .iter()
-                            .find(|turn| turn.message_id == frame.message_id)
+                            .find(|turn| turn.message_id == *message_id)
                             .map(|turn| turn.turn_id.clone())
                     })
-                    .unwrap_or_else(|| frame.message_id.clone());
+                    .unwrap_or_else(|| message_id.clone());
                 UndoFrame {
                     turn_id,
-                    message_id: frame.message_id.clone(),
+                    message_id: message_id.clone(),
                     status: UndoFrameStatus::Confirmed,
                     reverted_files,
                 }
@@ -2862,12 +2861,10 @@ mod tests {
         }
     }
 
-    fn make_stack(ids: &[&str]) -> Vec<UndoStackFrame> {
-        ids.iter()
-            .map(|id| UndoStackFrame {
-                message_id: (*id).into(),
-            })
-            .collect()
+    fn make_stack(ids: &[&str]) -> UndoStackSnapshot {
+        UndoStackSnapshot {
+            message_ids: ids.iter().map(|id| (*id).into()).collect(),
+        }
     }
 
     #[test]
@@ -3168,10 +3165,35 @@ mod tests {
     }
 
     #[test]
+    fn build_undo_state_preserves_order_previous_turn_and_unknown_fallback() {
+        let mut app = App::new();
+        app.undo_state = Some(UndoState {
+            stack: vec![UndoFrame {
+                turn_id: "previous-turn".into(),
+                message_id: "msg-1".into(),
+                status: UndoFrameStatus::Pending,
+                reverted_files: vec!["preserved.rs".into()],
+            }],
+            frontier_message_id: Some("msg-1".into()),
+        });
+
+        let state = app
+            .build_undo_state_from_server_stack(&make_stack(&["msg-1", "unknown"]), None, None)
+            .expect("undo state");
+
+        assert_eq!(state.stack[0].message_id, "msg-1");
+        assert_eq!(state.stack[0].turn_id, "previous-turn");
+        assert_eq!(state.stack[0].status, UndoFrameStatus::Confirmed);
+        assert_eq!(state.stack[0].reverted_files, ["preserved.rs"]);
+        assert_eq!(state.stack[1].message_id, "unknown");
+        assert_eq!(state.stack[1].turn_id, "unknown");
+    }
+
+    #[test]
     fn build_undo_state_returns_none_for_empty_stack() {
         let app = App::new();
         assert_eq!(
-            app.build_undo_state_from_server_stack(&[], None, None),
+            app.build_undo_state_from_server_stack(&UndoStackSnapshot::default(), None, None),
             None
         );
     }

@@ -21,11 +21,14 @@ use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
-use crate::domain::session::{SessionGroup, SessionListPage, SessionSummary};
+use crate::domain::session::{
+    ForkResult, RedoResult, SessionGroup, SessionListPage, SessionSummary, UndoResult,
+    UndoStackSnapshot,
+};
 use crate::protocol::{
-    AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
-    MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
-    RemoteSessionListInfo, SessionListRequest, UndoResultData, UndoStackFrame,
+    AuthProvidersData, ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo,
+    OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo,
+    SessionListRequest, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1260,10 +1263,8 @@ async fn handle_client_msg<C: AcpConnection>(
             let Some(session_id) = state.current_session_id().await else {
                 send_acp(
                     srv_tx,
-                    AcpAppEvent::ForkResult(ForkResultData {
-                        success: false,
+                    AcpAppEvent::ForkResult(ForkResult::Failed {
                         source_session_id: None,
-                        forked_session_id: None,
                         message: Some("cannot fork before a session is loaded".to_string()),
                     }),
                 );
@@ -1274,8 +1275,7 @@ async fn handle_client_msg<C: AcpConnection>(
             match connection.request(req).await {
                 Ok(response) => send_acp(
                     srv_tx,
-                    AcpAppEvent::ForkResult(ForkResultData {
-                        success: true,
+                    AcpAppEvent::ForkResult(ForkResult::Succeeded {
                         source_session_id: Some(session_id),
                         forked_session_id: Some(response.session_id.to_string()),
                         message: None,
@@ -1283,10 +1283,8 @@ async fn handle_client_msg<C: AcpConnection>(
                 ),
                 Err(err) => send_acp(
                     srv_tx,
-                    AcpAppEvent::ForkResult(ForkResultData {
-                        success: false,
+                    AcpAppEvent::ForkResult(ForkResult::Failed {
                         source_session_id: Some(session_id),
-                        forked_session_id: None,
                         message: Some(format!("ACP fork failed: {err:?}")),
                     }),
                 ),
@@ -1316,7 +1314,10 @@ async fn handle_client_msg<C: AcpConnection>(
             if let Ok(result) =
                 serde_json::from_value::<UndoResultData>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::UndoResult(result));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::UndoResult(undo_result_from_wire(result)),
+                );
             }
         }
         ClientMsg::Redo => {
@@ -1333,7 +1334,10 @@ async fn handle_client_msg<C: AcpConnection>(
             if let Ok(result) =
                 serde_json::from_value::<RedoResultData>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::RedoResult(result));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::RedoResult(redo_result_from_wire(result)),
+                );
             }
         }
         ClientMsg::ListRemoteNodes => {
@@ -1514,17 +1518,55 @@ fn load_session_cwd(cwd: Option<&str>, default_cwd: PathBuf) -> PathBuf {
         .unwrap_or(default_cwd)
 }
 
+fn undo_stack_snapshot_from_wire(frames: Vec<UndoStackFrame>) -> UndoStackSnapshot {
+    UndoStackSnapshot {
+        message_ids: frames.into_iter().map(|frame| frame.message_id).collect(),
+    }
+}
+
+fn undo_result_from_wire(result: UndoResultData) -> UndoResult {
+    let stack = undo_stack_snapshot_from_wire(result.undo_stack);
+    if result.success {
+        UndoResult::Applied {
+            target_message_id: result.message_id,
+            reverted_files: result.reverted_files,
+            message: result.message,
+            stack,
+        }
+    } else {
+        UndoResult::Rejected {
+            message: result.message,
+            stack,
+        }
+    }
+}
+
+fn redo_result_from_wire(result: RedoResultData) -> RedoResult {
+    let stack = undo_stack_snapshot_from_wire(result.undo_stack);
+    if result.success {
+        RedoResult::Applied {
+            message: result.message,
+            stack,
+        }
+    } else {
+        RedoResult::Rejected {
+            message: result.message,
+            stack,
+        }
+    }
+}
+
 async fn fetch_undo_stack<C: AcpConnection>(
     connection: &C,
     session_id: &str,
-) -> Result<Vec<UndoStackFrame>, acp_sdk::Error> {
+) -> Result<UndoStackSnapshot, acp_sdk::Error> {
     let response = call_querymt_ext(
         connection,
         "querymt/session/undoStack",
         json!({ "session_id": session_id }),
     )
     .await?;
-    Ok(ext_payload(&response)
+    let frames = ext_payload(&response)
         .get("undo_stack")
         .and_then(Value::as_array)
         .map(|items| {
@@ -1533,7 +1575,8 @@ async fn fetch_undo_stack<C: AcpConnection>(
                 .filter_map(|item| serde_json::from_value::<UndoStackFrame>(item.clone()).ok())
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default();
+    Ok(undo_stack_snapshot_from_wire(frames))
 }
 
 async fn post_connect_diagnostics<C: AcpConnection>(
@@ -2830,6 +2873,98 @@ mod tests {
             "provider": provider,
             "model": model,
         })
+    }
+
+    fn wire_stack(ids: &[&str]) -> Vec<UndoStackFrame> {
+        ids.iter()
+            .map(|message_id| UndoStackFrame {
+                message_id: (*message_id).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn undo_stack_snapshot_from_wire_preserves_message_order() {
+        let snapshot = undo_stack_snapshot_from_wire(wire_stack(&["message-2", "message-1"]));
+
+        assert_eq!(snapshot.message_ids, ["message-2", "message-1"]);
+    }
+
+    #[test]
+    fn undo_result_from_wire_maps_applied_details() {
+        let result = undo_result_from_wire(UndoResultData {
+            success: true,
+            message_id: Some("message-2".into()),
+            reverted_files: vec!["src/a.rs".into()],
+            message: Some("undone".into()),
+            undo_stack: wire_stack(&["message-1", "message-2"]),
+        });
+
+        assert_eq!(
+            result,
+            UndoResult::Applied {
+                target_message_id: Some("message-2".into()),
+                reverted_files: vec!["src/a.rs".into()],
+                message: Some("undone".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["message-1".into(), "message-2".into()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn undo_result_from_wire_rejects_and_discards_reverted_files() {
+        let result = undo_result_from_wire(UndoResultData {
+            success: false,
+            message_id: Some("ignored".into()),
+            reverted_files: vec!["ignored.rs".into()],
+            message: Some("undo rejected".into()),
+            undo_stack: wire_stack(&["message-1"]),
+        });
+
+        assert_eq!(
+            result,
+            UndoResult::Rejected {
+                message: Some("undo rejected".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["message-1".into()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn redo_result_from_wire_maps_applied_and_rejected_results() {
+        let applied = redo_result_from_wire(RedoResultData {
+            success: true,
+            message: Some("redone".into()),
+            undo_stack: wire_stack(&["message-1", "message-2"]),
+        });
+        assert_eq!(
+            applied,
+            RedoResult::Applied {
+                message: Some("redone".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["message-1".into(), "message-2".into()],
+                },
+            }
+        );
+
+        let rejected = redo_result_from_wire(RedoResultData {
+            success: false,
+            message: Some("redo rejected".into()),
+            undo_stack: wire_stack(&["message-1"]),
+        });
+        assert_eq!(
+            rejected,
+            RedoResult::Rejected {
+                message: Some("redo rejected".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["message-1".into()],
+                },
+            }
+        );
     }
 
     #[tokio::test]

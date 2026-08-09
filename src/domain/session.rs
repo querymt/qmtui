@@ -49,6 +49,50 @@ pub struct SessionChildrenPage {
     pub total_count: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoStackSnapshot {
+    pub message_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoResult {
+    Applied {
+        target_message_id: Option<String>,
+        reverted_files: Vec<String>,
+        message: Option<String>,
+        stack: UndoStackSnapshot,
+    },
+    Rejected {
+        message: Option<String>,
+        stack: UndoStackSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedoResult {
+    Applied {
+        message: Option<String>,
+        stack: UndoStackSnapshot,
+    },
+    Rejected {
+        message: Option<String>,
+        stack: UndoStackSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkResult {
+    Succeeded {
+        source_session_id: Option<String>,
+        forked_session_id: Option<String>,
+        message: Option<String>,
+    },
+    Failed {
+        source_session_id: Option<String>,
+        message: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoableTurn {
     pub turn_id: String,

@@ -893,24 +893,97 @@ mod session_page_data_tests {
 }
 
 #[cfg(test)]
-mod fork_result_tests {
-    use super::*;
+mod session_mutation_data_tests {
+    use super::{ForkResultData, RedoResultData, UndoResultData};
     use serde_json::json;
 
     #[test]
-    fn fork_result_deserializes_optional_fields() {
-        let result: ForkResultData = serde_json::from_value(json!({
+    fn undo_result_deserializes_success_fields_and_stack_order() {
+        let result: UndoResultData = serde_json::from_value(json!({
+            "success": true,
+            "message_id": "message-2",
+            "reverted_files": ["src/a.rs", "src/b.rs"],
+            "message": "undone",
+            "undo_stack": [
+                { "message_id": "message-1" },
+                { "message_id": "message-2" }
+            ]
+        }))
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.message_id.as_deref(), Some("message-2"));
+        assert_eq!(result.reverted_files, ["src/a.rs", "src/b.rs"]);
+        assert_eq!(result.message.as_deref(), Some("undone"));
+        assert_eq!(result.undo_stack[0].message_id, "message-1");
+        assert_eq!(result.undo_stack[1].message_id, "message-2");
+    }
+
+    #[test]
+    fn undo_result_deserializes_failure_with_default_collections() {
+        let result: UndoResultData = serde_json::from_value(json!({
+            "success": false,
+            "message_id": null,
+            "message": "undo rejected"
+        }))
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(result.reverted_files.is_empty());
+        assert!(result.undo_stack.is_empty());
+        assert_eq!(result.message.as_deref(), Some("undo rejected"));
+    }
+
+    #[test]
+    fn redo_result_deserializes_success_fields_and_stack_order() {
+        let result: RedoResultData = serde_json::from_value(json!({
+            "success": true,
+            "message": "redone",
+            "undo_stack": [
+                { "message_id": "message-1" },
+                { "message_id": "message-2" }
+            ]
+        }))
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.message.as_deref(), Some("redone"));
+        assert_eq!(result.undo_stack[0].message_id, "message-1");
+        assert_eq!(result.undo_stack[1].message_id, "message-2");
+    }
+
+    #[test]
+    fn redo_result_deserializes_failure_with_default_stack() {
+        let result: RedoResultData = serde_json::from_value(json!({
+            "success": false,
+            "message": "redo rejected"
+        }))
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(result.undo_stack.is_empty());
+        assert_eq!(result.message.as_deref(), Some("redo rejected"));
+    }
+
+    #[test]
+    fn fork_result_deserializes_present_and_missing_optional_fields() {
+        let succeeded: ForkResultData = serde_json::from_value(json!({
             "success": true,
             "source_session_id": "source-1",
             "forked_session_id": "fork-1",
             "message": "forked"
         }))
         .unwrap();
+        assert!(succeeded.success);
+        assert_eq!(succeeded.source_session_id.as_deref(), Some("source-1"));
+        assert_eq!(succeeded.forked_session_id.as_deref(), Some("fork-1"));
+        assert_eq!(succeeded.message.as_deref(), Some("forked"));
 
-        assert!(result.success);
-        assert_eq!(result.source_session_id.as_deref(), Some("source-1"));
-        assert_eq!(result.forked_session_id.as_deref(), Some("fork-1"));
-        assert_eq!(result.message.as_deref(), Some("forked"));
+        let failed: ForkResultData = serde_json::from_value(json!({ "success": false })).unwrap();
+        assert!(!failed.success);
+        assert_eq!(failed.source_session_id, None);
+        assert_eq!(failed.forked_session_id, None);
+        assert_eq!(failed.message, None);
     }
 }
 
