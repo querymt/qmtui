@@ -37,8 +37,10 @@ pub(crate) enum ServerChannelMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState};
     use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+    use crate::domain::elicitation::{
+        ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+    };
     use crate::domain::tool::ToolDetail;
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -480,8 +482,9 @@ mod tests {
 #[cfg(test)]
 mod external_editor_tests {
     use super::*;
-    use crate::app::{ActivityState, App};
+    use crate::app::App;
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
+    use crate::domain::activity::{ActivityState, SessionOp};
     use crate::domain::chat::ChatEntry;
     use crate::handlers::*;
     use crate::protocol::PromptBlock;
@@ -1329,7 +1332,7 @@ mod external_editor_tests {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
-        app.activity = ActivityState::SessionOp(app::SessionOp::Undo);
+        app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.input = "draft".into();
         app.input_cursor = app.input.len();
 
@@ -1613,8 +1616,9 @@ impl PersistenceGuard {
 #[cfg(test)]
 mod sessions_key_tests {
     use super::*;
+    use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
-    use crate::protocol::{ClientMsg, SessionGroup, SessionSummary};
+    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -2051,8 +2055,9 @@ mod sessions_key_tests {
 mod session_popup_key_tests {
     use super::*;
     use crate::app::Popup;
+    use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
-    use crate::protocol::{ClientMsg, SessionGroup, SessionSummary};
+    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2793,7 +2798,10 @@ mod session_popup_key_tests {
 #[cfg(test)]
 mod delegate_popup_key_tests {
     use super::*;
-    use crate::app::{DelegateEntry, DelegateStatus, Popup};
+    use crate::app::Popup;
+    use crate::domain::activity::{
+        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+    };
     use crate::handlers::*;
     use crossterm::event::KeyCode;
 
@@ -2805,10 +2813,10 @@ mod delegate_popup_key_tests {
             target_agent_id: Some("coder".into()),
             objective: objective.into(),
             status: DelegateStatus::Completed,
-            stats: app::DelegateStats::default(),
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
-            child_state: app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         }
     }
 
@@ -2916,10 +2924,10 @@ mod delegate_popup_key_tests {
             target_agent_id: None,
             objective: "pending task".into(),
             status: DelegateStatus::InProgress,
-            stats: app::DelegateStats::default(),
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
-            child_state: app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         }];
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);
@@ -2957,7 +2965,7 @@ mod delegate_popup_key_tests {
     fn delegate_enter_loads_awaiting_input_child_session() {
         let mut app = setup_delegate_app();
         app.delegate_entries[0].status = DelegateStatus::InProgress;
-        app.delegate_entries[0].child_state = app::DelegateChildState::PendingElicitation {
+        app.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             requested_schema: serde_json::json!({ "properties": {} }),
@@ -3344,7 +3352,10 @@ mod runtime_tests {
 mod auth_tests {
     use super::*;
     use crate::handlers::*;
-    use crate::protocol::*;
+    use crate::protocol::{
+        AuthMethod, AuthProviderEntry, AuthProvidersData, ClientMsg, OAuthFlowData, OAuthFlowKind,
+        OAuthResultData, OAuthStatus,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {

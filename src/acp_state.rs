@@ -2080,6 +2080,7 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::{App, Screen};
+    use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::model::DelegateModelPreference;
     use crate::domain::session::UndoState;
 
@@ -2737,17 +2738,17 @@ mod tests {
         app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
         app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app.session_stats.total_tool_calls = 2;
-        app.delegate_entries.push(crate::app::DelegateEntry {
+        app.delegate_entries.push(DelegateEntry {
             delegation_id: "delegate-1".into(),
             child_session_id: Some("child".into()),
             delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "keep".into(),
-            status: crate::app::DelegateStatus::InProgress,
-            stats: crate::app::DelegateStats::default(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
-            child_state: crate::app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         });
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionLoaded {
@@ -2780,24 +2781,22 @@ mod tests {
     fn native_session_loaded_root_clears_delegate_state() {
         let mut app = App::new();
         app.parent_session_id = Some("old-parent".into());
-        app.delegate_entries.push(crate::app::DelegateEntry {
+        app.delegate_entries.push(DelegateEntry {
             delegation_id: "delegate-1".into(),
             child_session_id: None,
             delegate_tool_call_id: None,
             target_agent_id: None,
             objective: "clear".into(),
-            status: crate::app::DelegateStatus::InProgress,
-            stats: crate::app::DelegateStats::default(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
-            child_state: crate::app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         });
-        app.pending_delegate_child_states.insert(
-            "child".into(),
-            crate::app::DelegateChildState::OtherProgress,
-        );
+        app.pending_delegate_child_states
+            .insert("child".into(), DelegateChildState::OtherProgress);
         app.pending_delegate_tool_calls
-            .push(crate::app::PendingDelegateToolCall {
+            .push(PendingDelegateToolCall {
                 tool_call_id: "tool-1".into(),
                 target_agent_id: None,
                 objective: "clear".into(),
@@ -3521,7 +3520,7 @@ mod tests {
     fn native_undo_result_success_updates_state_and_reloads_session() {
         let mut app = App::new();
         app.session_id = Some("session-1".into());
-        app.activity = ActivityState::SessionOp(crate::app::SessionOp::Undo);
+        app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.undoable_turns.push(UndoableTurn {
             turn_id: "u1".into(),
             message_id: "u1".into(),
@@ -3550,7 +3549,7 @@ mod tests {
     #[test]
     fn native_redo_result_failure_clears_pending_state_and_logs_warning() {
         let mut app = App::new();
-        app.activity = ActivityState::SessionOp(crate::app::SessionOp::Redo);
+        app.activity = ActivityState::SessionOp(SessionOp::Redo);
 
         let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResultData {
             success: false,

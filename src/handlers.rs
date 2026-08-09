@@ -2767,7 +2767,7 @@ mod model_popup_tests {
     use crate::config::TestPersistenceGuard;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
-    use crate::protocol;
+    use crate::domain::session::{SessionGroup, SessionSummary};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -2808,8 +2808,8 @@ mod model_popup_tests {
     #[test]
     fn start_page_enter_on_remote_session_attaches_instead_of_loading() {
         let mut app = App::new();
-        app.session_groups = vec![protocol::SessionGroup {
-            sessions: vec![protocol::SessionSummary {
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
                 attached: Some(false),
@@ -2834,8 +2834,8 @@ mod model_popup_tests {
     fn popup_enter_on_remote_session_attaches_instead_of_loading() {
         let mut app = App::new();
         app.popup = Popup::SessionSelect;
-        app.session_groups = vec![protocol::SessionGroup {
-            sessions: vec![protocol::SessionSummary {
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
                 attached: Some(true),
@@ -3346,8 +3346,8 @@ mod model_popup_tests {
         app.popup = Popup::ModelSelect;
         app.session_id = Some("remote-1".into());
         app.agent_mode = "build".into();
-        app.session_groups = vec![protocol::SessionGroup {
-            sessions: vec![protocol::SessionSummary {
+        app.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
                 ..Default::default()
@@ -3439,7 +3439,10 @@ mod model_popup_tests {
 
     #[test]
     fn delegate_popup_subscribes_with_child_target_agent() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
+        use crate::domain::activity::{
+            DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+        };
 
         let mut app = App::new();
         app.agent_id = Some("planner".into());

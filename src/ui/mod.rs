@@ -471,8 +471,15 @@ mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::{App, Screen};
+    use crate::domain::activity::{
+        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
+    };
     use crate::domain::chat::ChatEntry;
+    use crate::domain::elicitation::{
+        ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
+    };
     use crate::domain::model::ModelEntry;
+    use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -744,7 +751,7 @@ mod tests {
         app.current_model = Some("claude-sonnet".into());
         app.session_activity.insert(
             "session-a".into(),
-            crate::app::SessionActivity {
+            SessionActivity {
                 last_event_at: Instant::now(),
             },
         );
@@ -759,7 +766,7 @@ mod tests {
 
         app.session_activity.insert(
             "session-b".into(),
-            crate::app::SessionActivity {
+            SessionActivity {
                 last_event_at: Instant::now(),
             },
         );
@@ -774,7 +781,7 @@ mod tests {
 
         app.session_activity.insert(
             "session-c".into(),
-            crate::app::SessionActivity {
+            SessionActivity {
                 last_event_at: Instant::now(),
             },
         );
@@ -788,7 +795,7 @@ mod tests {
 
         app.session_activity.insert(
             "session-c".into(),
-            crate::app::SessionActivity {
+            SessionActivity {
                 last_event_at: Instant::now() - Duration::from_secs(6),
             },
         );
@@ -804,8 +811,6 @@ mod tests {
 
     #[test]
     fn draw_chat_shows_delegate_badge_when_entries_exist() {
-        use crate::app::{DelegateEntry, DelegateStatus};
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.session_id = Some("s1".into());
@@ -827,10 +832,10 @@ mod tests {
                 target_agent_id: None,
                 objective: "a".into(),
                 status: DelegateStatus::Completed,
-                stats: crate::app::DelegateStats::default(),
+                stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "d2".into(),
@@ -839,10 +844,10 @@ mod tests {
                 target_agent_id: None,
                 objective: "b".into(),
                 status: DelegateStatus::Completed,
-                stats: crate::app::DelegateStats::default(),
+                stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "d3".into(),
@@ -851,10 +856,10 @@ mod tests {
                 target_agent_id: None,
                 objective: "c".into(),
                 status: DelegateStatus::InProgress,
-                stats: crate::app::DelegateStats::default(),
+                stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -867,8 +872,6 @@ mod tests {
 
     #[test]
     fn draw_chat_shows_delegate_awaiting_input_badge() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStatus};
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.session_id = Some("s1".into());
@@ -882,7 +885,7 @@ mod tests {
             target_agent_id: Some("coder".into()),
             objective: "a".into(),
             status: DelegateStatus::InProgress,
-            stats: crate::app::DelegateStats::default(),
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
             child_state: DelegateChildState::PendingElicitation {
@@ -910,7 +913,6 @@ mod tests {
 
     #[test]
     fn draw_chat_failed_delegate_badge_uses_dim_surface_background() {
-        use crate::app::{DelegateEntry, DelegateStatus};
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -926,10 +928,10 @@ mod tests {
             target_agent_id: None,
             objective: "a".into(),
             status: DelegateStatus::Failed,
-            stats: crate::app::DelegateStats::default(),
+            stats: DelegateStats::default(),
             started_at: None,
             ended_at: None,
-            child_state: crate::app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         }];
 
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -943,7 +945,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
 
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -967,7 +969,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -985,7 +987,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
 
@@ -1008,7 +1010,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_shows_question_pending_marker_and_hint() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
 
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1058,7 +1060,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_hides_cost_column_when_all_rows_have_zero_cost() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
 
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1081,7 +1083,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -1099,7 +1101,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
 
@@ -1127,7 +1129,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_truncates_long_objectives_with_unicode_ellipsis() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
 
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1149,7 +1151,7 @@ mod tests {
             },
             started_at: None,
             ended_at: None,
-            child_state: crate::app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         }];
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
@@ -1169,7 +1171,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_failed_symbol_uses_dim_surface_background() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -1188,7 +1190,7 @@ mod tests {
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -1200,7 +1202,7 @@ mod tests {
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
 
@@ -1218,7 +1220,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_highlights_full_selected_row() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -1243,7 +1245,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -1261,7 +1263,7 @@ mod tests {
                 },
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
 
@@ -1307,7 +1309,7 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_shows_agent_name_column() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus, Popup};
+        use crate::app::Popup;
 
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1325,7 +1327,7 @@ mod tests {
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
             DelegateEntry {
                 delegation_id: "del-2".into(),
@@ -1337,7 +1339,7 @@ mod tests {
                 stats: DelegateStats::default(),
                 started_at: None,
                 ended_at: None,
-                child_state: crate::app::DelegateChildState::None,
+                child_state: DelegateChildState::None,
             },
         ];
 
@@ -1364,7 +1366,6 @@ mod tests {
 
     #[test]
     fn delegate_tool_call_label_uses_accent_color() {
-        use crate::app::{DelegateEntry, DelegateStats, DelegateStatus};
         use crate::theme::Theme;
 
         let mut app = App::new();
@@ -1386,7 +1387,7 @@ mod tests {
             stats: DelegateStats::default(),
             started_at: Some(1700000000),
             ended_at: Some(1700000045),
-            child_state: crate::app::DelegateChildState::None,
+            child_state: DelegateChildState::None,
         });
 
         let buffer = render_chat_buffer(&mut app, 60, 10);
@@ -1502,8 +1503,6 @@ mod tests {
 
     #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.agent_mode = "build".into();
@@ -1619,7 +1618,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.agent_mode = "build".into();
-        app.elicitation = Some(crate::app::ElicitationState::new_for_test(vec![]));
+        app.elicitation = Some(ElicitationState::new_for_test(vec![]));
         app.elicitation_ui = Some(ElicitationUiState::default());
 
         let _buffer = render_chat_buffer(&mut app, 80, 12);
@@ -1627,10 +1626,6 @@ mod tests {
 
     #[test]
     fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
-        use crate::app::{
-            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-        };
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.agent_mode = "build".into();
@@ -1672,10 +1667,6 @@ mod tests {
 
     #[test]
     fn draw_chat_wraps_long_elicitation_question() {
-        use crate::app::{
-            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-        };
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         let mut state = ElicitationState::new_for_test(vec![ElicitationField {
@@ -1708,10 +1699,6 @@ mod tests {
 
     #[test]
     fn draw_chat_wraps_long_elicitation_answers() {
-        use crate::app::{
-            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-        };
-
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
@@ -1741,10 +1728,6 @@ mod tests {
 
     #[test]
     fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
-        use crate::app::{
-            ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-        };
-
         let mut app = App::new();
         app.screen = Screen::Delegate;
         app.agent_mode = "build".into();
@@ -2400,8 +2383,6 @@ mod tests {
 
     #[test]
     fn delegate_row_fixture_marks_parent_awaiting_input() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
-
         let mut app = App::new();
         app.messages.push(delegate_tool_call(
             "tool-delegate-1",
@@ -2559,8 +2540,6 @@ mod tests {
 
     #[test]
     fn delegate_row_updates_after_child_state_change_without_message_append() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
-
         let mut app = App::new();
         app.messages
             .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
@@ -2603,8 +2582,6 @@ mod tests {
 
     #[test]
     fn delegate_row_awaiting_marker_uses_tool_call_identity_not_sequence() {
-        use crate::app::{DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus};
-
         let mut app = App::new();
         app.messages.push(ChatEntry::User {
             text: "first".into(),
@@ -3061,8 +3038,6 @@ mod tests {
 
     #[test]
     fn child_session_group_replays_elicitation_as_durable_card() {
-        use crate::protocol::{SessionGroup, SessionSummary};
-
         let mut app = App::new();
         app.session_groups = vec![SessionGroup {
             cwd: None,
@@ -3095,8 +3070,6 @@ mod tests {
 
     #[test]
     fn direct_elicitation_fixture_renders_active_popup() {
-        use crate::app::{ElicitationField, ElicitationFieldKind, ElicitationState};
-
         // Legacy envelope parsing is covered outside the UI; render an active popup directly.
         let mut app = App::new();
         app.screen = Screen::Delegate;
@@ -3858,7 +3831,6 @@ mod tests {
     // ── start-page session list row builder ───────────────────────────────────
 
     use crate::app::StartPageItem;
-    use crate::protocol::{SessionGroup, SessionSummary};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
