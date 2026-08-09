@@ -3351,9 +3351,11 @@ mod runtime_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    use crate::domain::auth::{AuthProviderEntry, OAuthFlowKind, OAuthStatus};
+    use crate::domain::auth::{
+        AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
+    };
     use crate::handlers::*;
-    use crate::protocol::{ClientMsg, OAuthFlowData, OAuthResultData};
+    use crate::protocol::ClientMsg;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3420,12 +3422,18 @@ mod auth_tests {
         app.auth_filter = "test".into();
         app.auth_selected = Some(2);
         app.auth_api_key_input = "secret".into();
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "old result".into(),
+        });
         app.open_auth_popup();
         assert_eq!(app.popup, app::Popup::ProviderAuth);
         assert_eq!(app.auth_cursor, 0);
         assert!(app.auth_filter.is_empty());
         assert!(app.auth_selected.is_none());
         assert!(app.auth_api_key_input.is_empty());
+        assert!(app.auth_last_result.is_none());
         assert!(app.auth_api_key_masked);
         assert_eq!(app.auth_panel, app::AuthPanel::List);
     }
@@ -3452,10 +3460,33 @@ mod auth_tests {
         app.auth_selected = Some(1);
         app.auth_panel = app::AuthPanel::ApiKeyInput;
         app.auth_api_key_input = "secret".into();
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Success,
+            message: "connected".into(),
+        });
         app.auth_close_detail();
         assert!(app.auth_selected.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
         assert!(app.auth_api_key_input.is_empty());
+        assert!(app.auth_last_result.is_none());
+    }
+
+    #[test]
+    fn auth_last_result_is_scoped_to_its_provider() {
+        let mut app = App::new();
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "authorization denied".into(),
+        });
+
+        assert!(app.auth_last_result_for_provider("anthropic").is_none());
+        assert_eq!(
+            app.auth_last_result_for_provider("openai")
+                .map(|result| result.message.as_str()),
+            Some("authorization denied")
+        );
     }
 
     // ── Key handler tests: List panel ─────────────────────────────────────────
@@ -3655,7 +3686,7 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
         app.auth_selected = Some(0);
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlowData {
+        app.auth_oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com".into(),
@@ -3673,7 +3704,7 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
         app.auth_selected = Some(0);
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlowData {
+        app.auth_oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com".into(),
@@ -3701,7 +3732,7 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
         app.auth_selected = Some(0);
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlowData {
+        app.auth_oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com/device".into(),
@@ -3743,7 +3774,7 @@ mod auth_tests {
         let mut app = App::new();
         app.popup = app::Popup::ProviderAuth;
 
-        let cmds = app.handle_acp_event(AcpAppEvent::OAuthFlowStarted(OAuthFlowData {
+        let cmds = app.handle_acp_event(AcpAppEvent::OAuthFlowStarted(OAuthFlow {
             flow_id: "flow-123".into(),
             provider: "openai".into(),
             authorization_url: "https://auth.example.com/authorize".into(),
@@ -3762,7 +3793,7 @@ mod auth_tests {
     #[test]
     fn native_oauth_result_success_clears_flow() {
         let mut app = App::new();
-        app.auth_oauth_flow = Some(OAuthFlowData {
+        app.auth_oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "openai".into(),
             authorization_url: "https://example.com".into(),
@@ -3770,22 +3801,50 @@ mod auth_tests {
         });
         app.auth_panel = app::AuthPanel::OAuthFlow;
 
-        let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResultData {
+        let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResult {
             provider: "openai".into(),
-            success: true,
+            status: OAuthResultStatus::Success,
             message: "Connected successfully".into(),
         }));
 
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, ClientMsg::ListAuthProviders))
-        );
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
         assert!(app.auth_oauth_flow.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
         assert_eq!(
-            app.auth_result_message,
-            Some((true, "Connected successfully".into()))
+            app.auth_last_result,
+            Some(OAuthResult {
+                provider: "openai".into(),
+                status: OAuthResultStatus::Success,
+                message: "Connected successfully".into(),
+            })
         );
+    }
+
+    #[test]
+    fn native_oauth_result_failure_preserves_flow_and_refreshes_providers() {
+        let mut app = App::new();
+        let flow = OAuthFlow {
+            flow_id: "f1".into(),
+            provider: "anthropic".into(),
+            authorization_url: "https://example.com".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        };
+        app.auth_oauth_flow = Some(flow.clone());
+        app.auth_panel = app::AuthPanel::OAuthFlow;
+
+        let result = OAuthResult {
+            provider: "anthropic".into(),
+            status: OAuthResultStatus::Failure,
+            message: "Authorization denied".into(),
+        };
+        let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(result.clone()));
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
+        assert_eq!(app.auth_oauth_flow, Some(flow));
+        assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
+        assert_eq!(app.auth_last_result, Some(result));
     }
 
     // ── Disconnect / clear credential tests (C-d in List panel) ─────────────
@@ -3868,7 +3927,7 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
         app.auth_selected = Some(0);
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlowData {
+        app.auth_oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://auth.example.com/authorize".into(),
@@ -3880,7 +3939,12 @@ mod auth_tests {
         // In CI there's no clipboard tool, so it falls back to the URL display
         assert!(
             app.auth_clipboard_fallback.is_some()
-                || app.auth_result_message == Some((true, "Copied to clipboard".into())),
+                || app.auth_last_result
+                    == Some(OAuthResult {
+                        provider: "codex".into(),
+                        status: OAuthResultStatus::Success,
+                        message: "Copied to clipboard".into(),
+                    }),
             "C-y should attempt clipboard copy"
         );
     }

@@ -1397,7 +1397,7 @@ pub struct ErrorData {
 // ── Auth / token types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct OAuthFlowData {
+pub struct OAuthFlowDto {
     pub flow_id: String,
     pub provider: String,
     pub authorization_url: String,
@@ -1405,7 +1405,7 @@ pub struct OAuthFlowData {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct OAuthResultData {
+pub struct OAuthResultDto {
     pub provider: String,
     pub success: bool,
     pub message: String,
@@ -1418,9 +1418,75 @@ pub struct AuthProvidersData {
 
 #[cfg(test)]
 mod auth_data_tests {
-    use super::AuthProvidersData;
-    use crate::domain::auth::{AuthMethod, OAuthStatus};
+    use super::{AuthProvidersData, OAuthFlowDto, OAuthResultDto};
+    use crate::domain::auth::{AuthMethod, OAuthFlowKind, OAuthStatus};
     use serde_json::json;
+
+    #[test]
+    fn oauth_flow_dto_deserializes_both_flow_kinds_and_requires_fields() {
+        for (wire_kind, expected_kind) in [
+            ("redirect_code", OAuthFlowKind::RedirectCode),
+            ("device_poll", OAuthFlowKind::DevicePoll),
+        ] {
+            let flow: OAuthFlowDto = serde_json::from_value(json!({
+                "flow_id": "flow-123",
+                "provider": "openai",
+                "authorization_url": "https://example.test/authorize",
+                "flow_kind": wire_kind
+            }))
+            .unwrap();
+            assert_eq!(flow.flow_id, "flow-123");
+            assert_eq!(flow.provider, "openai");
+            assert_eq!(flow.authorization_url, "https://example.test/authorize");
+            assert_eq!(flow.flow_kind, expected_kind);
+        }
+
+        let complete = json!({
+            "flow_id": "flow-123",
+            "provider": "openai",
+            "authorization_url": "https://example.test/authorize",
+            "flow_kind": "redirect_code"
+        });
+        for field in ["flow_id", "provider", "authorization_url", "flow_kind"] {
+            let mut missing = complete.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<OAuthFlowDto>(missing).is_err());
+        }
+    }
+
+    #[test]
+    fn oauth_result_dto_deserializes_success_failure_and_requires_fields() {
+        let success: OAuthResultDto = serde_json::from_value(json!({
+            "provider": "openai",
+            "success": true,
+            "message": "connected"
+        }))
+        .unwrap();
+        assert_eq!(success.provider, "openai");
+        assert!(success.success);
+        assert_eq!(success.message, "connected");
+
+        let failure: OAuthResultDto = serde_json::from_value(json!({
+            "provider": "anthropic",
+            "success": false,
+            "message": "authorization denied"
+        }))
+        .unwrap();
+        assert_eq!(failure.provider, "anthropic");
+        assert!(!failure.success);
+        assert_eq!(failure.message, "authorization denied");
+
+        let complete = json!({
+            "provider": "openai",
+            "success": true,
+            "message": "connected"
+        });
+        for field in ["provider", "success", "message"] {
+            let mut missing = complete.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<OAuthResultDto>(missing).is_err());
+        }
+    }
 
     #[test]
     fn auth_providers_data_deserializes_mixed_providers() {

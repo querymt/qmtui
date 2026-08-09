@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 
 use crate::app::{self, App, CommandPaletteAction, LogLevel, Popup, Screen};
 use crate::domain::activity::{ActivityState, SessionOp};
-use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
+use crate::domain::auth::{OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::model::ModelEntry;
 
@@ -2220,7 +2220,7 @@ pub(crate) fn handle_auth_popup_key(
                 let filtered = app.filtered_auth_providers();
                 if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
                     let provider = &app.auth_providers[real_idx];
-                    app.auth_result_message = None;
+                    app.auth_last_result = None;
                     if provider.is_unconfigurable() {
                         app.auth_selected = Some(real_idx);
                         // Stay in list — the draw fn shows the info message
@@ -2450,7 +2450,16 @@ fn copy_text_to_clipboard(text: &str) -> bool {
 
 fn try_copy_to_clipboard(app: &mut App, text: &str) {
     if copy_text_to_clipboard(text) {
-        app.auth_result_message = Some((true, "Copied to clipboard".into()));
+        let provider = app
+            .auth_oauth_flow
+            .as_ref()
+            .map(|flow| flow.provider.clone())
+            .unwrap_or_default();
+        app.auth_last_result = Some(OAuthResult {
+            provider,
+            status: OAuthResultStatus::Success,
+            message: "Copied to clipboard".into(),
+        });
     } else {
         app.auth_clipboard_fallback = Some(text.to_string());
     }

@@ -9,7 +9,7 @@ use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
 };
-use crate::domain::auth::AuthProviderEntry;
+use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::ModelEntry;
@@ -20,8 +20,8 @@ use crate::domain::session::{
 };
 use crate::domain::tool::ToolDetail;
 use crate::protocol::{
-    ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, OAuthFlowData,
-    OAuthResultData, RemoteSessionAttachInfo, RemoteSessionListInfo, SessionListRequest,
+    ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
+    RemoteSessionListInfo, SessionListRequest,
 };
 use crate::tool_detail;
 
@@ -166,8 +166,8 @@ pub(crate) enum AcpAppEvent {
     RedoResult(RedoResult),
     ForkResult(ForkResult),
     AuthProviders(Vec<AuthProviderEntry>),
-    OAuthFlowStarted(OAuthFlowData),
-    OAuthResult(OAuthResultData),
+    OAuthFlowStarted(OAuthFlow),
+    OAuthResult(OAuthResult),
     InfoLog {
         target: &'static str,
         message: String,
@@ -530,18 +530,19 @@ impl crate::app::App {
                 self.auth_panel = crate::app::AuthPanel::OAuthFlow;
                 self.auth_oauth_response.clear();
                 self.auth_oauth_response_cursor = 0;
-                self.auth_result_message = None;
+                self.auth_last_result = None;
                 vec![]
             }
             AcpAppEvent::OAuthResult(result) => {
-                let level = if result.success {
+                let is_success = result.is_success();
+                let level = if is_success {
                     LogLevel::Info
                 } else {
                     LogLevel::Warn
                 };
                 self.push_log(level, "auth", &result.message);
-                self.auth_result_message = Some((result.success, result.message));
-                if result.success {
+                self.auth_last_result = Some(result);
+                if is_success {
                     self.auth_oauth_flow = None;
                     self.auth_panel = crate::app::AuthPanel::List;
                 }

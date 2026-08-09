@@ -129,6 +129,33 @@ pub enum OAuthFlowKind {
     DevicePoll,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthFlow {
+    pub flow_id: String,
+    pub provider: String,
+    pub authorization_url: String,
+    pub flow_kind: OAuthFlowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthResultStatus {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthResult {
+    pub provider: String,
+    pub status: OAuthResultStatus,
+    pub message: String,
+}
+
+impl OAuthResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self.status, OAuthResultStatus::Success)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +325,19 @@ mod tests {
             serde_json::from_value::<OAuthFlowKind>(json!("device_poll")).unwrap(),
             OAuthFlowKind::DevicePoll
         );
+    }
+
+    #[test]
+    fn oauth_result_reports_success_from_semantic_status() {
+        let mut result = OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Success,
+            message: "connected".into(),
+        };
+        assert!(result.is_success());
+
+        result.status = OAuthResultStatus::Failure;
+        assert!(!result.is_success());
     }
 
     #[test]
