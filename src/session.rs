@@ -5,9 +5,13 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::app::*;
+use crate::app::{
+    App, FileIndexEntryLite, MAX_RECENT_SESSIONS, MAX_VISIBLE_GROUPS, PathCompletionState, Popup,
+    PopupItem, StartPageItem,
+};
 use crate::domain::activity::{DelegateEntry, SessionActivity};
-use crate::protocol::*;
+use crate::domain::session::{SessionGroup, SessionSummary};
+use crate::protocol::SessionChildrenData;
 
 /// Returns indices of sessions in `group` whose title or ID matches `q`.
 /// When `q` is empty every session matches in original order.

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub(crate) use crate::domain::session::{SessionGroup, SessionSummary};
+use crate::domain::session::{SessionGroup, SessionSummary};
 
 // --- Client → Server messages ---
 
