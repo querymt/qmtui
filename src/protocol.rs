@@ -242,46 +242,19 @@ impl From<Command> for ClientMsg {
 
 impl ClientMsg {
     pub fn list_sessions_browse() -> Self {
-        Self::list_sessions_discovery(None)
+        Command::list_sessions_browse().into()
     }
 
     pub fn list_sessions_discovery(cursor: Option<String>) -> Self {
-        Self::ListSessions {
-            request: SessionListRequest::Discovery,
-            mode: None,
-            cursor,
-            limit: None,
-            cwd: None,
-            query: None,
-            include_remote: Some(true),
-            session_scope: SessionScope::Root,
-        }
+        Command::list_sessions_discovery(cursor).into()
     }
 
     pub fn list_sessions_workspace(cwd: String) -> Self {
-        Self::ListSessions {
-            request: SessionListRequest::WorkspaceFirstPage { cwd: cwd.clone() },
-            mode: Some("group".to_string()),
-            cursor: None,
-            limit: Some(10),
-            cwd: Some(cwd),
-            query: None,
-            include_remote: None,
-            session_scope: SessionScope::Root,
-        }
+        Command::list_sessions_workspace(cwd).into()
     }
 
     pub fn list_sessions_group(cwd: String, cursor: String) -> Self {
-        Self::ListSessions {
-            request: SessionListRequest::WorkspaceContinuation { cwd: cwd.clone() },
-            mode: Some("group".to_string()),
-            cursor: Some(cursor),
-            limit: Some(10),
-            cwd: Some(cwd),
-            query: None,
-            include_remote: None,
-            session_scope: SessionScope::Root,
-        }
+        Command::list_sessions_group(cwd, cursor).into()
     }
 
     pub fn list_session_children(
@@ -289,12 +262,7 @@ impl ClientMsg {
         cursor: Option<String>,
         limit: u32,
     ) -> Self {
-        Self::ListSessionChildren {
-            parent_session_id,
-            cursor,
-            limit: Some(limit),
-            session_scope: SessionScope::Forks,
-        }
+        Command::list_session_children(parent_session_id, cursor, limit).into()
     }
 }
 
