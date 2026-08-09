@@ -390,9 +390,18 @@ impl crate::app::App {
                             }];
                         }
                     }
-                    UndoResult::Rejected { message, stack } => {
-                        self.undo_state =
-                            self.build_undo_state_from_server_stack(&stack, None, None);
+                    UndoResult::Rejected {
+                        target_message_id,
+                        message,
+                        stack,
+                    } => {
+                        let preferred =
+                            target_message_id.or_else(|| stack.message_ids.last().cloned());
+                        self.undo_state = self.build_undo_state_from_server_stack(
+                            &stack,
+                            preferred.as_deref(),
+                            None,
+                        );
                         self.set_status(
                             LogLevel::Warn,
                             "session",
@@ -2104,7 +2113,7 @@ mod tests {
     use crate::app::{App, Screen};
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::model::DelegateModelPreference;
-    use crate::domain::session::{SessionListPage, UndoState};
+    use crate::domain::session::{SessionListPage, UndoFrame, UndoFrameStatus, UndoState};
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -3560,7 +3569,7 @@ mod tests {
         });
 
         let replies = app.handle_acp_event(AcpAppEvent::UndoResult(UndoResult::Applied {
-            target_message_id: None,
+            target_message_id: Some("u1".into()),
             reverted_files: vec!["src/main.rs".into()],
             message: None,
             stack: UndoStackSnapshot {
@@ -3582,16 +3591,38 @@ mod tests {
     }
 
     #[test]
-    fn native_undo_result_failure_rebuilds_state_without_reload() {
+    fn native_undo_rejection_without_target_uses_stack_tail_without_reload() {
         let mut app = App::new();
         app.session_id = Some("session-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.streaming_content = "keep streaming content".into();
+        app.undoable_turns = vec![
+            UndoableTurn {
+                turn_id: "turn-1".into(),
+                message_id: "msg-1".into(),
+                text: "first".into(),
+            },
+            UndoableTurn {
+                turn_id: "turn-2".into(),
+                message_id: "msg-2".into(),
+                text: "second".into(),
+            },
+        ];
+        app.undo_state = Some(UndoState {
+            stack: vec![UndoFrame {
+                turn_id: "turn-1".into(),
+                message_id: "msg-1".into(),
+                status: UndoFrameStatus::Confirmed,
+                reverted_files: vec![],
+            }],
+            frontier_message_id: Some("msg-1".into()),
+        });
 
         let replies = app.handle_acp_event(AcpAppEvent::UndoResult(UndoResult::Rejected {
+            target_message_id: None,
             message: Some("Undo rejected".into()),
             stack: UndoStackSnapshot {
-                message_ids: vec!["u1".into()],
+                message_ids: vec!["msg-1".into(), "msg-2".into()],
             },
         }));
 
@@ -3599,9 +3630,52 @@ mod tests {
         assert_eq!(app.status, "Undo rejected");
         assert_eq!(app.streaming_content, "keep streaming content");
         assert!(replies.is_empty());
-        let frame = &app.undo_state.as_ref().unwrap().stack[0];
-        assert_eq!(frame.message_id, "u1");
-        assert!(frame.reverted_files.is_empty());
+        let undo_state = app.undo_state.as_ref().expect("undo state");
+        assert_eq!(undo_state.frontier_message_id.as_deref(), Some("msg-2"));
+        assert!(
+            undo_state
+                .stack
+                .iter()
+                .all(|frame| frame.reverted_files.is_empty())
+        );
+        assert_eq!(
+            app.current_undo_target()
+                .map(|turn| turn.message_id.as_str()),
+            Some("msg-1")
+        );
+    }
+
+    #[test]
+    fn native_undo_rejection_prefers_explicit_target() {
+        let mut app = App::new();
+        app.undoable_turns = vec![
+            UndoableTurn {
+                turn_id: "turn-1".into(),
+                message_id: "msg-1".into(),
+                text: "first".into(),
+            },
+            UndoableTurn {
+                turn_id: "turn-2".into(),
+                message_id: "msg-2".into(),
+                text: "second".into(),
+            },
+        ];
+
+        let replies = app.handle_acp_event(AcpAppEvent::UndoResult(UndoResult::Rejected {
+            target_message_id: Some("msg-1".into()),
+            message: None,
+            stack: UndoStackSnapshot {
+                message_ids: vec!["msg-1".into(), "msg-2".into()],
+            },
+        }));
+
+        assert!(replies.is_empty());
+        assert_eq!(
+            app.undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("msg-1")
+        );
     }
 
     #[test]

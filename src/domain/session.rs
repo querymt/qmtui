@@ -63,6 +63,7 @@ pub enum UndoResult {
         stack: UndoStackSnapshot,
     },
     Rejected {
+        target_message_id: Option<String>,
         message: Option<String>,
         stack: UndoStackSnapshot,
     },
