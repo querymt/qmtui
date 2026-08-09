@@ -19,11 +19,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
+use crate::domain::model::ModelEntry;
+use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::protocol::{
-    AgentInfo, AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
-    MeshStatusInfo, OAuthFlowData, OAuthResultData, ProfileInfo, RedoResultData,
-    RemoteSessionAttachInfo, RemoteSessionListInfo, SessionGroup, SessionListRequest,
-    SessionSummary, UndoResultData, UndoStackFrame,
+    AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
+    MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
+    RemoteSessionListInfo, SessionGroup, SessionListRequest, SessionSummary, UndoResultData,
+    UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +68,8 @@ struct AcpModelEntry {
 }
 
 impl AcpModelEntry {
-    fn to_app_model(&self) -> crate::protocol::ModelEntry {
-        crate::protocol::ModelEntry {
+    fn to_app_model(&self) -> ModelEntry {
+        ModelEntry {
             id: self.id.clone(),
             label: self.label.clone(),
             provider: self.provider.clone(),

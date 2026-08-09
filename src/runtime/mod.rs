@@ -11,6 +11,7 @@ use crate::{
     acp_state::AcpAppEvent,
     app::{self, App, Screen},
     config,
+    domain::model::DelegateModelPreference,
     protocol::ClientMsg,
     server_manager, theme,
 };
@@ -1481,7 +1482,7 @@ pub async fn run() -> anyhow::Result<()> {
             };
             legacy_preferences.insert(
                 agent_id.clone(),
-                crate::protocol::DelegateModelPreference {
+                DelegateModelPreference {
                     model_id: model_key.clone(),
                     provider: provider.to_string(),
                     model: model.to_string(),
@@ -3090,12 +3091,13 @@ mod chord_reasoning_effort_tests {
 #[cfg(test)]
 mod reasoning_effort_integration_tests {
     use super::*;
+    use crate::domain::model::ModelEntry;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
     use tokio::sync::mpsc;
 
-    fn make_model(provider: &str, model: &str) -> crate::protocol::ModelEntry {
-        crate::protocol::ModelEntry {
+    fn make_model(provider: &str, model: &str) -> ModelEntry {
+        ModelEntry {
             id: format!("{provider}/{model}"),
             label: model.into(),
             provider: provider.into(),

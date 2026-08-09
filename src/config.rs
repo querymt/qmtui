@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::DelegateModelPreference;
+use crate::domain::model::DelegateModelPreference;
 
 // ── path overrides for tests ─────────────────────────────────────────────────
 
@@ -182,6 +182,7 @@ impl TuiConfig {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::domain::model::ModelEntry;
     use serial_test::serial;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -373,7 +374,7 @@ mod tests {
     fn config_round_trip_with_delegate_models() {
         let _guard = TestPathGuard::new("delegate-models-rt");
         let mut app = App::new();
-        let coder = crate::protocol::ModelEntry {
+        let coder = ModelEntry {
             id: "anthropic/claude-sonnet".into(),
             label: "Claude Sonnet".into(),
             provider: "anthropic".into(),
@@ -383,7 +384,7 @@ mod tests {
             family: None,
             quant: None,
         };
-        let planner = crate::protocol::ModelEntry {
+        let planner = ModelEntry {
             id: "openai/gpt-4o".into(),
             label: "GPT-4o".into(),
             provider: "openai".into(),
