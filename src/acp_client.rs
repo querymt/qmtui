@@ -19,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
+use crate::command::{Command, PromptBlock, SessionListRequest};
 use crate::domain::auth::{OAuthFlow, OAuthResult, OAuthResultStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
@@ -27,9 +28,9 @@ use crate::domain::session::{
     UndoStackSnapshot,
 };
 use crate::protocol::{
-    AuthProvidersData, ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo,
-    OAuthFlowDto, OAuthResultDto, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo,
-    SessionListRequest, UndoResultData, UndoStackFrame,
+    AuthProvidersData, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, OAuthFlowDto,
+    OAuthResultDto, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo, UndoResultData,
+    UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,7 +540,7 @@ pub async fn probe_websocket(url: &str, timeout: Duration) -> bool {
 
 pub(crate) async fn run_websocket_agent(
     url: String,
-    cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     conn_tx: mpsc::UnboundedSender<crate::ConnectionManagerEvent>,
     launch_cwd: Option<String>,
@@ -611,7 +612,7 @@ pub(crate) async fn run_websocket_agent(
                 let Some(cmd) = cmd else {
                     break Ok(());
                 };
-                if let Err(err) = handle_client_msg(&connection, &state, &srv_tx, cmd).await {
+                if let Err(err) = handle_command(&connection, &state, &srv_tx, cmd).await {
                     send_error(&srv_tx, format!("ACP request failed: {err:?}"));
                 }
             }
@@ -821,7 +822,7 @@ async fn handle_ws_elicitation_request(
 
 pub(crate) async fn run_stdio_agent(
     agent: AcpAgent,
-    cmd_rx: &mut mpsc::UnboundedReceiver<ClientMsg>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
     conn_tx: mpsc::UnboundedSender<crate::ConnectionManagerEvent>,
     launch_cwd: Option<String>,
@@ -883,7 +884,7 @@ pub(crate) async fn run_stdio_agent(
             ));
 
             while let Some(cmd) = cmd_rx.recv().await {
-                if let Err(err) = handle_client_msg(&connection, &state, &srv_tx, cmd).await {
+                if let Err(err) = handle_command(&connection, &state, &srv_tx, cmd).await {
                     send_error(&srv_tx, format!("ACP request failed: {err:?}"));
                 }
             }
@@ -893,14 +894,14 @@ pub(crate) async fn run_stdio_agent(
         .await
 }
 
-async fn handle_client_msg<C: AcpConnection>(
+async fn handle_command<C: AcpConnection>(
     connection: &C,
     state: &Arc<AcpRuntimeState>,
     srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
-    cmd: ClientMsg,
+    cmd: Command,
 ) -> Result<(), acp_sdk::Error> {
     match cmd {
-        ClientMsg::Init => {
+        Command::Init => {
             let response = connection
                 .request(
                     acp::InitializeRequest::new(ProtocolVersion::V1)
@@ -926,14 +927,9 @@ async fn handle_client_msg<C: AcpConnection>(
             );
             post_connect_diagnostics(connection, srv_tx).await;
         }
-        ClientMsg::ListSessions {
-            request,
-            cursor,
-            cwd,
-            ..
-        } => {
+        Command::ListSessions { request, cursor } => {
             let mut req = acp::ListSessionsRequest::new().cursor(cursor);
-            if let Some(cwd) = cwd.as_deref() {
+            if let Some(cwd) = request.cwd() {
                 req = req.cwd(PathBuf::from(cwd));
             }
             match connection.request(req).await {
@@ -947,9 +943,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 ),
             }
         }
-        ClientMsg::NewSession {
-            cwd, profile_id, ..
-        } => {
+        Command::NewSession { cwd, profile_id } => {
             let mut req = acp::NewSessionRequest::new(
                 cwd.map(PathBuf::from)
                     .unwrap_or_else(|| state.default_cwd()),
@@ -973,7 +967,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_config_updates(state, srv_tx, config_options).await;
             }
         }
-        ClientMsg::LoadSession { session_id, cwd } => {
+        Command::LoadSession { session_id, cwd } => {
             state.set_current_session_id(session_id.clone()).await;
             state.begin_loading(&session_id).await;
             let load_cwd = load_session_cwd(cwd.as_deref(), state.default_cwd());
@@ -1033,7 +1027,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::UndoStack(undo_stack));
             }
         }
-        ClientMsg::Prompt { prompt, local_id } => {
+        Command::Prompt { prompt, local_id } => {
             let Some(session_id) = state.current_session_id().await else {
                 send_error(srv_tx, "cannot prompt before a session is loaded");
                 return Ok(());
@@ -1068,7 +1062,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 Ok(())
             })?;
         }
-        ClientMsg::CancelSession => {
+        Command::CancelSession => {
             let Some(session_id) = state.current_session_id().await else {
                 send_acp(
                     srv_tx,
@@ -1088,15 +1082,15 @@ async fn handle_client_msg<C: AcpConnection>(
                 },
             );
         }
-        ClientMsg::DeleteSession { session_id } => {
+        Command::DeleteSession { session_id } => {
             connection
                 .request(acp::DeleteSessionRequest::new(session_id))
                 .await?;
         }
-        ClientMsg::SetAgentMode { mode } => {
+        Command::SetAgentMode { mode } => {
             set_config_option(connection, state, srv_tx, "mode", &mode, None).await?;
         }
-        ClientMsg::SetReasoningEffort { reasoning_effort } => {
+        Command::SetReasoningEffort { reasoning_effort } => {
             set_config_option(
                 connection,
                 state,
@@ -1107,7 +1101,7 @@ async fn handle_client_msg<C: AcpConnection>(
             )
             .await?;
         }
-        ClientMsg::SetSessionModel {
+        Command::SetSessionModel {
             session_id,
             model_id,
             node_id,
@@ -1141,7 +1135,7 @@ async fn handle_client_msg<C: AcpConnection>(
             send_provider_changed(srv_tx, &model);
             send_config_updates(state, srv_tx, response.config_options).await;
         }
-        ClientMsg::ListAllModels { refresh } => {
+        Command::ListAllModels { refresh } => {
             let response = load_acp_models(connection, refresh).await?;
             state.set_models(response.models.clone()).await;
             send_models(srv_tx, &response);
@@ -1150,7 +1144,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_provider_changed(srv_tx, &model);
             }
         }
-        ClientMsg::ListProfiles => match load_acp_profiles(connection).await {
+        Command::ListProfiles => match load_acp_profiles(connection).await {
             Ok(response) => send_profiles(srv_tx, response),
             Err(err) => send_acp(
                 srv_tx,
@@ -1160,7 +1154,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 },
             ),
         },
-        ClientMsg::ListProfileAgents { profile_id } => {
+        Command::ListProfileAgents { profile_id } => {
             match load_acp_profile_agents(connection, &profile_id).await {
                 Ok(response) => send_acp(
                     srv_tx,
@@ -1178,7 +1172,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 ),
             }
         }
-        ClientMsg::SetDelegateModel {
+        Command::SetDelegateModel {
             session_id,
             agent_id,
             model_id,
@@ -1206,7 +1200,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 },
             );
         }
-        ClientMsg::ListAuthProviders => {
+        Command::ListAuthProviders => {
             let response = call_querymt_ext(connection, "querymt/auth/status", json!({})).await?;
             if let Ok(auth) =
                 serde_json::from_value::<AuthProvidersData>(ext_payload(&response).clone())
@@ -1214,7 +1208,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::AuthProviders(auth.providers));
             }
         }
-        ClientMsg::StartOAuthLogin { provider } => {
+        Command::StartOAuthLogin { provider } => {
             let response = call_querymt_ext(
                 connection,
                 "querymt/auth/start",
@@ -1229,7 +1223,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 );
             }
         }
-        ClientMsg::CompleteOAuthLogin { flow_id, response } => {
+        Command::CompleteOAuthLogin { flow_id, response } => {
             let response = call_querymt_ext(
                 connection,
                 "querymt/auth/complete",
@@ -1245,7 +1239,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 );
             }
         }
-        ClientMsg::DisconnectOAuth { provider } => {
+        Command::DisconnectOAuth { provider } => {
             let response = call_querymt_ext(
                 connection,
                 "querymt/auth/logout",
@@ -1261,14 +1255,14 @@ async fn handle_client_msg<C: AcpConnection>(
                 );
             }
         }
-        ClientMsg::ElicitationResponse {
+        Command::ElicitationResponse {
             elicitation_id,
             action,
             content,
         } => {
             respond_to_elicitation(state, &elicitation_id, &action, content).await;
         }
-        ClientMsg::ForkSession { message_id } => {
+        Command::ForkSession { message_id } => {
             let Some(session_id) = state.current_session_id().await else {
                 send_acp(
                     srv_tx,
@@ -1299,9 +1293,8 @@ async fn handle_client_msg<C: AcpConnection>(
                 ),
             }
         }
-        ClientMsg::SubscribeSession { .. } => {}
-        ClientMsg::GetAgentMode => {}
-        ClientMsg::GetFileIndex => {
+        Command::SubscribeSession { .. } => {}
+        Command::GetFileIndex => {
             // TODO(ACP parity): replace the deprecated UI file-index endpoint with
             // an ACP/QueryMT extension or client-side workspace indexing.
             send_error(
@@ -1309,7 +1302,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 "file mentions are not exposed in the ACP subset yet",
             );
         }
-        ClientMsg::Undo { message_id } => {
+        Command::Undo { message_id } => {
             let Some(session_id) = state.current_session_id().await else {
                 send_error(srv_tx, "cannot undo before a session is loaded");
                 return Ok(());
@@ -1329,7 +1322,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 );
             }
         }
-        ClientMsg::Redo => {
+        Command::Redo => {
             let Some(session_id) = state.current_session_id().await else {
                 send_error(srv_tx, "cannot redo before a session is loaded");
                 return Ok(());
@@ -1349,7 +1342,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 );
             }
         }
-        ClientMsg::ListRemoteNodes => {
+        Command::ListRemoteNodes => {
             let status_resp =
                 call_querymt_ext(connection, "querymt/mesh/status", json!({})).await?;
             if let Ok(status) =
@@ -1364,7 +1357,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
             }
         }
-        ClientMsg::ListRemoteSessions {
+        Command::ListRemoteSessions {
             node_id,
             offset,
             limit,
@@ -1372,7 +1365,7 @@ async fn handle_client_msg<C: AcpConnection>(
             let response = call_querymt_ext(
                 connection,
                 "querymt/remote/sessions",
-                json!({ "node_id": node_id, "offset": offset.unwrap_or(0), "limit": limit.unwrap_or(50) }),
+                json!({ "node_id": node_id, "offset": offset, "limit": limit }),
             )
             .await?;
             if let Ok(list) =
@@ -1381,7 +1374,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::RemoteSessions(list));
             }
         }
-        ClientMsg::CreateRemoteSession { node_id, cwd, .. } => {
+        Command::CreateRemoteSession { node_id, cwd } => {
             let response = call_querymt_ext(
                 connection,
                 "querymt/remote/createSession",
@@ -1394,7 +1387,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
             }
         }
-        ClientMsg::AttachRemoteSession {
+        Command::AttachRemoteSession {
             node_id,
             session_id,
         } => {
@@ -1410,7 +1403,7 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
             }
         }
-        ClientMsg::CreateMeshInvite {
+        Command::CreateMeshInvite {
             mesh_name,
             ttl,
             max_uses,
@@ -1427,11 +1420,10 @@ async fn handle_client_msg<C: AcpConnection>(
                 send_acp(srv_tx, AcpAppEvent::MeshInviteCreated(invite));
             }
         }
-        ClientMsg::ListSessionChildren { .. }
-        | ClientMsg::DismissRemoteSession { .. }
-        | ClientMsg::SetApiToken { .. }
-        | ClientMsg::ClearApiToken { .. }
-        | ClientMsg::SetAuthMethod { .. } => {
+        Command::ListSessionChildren { .. }
+        | Command::DismissRemoteSession { .. }
+        | Command::SetApiToken { .. }
+        | Command::ClearApiToken { .. } => {
             // TODO(ACP parity): these actions relied on QueryMT UI-API-only
             // methods. Keep them explicit instead of silently falling back.
             send_error(
@@ -1667,14 +1659,12 @@ fn client_capabilities() -> acp::ClientCapabilities {
         )
 }
 
-fn prompt_blocks(blocks: Vec<crate::protocol::PromptBlock>) -> Vec<acp::ContentBlock> {
+fn prompt_blocks(blocks: Vec<PromptBlock>) -> Vec<acp::ContentBlock> {
     blocks
         .into_iter()
         .map(|block| match block {
-            crate::protocol::PromptBlock::Text { text } => {
-                acp::ContentBlock::Text(acp::TextContent::new(text))
-            }
-            crate::protocol::PromptBlock::ResourceLink { name, uri } => {
+            PromptBlock::Text { text } => acp::ContentBlock::Text(acp::TextContent::new(text)),
+            PromptBlock::ResourceLink { name, uri } => {
                 acp::ContentBlock::ResourceLink(acp::ResourceLink::new(name, uri))
             }
         })
@@ -2912,6 +2902,29 @@ mod tests {
                 message_id: (*message_id).into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn prompt_blocks_convert_semantic_text_and_resource_links() {
+        let blocks = prompt_blocks(vec![
+            PromptBlock::Text {
+                text: "inspect this".into(),
+            },
+            PromptBlock::ResourceLink {
+                name: "main.rs".into(),
+                uri: "file:///repo/src/main.rs".into(),
+            },
+        ]);
+
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                acp::ContentBlock::Text(text),
+                acp::ContentBlock::ResourceLink(link),
+            ] if text.text == "inspect this"
+                && link.name == "main.rs"
+                && link.uri == "file:///repo/src/main.rs"
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use crate::{
     acp_client::{self, AcpEndpoint},
     app::ConnectionEvent,
-    protocol::ClientMsg,
+    command::Command,
     server_manager::ServerEvent,
 };
 
@@ -19,7 +19,7 @@ fn reconnect_delay_ms(attempt: u32) -> u64 {
 pub(super) async fn connection_manager(
     endpoint: AcpEndpoint,
     srv_tx: mpsc::UnboundedSender<ServerChannelMsg>,
-    mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
+    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     conn_tx: mpsc::UnboundedSender<ConnectionManagerEvent>,
     sup_event_tx: mpsc::UnboundedSender<ServerEvent>,
     launch_cwd: Option<String>,

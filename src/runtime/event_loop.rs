@@ -8,7 +8,6 @@ use crate::{
     app::{self, App},
     command::Command,
     handlers::{AppAction, handle_key, handle_mouse},
-    protocol::ClientMsg,
     server_manager::{self, ServerEvent, ServerState},
     ui,
 };
@@ -24,23 +23,8 @@ fn tick_from_elapsed(elapsed: Duration) -> u64 {
     (elapsed.as_millis() / 80) as u64
 }
 
-fn send_command(
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
-    command: Command,
-    agent_id: &Option<String>,
-) -> anyhow::Result<()> {
-    let load_session_id = match &command {
-        Command::LoadSession { session_id, .. } => Some(session_id.clone()),
-        _ => None,
-    };
-
-    cmd_tx.send(command.into())?;
-    if let Some(session_id) = load_session_id {
-        cmd_tx.send(ClientMsg::SubscribeSession {
-            session_id,
-            agent_id: agent_id.clone(),
-        })?;
-    }
+fn send_command(cmd_tx: &mpsc::UnboundedSender<Command>, command: Command) -> anyhow::Result<()> {
+    cmd_tx.send(command)?;
     Ok(())
 }
 
@@ -50,7 +34,7 @@ pub(super) async fn run_loop(
     srv_rx: &mut mpsc::UnboundedReceiver<ServerChannelMsg>,
     conn_rx: &mut mpsc::UnboundedReceiver<ConnectionManagerEvent>,
     sup_rx: &mut mpsc::UnboundedReceiver<server_manager::ServerEvent>,
-    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     let mut term_events = EventStream::new();
 
@@ -67,12 +51,12 @@ pub(super) async fn run_loop(
                         let was_connected = app.conn == app::ConnState::Connected;
                         app.handle_connection_event(state);
                         if app.conn == app::ConnState::Connected {
-                            cmd_tx.send(ClientMsg::Init)?;
-                            cmd_tx.send(ClientMsg::list_sessions_browse())?;
-                            cmd_tx.send(ClientMsg::ListAllModels { refresh: false })?;
+                            cmd_tx.send(Command::Init)?;
+                            cmd_tx.send(Command::list_sessions_browse())?;
+                            cmd_tx.send(Command::ListAllModels { refresh: false })?;
                             if let Some(session_id) = app.session_id.clone() {
                                 if let Some(node_id) = app.session_remote_node_id(&session_id) {
-                                    cmd_tx.send(ClientMsg::AttachRemoteSession {
+                                    cmd_tx.send(Command::AttachRemoteSession {
                                         node_id: node_id.to_string(),
                                         session_id,
                                     })?;
@@ -83,14 +67,13 @@ pub(super) async fn run_loop(
                                         "remote session is missing node id; reconnect attach skipped",
                                     );
                                 } else {
-                                    cmd_tx.send(ClientMsg::LoadSession {
-                                        session_id: session_id.clone(),
-                                        cwd: app.current_session_cwd(),
-                                    })?;
-                                    cmd_tx.send(ClientMsg::SubscribeSession {
+                                    for command in Command::load_session_commands(
                                         session_id,
-                                        agent_id: app.agent_id.clone(),
-                                    })?;
+                                        app.current_session_cwd(),
+                                        app.agent_id.clone(),
+                                    ) {
+                                        cmd_tx.send(command)?;
+                                    }
                                 }
                             }
                         } else if was_connected && app.conn == app::ConnState::Disconnected {
@@ -105,7 +88,7 @@ pub(super) async fn run_loop(
             }
             Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
                 for command in app.handle_acp_event(event) {
-                    send_command(cmd_tx, command, &app.agent_id)?;
+                    send_command(cmd_tx, command)?;
                 }
             }
             Some(sup_event) = sup_rx.recv() => {
@@ -200,10 +183,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{send_command, tick_from_elapsed};
-    use crate::{command::Command, protocol::ClientMsg};
+    use crate::command::Command;
 
     #[test]
-    fn load_session_command_sends_load_and_subscribe() {
+    fn send_command_sends_each_command_once_without_implicit_subscribe() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         send_command(
@@ -212,23 +195,15 @@ mod tests {
                 session_id: "session-1".into(),
                 cwd: Some("/repo".into()),
             },
-            &Some("agent-1".into()),
         )
         .unwrap();
 
         assert!(matches!(
             rx.try_recv().unwrap(),
-            ClientMsg::LoadSession {
+            Command::LoadSession {
                 session_id,
                 cwd: Some(cwd),
             } if session_id == "session-1" && cwd == "/repo"
-        ));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            ClientMsg::SubscribeSession {
-                session_id,
-                agent_id: Some(agent_id),
-            } if session_id == "session-1" && agent_id == "agent-1"
         ));
         assert!(rx.try_recv().is_err());
     }
