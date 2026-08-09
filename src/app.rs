@@ -261,6 +261,7 @@ pub struct AppLogEntry {
 // ── Delegation tracking ───────────────────────────────────────────────────────
 
 /// Update per-delegation stats from a single event arriving on a child session.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventKind) {
     match kind {
         EventKind::ToolCallStart { .. } => {
@@ -301,6 +302,7 @@ pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventK
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: &EventKind) {
     match kind {
         EventKind::ElicitationRequested {
@@ -361,6 +363,7 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_str: &str) {
     let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) else {
         return;
@@ -764,9 +767,6 @@ pub struct App {
     pub parent_session_id: Option<String>,
     /// Staging field: set by delegate popup before LoadSession, consumed by session_loaded.
     pub pending_parent_session_id: Option<String>,
-    /// Set after DelegationCompleted/DelegationFailed; consumed by the next
-    /// UserMessageStored to suppress the noisy batch-result message.
-    pub suppress_delegation_result: bool,
     /// Child-session state observed before a delegation entry can be linked.
     pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
     pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
@@ -982,7 +982,6 @@ impl App {
             delegate_filter: String::new(),
             parent_session_id: None,
             pending_parent_session_id: None,
-            suppress_delegation_result: false,
             pending_delegate_child_states: HashMap::new(),
             pending_delegate_child_stats: HashMap::new(),
             delegate_child_message_ids: HashMap::new(),
@@ -1062,9 +1061,6 @@ impl App {
     pub fn reasoning_effort_label(&self) -> &str {
         self.reasoning_effort.as_deref().unwrap_or("auto")
     }
-
-    /// Valid reasoning effort levels (excluding "auto" which maps to `None`).
-    pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 
     /// Cycle through `[auto, low, medium, high, max]` (wraps around).
     /// Updates `self.reasoning_effort` optimistically, saves the new value as
@@ -1183,21 +1179,10 @@ impl App {
             .find(|profile| profile.id == profile_id)
     }
 
-    pub fn active_profile(&self) -> Option<&ProfileInfo> {
-        self.active_profile_id
-            .as_deref()
-            .and_then(|profile_id| self.profile_by_id(profile_id))
-    }
-
     pub fn current_session_profile_id(&self) -> Option<&str> {
         self.session_id
             .as_deref()
             .and_then(|session_id| self.session_profiles.get(session_id).map(String::as_str))
-    }
-
-    pub fn current_session_profile(&self) -> Option<&ProfileInfo> {
-        self.current_session_profile_id()
-            .and_then(|profile_id| self.profile_by_id(profile_id))
     }
 
     pub fn profile_display_name(&self, profile_id: &str) -> String {
@@ -1728,6 +1713,7 @@ impl App {
         self.session_stats.open_llm_request_instant = None;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply_event_stats(&mut self, kind: &EventKind, timestamp: Option<i64>) {
         match kind {
             EventKind::ToolCallStart { .. } => {
@@ -1816,6 +1802,7 @@ impl App {
             .unwrap_or(false)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_session_label(&self) -> Option<&'static str> {
         match self.activity {
             ActivityState::SessionOp(SessionOp::Undo) => Some("undoing"),
@@ -1978,6 +1965,7 @@ impl App {
     // ── delegate model preferences ───────────────────────────────────────────
 
     /// Whether there are multiple agents (multi-agent / delegation mode).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_multi_agent(&self) -> bool {
         self.agents.len() > 1
     }
@@ -2875,7 +2863,16 @@ mod session_mode_tests {
 mod tests {
     use super::*;
     use crate::domain::chat::OUTCOME_BULLET;
-    use crate::protocol::{AgentEvent, ProgressKind};
+    use crate::protocol::ProgressKind;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestAgentEvent {
+        #[serde(default)]
+        timestamp: Option<String>,
+        #[serde(flatten)]
+        kind: EventKind,
+    }
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {
@@ -2894,76 +2891,69 @@ mod tests {
     #[test]
     fn backend_next_protocol_events_deserialize() {
         let session_queued = serde_json::json!({
-            "kind": {
-                "type": "session_queued",
-                "data": { "reason": "waiting for previous operation to complete" }
-            },
+            "type": "session_queued",
+            "data": { "reason": "waiting for previous operation to complete" },
             "timestamp": null
         });
         let session_configured = serde_json::json!({
-            "kind": {
-                "type": "session_configured",
-                "data": {
-                    "cwd": "/workspace/project",
-                    "mcp_servers": [],
-                    "limits": {
-                        "max_steps": 200,
-                        "max_turns": 50,
-                        "max_cost_usd": null
-                    }
+            "type": "session_configured",
+            "data": {
+                "cwd": "/workspace/project",
+                "mcp_servers": [],
+                "limits": {
+                    "max_steps": 200,
+                    "max_turns": 50,
+                    "max_cost_usd": null
                 }
             },
             "timestamp": null
         });
         let tools_available = serde_json::json!({
-            "kind": {
-                "type": "tools_available",
-                "data": {
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "search_text",
-                            "description": "Search file contents",
-                            "parameters": { "type": "object" }
-                        }
-                    }],
-                    "tools_hash": "123456789"
-                }
+            "type": "tools_available",
+            "data": {
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "search_text",
+                        "description": "Search file contents",
+                        "parameters": { "type": "object" }
+                    }
+                }],
+                "tools_hash": "123456789"
             },
             "timestamp": null
         });
         let artifact_recorded = serde_json::json!({
-            "kind": {
-                "type": "artifact_recorded",
-                "data": {
-                    "artifact": {
-                        "kind": "file",
-                        "uri": null,
-                        "path": "src/generated.txt",
-                        "summary": "Produced by write_file",
-                        "created_at": "2026-04-29T14:25:09Z"
-                    }
+            "type": "artifact_recorded",
+            "data": {
+                "artifact": {
+                    "kind": "file",
+                    "uri": null,
+                    "path": "src/generated.txt",
+                    "summary": "Produced by write_file",
+                    "created_at": "2026-04-29T14:25:09Z"
                 }
             },
             "timestamp": null
         });
 
-        let queued: AgentEvent = serde_json::from_value(session_queued).unwrap();
+        let queued: TestAgentEvent = serde_json::from_value(session_queued).unwrap();
+        assert!(queued.timestamp.is_none());
         assert!(
             matches!(queued.kind, EventKind::SessionQueued { reason } if reason == "waiting for previous operation to complete")
         );
 
-        let configured: AgentEvent = serde_json::from_value(session_configured).unwrap();
+        let configured: TestAgentEvent = serde_json::from_value(session_configured).unwrap();
         assert!(
             matches!(configured.kind, EventKind::SessionConfigured { cwd, mcp_servers, limits } if cwd.as_deref() == Some("/workspace/project") && mcp_servers.is_empty() && limits.as_ref().and_then(|l| l.max_steps) == Some(200))
         );
 
-        let available: AgentEvent = serde_json::from_value(tools_available).unwrap();
+        let available: TestAgentEvent = serde_json::from_value(tools_available).unwrap();
         assert!(
             matches!(available.kind, EventKind::ToolsAvailable { tools, tools_hash } if tools.first().and_then(|tool| tool.function.as_ref()).map(|function| function.name.as_str()) == Some("search_text") && tools_hash.is_some())
         );
 
-        let artifact: AgentEvent = serde_json::from_value(artifact_recorded).unwrap();
+        let artifact: TestAgentEvent = serde_json::from_value(artifact_recorded).unwrap();
         assert!(
             matches!(artifact.kind, EventKind::ArtifactRecorded { artifact } if artifact.kind == "file" && artifact.path.as_deref() == Some("src/generated.txt") && artifact.summary.as_deref() == Some("Produced by write_file"))
         );
@@ -2972,43 +2962,36 @@ mod tests {
     #[test]
     fn backend_snapshot_and_progress_events_deserialize() {
         let snapshot_start = serde_json::json!({
-            "kind": {
-                "type": "snapshot_start",
-                "data": { "policy": "diff" }
-            },
+            "type": "snapshot_start",
+            "data": { "policy": "diff" },
             "timestamp": null
         });
         let snapshot_end = serde_json::json!({
-            "kind": {
-                "type": "snapshot_end",
-                "data": { "summary": "1 modified" }
-            },
+            "type": "snapshot_end",
+            "data": { "summary": "1 modified" },
             "timestamp": null
         });
         let progress_recorded = serde_json::json!({
-            "kind": {
-                "type": "progress_recorded",
-                "data": {
-                    "progress_entry": {
-                        "kind": "tool_call",
-                        "content": "Calling tool: shell",
-                        "metadata": "{\"tool\":\"shell\"}",
-                        "created_at": "2026-04-13T00:00:00Z"
-                    }
+            "type": "progress_recorded",
+            "data": {
+                "progress_entry": {
+                    "kind": "tool_call",
+                    "content": "Calling tool: shell",
+                    "metadata": "{\"tool\":\"shell\"}",
+                    "created_at": "2026-04-13T00:00:00Z"
                 }
             },
             "timestamp": null
         });
 
-        let start: AgentEvent = serde_json::from_value(snapshot_start).unwrap();
-        assert!(matches!(start.kind, EventKind::SnapshotStart { policy } if policy == "diff"));
+        let start: TestAgentEvent = serde_json::from_value(snapshot_start).unwrap();
+        let end: TestAgentEvent = serde_json::from_value(snapshot_end).unwrap();
+        let progress: TestAgentEvent = serde_json::from_value(progress_recorded).unwrap();
 
-        let end: AgentEvent = serde_json::from_value(snapshot_end).unwrap();
+        assert!(matches!(start.kind, EventKind::SnapshotStart { policy } if policy == "diff"));
         assert!(
             matches!(end.kind, EventKind::SnapshotEnd { summary } if summary.as_deref() == Some("1 modified"))
         );
-
-        let progress: AgentEvent = serde_json::from_value(progress_recorded).unwrap();
         assert!(
             matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
         );

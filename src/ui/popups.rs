@@ -595,8 +595,6 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
 
 // ── Delegate session popup ─────────────────────────────────────────────────────
 
-const DELEGATE_POPUP_MAX_W: u16 = 72;
-const DELEGATE_POPUP_MIN_W: u16 = 36;
 const DELEGATE_STATUS_COL_W: usize = 1;
 const DELEGATE_ICON_TOOLS: &str = "\u{2692}"; // ⚒
 const DELEGATE_ICON_MSG: &str = "\u{1F5E9}"; // 🗩

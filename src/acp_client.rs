@@ -121,6 +121,7 @@ struct AcpProfileAgentsResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DelegateModelOverrideInfo {
     pub model_id: String,
+    #[allow(dead_code)] // Preserved from the ACP response for remote model identity.
     #[serde(default)]
     pub node_id: Option<String>,
 }

@@ -27,7 +27,9 @@ const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpinnerKind {
     Braille,
+    #[allow(dead_code)] // Retained for alternate spinner fixtures.
     Line,
+    #[allow(dead_code)] // Retained for alternate spinner fixtures.
     Dots,
 }
 

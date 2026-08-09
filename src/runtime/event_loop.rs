@@ -105,16 +105,6 @@ pub(super) async fn run_loop(
                             app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
                         }
                     }
-                    ServerEvent::BinaryNotFound => {
-                        app.server_state = ServerState::BinaryNotFound;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                app::LogLevel::Warn,
-                                "acp",
-                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
-                            );
-                        }
-                    }
                     ServerEvent::StartFailed { error } => {
                         app.server_state = ServerState::StartFailed { error: error.clone() };
                         app.set_status(

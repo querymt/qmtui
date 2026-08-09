@@ -70,6 +70,7 @@ impl DelegateEntry {
             )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_elicitation(&self) -> Option<(&str, &str, &str)> {
         match &self.child_state {
             DelegateChildState::PendingElicitation {
@@ -123,8 +124,13 @@ pub enum ActivityState {
     Idle,
     Thinking,
     Streaming,
-    RunningTool { name: String },
-    Compacting { token_estimate: u32 },
+    RunningTool {
+        name: String,
+    },
+    #[allow(dead_code)] // Retained for compaction rendering and replay state.
+    Compacting {
+        token_estimate: u32,
+    },
     SessionOp(SessionOp),
 }
 

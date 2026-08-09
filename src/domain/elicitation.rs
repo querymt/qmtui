@@ -29,6 +29,7 @@ pub struct ElicitationField {
 pub struct ElicitationState {
     pub elicitation_id: String,
     pub message: String,
+    #[allow(dead_code)] // Retained so responses can preserve their ACP source metadata.
     pub source: String,
     pub fields: Vec<ElicitationField>,
     /// Accumulated schema values (field name -> value).

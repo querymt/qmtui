@@ -18,6 +18,7 @@ pub enum ToolDetail {
     /// Compact one-liner info for display after the tool name.
     Summary(String),
     /// One-liner header with output displayed below it.
+    #[allow(dead_code)] // Retained for tool-result rendering.
     SummaryWithOutput {
         header: String,
         output: String,
@@ -33,6 +34,7 @@ pub enum ToolDetail {
         edit_count: usize,
         sections: Vec<DiffPreviewSection>,
     },
+    #[allow(dead_code)] // Retained for replace-symbol rendering and UI fixtures.
     ReplaceSymbol {
         title: String,
         sections: Vec<DiffPreviewSection>,

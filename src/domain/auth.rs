@@ -53,6 +53,7 @@ impl AuthProviderEntry {
     }
 
     /// Provider supports multiple auth methods (both OAuth and API key).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_multiple_auth_methods(&self) -> bool {
         self.supports_oauth && self.env_var_name.is_some()
     }
