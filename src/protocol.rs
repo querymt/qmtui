@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::auth::{AuthMethod, AuthProviderEntry, OAuthFlowKind};
-use crate::domain::session::{SessionGroup, SessionSummary};
 
 // --- Client → Server messages ---
 
@@ -624,7 +623,7 @@ pub struct SessionCreatedData {
 #[derive(Debug, Default, Deserialize)]
 pub struct SessionListData {
     #[serde(default)]
-    pub groups: Vec<SessionGroup>,
+    pub groups: Vec<SessionGroupData>,
     #[serde(default)]
     pub next_cursor: Option<String>,
     #[serde(default)]
@@ -632,10 +631,67 @@ pub struct SessionListData {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct SessionGroupData {
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub sessions: Vec<SessionSummaryData>,
+    /// ISO 8601 timestamp of the most recent activity in this group.
+    #[serde(default)]
+    pub latest_activity: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<u64>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionSummaryData {
+    pub session_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Working directory for this session (may differ from group cwd for remote sessions).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Parent session ID if this is a forked session.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub fork_origin: Option<String>,
+    #[serde(default)]
+    pub session_kind: Option<String>,
+    /// Whether this session has child (forked) sessions.
+    #[serde(default)]
+    pub has_children: bool,
+    /// Number of direct forked child sessions.
+    #[serde(default)]
+    pub fork_count: u64,
+    #[serde(default)]
+    pub children: Vec<SessionSummaryData>,
+    #[serde(default)]
+    pub children_next_cursor: Option<String>,
+    #[serde(default)]
+    pub children_total_count: Option<u64>,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub attached: Option<bool>,
+    #[serde(default)]
+    pub runtime_state: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct SessionChildrenData {
     pub parent_session_id: String,
     #[serde(default)]
-    pub sessions: Vec<SessionSummary>,
+    pub sessions: Vec<SessionSummaryData>,
     #[serde(default)]
     pub next_cursor: Option<String>,
     #[serde(default)]
@@ -698,6 +754,142 @@ pub struct ForkResultData {
     pub forked_session_id: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod session_page_data_tests {
+    use super::{SessionChildrenData, SessionListData};
+    use serde_json::json;
+
+    #[test]
+    fn session_pages_deserialize_recursive_wire_fields_and_defaults() {
+        let list: SessionListData = serde_json::from_value(json!({
+            "groups": [{
+                "cwd": "/workspace/project",
+                "latest_activity": "2024-02-01T00:00:00Z",
+                "total_count": 4,
+                "next_cursor": "group-next",
+                "unknown_group_field": true,
+                "sessions": [{
+                    "session_id": "root",
+                    "name": "Session One",
+                    "title": "Root",
+                    "cwd": "/workspace/project",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "updated_at": "2024-02-01T00:00:00Z",
+                    "parent_session_id": null,
+                    "fork_origin": "manual",
+                    "session_kind": "interactive",
+                    "has_children": true,
+                    "fork_count": 1,
+                    "children_next_cursor": "child-next",
+                    "children_total_count": 2,
+                    "node": "remote",
+                    "node_id": "node-1",
+                    "attached": true,
+                    "runtime_state": "running",
+                    "unknown_session_field": "ignored",
+                    "children": [{
+                        "session_id": "child",
+                        "parent_session_id": "root",
+                        "fork_origin": "manual",
+                        "children_next_cursor": "grandchild-next",
+                        "children_total_count": 1,
+                        "node_id": "node-2",
+                        "children": [{ "session_id": "grandchild" }]
+                    }]
+                }]
+            }],
+            "next_cursor": "list-next",
+            "total_count": 9,
+            "unknown_page_field": null
+        }))
+        .expect("session list wire shape should deserialize");
+
+        assert_eq!(list.next_cursor.as_deref(), Some("list-next"));
+        assert_eq!(list.total_count, Some(9));
+        let group = &list.groups[0];
+        assert_eq!(group.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(
+            group.latest_activity.as_deref(),
+            Some("2024-02-01T00:00:00Z")
+        );
+        assert_eq!(group.total_count, Some(4));
+        assert_eq!(group.next_cursor.as_deref(), Some("group-next"));
+        let root = &group.sessions[0];
+        assert_eq!(root.session_id, "root");
+        assert_eq!(root.name.as_deref(), Some("Session One"));
+        assert_eq!(root.title.as_deref(), Some("Root"));
+        assert_eq!(root.cwd.as_deref(), Some("/workspace/project"));
+        assert_eq!(root.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(root.updated_at.as_deref(), Some("2024-02-01T00:00:00Z"));
+        assert_eq!(root.parent_session_id, None);
+        assert_eq!(root.fork_origin.as_deref(), Some("manual"));
+        assert_eq!(root.session_kind.as_deref(), Some("interactive"));
+        assert!(root.has_children);
+        assert_eq!(root.fork_count, 1);
+        assert_eq!(root.children_next_cursor.as_deref(), Some("child-next"));
+        assert_eq!(root.children_total_count, Some(2));
+        assert_eq!(root.node.as_deref(), Some("remote"));
+        assert_eq!(root.node_id.as_deref(), Some("node-1"));
+        assert_eq!(root.attached, Some(true));
+        assert_eq!(root.runtime_state.as_deref(), Some("running"));
+
+        let child = &root.children[0];
+        assert_eq!(child.session_id, "child");
+        assert_eq!(child.parent_session_id.as_deref(), Some("root"));
+        assert_eq!(child.fork_origin.as_deref(), Some("manual"));
+        assert_eq!(
+            child.children_next_cursor.as_deref(),
+            Some("grandchild-next")
+        );
+        assert_eq!(child.children_total_count, Some(1));
+        assert_eq!(child.node_id.as_deref(), Some("node-2"));
+        assert_eq!(child.children[0].session_id, "grandchild");
+        assert_eq!(child.children[0].fork_count, 0);
+        assert!(child.children[0].children.is_empty());
+
+        let children: SessionChildrenData = serde_json::from_value(json!({
+            "parent_session_id": "root",
+            "sessions": [{
+                "session_id": "child",
+                "node_id": "node-2",
+                "children_next_cursor": "nested-next",
+                "children_total_count": 1,
+                "children": [{ "session_id": "grandchild" }]
+            }],
+            "next_cursor": "children-next",
+            "total_count": 3
+        }))
+        .expect("session children wire shape should deserialize");
+        assert_eq!(children.parent_session_id, "root");
+        assert_eq!(children.next_cursor.as_deref(), Some("children-next"));
+        assert_eq!(children.total_count, Some(3));
+        assert_eq!(children.sessions[0].node_id.as_deref(), Some("node-2"));
+        assert_eq!(
+            children.sessions[0].children_next_cursor.as_deref(),
+            Some("nested-next")
+        );
+        assert_eq!(children.sessions[0].children_total_count, Some(1));
+        assert_eq!(children.sessions[0].children[0].session_id, "grandchild");
+
+        let defaulted_children: SessionChildrenData = serde_json::from_value(json!({
+            "parent_session_id": "root",
+            "sessions": [{ "session_id": "child" }]
+        }))
+        .expect("session children defaults should deserialize");
+        assert_eq!(defaulted_children.sessions[0].fork_count, 0);
+        assert!(!defaulted_children.sessions[0].has_children);
+        assert!(defaulted_children.sessions[0].children.is_empty());
+        assert_eq!(defaulted_children.next_cursor, None);
+        assert_eq!(defaulted_children.total_count, None);
+
+        let empty_list: SessionListData =
+            serde_json::from_value(json!({})).expect("session list defaults should deserialize");
+        assert!(empty_list.groups.is_empty());
+        assert_eq!(empty_list.next_cursor, None);
+        assert_eq!(empty_list.total_count, None);
+    }
 }
 
 #[cfg(test)]

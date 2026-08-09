@@ -21,7 +21,7 @@ use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
-use crate::domain::session::{SessionGroup, SessionSummary};
+use crate::domain::session::{SessionGroup, SessionListPage, SessionSummary};
 use crate::protocol::{
     AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
@@ -2467,11 +2467,10 @@ fn flatten_select_entries(option: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn send_session_list(
-    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
-    request: SessionListRequest,
+fn session_list_page_from_acp(
+    request: &SessionListRequest,
     response: acp::ListSessionsResponse,
-) {
+) -> SessionListPage {
     let mut groups: BTreeMap<Option<String>, Vec<SessionSummary>> = BTreeMap::new();
     let response_cursor = response.next_cursor.map(|cursor| cursor.to_string());
 
@@ -2525,14 +2524,20 @@ fn send_session_list(
         })
         .collect::<Vec<_>>();
 
-    send_acp(
-        srv_tx,
-        AcpAppEvent::SessionList {
-            request,
-            groups,
-            next_cursor: response_cursor,
-        },
-    );
+    SessionListPage {
+        groups,
+        next_cursor: response_cursor,
+        total_count: None,
+    }
+}
+
+fn send_session_list(
+    srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>,
+    request: SessionListRequest,
+    response: acp::ListSessionsResponse,
+) {
+    let page = session_list_page_from_acp(&request, response);
+    send_acp(srv_tx, AcpAppEvent::SessionList { request, page });
 }
 
 fn send_state(
@@ -2885,8 +2890,37 @@ mod tests {
     }
 
     #[test]
-    fn acp_root_session_list_preserves_only_the_global_cursor() {
+    fn send_session_list_emits_request_and_domain_page() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = SessionListRequest::WorkspaceContinuation {
+            cwd: "/repo".to_string(),
+        };
+        let response = acp::ListSessionsResponse::new(vec![acp::SessionInfo::new(
+            acp::SessionId::from("session-1"),
+            Path::new("/from-response"),
+        )])
+        .next_cursor(Some("cursor-2".to_string()));
+
+        send_session_list(&tx, request.clone(), response);
+
+        match rx.try_recv().expect("session list event") {
+            ServerChannelMsg::Acp(AcpAppEvent::SessionList {
+                request: emitted_request,
+                page,
+            }) => {
+                assert_eq!(emitted_request, request);
+                assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
+                assert_eq!(page.groups.len(), 1);
+                assert_eq!(page.groups[0].cwd.as_deref(), Some("/repo"));
+                assert_eq!(page.groups[0].next_cursor.as_deref(), Some("cursor-2"));
+                assert_eq!(page.groups[0].sessions.len(), 1);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_root_session_list_preserves_only_the_global_cursor() {
         let response = acp::ListSessionsResponse::new(vec![
             acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo")),
             acp::SessionInfo::new(acp::SessionId::from("s2"), Path::new("/repo")),
@@ -2894,53 +2928,37 @@ mod tests {
         ])
         .next_cursor(Some("100".to_string()));
 
-        send_session_list(&tx, SessionListRequest::Discovery, response);
+        let page = session_list_page_from_acp(&SessionListRequest::Discovery, response);
 
-        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
-        assert!(matches!(
-            event,
-            AcpAppEvent::SessionList {
-                request: SessionListRequest::Discovery,
-                groups,
-                next_cursor: Some(cursor),
-            } if cursor == "100"
-                && groups.len() == 2
-                && groups.iter().all(|group| group.next_cursor.is_none())
-        ));
+        assert_eq!(page.next_cursor.as_deref(), Some("100"));
+        assert_eq!(page.total_count, None);
+        assert_eq!(page.groups.len(), 2);
+        assert!(page.groups.iter().all(|group| group.next_cursor.is_none()));
     }
 
     #[test]
     fn acp_cwd_session_list_maps_next_cursor_to_group_cursor() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
         let response = acp::ListSessionsResponse::new(vec![
-            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/repo"))
+            acp::SessionInfo::new(acp::SessionId::from("s1"), Path::new("/from-response"))
                 .title(Some("One".to_string()))
                 .updated_at(Some("2024-01-01T00:00:00Z".to_string())),
         ])
         .next_cursor(Some("cursor-2".to_string()));
+        let request = SessionListRequest::WorkspaceContinuation {
+            cwd: "/repo".to_string(),
+        };
 
-        send_session_list(
-            &tx,
-            SessionListRequest::WorkspaceContinuation {
-                cwd: "/repo".to_string(),
-            },
-            response,
+        let page = session_list_page_from_acp(&request, response);
+
+        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.groups[0].cwd.as_deref(), Some("/repo"));
+        assert_eq!(page.groups[0].next_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(page.groups[0].sessions[0].session_id, "s1");
+        assert_eq!(
+            page.groups[0].sessions[0].cwd.as_deref(),
+            Some("/from-response")
         );
-
-        let ServerChannelMsg::Acp(event) = rx.try_recv().expect("session list event");
-        assert!(matches!(
-            event,
-            AcpAppEvent::SessionList {
-                request: SessionListRequest::WorkspaceContinuation { cwd },
-                groups,
-                next_cursor: Some(root_cursor),
-            } if cwd == "/repo"
-                && root_cursor == "cursor-2"
-                && groups.len() == 1
-                && groups[0].cwd.as_deref() == Some("/repo")
-                && groups[0].next_cursor.as_deref() == Some("cursor-2")
-                && groups[0].sessions[0].session_id == "s1"
-        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
-use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
+use crate::domain::session::{SessionGroup, SessionListPage, SessionSummary, UndoableTurn};
 use crate::domain::tool::ToolDetail;
 use crate::protocol::{
     ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, OAuthFlowData,
@@ -125,8 +125,7 @@ pub(crate) enum AcpAppEvent {
     RemoteSessionAttached(RemoteSessionAttachInfo),
     SessionList {
         request: SessionListRequest,
-        groups: Vec<SessionGroup>,
-        next_cursor: Option<String>,
+        page: SessionListPage,
     },
     SessionListFailed {
         request: SessionListRequest,
@@ -315,11 +314,9 @@ impl crate::app::App {
                 &attached.node_id,
                 attached.attached,
             ),
-            AcpAppEvent::SessionList {
-                request,
-                groups,
-                next_cursor,
-            } => self.apply_acp_session_list(request, groups, next_cursor),
+            AcpAppEvent::SessionList { request, page } => {
+                self.apply_acp_session_list(request, page)
+            }
             AcpAppEvent::SessionListFailed { request, message } => {
                 self.apply_acp_session_list_failure(&request);
                 self.push_acp_error(&message);
@@ -589,9 +586,13 @@ impl crate::app::App {
     fn apply_acp_session_list(
         &mut self,
         request: SessionListRequest,
-        mut groups: Vec<SessionGroup>,
-        next_cursor: Option<String>,
+        page: SessionListPage,
     ) -> Vec<ClientMsg> {
+        let SessionListPage {
+            mut groups,
+            next_cursor,
+            total_count: _,
+        } = page;
         for group in &mut groups {
             group.total_count = None;
             for session in &group.sessions {
@@ -2083,7 +2084,7 @@ mod tests {
     use crate::app::{App, Screen};
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::model::DelegateModelPreference;
-    use crate::domain::session::UndoState;
+    use crate::domain::session::{SessionListPage, UndoState};
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -2137,6 +2138,14 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+        }
+    }
+
+    fn session_list_page(groups: Vec<SessionGroup>, next_cursor: Option<&str>) -> SessionListPage {
+        SessionListPage {
+            groups,
+            next_cursor: next_cursor.map(str::to_string),
+            total_count: None,
         }
     }
 
@@ -2516,8 +2525,10 @@ mod tests {
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
-            groups: vec![session_group("/repo", &["s1", "s2"])],
-            next_cursor: Some("opaque-root-2".into()),
+            page: session_list_page(
+                vec![session_group("/repo", &["s1", "s2"])],
+                Some("opaque-root-2"),
+            ),
         });
 
         assert!(app.session_discovery_in_progress);
@@ -2557,8 +2568,7 @@ mod tests {
             request: SessionListRequest::WorkspaceFirstPage {
                 cwd: "/repo".into(),
             },
-            groups: vec![page],
-            next_cursor: Some("opaque-workspace-2".into()),
+            page: session_list_page(vec![page], Some("opaque-workspace-2")),
         });
 
         assert!(app.hydrated_session_groups.contains("/repo"));
@@ -2587,11 +2597,13 @@ mod tests {
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
-            groups: vec![
-                session_group("/repo", &["stale-discovery"]),
-                session_group("/later", &["later-1"]),
-            ],
-            next_cursor: None,
+            page: session_list_page(
+                vec![
+                    session_group("/repo", &["stale-discovery"]),
+                    session_group("/later", &["later-1"]),
+                ],
+                None,
+            ),
         });
 
         let repo = app
@@ -2626,8 +2638,7 @@ mod tests {
             request: SessionListRequest::WorkspaceContinuation {
                 cwd: "/repo".into(),
             },
-            groups: vec![group],
-            next_cursor: Some("cursor-2".into()),
+            page: session_list_page(vec![group], Some("cursor-2")),
         });
 
         assert!(app.pending_session_group_loads.is_empty());

@@ -10,8 +10,7 @@ use crate::app::{
     PopupItem, StartPageItem,
 };
 use crate::domain::activity::{DelegateEntry, SessionActivity};
-use crate::domain::session::{SessionGroup, SessionSummary};
-use crate::protocol::SessionChildrenData;
+use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionSummary};
 
 /// Returns indices of sessions in `group` whose title or ID matches `q`.
 /// When `q` is empty every session matches in original order.
@@ -194,7 +193,7 @@ impl App {
         false
     }
 
-    pub fn merge_session_children(&mut self, data: SessionChildrenData) {
+    pub fn merge_session_children(&mut self, data: SessionChildrenPage) {
         let had_pending_request = self
             .pending_session_child_loads
             .remove(&data.parent_session_id);
@@ -778,7 +777,7 @@ mod tests {
         remote.node_id = Some("node-1".into());
         let mut delegated = session("delegated-child");
         delegated.fork_origin = Some("delegation".into());
-        app.merge_session_children(SessionChildrenData {
+        app.merge_session_children(SessionChildrenPage {
             parent_session_id: "parent".into(),
             sessions: vec![session("child-1"), remote, delegated, session("child-1")],
             next_cursor: Some("cursor-2".into()),
@@ -802,7 +801,7 @@ mod tests {
         assert!(app.pending_session_child_loads.is_empty());
 
         app.pending_session_child_loads.insert("parent".into());
-        app.merge_session_children(SessionChildrenData {
+        app.merge_session_children(SessionChildrenPage {
             parent_session_id: "parent".into(),
             sessions: vec![session("remote-child"), session("child-2")],
             next_cursor: None,
@@ -823,7 +822,7 @@ mod tests {
 
         app.pending_session_child_loads
             .insert("missing-parent".into());
-        app.merge_session_children(SessionChildrenData {
+        app.merge_session_children(SessionChildrenPage {
             parent_session_id: "missing-parent".into(),
             ..Default::default()
         });

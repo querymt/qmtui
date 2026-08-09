@@ -3657,7 +3657,6 @@ mod tests {
 mod start_page_tests {
     use super::*;
     use crate::domain::session::SessionSummary;
-    use crate::protocol::SessionListData;
 
     fn make_group(cwd: Option<&str>, ids: &[(&str, Option<&str>)]) -> SessionGroup {
         SessionGroup {
@@ -3849,68 +3848,6 @@ mod start_page_tests {
                 depth: 0,
             } if path == &vec![0]
         ));
-    }
-
-    // ── session_list message preserves group structure ────────────────────────
-
-    #[test]
-    fn session_summary_defaults_missing_fork_count_to_zero() {
-        let session: SessionSummary = serde_json::from_value(serde_json::json!({
-            "session_id": "s1",
-            "title": "Session One"
-        }))
-        .expect("session summary without fork_count should parse");
-
-        assert_eq!(session.fork_count, 0);
-    }
-
-    #[test]
-    fn backend_shaped_session_list_deserializes_with_new_fields() {
-        let list: SessionListData = serde_json::from_value(serde_json::json!({
-            "groups": [
-                {
-                    "cwd": "/workspace/project",
-                    "latest_activity": "2024-02-01T00:00:00Z",
-                    "total_count": 1,
-                    "next_cursor": "group-next",
-                    "sessions": [
-                        {
-                            "session_id": "s1",
-                            "name": "Session One",
-                            "cwd": "/workspace/project",
-                            "title": "T1",
-                            "created_at": "2024-01-01T00:00:00Z",
-                            "updated_at": "2024-02-01T00:00:00Z",
-                            "parent_session_id": null,
-                            "fork_origin": null,
-                            "session_kind": "interactive",
-                            "has_children": true,
-                            "fork_count": 3,
-                            "node": "local",
-                            "node_id": "node-1",
-                            "attached": true,
-                            "runtime_state": "running"
-                        }
-                    ]
-                }
-            ],
-            "next_cursor": "list-next",
-            "total_count": 1
-        }))
-        .expect("backend session_list shape should parse");
-
-        assert_eq!(list.next_cursor.as_deref(), Some("list-next"));
-        assert_eq!(list.total_count, Some(1));
-        assert_eq!(list.groups[0].total_count, Some(1));
-        assert_eq!(list.groups[0].next_cursor.as_deref(), Some("group-next"));
-        let session = &list.groups[0].sessions[0];
-        assert_eq!(session.name.as_deref(), Some("Session One"));
-        assert_eq!(session.session_kind.as_deref(), Some("interactive"));
-        assert_eq!(session.fork_count, 3);
-        assert_eq!(session.node.as_deref(), Some("local"));
-        assert_eq!(session.node_id.as_deref(), Some("node-1"));
-        assert_eq!(session.attached, Some(true));
-        assert_eq!(session.runtime_state.as_deref(), Some("running"));
     }
 
     #[test]
