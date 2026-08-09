@@ -4,16 +4,12 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-#[allow(unused_imports)]
-pub(crate) use crate::domain::activity::{
-    ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
-    PendingDelegateToolCall, SessionActivity, SessionOp, SessionStatsLite,
+use crate::domain::activity::{
+    ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
+    SessionActivity, SessionOp, SessionStatsLite,
 };
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
-#[allow(unused_imports)]
-pub(crate) use crate::domain::elicitation::{
-    ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
-};
+use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
@@ -23,7 +19,10 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
-use crate::protocol::*;
+use crate::protocol::{
+    ClientMsg, EventKind, MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
+    UndoStackFrame,
+};
 use crate::ui::{CardCache, ElicitationUiState};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
@@ -2098,6 +2097,7 @@ impl App {
 #[cfg(test)]
 mod reasoning_effort_tests {
     use super::*;
+    use crate::domain::session::SessionSummary;
 
     // ── reasoning_effort_label ────────────────────────────────────────────────
 
@@ -2485,6 +2485,7 @@ mod reasoning_effort_tests {
 #[cfg(test)]
 mod delegate_entry_tests {
     use super::*;
+    use crate::domain::activity::DelegateStatus;
 
     fn make_entry(delegation_id: &str, objective: &str, status: DelegateStatus) -> DelegateEntry {
         DelegateEntry {
@@ -2851,6 +2852,7 @@ mod session_mode_tests {
 mod tests {
     use super::*;
     use crate::domain::chat::OUTCOME_BULLET;
+    use crate::protocol::{AgentEvent, ProgressKind};
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {
@@ -3655,6 +3657,7 @@ mod tests {
 mod start_page_tests {
     use super::*;
     use crate::domain::session::SessionSummary;
+    use crate::protocol::SessionListData;
 
     fn make_group(cwd: Option<&str>, ids: &[(&str, Option<&str>)]) -> SessionGroup {
         SessionGroup {

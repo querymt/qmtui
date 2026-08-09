@@ -21,11 +21,11 @@ use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
+use crate::domain::session::{SessionGroup, SessionSummary};
 use crate::protocol::{
     AuthProvidersData, ClientMsg, ForkResultData, MeshInviteCreatedInfo, MeshNodesInfo,
     MeshStatusInfo, OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo,
-    RemoteSessionListInfo, SessionGroup, SessionListRequest, SessionSummary, UndoResultData,
-    UndoStackFrame,
+    RemoteSessionListInfo, SessionListRequest, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
