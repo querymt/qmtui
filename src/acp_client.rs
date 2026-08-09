@@ -2957,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_session_pages_map_recursively_to_domain() {
+    fn wire_session_list_page_maps_recursively_to_domain() {
         let list = session_list_page_from_wire(SessionListData {
             groups: vec![SessionGroupData {
                 cwd: Some("/repo".into()),
@@ -2971,7 +2971,7 @@ mod tests {
                     cwd: Some("/repo".into()),
                     created_at: Some("2024-01-01T00:00:00Z".into()),
                     updated_at: Some("2024-02-01T00:00:00Z".into()),
-                    parent_session_id: None,
+                    parent_session_id: Some("source".into()),
                     fork_origin: Some("manual".into()),
                     session_kind: Some("interactive".into()),
                     has_children: true,
@@ -2979,6 +2979,12 @@ mod tests {
                     children: vec![SessionSummaryData {
                         session_id: "child".into(),
                         parent_session_id: Some("root".into()),
+                        children: vec![SessionSummaryData {
+                            session_id: "grandchild".into(),
+                            ..Default::default()
+                        }],
+                        children_next_cursor: Some("grandchild-next".into()),
+                        children_total_count: Some(1),
                         node_id: Some("node-child".into()),
                         ..Default::default()
                     }],
@@ -3005,43 +3011,77 @@ mod tests {
         assert_eq!(group.total_count, Some(2));
         assert_eq!(group.next_cursor.as_deref(), Some("group-next"));
         let root = &group.sessions[0];
+        assert_eq!(root.session_id, "root");
         assert_eq!(root.name.as_deref(), Some("Root name"));
         assert_eq!(root.title.as_deref(), Some("Root title"));
         assert_eq!(root.cwd.as_deref(), Some("/repo"));
         assert_eq!(root.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
         assert_eq!(root.updated_at.as_deref(), Some("2024-02-01T00:00:00Z"));
-        assert_eq!(root.parent_session_id, None);
+        assert_eq!(root.parent_session_id.as_deref(), Some("source"));
         assert_eq!(root.fork_origin.as_deref(), Some("manual"));
         assert_eq!(root.session_kind.as_deref(), Some("interactive"));
         assert!(root.has_children);
         assert_eq!(root.fork_count, 1);
-        assert_eq!(root.children[0].session_id, "child");
-        assert_eq!(root.children[0].parent_session_id.as_deref(), Some("root"));
-        assert_eq!(root.children[0].node_id.as_deref(), Some("node-child"));
         assert_eq!(root.children_next_cursor.as_deref(), Some("child-next"));
         assert_eq!(root.children_total_count, Some(1));
         assert_eq!(root.node.as_deref(), Some("remote"));
         assert_eq!(root.node_id.as_deref(), Some("node-root"));
         assert_eq!(root.attached, Some(true));
         assert_eq!(root.runtime_state.as_deref(), Some("running"));
+        let child = &root.children[0];
+        assert_eq!(child.session_id, "child");
+        assert_eq!(child.parent_session_id.as_deref(), Some("root"));
+        assert_eq!(child.node_id.as_deref(), Some("node-child"));
+        assert_eq!(
+            child.children_next_cursor.as_deref(),
+            Some("grandchild-next")
+        );
+        assert_eq!(child.children_total_count, Some(1));
+        assert_eq!(child.children[0].session_id, "grandchild");
+    }
 
+    #[test]
+    fn wire_session_children_page_maps_recursively_to_domain() {
         let children = session_children_page_from_wire(SessionChildrenData {
             parent_session_id: "root".into(),
             sessions: vec![SessionSummaryData {
                 session_id: "child".into(),
+                parent_session_id: Some("root".into()),
+                node_id: Some("node-child".into()),
                 children: vec![SessionSummaryData {
                     session_id: "grandchild".into(),
+                    parent_session_id: Some("child".into()),
+                    node_id: Some("node-grandchild".into()),
                     ..Default::default()
                 }],
+                children_next_cursor: Some("grandchild-next".into()),
+                children_total_count: Some(1),
                 ..Default::default()
             }],
             next_cursor: Some("children-next".into()),
             total_count: Some(3),
         });
+
         assert_eq!(children.parent_session_id, "root");
-        assert_eq!(children.sessions[0].children[0].session_id, "grandchild");
         assert_eq!(children.next_cursor.as_deref(), Some("children-next"));
         assert_eq!(children.total_count, Some(3));
+        let child = &children.sessions[0];
+        assert_eq!(child.parent_session_id.as_deref(), Some("root"));
+        assert_eq!(child.node_id.as_deref(), Some("node-child"));
+        assert_eq!(
+            child.children_next_cursor.as_deref(),
+            Some("grandchild-next")
+        );
+        assert_eq!(child.children_total_count, Some(1));
+        assert_eq!(child.children[0].session_id, "grandchild");
+        assert_eq!(
+            child.children[0].parent_session_id.as_deref(),
+            Some("child")
+        );
+        assert_eq!(
+            child.children[0].node_id.as_deref(),
+            Some("node-grandchild")
+        );
     }
 
     #[test]
