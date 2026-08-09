@@ -2267,6 +2267,7 @@ pub(crate) fn handle_auth_popup_key(
                 if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
                     let provider = &app.auth_providers[real_idx];
                     if provider.env_var_name.is_some() || provider.has_stored_api_key {
+                        app.auth_ui_notice = None;
                         app.auth_selected = Some(real_idx);
                         app.auth_panel = AuthPanel::ApiKeyInput;
                         app.auth_api_key_input.clear();
@@ -2280,6 +2281,7 @@ pub(crate) fn handle_auth_popup_key(
                 if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
                     let provider = &app.auth_providers[real_idx];
                     if provider.supports_oauth {
+                        app.auth_ui_notice = None;
                         app.auth_selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
                         cmd_tx.send(ClientMsg::StartOAuthLogin {
@@ -2451,6 +2453,8 @@ fn copy_text_to_clipboard(text: &str) -> bool {
 }
 
 fn try_copy_to_clipboard(app: &mut App, provider: &str, text: &str) {
+    app.auth_ui_notice = None;
+    app.auth_clipboard_fallback = None;
     if copy_text_to_clipboard(text) {
         app.auth_ui_notice = Some(AuthUiNotice {
             provider: Some(provider.to_string()),
@@ -2458,6 +2462,7 @@ fn try_copy_to_clipboard(app: &mut App, provider: &str, text: &str) {
             message: "Copied to clipboard".into(),
         });
     } else {
+        app.auth_ui_notice = None;
         app.auth_clipboard_fallback = Some(text.to_string());
     }
 }

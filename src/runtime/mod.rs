@@ -3816,6 +3816,28 @@ mod auth_tests {
     // ── Native ACP event handling tests ───────────────────────────────────────
 
     #[test]
+    fn native_initialized_event_clears_auth_ui_notice() {
+        let mut app = App::new();
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
+
+        let cmds = app.handle_acp_event(AcpAppEvent::Initialized {
+            agent_id: "agent-1".into(),
+            agent_name: "Agent".into(),
+            profiles: Vec::new(),
+            active_profile_id: None,
+            agent_mode: None,
+            reasoning_effort: None,
+        });
+
+        assert!(cmds.is_empty());
+        assert!(app.auth_ui_notice.is_none());
+    }
+
+    #[test]
     fn native_auth_providers_event_populates_list() {
         let mut app = App::new();
         let mut openai = make_provider("OpenAI");
@@ -3877,11 +3899,6 @@ mod auth_tests {
             flow_kind: OAuthFlowKind::RedirectCode,
         });
         app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_ui_notice = Some(AuthUiNotice {
-            provider: Some("openai".into()),
-            success: true,
-            message: "Copied to clipboard".into(),
-        });
 
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResult {
             provider: "openai".into(),
@@ -3893,7 +3910,6 @@ mod auth_tests {
         assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
         assert!(app.auth_oauth_flow.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
-        assert!(app.auth_ui_notice.is_none());
         assert_eq!(
             app.auth_last_result,
             Some(OAuthResult {
@@ -3928,6 +3944,24 @@ mod auth_tests {
         assert_eq!(app.auth_oauth_flow, Some(flow));
         assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
         assert_eq!(app.auth_last_result, Some(result));
+    }
+
+    #[test]
+    fn native_oauth_result_clears_auth_ui_notice() {
+        let mut app = App::new();
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "Copied to clipboard".into(),
+        });
+
+        app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "Authorization denied".into(),
+        }));
+
+        assert!(app.auth_ui_notice.is_none());
     }
 
     // ── Disconnect / clear credential tests (C-d in List panel) ─────────────
@@ -4019,16 +4053,22 @@ mod auth_tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('y'), &tx).unwrap();
-        // In CI there's no clipboard tool, so it falls back to the URL display
+
+        let expected_notice = AuthUiNotice {
+            provider: Some("codex".into()),
+            success: true,
+            message: "Copied to clipboard".into(),
+        };
+        let expected_url = "https://auth.example.com/authorize";
         assert!(
-            app.auth_clipboard_fallback.is_some()
-                || app.auth_ui_notice
-                    == Some(AuthUiNotice {
-                        provider: Some("codex".into()),
-                        success: true,
-                        message: "Copied to clipboard".into(),
-                    }),
-            "C-y should attempt clipboard copy"
+            matches!(
+                (&app.auth_ui_notice, &app.auth_clipboard_fallback),
+                (Some(notice), None) if notice == &expected_notice
+            ) || matches!(
+                (&app.auth_ui_notice, &app.auth_clipboard_fallback),
+                (None, Some(url)) if url == expected_url
+            ),
+            "C-y should show the provider notice or exact fallback URL"
         );
         assert!(app.auth_last_result.is_none());
     }
