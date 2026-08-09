@@ -1535,6 +1535,7 @@ fn undo_result_from_wire(result: UndoResultData) -> UndoResult {
         }
     } else {
         UndoResult::Rejected {
+            target_message_id: result.message_id,
             message: result.message,
             stack,
         }
@@ -2914,10 +2915,10 @@ mod tests {
     }
 
     #[test]
-    fn undo_result_from_wire_rejects_and_discards_reverted_files() {
+    fn undo_result_from_wire_preserves_rejected_target_and_discards_files() {
         let result = undo_result_from_wire(UndoResultData {
             success: false,
-            message_id: Some("ignored".into()),
+            message_id: Some("message-1".into()),
             reverted_files: vec!["ignored.rs".into()],
             message: Some("undo rejected".into()),
             undo_stack: wire_stack(&["message-1"]),
@@ -2926,6 +2927,7 @@ mod tests {
         assert_eq!(
             result,
             UndoResult::Rejected {
+                target_message_id: Some("message-1".into()),
                 message: Some("undo rejected".into()),
                 stack: UndoStackSnapshot {
                     message_ids: vec!["message-1".into()],
