@@ -1,4 +1,5 @@
 pub(crate) mod activity;
+pub(crate) mod auth;
 pub(crate) mod chat;
 pub(crate) mod elicitation;
 pub(crate) mod model;

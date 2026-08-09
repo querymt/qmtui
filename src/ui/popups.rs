@@ -9,9 +9,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AuthPanel, LogLevel, session_group_count_text};
 use crate::domain::activity::DelegateStats;
+use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::ProfileInfo;
-use crate::protocol::OAuthStatus;
 use crate::theme::Theme;
 
 use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
@@ -2847,7 +2847,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             let mut lines: Vec<Line<'static>> = Vec::new();
 
             if let Some(ref flow) = app.auth_oauth_flow {
-                let is_device_poll = flow.flow_kind == crate::protocol::OAuthFlowKind::DevicePoll;
+                let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
 
                 lines.push(Line::from(Span::styled(
                     format!(" OAuth for {}", flow.provider),
@@ -2928,7 +2928,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 && app
                     .auth_oauth_flow
                     .as_ref()
-                    .is_some_and(|f| f.flow_kind != crate::protocol::OAuthFlowKind::DevicePoll)
+                    .is_some_and(|f| f.flow_kind != OAuthFlowKind::DevicePoll)
             {
                 let avail = area.width.saturating_sub(3) as usize;
                 let (_, oauth_cur) = scroll_input(
