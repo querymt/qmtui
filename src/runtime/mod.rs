@@ -3351,6 +3351,7 @@ mod runtime_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+    use crate::app::AuthUiNotice;
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
@@ -3427,6 +3428,11 @@ mod auth_tests {
             status: OAuthResultStatus::Failure,
             message: "old result".into(),
         });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         app.open_auth_popup();
         assert_eq!(app.popup, app::Popup::ProviderAuth);
         assert_eq!(app.auth_cursor, 0);
@@ -3434,6 +3440,7 @@ mod auth_tests {
         assert!(app.auth_selected.is_none());
         assert!(app.auth_api_key_input.is_empty());
         assert!(app.auth_last_result.is_none());
+        assert!(app.auth_ui_notice.is_none());
         assert!(app.auth_api_key_masked);
         assert_eq!(app.auth_panel, app::AuthPanel::List);
     }
@@ -3465,15 +3472,21 @@ mod auth_tests {
             status: OAuthResultStatus::Success,
             message: "connected".into(),
         });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: None,
+            success: true,
+            message: "saved".into(),
+        });
         app.auth_close_detail();
         assert!(app.auth_selected.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
         assert!(app.auth_api_key_input.is_empty());
         assert!(app.auth_last_result.is_none());
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
-    fn auth_last_result_is_scoped_to_its_provider() {
+    fn auth_feedback_scopes_oauth_result_to_its_provider() {
         let mut app = App::new();
         app.auth_last_result = Some(OAuthResult {
             provider: "openai".into(),
@@ -3481,11 +3494,50 @@ mod auth_tests {
             message: "authorization denied".into(),
         });
 
-        assert!(app.auth_last_result_for_provider("anthropic").is_none());
+        assert_eq!(app.auth_feedback_for_provider("anthropic"), None);
         assert_eq!(
-            app.auth_last_result_for_provider("openai")
-                .map(|result| result.message.as_str()),
-            Some("authorization denied")
+            app.auth_feedback_for_provider("openai"),
+            Some((false, "authorization denied"))
+        );
+    }
+
+    #[test]
+    fn auth_feedback_scopes_ui_notice_and_takes_precedence() {
+        let mut app = App::new();
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "authorization denied".into(),
+        });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "Copied to clipboard".into(),
+        });
+
+        assert_eq!(app.auth_feedback_for_provider("anthropic"), None);
+        assert_eq!(
+            app.auth_feedback_for_provider("openai"),
+            Some((true, "Copied to clipboard"))
+        );
+    }
+
+    #[test]
+    fn auth_feedback_supports_generic_ui_notice() {
+        let mut app = App::new();
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: None,
+            success: false,
+            message: "Clipboard unavailable".into(),
+        });
+
+        assert_eq!(
+            app.auth_feedback_for_provider("openai"),
+            Some((false, "Clipboard unavailable"))
+        );
+        assert_eq!(
+            app.auth_feedback_for_provider("anthropic"),
+            Some((false, "Clipboard unavailable"))
         );
     }
 
@@ -3531,10 +3583,22 @@ mod auth_tests {
     #[test]
     fn auth_list_enter_on_api_key_only_opens_api_key_panel() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "old result".into(),
+        });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
         assert_eq!(app.auth_selected, Some(0));
+        assert!(app.auth_last_result.is_none());
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
@@ -3774,6 +3838,17 @@ mod auth_tests {
         let mut app = App::new();
         app.popup = app::Popup::ProviderAuth;
 
+        app.auth_last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "old result".into(),
+        });
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "old notice".into(),
+        });
+
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthFlowStarted(OAuthFlow {
             flow_id: "flow-123".into(),
             provider: "openai".into(),
@@ -3788,6 +3863,8 @@ mod auth_tests {
         assert_eq!(flow.provider, "openai");
         assert_eq!(flow.flow_kind, OAuthFlowKind::RedirectCode);
         assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
+        assert!(app.auth_last_result.is_none());
+        assert!(app.auth_ui_notice.is_none());
     }
 
     #[test]
@@ -3800,6 +3877,11 @@ mod auth_tests {
             flow_kind: OAuthFlowKind::RedirectCode,
         });
         app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth_ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "Copied to clipboard".into(),
+        });
 
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResult {
             provider: "openai".into(),
@@ -3811,6 +3893,7 @@ mod auth_tests {
         assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
         assert!(app.auth_oauth_flow.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth_ui_notice.is_none());
         assert_eq!(
             app.auth_last_result,
             Some(OAuthResult {
@@ -3939,14 +4022,15 @@ mod auth_tests {
         // In CI there's no clipboard tool, so it falls back to the URL display
         assert!(
             app.auth_clipboard_fallback.is_some()
-                || app.auth_last_result
-                    == Some(OAuthResult {
-                        provider: "codex".into(),
-                        status: OAuthResultStatus::Success,
+                || app.auth_ui_notice
+                    == Some(AuthUiNotice {
+                        provider: Some("codex".into()),
+                        success: true,
                         message: "Copied to clipboard".into(),
                     }),
             "C-y should attempt clipboard copy"
         );
+        assert!(app.auth_last_result.is_none());
     }
 
     #[test]

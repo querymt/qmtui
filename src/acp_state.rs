@@ -214,6 +214,7 @@ impl crate::app::App {
                 if let Some(effort) = reasoning_effort {
                     self.reasoning_effort = effort;
                 }
+                self.auth_ui_notice = None;
                 self.set_status(LogLevel::Info, "connection", "connected");
                 vec![]
             }
@@ -531,6 +532,7 @@ impl crate::app::App {
                 self.auth_oauth_response.clear();
                 self.auth_oauth_response_cursor = 0;
                 self.auth_last_result = None;
+                self.auth_ui_notice = None;
                 vec![]
             }
             AcpAppEvent::OAuthResult(result) => {
@@ -541,6 +543,7 @@ impl crate::app::App {
                     LogLevel::Warn
                 };
                 self.push_log(level, "auth", &result.message);
+                self.auth_ui_notice = None;
                 self.auth_last_result = Some(result);
                 if is_success {
                     self.auth_oauth_flow = None;
