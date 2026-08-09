@@ -8,7 +8,7 @@ use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
     SessionActivity, SessionOp, SessionStatsLite,
 };
-use crate::domain::auth::AuthProviderEntry;
+use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
@@ -740,10 +740,10 @@ pub struct App {
     pub auth_api_key_input: String,
     pub auth_api_key_cursor: usize,
     pub auth_api_key_masked: bool,
-    pub auth_oauth_flow: Option<crate::protocol::OAuthFlowData>,
+    pub auth_oauth_flow: Option<OAuthFlow>,
     pub auth_oauth_response: String,
     pub auth_oauth_response_cursor: usize,
-    pub auth_result_message: Option<(bool, String)>,
+    pub auth_last_result: Option<OAuthResult>,
     /// When clipboard copy fails, store the URL here for a fallback display popup.
     pub auth_clipboard_fallback: Option<String>,
 
@@ -968,7 +968,7 @@ impl App {
             auth_oauth_flow: None,
             auth_oauth_response: String::new(),
             auth_oauth_response_cursor: 0,
-            auth_result_message: None,
+            auth_last_result: None,
             auth_clipboard_fallback: None,
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
@@ -1136,7 +1136,7 @@ impl App {
         self.auth_oauth_flow = None;
         self.auth_oauth_response.clear();
         self.auth_oauth_response_cursor = 0;
-        self.auth_result_message = None;
+        self.auth_last_result = None;
         self.auth_clipboard_fallback = None;
     }
 
@@ -1149,8 +1149,14 @@ impl App {
         self.auth_oauth_flow = None;
         self.auth_oauth_response.clear();
         self.auth_oauth_response_cursor = 0;
-        self.auth_result_message = None;
+        self.auth_last_result = None;
         self.auth_clipboard_fallback = None;
+    }
+
+    pub fn auth_last_result_for_provider(&self, provider: &str) -> Option<&OAuthResult> {
+        self.auth_last_result
+            .as_ref()
+            .filter(|result| result.provider == provider)
     }
 
     pub fn profile_by_id(&self, profile_id: &str) -> Option<&ProfileInfo> {

@@ -19,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
+use crate::domain::auth::{OAuthFlow, OAuthResult, OAuthResultStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
@@ -27,7 +28,7 @@ use crate::domain::session::{
 };
 use crate::protocol::{
     AuthProvidersData, ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo,
-    OAuthFlowData, OAuthResultData, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo,
+    OAuthFlowDto, OAuthResultDto, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo,
     SessionListRequest, UndoResultData, UndoStackFrame,
 };
 
@@ -1220,10 +1221,12 @@ async fn handle_client_msg<C: AcpConnection>(
                 json!({ "provider": provider }),
             )
             .await?;
-            if let Ok(flow) =
-                serde_json::from_value::<OAuthFlowData>(ext_payload(&response).clone())
+            if let Ok(flow) = serde_json::from_value::<OAuthFlowDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::OAuthFlowStarted(flow));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::OAuthFlowStarted(oauth_flow_from_wire(flow)),
+                );
             }
         }
         ClientMsg::CompleteOAuthLogin { flow_id, response } => {
@@ -1234,9 +1237,12 @@ async fn handle_client_msg<C: AcpConnection>(
             )
             .await?;
             if let Ok(result) =
-                serde_json::from_value::<OAuthResultData>(ext_payload(&response).clone())
+                serde_json::from_value::<OAuthResultDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::OAuthResult(result));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::OAuthResult(oauth_result_from_wire(result)),
+                );
             }
         }
         ClientMsg::DisconnectOAuth { provider } => {
@@ -1247,9 +1253,12 @@ async fn handle_client_msg<C: AcpConnection>(
             )
             .await?;
             if let Ok(result) =
-                serde_json::from_value::<OAuthResultData>(ext_payload(&response).clone())
+                serde_json::from_value::<OAuthResultDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::OAuthResult(result));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::OAuthResult(oauth_result_from_wire(result)),
+                );
             }
         }
         ClientMsg::ElicitationResponse {
@@ -1516,6 +1525,27 @@ fn send_profiles(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, response: Acp
 fn load_session_cwd(cwd: Option<&str>, default_cwd: PathBuf) -> PathBuf {
     cwd.and_then(|cwd| (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd)))
         .unwrap_or(default_cwd)
+}
+
+fn oauth_flow_from_wire(flow: OAuthFlowDto) -> OAuthFlow {
+    OAuthFlow {
+        flow_id: flow.flow_id,
+        provider: flow.provider,
+        authorization_url: flow.authorization_url,
+        flow_kind: flow.flow_kind,
+    }
+}
+
+fn oauth_result_from_wire(result: OAuthResultDto) -> OAuthResult {
+    OAuthResult {
+        provider: result.provider,
+        status: if result.success {
+            OAuthResultStatus::Success
+        } else {
+            OAuthResultStatus::Failure
+        },
+        message: result.message,
+    }
 }
 
 fn undo_stack_snapshot_from_wire(frames: Vec<UndoStackFrame>) -> UndoStackSnapshot {
@@ -2882,6 +2912,45 @@ mod tests {
                 message_id: (*message_id).into(),
             })
             .collect()
+    }
+
+    #[test]
+    fn oauth_flow_from_wire_preserves_semantic_fields() {
+        let flow = oauth_flow_from_wire(OAuthFlowDto {
+            flow_id: "flow-123".into(),
+            provider: "openai".into(),
+            authorization_url: "https://auth.example.com/authorize".into(),
+            flow_kind: crate::domain::auth::OAuthFlowKind::DevicePoll,
+        });
+
+        assert_eq!(flow.flow_id, "flow-123");
+        assert_eq!(flow.provider, "openai");
+        assert_eq!(flow.authorization_url, "https://auth.example.com/authorize");
+        assert_eq!(
+            flow.flow_kind,
+            crate::domain::auth::OAuthFlowKind::DevicePoll
+        );
+    }
+
+    #[test]
+    fn oauth_result_from_wire_maps_status_and_preserves_provider() {
+        let success = oauth_result_from_wire(OAuthResultDto {
+            provider: "openai".into(),
+            success: true,
+            message: "connected".into(),
+        });
+        assert_eq!(success.provider, "openai");
+        assert_eq!(success.status, OAuthResultStatus::Success);
+        assert_eq!(success.message, "connected");
+
+        let failure = oauth_result_from_wire(OAuthResultDto {
+            provider: "anthropic".into(),
+            success: false,
+            message: "authorization denied".into(),
+        });
+        assert_eq!(failure.provider, "anthropic");
+        assert_eq!(failure.status, OAuthResultStatus::Failure);
+        assert_eq!(failure.message, "authorization denied");
     }
 
     #[test]

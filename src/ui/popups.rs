@@ -2724,8 +2724,8 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 )));
             }
 
-            if let Some((success, ref msg)) = app.auth_result_message {
-                let style = if success {
+            if let Some(result) = app.auth_last_result_for_provider(&provider.provider) {
+                let style = if result.is_success() {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
                         .bg(Theme::bg_dim())
@@ -2734,7 +2734,10 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                         .fg(Theme::err())
                         .bg(Theme::bg_dim())
                 };
-                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", result.message),
+                    style,
+                )));
             }
 
             for (i, line) in lines.into_iter().enumerate() {
@@ -2807,8 +2810,8 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(input_text, input_style),
             ]));
 
-            if let Some((success, ref msg)) = app.auth_result_message {
-                let style = if success {
+            if let Some(result) = app.auth_last_result_for_provider(&provider.provider) {
+                let style = if result.is_success() {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
                         .bg(Theme::bg_dim())
@@ -2817,7 +2820,10 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                         .fg(Theme::err())
                         .bg(Theme::bg_dim())
                 };
-                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", result.message),
+                    style,
+                )));
             }
 
             for (i, line) in lines.into_iter().enumerate() {
@@ -2897,8 +2903,8 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 )));
             }
 
-            if let Some((success, ref msg)) = app.auth_result_message {
-                let style = if success {
+            if let Some(result) = app.auth_last_result_for_provider(&provider.provider) {
+                let style = if result.is_success() {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
                         .bg(Theme::bg_dim())
@@ -2907,7 +2913,10 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                         .fg(Theme::err())
                         .bg(Theme::bg_dim())
                 };
-                lines.push(Line::from(Span::styled(format!(" {msg}"), style)));
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", result.message),
+                    style,
+                )));
             }
 
             for (i, line) in lines.into_iter().enumerate() {
