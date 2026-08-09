@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::command::Command;
+use crate::command::SessionListRequest;
 use crate::domain::auth::{AuthMethod, AuthProviderEntry, OAuthFlowKind};
-
-pub(crate) use crate::command::SessionListRequest;
 
 // --- Client → Server messages ---
 
@@ -160,101 +158,48 @@ pub enum ClientMsg {
     },
 }
 
-impl From<Command> for ClientMsg {
-    fn from(command: Command) -> Self {
-        match command {
-            Command::ListSessions { request, cursor } => {
-                let (mode, limit, cwd, include_remote) = match &request {
-                    SessionListRequest::Discovery => (None, None, None, Some(true)),
-                    SessionListRequest::WorkspaceFirstPage { cwd }
-                    | SessionListRequest::WorkspaceContinuation { cwd } => {
-                        (Some("group".to_string()), Some(10), Some(cwd.clone()), None)
-                    }
-                };
-                Self::ListSessions {
-                    request,
-                    mode,
-                    cursor,
-                    limit,
-                    cwd,
-                    query: None,
-                    include_remote,
-                    session_scope: SessionScope::Root,
-                }
-            }
-            Command::ListRemoteSessions {
-                node_id,
-                offset,
-                limit,
-            } => Self::ListRemoteSessions {
-                node_id,
-                offset: Some(offset),
-                limit: Some(limit),
-            },
-            Command::CreateMeshInvite {
-                mesh_name,
-                ttl,
-                max_uses,
-            } => Self::CreateMeshInvite {
-                mesh_name,
-                ttl,
-                max_uses,
-            },
-            Command::ListSessionChildren {
-                parent_session_id,
-                cursor,
-                limit,
-            } => Self::ListSessionChildren {
-                parent_session_id,
-                cursor,
-                limit: Some(limit),
-                session_scope: SessionScope::Forks,
-            },
-            Command::SetReasoningEffort { reasoning_effort } => {
-                Self::SetReasoningEffort { reasoning_effort }
-            }
-            Command::ListProfileAgents { profile_id } => Self::ListProfileAgents { profile_id },
-            Command::SetDelegateModel {
-                session_id,
-                agent_id,
-                model_id,
-                node_id,
-            } => Self::SetDelegateModel {
-                session_id,
-                agent_id,
-                model_id,
-                node_id,
-            },
-            Command::LoadSession { session_id, cwd } => Self::LoadSession { session_id, cwd },
-            Command::SubscribeSession {
-                session_id,
-                agent_id,
-            } => Self::SubscribeSession {
-                session_id,
-                agent_id,
-            },
-            Command::GetFileIndex => Self::GetFileIndex,
-            Command::SetAgentMode { mode } => Self::SetAgentMode { mode },
-            Command::ListAuthProviders => Self::ListAuthProviders,
-        }
-    }
-}
-
 impl ClientMsg {
     pub fn list_sessions_browse() -> Self {
-        Command::list_sessions_browse().into()
+        Self::list_sessions_discovery(None)
     }
 
     pub fn list_sessions_discovery(cursor: Option<String>) -> Self {
-        Command::list_sessions_discovery(cursor).into()
+        Self::ListSessions {
+            request: SessionListRequest::Discovery,
+            mode: None,
+            cursor,
+            limit: None,
+            cwd: None,
+            query: None,
+            include_remote: Some(true),
+            session_scope: SessionScope::Root,
+        }
     }
 
     pub fn list_sessions_workspace(cwd: String) -> Self {
-        Command::list_sessions_workspace(cwd).into()
+        Self::ListSessions {
+            request: SessionListRequest::WorkspaceFirstPage { cwd: cwd.clone() },
+            mode: Some("group".to_string()),
+            cursor: None,
+            limit: Some(10),
+            cwd: Some(cwd),
+            query: None,
+            include_remote: None,
+            session_scope: SessionScope::Root,
+        }
     }
 
     pub fn list_sessions_group(cwd: String, cursor: String) -> Self {
-        Command::list_sessions_group(cwd, cursor).into()
+        Self::ListSessions {
+            request: SessionListRequest::WorkspaceContinuation { cwd: cwd.clone() },
+            mode: Some("group".to_string()),
+            cursor: Some(cursor),
+            limit: Some(10),
+            cwd: Some(cwd),
+            query: None,
+            include_remote: None,
+            session_scope: SessionScope::Root,
+        }
     }
 
     pub fn list_session_children(
@@ -262,193 +207,12 @@ impl ClientMsg {
         cursor: Option<String>,
         limit: u32,
     ) -> Self {
-        Command::list_session_children(parent_session_id, cursor, limit).into()
-    }
-}
-
-#[cfg(test)]
-mod command_conversion_tests {
-    use super::{ClientMsg, SessionListRequest, SessionScope};
-    use crate::command::Command;
-
-    #[test]
-    fn list_session_commands_preserve_semantics_and_bound_wire_fields() {
-        let discovery = ClientMsg::from(Command::list_sessions_discovery(Some("root-2".into())));
-        assert!(matches!(
-            discovery,
-            ClientMsg::ListSessions {
-                request: SessionListRequest::Discovery,
-                mode: None,
-                cursor: Some(cursor),
-                limit: None,
-                cwd: None,
-                query: None,
-                include_remote: Some(true),
-                session_scope: SessionScope::Root,
-            } if cursor == "root-2"
-        ));
-
-        let first = ClientMsg::from(Command::list_sessions_workspace("/repo".into()));
-        assert!(matches!(
-            first,
-            ClientMsg::ListSessions {
-                request: SessionListRequest::WorkspaceFirstPage { cwd: request_cwd },
-                mode: Some(mode),
-                cursor: None,
-                limit: Some(10),
-                cwd: Some(wire_cwd),
-                query: None,
-                include_remote: None,
-                session_scope: SessionScope::Root,
-            } if request_cwd == "/repo" && mode == "group" && wire_cwd == "/repo"
-        ));
-
-        let continuation = ClientMsg::from(Command::list_sessions_group(
-            "/repo".into(),
-            "workspace-2".into(),
-        ));
-        assert!(matches!(
-            continuation,
-            ClientMsg::ListSessions {
-                request: SessionListRequest::WorkspaceContinuation { cwd: request_cwd },
-                mode: Some(mode),
-                cursor: Some(cursor),
-                limit: Some(10),
-                cwd: Some(wire_cwd),
-                query: None,
-                include_remote: None,
-                session_scope: SessionScope::Root,
-            } if request_cwd == "/repo"
-                && mode == "group"
-                && cursor == "workspace-2"
-                && wire_cwd == "/repo"
-        ));
-
-        let children = ClientMsg::from(Command::list_session_children(
-            "parent-1".into(),
-            Some("child-2".into()),
-            25,
-        ));
-        assert!(matches!(
-            children,
-            ClientMsg::ListSessionChildren {
-                parent_session_id,
-                cursor: Some(cursor),
-                limit: Some(25),
-                session_scope: SessionScope::Forks,
-            } if parent_session_id == "parent-1" && cursor == "child-2"
-        ));
-    }
-
-    #[test]
-    fn mesh_and_model_commands_convert_exactly() {
-        let remote = ClientMsg::from(Command::ListRemoteSessions {
-            node_id: "node-1".into(),
-            offset: 5,
-            limit: 50,
-        });
-        assert!(matches!(
-            remote,
-            ClientMsg::ListRemoteSessions {
-                node_id,
-                offset: Some(5),
-                limit: Some(50),
-            } if node_id == "node-1"
-        ));
-
-        let invite = ClientMsg::from(Command::CreateMeshInvite {
-            mesh_name: Some("team".into()),
-            ttl: Some("24h".into()),
-            max_uses: Some(3),
-        });
-        assert!(matches!(
-            invite,
-            ClientMsg::CreateMeshInvite {
-                mesh_name: Some(mesh_name),
-                ttl: Some(ttl),
-                max_uses: Some(3),
-            } if mesh_name == "team" && ttl == "24h"
-        ));
-
-        let effort = ClientMsg::from(Command::SetReasoningEffort {
-            reasoning_effort: "high".into(),
-        });
-        assert!(matches!(
-            effort,
-            ClientMsg::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
-        ));
-
-        let agents = ClientMsg::from(Command::ListProfileAgents {
-            profile_id: "code".into(),
-        });
-        assert!(matches!(
-            agents,
-            ClientMsg::ListProfileAgents { profile_id } if profile_id == "code"
-        ));
-
-        let delegate = ClientMsg::from(Command::SetDelegateModel {
-            session_id: "session-1".into(),
-            agent_id: "reviewer".into(),
-            model_id: Some("provider/model".into()),
-            node_id: Some("node-2".into()),
-        });
-        assert!(matches!(
-            delegate,
-            ClientMsg::SetDelegateModel {
-                session_id,
-                agent_id,
-                model_id: Some(model_id),
-                node_id: Some(node_id),
-            } if session_id == "session-1"
-                && agent_id == "reviewer"
-                && model_id == "provider/model"
-                && node_id == "node-2"
-        ));
-    }
-
-    #[test]
-    fn session_and_input_commands_convert_exactly() {
-        let load = ClientMsg::from(Command::LoadSession {
-            session_id: "session-1".into(),
-            cwd: Some("/repo".into()),
-        });
-        assert!(matches!(
-            load,
-            ClientMsg::LoadSession {
-                session_id,
-                cwd: Some(cwd),
-            } if session_id == "session-1" && cwd == "/repo"
-        ));
-
-        let subscribe = ClientMsg::from(Command::SubscribeSession {
-            session_id: "session-1".into(),
-            agent_id: Some("agent-1".into()),
-        });
-        assert!(matches!(
-            subscribe,
-            ClientMsg::SubscribeSession {
-                session_id,
-                agent_id: Some(agent_id),
-            } if session_id == "session-1" && agent_id == "agent-1"
-        ));
-
-        assert!(matches!(
-            ClientMsg::from(Command::GetFileIndex),
-            ClientMsg::GetFileIndex
-        ));
-
-        let mode = ClientMsg::from(Command::SetAgentMode {
-            mode: "plan".into(),
-        });
-        assert!(matches!(
-            mode,
-            ClientMsg::SetAgentMode { mode } if mode == "plan"
-        ));
-
-        assert!(matches!(
-            ClientMsg::from(Command::ListAuthProviders),
-            ClientMsg::ListAuthProviders
-        ));
+        Self::ListSessionChildren {
+            parent_session_id,
+            cursor,
+            limit: Some(limit),
+            session_scope: SessionScope::Forks,
+        }
     }
 }
 
@@ -782,6 +546,39 @@ mod client_msg_tests {
                     "agent_id": "coder",
                     "model_id": "openai/gpt-5",
                     "node_id": "node-1"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_serializes_exact_shape() {
+        let value = serde_json::to_value(ClientMsg::Prompt {
+            prompt: vec![
+                super::PromptBlock::Text {
+                    text: "inspect this".into(),
+                },
+                super::PromptBlock::ResourceLink {
+                    name: "main.rs".into(),
+                    uri: "file:///repo/src/main.rs".into(),
+                },
+            ],
+            local_id: "local-1".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "prompt",
+                "data": {
+                    "prompt": [
+                        { "type": "text", "data": { "text": "inspect this" } },
+                        {
+                            "type": "resource_link",
+                            "data": { "name": "main.rs", "uri": "file:///repo/src/main.rs" }
+                        }
+                    ]
                 }
             })
         );

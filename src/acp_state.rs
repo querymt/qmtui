@@ -386,10 +386,12 @@ impl crate::app::App {
                         self.streaming_cache.invalidate();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.session_id {
-                            return vec![Command::LoadSession {
-                                session_id: sid.clone(),
-                                cwd: self.current_session_cwd(),
-                            }];
+                            return Command::load_session_commands(
+                                sid.clone(),
+                                self.current_session_cwd(),
+                                self.agent_id.clone(),
+                            )
+                            .into();
                         }
                     }
                     UndoResult::Rejected {
@@ -421,10 +423,12 @@ impl crate::app::App {
                             self.build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(LogLevel::Info, "session", "redone - reloading session");
                         if let Some(ref sid) = self.session_id {
-                            return vec![Command::LoadSession {
-                                session_id: sid.clone(),
-                                cwd: self.current_session_cwd(),
-                            }];
+                            return Command::load_session_commands(
+                                sid.clone(),
+                                self.current_session_cwd(),
+                                self.agent_id.clone(),
+                            )
+                            .into();
                         }
                     }
                     RedoResult::Rejected { message, stack } => {
@@ -449,16 +453,12 @@ impl crate::app::App {
                     } => {
                         self.popup = Popup::None;
                         self.set_status(LogLevel::Info, "fork", "forked - loading session");
-                        return vec![
-                            Command::LoadSession {
-                                session_id: forked_session_id.clone(),
-                                cwd: self.current_session_cwd(),
-                            },
-                            Command::SubscribeSession {
-                                session_id: forked_session_id,
-                                agent_id: self.agent_id.clone(),
-                            },
-                        ];
+                        return Command::load_session_commands(
+                            forked_session_id,
+                            self.current_session_cwd(),
+                            self.agent_id.clone(),
+                        )
+                        .into();
                     }
                     ForkResult::Succeeded {
                         source_session_id: _,
@@ -2532,8 +2532,9 @@ mod tests {
     }
 
     #[test]
-    fn native_remote_attach_loads_attached_session() {
+    fn native_remote_attach_loads_and_subscribes_once() {
         let mut app = App::new();
+        app.agent_id = Some("agent-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
             RemoteSessionAttachInfo {
@@ -2548,7 +2549,12 @@ mod tests {
         assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
         assert!(matches!(
             replies.as_slice(),
-            [Command::LoadSession { session_id, .. }] if session_id == "remote-1"
+            [
+                Command::LoadSession { session_id: load_id, .. },
+                Command::SubscribeSession { session_id: subscribe_id, agent_id },
+            ] if load_id == "remote-1"
+                && subscribe_id == "remote-1"
+                && agent_id.as_deref() == Some("agent-1")
         ));
     }
 
@@ -3564,6 +3570,7 @@ mod tests {
     fn native_undo_result_success_updates_state_and_reloads_session() {
         let mut app = App::new();
         app.session_id = Some("session-1".into());
+        app.agent_id = Some("agent-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.undoable_turns.push(UndoableTurn {
             turn_id: "u1".into(),
@@ -3589,7 +3596,13 @@ mod tests {
         );
         assert!(matches!(
             replies.as_slice(),
-            [Command::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
+            [
+                Command::LoadSession { session_id: load_id, cwd },
+                Command::SubscribeSession { session_id: subscribe_id, agent_id },
+            ] if load_id == "session-1"
+                && subscribe_id == "session-1"
+                && cwd.is_none()
+                && agent_id.as_deref() == Some("agent-1")
         ));
     }
 
@@ -3685,6 +3698,7 @@ mod tests {
     fn native_redo_result_success_rebuilds_state_and_reloads_session() {
         let mut app = App::new();
         app.session_id = Some("session-1".into());
+        app.agent_id = Some("agent-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Redo);
 
         let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResult::Applied {
@@ -3699,7 +3713,13 @@ mod tests {
         assert!(app.can_redo());
         assert!(matches!(
             replies.as_slice(),
-            [Command::LoadSession { session_id, cwd }] if session_id == "session-1" && cwd.is_none()
+            [
+                Command::LoadSession { session_id: load_id, cwd },
+                Command::SubscribeSession { session_id: subscribe_id, agent_id },
+            ] if load_id == "session-1"
+                && subscribe_id == "session-1"
+                && cwd.is_none()
+                && agent_id.as_deref() == Some("agent-1")
         ));
     }
 
@@ -3741,6 +3761,7 @@ mod tests {
         assert_eq!(app.pending_fork_message_id, None);
         assert_eq!(app.popup, Popup::None);
         assert_eq!(app.status, "forked - loading session");
+        assert_eq!(replies.len(), 2);
         assert!(matches!(
             replies.as_slice(),
             [
