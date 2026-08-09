@@ -19,7 +19,8 @@ pub(super) const COLLAPSE_CLOSED: &str = "\u{25B8}"; // ▸ collapsed group
 ///
 /// Returned by [`build_start_page_rows`] and consumed by [`draw_start`].
 pub(crate) struct StartPageRow {
-    /// The logical item this row represents.
+    /// The logical item this row represents in rendering fixtures.
+    #[cfg(test)]
     pub(crate) item: crate::app::StartPageItem,
     /// Pre-rendered line (spans already styled).
     pub(crate) line: Line<'static>,
@@ -137,6 +138,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
         };
 
         rows.push(StartPageRow {
+            #[cfg(test)]
             item: item.clone(),
             line,
             selected,

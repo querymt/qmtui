@@ -6,12 +6,14 @@ pub struct ProfileInfo {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[allow(dead_code)] // Preserved from the profile catalog wire contract.
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
     pub config_kind: Option<String>,
+    #[allow(dead_code)] // Preserved from the profile catalog wire contract.
     #[serde(default)]
     pub fingerprint: Option<String>,
 }
@@ -20,8 +22,10 @@ pub struct ProfileInfo {
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
+    #[allow(dead_code)] // Preserved from the profile-agent wire contract.
     #[serde(default)]
     pub description: Option<String>,
+    #[allow(dead_code)] // Preserved from the profile-agent wire contract.
     #[serde(default)]
     pub capabilities: Vec<String>,
 }

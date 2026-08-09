@@ -14,8 +14,6 @@ pub enum ServerEvent {
     Starting,
     /// ACP process is running and the client connection is active.
     Started,
-    /// No `qmtcode` binary could be found.
-    BinaryNotFound,
     /// ACP process failed to start or connect.
     StartFailed { error: String },
     /// ACP process exited.
@@ -27,7 +25,6 @@ pub enum ServerEvent {
 pub enum ServerState {
     #[default]
     Disabled,
-    BinaryNotFound,
     Starting,
     Running,
     StartFailed {
@@ -77,10 +74,6 @@ pub fn find_binary_info(configured_path: Option<&str>) -> BinaryDiscovery {
         configured_exists,
         used_path_lookup,
     }
-}
-
-pub fn find_binary(configured_path: Option<&str>) -> Option<OsString> {
-    find_binary_info(configured_path).binary
 }
 
 pub fn build_acp_argv(binary: OsString, args: Vec<String>) -> Vec<String> {
