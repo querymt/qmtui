@@ -24,6 +24,26 @@ fn tick_from_elapsed(elapsed: Duration) -> u64 {
     (elapsed.as_millis() / 80) as u64
 }
 
+fn send_command(
+    cmd_tx: &mpsc::UnboundedSender<ClientMsg>,
+    command: Command,
+    agent_id: &Option<String>,
+) -> anyhow::Result<()> {
+    let load_session_id = match &command {
+        Command::LoadSession { session_id, .. } => Some(session_id.clone()),
+        _ => None,
+    };
+
+    cmd_tx.send(command.into())?;
+    if let Some(session_id) = load_session_id {
+        cmd_tx.send(ClientMsg::SubscribeSession {
+            session_id,
+            agent_id: agent_id.clone(),
+        })?;
+    }
+    Ok(())
+}
+
 pub(super) async fn run_loop(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -85,16 +105,7 @@ pub(super) async fn run_loop(
             }
             Some(ServerChannelMsg::Acp(event)) = srv_rx.recv() => {
                 for command in app.handle_acp_event(event) {
-                    if let Command::LoadSession { ref session_id, .. } = command {
-                        let sid = session_id.clone();
-                        cmd_tx.send(command.into())?;
-                        cmd_tx.send(ClientMsg::SubscribeSession {
-                            session_id: sid,
-                            agent_id: app.agent_id.clone(),
-                        })?;
-                    } else {
-                        cmd_tx.send(command.into())?;
-                    }
+                    send_command(cmd_tx, command, &app.agent_id)?;
                 }
             }
             Some(sup_event) = sup_rx.recv() => {
@@ -186,7 +197,41 @@ pub(super) async fn run_loop(
 mod tests {
     use std::time::Duration;
 
-    use super::tick_from_elapsed;
+    use tokio::sync::mpsc;
+
+    use super::{send_command, tick_from_elapsed};
+    use crate::{command::Command, protocol::ClientMsg};
+
+    #[test]
+    fn load_session_command_sends_load_and_subscribe() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        send_command(
+            &tx,
+            Command::LoadSession {
+                session_id: "session-1".into(),
+                cwd: Some("/repo".into()),
+            },
+            &Some("agent-1".into()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ClientMsg::LoadSession {
+                session_id,
+                cwd: Some(cwd),
+            } if session_id == "session-1" && cwd == "/repo"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ClientMsg::SubscribeSession {
+                session_id,
+                agent_id: Some(agent_id),
+            } if session_id == "session-1" && agent_id == "agent-1"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn tick_from_elapsed_zero_is_zero() {
