@@ -537,6 +537,13 @@ pub enum ModelPopupItem {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthUiNotice {
+    pub provider: Option<String>,
+    pub success: bool,
+    pub message: String,
+}
+
 /// Which sub-panel is active in the provider auth popup.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AuthPanel {
@@ -744,6 +751,7 @@ pub struct App {
     pub auth_oauth_response: String,
     pub auth_oauth_response_cursor: usize,
     pub auth_last_result: Option<OAuthResult>,
+    pub auth_ui_notice: Option<AuthUiNotice>,
     /// When clipboard copy fails, store the URL here for a fallback display popup.
     pub auth_clipboard_fallback: Option<String>,
 
@@ -969,6 +977,7 @@ impl App {
             auth_oauth_response: String::new(),
             auth_oauth_response_cursor: 0,
             auth_last_result: None,
+            auth_ui_notice: None,
             auth_clipboard_fallback: None,
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
@@ -1137,6 +1146,7 @@ impl App {
         self.auth_oauth_response.clear();
         self.auth_oauth_response_cursor = 0;
         self.auth_last_result = None;
+        self.auth_ui_notice = None;
         self.auth_clipboard_fallback = None;
     }
 
@@ -1150,13 +1160,24 @@ impl App {
         self.auth_oauth_response.clear();
         self.auth_oauth_response_cursor = 0;
         self.auth_last_result = None;
+        self.auth_ui_notice = None;
         self.auth_clipboard_fallback = None;
     }
 
-    pub fn auth_last_result_for_provider(&self, provider: &str) -> Option<&OAuthResult> {
+    pub fn auth_feedback_for_provider(&self, provider: &str) -> Option<(bool, &str)> {
+        if let Some(notice) = self.auth_ui_notice.as_ref().filter(|notice| {
+            notice
+                .provider
+                .as_deref()
+                .is_none_or(|notice_provider| notice_provider == provider)
+        }) {
+            return Some((notice.success, notice.message.as_str()));
+        }
+
         self.auth_last_result
             .as_ref()
             .filter(|result| result.provider == provider)
+            .map(|result| (result.is_success(), result.message.as_str()))
     }
 
     pub fn profile_by_id(&self, profile_id: &str) -> Option<&ProfileInfo> {
