@@ -518,6 +518,21 @@ mod client_msg_tests {
     }
 
     #[test]
+    fn set_oauth_auth_method_serializes_exact_shape() {
+        assert_eq!(
+            serde_json::to_value(ClientMsg::SetAuthMethod {
+                provider: "openai".into(),
+                method: AuthMethod::OAuth,
+            })
+            .unwrap(),
+            json!({
+                "type": "set_auth_method",
+                "data": { "provider": "openai", "method": "oauth" }
+            })
+        );
+    }
+
+    #[test]
     fn delegate_profile_messages_serialize() {
         let agents = serde_json::to_value(ClientMsg::ListProfileAgents {
             profile_id: "quorum".into(),
