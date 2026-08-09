@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use crate::app::{App, LogLevel, Popup};
+use crate::command::Command;
 use crate::protocol::{
-    ClientMsg, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionInfo,
-    RemoteSessionListInfo,
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionInfo, RemoteSessionListInfo,
 };
 
 const INVITE_ERROR_TTL: Duration = Duration::from_secs(5);
@@ -108,7 +108,7 @@ impl App {
         self.push_log(LogLevel::Info, "mesh", format!("mesh invite: {url}"));
     }
 
-    pub fn mesh_invite_form_command(&mut self) -> Option<ClientMsg> {
+    pub fn mesh_invite_form_command(&mut self) -> Option<Command> {
         let max_uses = match self.mesh_invite_max_uses.trim().parse::<u32>() {
             Ok(max_uses) if max_uses > 0 => max_uses,
             Ok(_) => {
@@ -130,7 +130,7 @@ impl App {
         let mesh_name = (!self.mesh_invite_name.trim().is_empty())
             .then(|| self.mesh_invite_name.trim().to_string());
         self.clear_mesh_error();
-        Some(ClientMsg::CreateMeshInvite {
+        Some(Command::CreateMeshInvite {
             mesh_name,
             ttl,
             max_uses: Some(max_uses),
@@ -152,7 +152,7 @@ impl App {
         );
     }
 
-    pub fn apply_mesh_nodes(&mut self, nodes: MeshNodesInfo) -> Vec<ClientMsg> {
+    pub fn apply_mesh_nodes(&mut self, nodes: MeshNodesInfo) -> Vec<Command> {
         self.mesh_node_count = Some(nodes.nodes.len() as u32);
         self.mesh_nodes = nodes.nodes;
         if self.mesh_node_cursor >= self.mesh_nodes.len() {
@@ -164,10 +164,10 @@ impl App {
             format!("mesh nodes: {}", self.mesh_nodes.len()),
         );
         self.selected_mesh_node_id()
-            .map(|node_id| ClientMsg::ListRemoteSessions {
+            .map(|node_id| Command::ListRemoteSessions {
                 node_id: node_id.to_string(),
-                offset: Some(0),
-                limit: Some(50),
+                offset: 0,
+                limit: 50,
             })
             .into_iter()
             .collect()
@@ -192,21 +192,21 @@ impl App {
         session_id: &str,
         node_id: &str,
         attached: bool,
-    ) -> Vec<ClientMsg> {
+    ) -> Vec<Command> {
         self.remember_remote_session_node(session_id, node_id);
         if attached {
             self.popup = Popup::None;
             self.set_status(LogLevel::Info, "mesh", "remote session attached");
-            vec![ClientMsg::LoadSession {
+            vec![Command::LoadSession {
                 session_id: session_id.to_string(),
                 cwd: self.current_session_cwd(),
             }]
         } else {
             self.set_status(LogLevel::Info, "mesh", "remote session created");
-            vec![ClientMsg::ListRemoteSessions {
+            vec![Command::ListRemoteSessions {
                 node_id: node_id.to_string(),
-                offset: Some(0),
-                limit: Some(50),
+                offset: 0,
+                limit: 50,
             }]
         }
     }
@@ -235,7 +235,7 @@ impl App {
             .get(self.remote_session_cursor)
     }
 
-    pub fn move_mesh_node_cursor(&mut self, delta: isize) -> Option<ClientMsg> {
+    pub fn move_mesh_node_cursor(&mut self, delta: isize) -> Option<Command> {
         let len = self.mesh_nodes.len();
         if len == 0 {
             self.mesh_node_cursor = 0;
@@ -245,10 +245,10 @@ impl App {
             (self.mesh_node_cursor as isize + delta).rem_euclid(len as isize) as usize;
         self.remote_session_cursor = 0;
         self.selected_mesh_node_id()
-            .map(|node_id| ClientMsg::ListRemoteSessions {
+            .map(|node_id| Command::ListRemoteSessions {
                 node_id: node_id.to_string(),
-                offset: Some(0),
-                limit: Some(50),
+                offset: 0,
+                limit: 50,
             })
     }
 

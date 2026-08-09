@@ -3352,6 +3352,7 @@ mod runtime_tests {
 mod auth_tests {
     use super::*;
     use crate::app::AuthUiNotice;
+    use crate::command::Command;
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
@@ -3943,7 +3944,7 @@ mod auth_tests {
         }));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
+        assert!(matches!(cmds[0], Command::ListAuthProviders));
         assert!(app.auth_oauth_flow.is_none());
         assert_eq!(app.auth_panel, app::AuthPanel::List);
         assert_eq!(
@@ -3976,7 +3977,7 @@ mod auth_tests {
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(result.clone()));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], ClientMsg::ListAuthProviders));
+        assert!(matches!(cmds[0], Command::ListAuthProviders));
         assert_eq!(app.auth_oauth_flow, Some(flow));
         assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
         assert_eq!(app.auth_last_result, Some(result));

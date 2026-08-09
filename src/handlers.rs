@@ -257,7 +257,7 @@ fn open_session_popup(
     app.session_cursor = 0;
     app.session_filter.clear();
     if let Some(request) = app.begin_session_discovery() {
-        cmd_tx.send(request)?;
+        cmd_tx.send(request.into())?;
     }
     Ok(())
 }
@@ -355,7 +355,7 @@ pub(crate) fn handle_mesh_popup_key(
         KeyCode::Up => match app.mesh_focus {
             crate::mesh::MeshFocus::Nodes => {
                 if let Some(msg) = app.move_mesh_node_cursor(-1) {
-                    cmd_tx.send(msg)?;
+                    cmd_tx.send(msg.into())?;
                 }
             }
             crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(-1),
@@ -363,7 +363,7 @@ pub(crate) fn handle_mesh_popup_key(
         KeyCode::Down => match app.mesh_focus {
             crate::mesh::MeshFocus::Nodes => {
                 if let Some(msg) = app.move_mesh_node_cursor(1) {
-                    cmd_tx.send(msg)?;
+                    cmd_tx.send(msg.into())?;
                 }
             }
             crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(1),
@@ -446,7 +446,7 @@ pub(crate) fn handle_mesh_invite_popup_key(
         },
         KeyCode::Enter => {
             if let Some(msg) = app.mesh_invite_form_command() {
-                cmd_tx.send(msg)?;
+                cmd_tx.send(msg.into())?;
                 app.set_status(app::LogLevel::Info, "mesh", "creating invite...");
             }
         }
@@ -578,7 +578,7 @@ pub(crate) fn handle_key(
         }
         match app.cycle_reasoning_effort() {
             Some(msg) => {
-                cmd_tx.send(msg)?;
+                cmd_tx.send(msg.into())?;
                 app.set_status(
                     app::LogLevel::Info,
                     "model",
@@ -884,7 +884,7 @@ pub(crate) fn handle_sessions_key(
                 parent_path,
             } => {
                 if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request)?;
+                    cmd_tx.send(request.into())?;
                 }
             }
             SessionKeyAction::None => {}
@@ -943,7 +943,7 @@ pub(crate) fn handle_sessions_key(
                 app.session_child_page_request(group_idx, &parent_path)
             };
             if let Some(request) = request {
-                cmd_tx.send(request)?;
+                cmd_tx.send(request.into())?;
             }
         }
         SessionKeyAction::None => {}
@@ -983,7 +983,7 @@ pub(crate) fn handle_session_popup_key(
                 parent_path,
             } => {
                 if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request)?;
+                    cmd_tx.send(request.into())?;
                 }
             }
             SessionKeyAction::None => {}
@@ -1039,7 +1039,7 @@ pub(crate) fn handle_session_popup_key(
                 app.session_child_page_request(group_idx, &parent_path)
             };
             if let Some(request) = request {
-                cmd_tx.send(request)?;
+                cmd_tx.send(request.into())?;
             }
         }
         SessionKeyAction::NewSession | SessionKeyAction::None => {}
@@ -1701,7 +1701,7 @@ pub(crate) fn handle_chat_key(
             // 3. Accept mention completion.
             if app.mention_state.is_some() && app.accept_selected_mention() {
                 if let Some(msg) = app.request_file_index_if_needed() {
-                    cmd_tx.send(msg)?;
+                    cmd_tx.send(msg.into())?;
                 }
                 return Ok(AppAction::None);
             }
@@ -1749,13 +1749,13 @@ pub(crate) fn handle_chat_key(
                 && app.accept_selected_mention()
                 && let Some(msg) = app.request_file_index_if_needed()
             {
-                cmd_tx.send(msg)?;
+                cmd_tx.send(msg.into())?;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
             app.input_insert(c);
             if let Some(msg) = app.request_file_index_if_needed() {
-                cmd_tx.send(msg)?;
+                cmd_tx.send(msg.into())?;
             }
         }
         KeyCode::Up => {
@@ -1974,7 +1974,7 @@ fn try_execute_slash_command(
                         return Ok(SlashResult::Handled);
                     }
                     let msg = app.set_reasoning_effort(Some(&level)).unwrap();
-                    cmd_tx.send(msg)?;
+                    cmd_tx.send(msg.into())?;
                     app.set_status(
                         app::LogLevel::Info,
                         "model",
@@ -2031,7 +2031,7 @@ fn try_execute_slash_command(
             app.session_cursor = 0;
             app.session_filter.clear();
             if let Some(request) = app.begin_session_discovery() {
-                cmd_tx.send(request)?;
+                cmd_tx.send(request.into())?;
             }
         }
         "delegates" => {

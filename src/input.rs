@@ -2,7 +2,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::app::{App, FileIndexEntryLite, MentionState, SlashCompletionState};
-use crate::protocol::ClientMsg;
+use crate::command::Command;
 use crate::ui::build_input_visual_layout;
 
 impl App {
@@ -206,11 +206,11 @@ impl App {
         });
     }
 
-    pub fn request_file_index_if_needed(&mut self) -> Option<ClientMsg> {
+    pub fn request_file_index_if_needed(&mut self) -> Option<Command> {
         if self.mention_state.is_some() && self.file_index.is_empty() && !self.file_index_loading {
             self.file_index_loading = true;
             self.file_index_error = None;
-            return Some(ClientMsg::GetFileIndex);
+            return Some(Command::GetFileIndex);
         }
         None
     }
