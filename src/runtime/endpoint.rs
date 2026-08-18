@@ -38,6 +38,7 @@ pub(super) enum EndpointSelection {
         discovered_ws: Option<String>,
         missing_binary_fallback: bool,
     },
+    BinaryNotFound,
     Disabled,
 }
 

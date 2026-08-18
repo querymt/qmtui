@@ -23,23 +23,19 @@ pub enum ChatEntry {
         is_error: bool,
         detail: ToolDetail,
     },
-    #[allow(dead_code)] // Retained for compaction event rendering.
     CompactionStart {
         token_estimate: u32,
     },
-    #[allow(dead_code)] // Retained for compaction event rendering.
     CompactionEnd {
         token_estimate: Option<u32>,
         summary: String,
         summary_len: u32,
     },
-    #[allow(dead_code)] // Retained for informational replay entries.
     Info(String),
     Error(String),
     Elicitation {
         elicitation_id: String,
         message: String,
-        #[allow(dead_code)] // Retained to preserve elicitation origin metadata.
         source: String,
         /// None = pending; Some = responded with this outcome label.
         outcome: Option<String>,

@@ -25,7 +25,6 @@ thread_local! {
     static FRAME_THEME_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[allow(dead_code)] // Style helpers form the internal rendering palette, including reserved states.
 impl Theme {
     pub fn init(id: &str) {
         let idx = DARK_THEMES.iter().position(|t| t.id == id).unwrap_or(0);

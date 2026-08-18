@@ -11,33 +11,26 @@ pub struct SessionGroup {
 #[derive(Debug, Clone, Default)]
 pub struct SessionSummary {
     pub session_id: String,
-    #[allow(dead_code)] // Preserved from ACP session metadata.
     pub name: Option<String>,
     pub title: Option<String>,
     /// Working directory for this session (may differ from group cwd for remote sessions).
     pub cwd: Option<String>,
-    #[allow(dead_code)] // Preserved from ACP session metadata.
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     /// Parent session ID if this is a forked session.
     pub parent_session_id: Option<String>,
     pub fork_origin: Option<String>,
-    #[allow(dead_code)] // Preserved from ACP session metadata.
     pub session_kind: Option<String>,
     /// Whether this session has child (forked) sessions.
-    #[allow(dead_code)] // Preserved for native child-page merging and UI expansion.
     pub has_children: bool,
     /// Number of direct forked child sessions.
     pub fork_count: u64,
     pub children: Vec<SessionSummary>,
     pub children_next_cursor: Option<String>,
-    #[allow(dead_code)] // Preserved for native child-page pagination.
     pub children_total_count: Option<u64>,
     pub node: Option<String>,
     pub node_id: Option<String>,
-    #[allow(dead_code)] // Preserved from remote session metadata.
     pub attached: Option<bool>,
-    #[allow(dead_code)] // Preserved from remote session metadata.
     pub runtime_state: Option<String>,
 }
 
@@ -45,11 +38,9 @@ pub struct SessionSummary {
 pub struct SessionListPage {
     pub groups: Vec<SessionGroup>,
     pub next_cursor: Option<String>,
-    #[allow(dead_code)] // Preserved from the native ACP page response.
     pub total_count: Option<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct SessionChildrenPage {
     pub parent_session_id: String,

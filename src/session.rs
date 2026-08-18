@@ -50,7 +50,6 @@ fn matching_session_indices(group: &SessionGroup, q: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn session_by_id_mut<'a>(
     sessions: &'a mut [SessionSummary],
     session_id: &str,
@@ -66,7 +65,6 @@ fn session_by_id_mut<'a>(
     None
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fork_browsing_child(session: &SessionSummary) -> bool {
     session.fork_origin.as_deref() != Some("delegation")
 }
@@ -195,7 +193,6 @@ impl App {
         false
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge_session_children(&mut self, data: SessionChildrenPage) {
         let had_pending_request = self
             .pending_session_child_loads
@@ -253,7 +250,6 @@ impl App {
     /// Flat list of sessions that match the current filter, across all groups.
     ///
     /// Used by the session popup (which shows a flat list) for backward compatibility.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn filtered_sessions(&self) -> Vec<&SessionSummary> {
         let q = self.session_filter.to_lowercase();
         self.session_groups
@@ -701,7 +697,6 @@ impl App {
         );
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_session_count(&self) -> usize {
         const ACTIVE_SESSION_WINDOW: Duration = Duration::from_secs(5);
         let now = Instant::now();

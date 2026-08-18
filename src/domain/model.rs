@@ -18,8 +18,6 @@ pub struct ModelEntry {
     pub node_id: Option<String>,
     #[serde(default)]
     pub node_label: Option<String>,
-    #[allow(dead_code)] // Preserved from ACP model metadata for future presentation.
     pub family: Option<String>,
-    #[allow(dead_code)] // Preserved from ACP model metadata for future presentation.
     pub quant: Option<String>,
 }

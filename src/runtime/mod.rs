@@ -1532,7 +1532,7 @@ pub async fn run() -> anyhow::Result<()> {
             } | EndpointSelection::Endpoint {
                 missing_binary_fallback: true,
                 ..
-            }
+            } | EndpointSelection::BinaryNotFound
         ) {
             log_server_binary_discovery(&mut app, &cfg, &discovery);
         }
@@ -1557,6 +1557,10 @@ pub async fn run() -> anyhow::Result<()> {
             discovered_ws: _,
             missing_binary_fallback: _,
         } => (Some(endpoint), state),
+        EndpointSelection::BinaryNotFound => {
+            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
+            (None, server_manager::ServerState::BinaryNotFound)
+        }
         EndpointSelection::Disabled => (None, server_manager::ServerState::Disabled),
     };
 
@@ -1600,16 +1604,12 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 #[cfg(test)]
-struct PersistenceGuard {
-    _guard: config::TestPersistenceGuard,
-}
+struct PersistenceGuard(config::TestPersistenceGuard);
 
 #[cfg(test)]
 impl PersistenceGuard {
     fn new(label: &str) -> Self {
-        Self {
-            _guard: config::TestPersistenceGuard::new(label),
-        }
+        Self(config::TestPersistenceGuard::new(label))
     }
 }
 
@@ -3126,6 +3126,10 @@ mod reasoning_effort_integration_tests {
             family: None,
             quant: None,
         }
+    }
+
+    fn chord_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
     fn tab_key() -> KeyEvent {
