@@ -13,6 +13,10 @@ use crate::domain::activity::{
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
+use crate::domain::mesh::{
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
+    RemoteSessionListInfo,
+};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
@@ -20,10 +24,6 @@ use crate::domain::session::{
     UndoStackSnapshot, UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
-use crate::protocol::{
-    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
-    RemoteSessionListInfo,
-};
 use crate::tool_detail;
 
 #[derive(Debug, Clone, Default)]
@@ -313,11 +313,9 @@ impl crate::app::App {
                 self.apply_remote_sessions(list);
                 vec![]
             }
-            AcpAppEvent::RemoteSessionAttached(attached) => self.apply_remote_session_attached(
-                &attached.session_id,
-                &attached.node_id,
-                attached.attached,
-            ),
+            AcpAppEvent::RemoteSessionAttached(attached) => {
+                self.apply_remote_session_attached(attached)
+            }
             AcpAppEvent::SessionList { request, page } => {
                 self.apply_acp_session_list(request, page)
             }
@@ -2117,6 +2115,7 @@ mod tests {
     use super::*;
     use crate::app::{App, Screen};
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
+    use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
     use crate::domain::session::{SessionListPage, UndoFrame, UndoFrameStatus, UndoState};
 
@@ -2497,7 +2496,7 @@ mod tests {
         let mut app = App::new();
 
         let replies = app.handle_acp_event(AcpAppEvent::MeshNodes(MeshNodesInfo {
-            nodes: vec![crate::protocol::RemoteNodeInfo {
+            nodes: vec![RemoteNodeInfo {
                 id: "node-1".into(),
                 label: "framework".into(),
                 active_sessions: 2,
@@ -2512,6 +2511,37 @@ mod tests {
             [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
                 if node_id == "node-1"
         ));
+    }
+
+    #[test]
+    fn native_remote_sessions_store_values_and_clamp_cursor() {
+        let mut app = App::new();
+        app.mesh_nodes = vec![RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "Framework".into(),
+            ..Default::default()
+        }];
+        app.remote_session_cursor = 4;
+
+        let replies = app.handle_acp_event(AcpAppEvent::RemoteSessions(RemoteSessionListInfo {
+            node_id: "node-1".into(),
+            sessions: vec![RemoteSessionInfo {
+                id: "session-1".into(),
+                node_id: "node-1".into(),
+                title: Some("Boundary".into()),
+                ..Default::default()
+            }],
+            next_offset: Some(50),
+            total_count: 51,
+        }));
+
+        assert!(replies.is_empty());
+        assert_eq!(app.remote_session_cursor, 0);
+        assert_eq!(app.selected_remote_sessions()[0].id, "session-1");
+        assert_eq!(
+            app.selected_remote_sessions()[0].title.as_deref(),
+            Some("Boundary")
+        );
     }
 
     #[test]
@@ -2555,6 +2585,49 @@ mod tests {
             ] if load_id == "remote-1"
                 && subscribe_id == "remote-1"
                 && agent_id.as_deref() == Some("agent-1")
+        ));
+    }
+
+    #[test]
+    fn native_remote_attach_uses_current_cwd_and_detached_refreshes_sessions() {
+        let mut app = App::new();
+        app.agent_id = Some("agent-1".into());
+        app.launch_cwd = Some("/launch".into());
+
+        let attached = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
+            RemoteSessionAttachInfo {
+                session_id: "remote-1".into(),
+                node_id: "node-1".into(),
+                attached: true,
+                config_options: vec![Value::String("retained but unused".into())],
+                snapshot: serde_json::json!({ "retained": true }),
+            },
+        ));
+        assert!(matches!(
+            attached.as_slice(),
+            [
+                Command::LoadSession { session_id, cwd: Some(cwd) },
+                Command::SubscribeSession { session_id: subscribed_id, agent_id },
+            ] if session_id == "remote-1"
+                && cwd == "/launch"
+                && subscribed_id == "remote-1"
+                && agent_id.as_deref() == Some("agent-1")
+        ));
+
+        let detached = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
+            RemoteSessionAttachInfo {
+                session_id: "remote-2".into(),
+                node_id: "node-2".into(),
+                attached: false,
+                config_options: Vec::new(),
+                snapshot: Value::Null,
+            },
+        ));
+        assert_eq!(app.session_remote_node_id("remote-2"), Some("node-2"));
+        assert!(matches!(
+            detached.as_slice(),
+            [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
+                if node_id == "node-2"
         ));
     }
 

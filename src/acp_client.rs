@@ -21,6 +21,10 @@ use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::command::{Command, PromptBlock, SessionListRequest};
 use crate::domain::auth::{OAuthFlow, OAuthResult, OAuthResultStatus};
+use crate::domain::mesh::{
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshScopeInfo, MeshStatusInfo, RemoteNodeInfo,
+    RemoteSessionAttachInfo, RemoteSessionInfo, RemoteSessionListInfo,
+};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
@@ -28,9 +32,9 @@ use crate::domain::session::{
     UndoStackSnapshot,
 };
 use crate::protocol::{
-    AuthProvidersData, MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, OAuthFlowDto,
-    OAuthResultDto, RedoResultData, RemoteSessionAttachInfo, RemoteSessionListInfo, UndoResultData,
-    UndoStackFrame,
+    AuthProvidersData, MeshInviteCreatedDto, MeshNodesDto, MeshScopeDto, MeshStatusDto,
+    OAuthFlowDto, OAuthResultDto, RedoResultData, RemoteNodeDto, RemoteSessionAttachDto,
+    RemoteSessionDto, RemoteSessionListDto, UndoResultData, UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -677,9 +681,9 @@ async fn handle_websocket_text(
             if let Ok(nodes_resp) =
                 call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
                 && let Ok(nodes) =
-                    serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
+                    serde_json::from_value::<MeshNodesDto>(ext_payload(&nodes_resp).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(mesh_nodes_from_wire(nodes)));
             }
         }
         _ => {}
@@ -1346,15 +1350,18 @@ async fn handle_command<C: AcpConnection>(
             let status_resp =
                 call_querymt_ext(connection, "querymt/mesh/status", json!({})).await?;
             if let Ok(status) =
-                serde_json::from_value::<MeshStatusInfo>(ext_payload(&status_resp).clone())
+                serde_json::from_value::<MeshStatusDto>(ext_payload(&status_resp).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::MeshStatus(status));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::MeshStatus(mesh_status_from_wire(status)),
+                );
             }
             let nodes_resp = call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await?;
             if let Ok(nodes) =
-                serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
+                serde_json::from_value::<MeshNodesDto>(ext_payload(&nodes_resp).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(mesh_nodes_from_wire(nodes)));
             }
         }
         Command::ListRemoteSessions {
@@ -1369,9 +1376,12 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(list) =
-                serde_json::from_value::<RemoteSessionListInfo>(ext_payload(&response).clone())
+                serde_json::from_value::<RemoteSessionListDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::RemoteSessions(list));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::RemoteSessions(remote_session_list_from_wire(list)),
+                );
             }
         }
         Command::CreateRemoteSession { node_id, cwd } => {
@@ -1382,9 +1392,12 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(attached) =
-                serde_json::from_value::<RemoteSessionAttachInfo>(ext_payload(&response).clone())
+                serde_json::from_value::<RemoteSessionAttachDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::RemoteSessionAttached(remote_session_attach_from_wire(attached)),
+                );
             }
         }
         Command::AttachRemoteSession {
@@ -1398,9 +1411,12 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(attached) =
-                serde_json::from_value::<RemoteSessionAttachInfo>(ext_payload(&response).clone())
+                serde_json::from_value::<RemoteSessionAttachDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::RemoteSessionAttached(attached));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::RemoteSessionAttached(remote_session_attach_from_wire(attached)),
+                );
             }
         }
         Command::CreateMeshInvite {
@@ -1415,9 +1431,12 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(invite) =
-                serde_json::from_value::<MeshInviteCreatedInfo>(ext_payload(&response).clone())
+                serde_json::from_value::<MeshInviteCreatedDto>(ext_payload(&response).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::MeshInviteCreated(invite));
+                send_acp(
+                    srv_tx,
+                    AcpAppEvent::MeshInviteCreated(mesh_invite_created_from_wire(invite)),
+                );
             }
         }
         Command::ListSessionChildren { .. }
@@ -1517,6 +1536,93 @@ fn send_profiles(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, response: Acp
 fn load_session_cwd(cwd: Option<&str>, default_cwd: PathBuf) -> PathBuf {
     cwd.and_then(|cwd| (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd)))
         .unwrap_or(default_cwd)
+}
+
+fn mesh_status_from_wire(status: MeshStatusDto) -> MeshStatusInfo {
+    MeshStatusInfo {
+        enabled: status.enabled,
+        peer_id: status.peer_id,
+        transport: status.transport,
+        known_peer_count: status.known_peer_count,
+        has_invite_store: status.has_invite_store,
+        has_mesh_state_store: status.has_mesh_state_store,
+        scopes: status
+            .scopes
+            .into_iter()
+            .map(mesh_scope_from_wire)
+            .collect(),
+    }
+}
+
+fn mesh_scope_from_wire(scope: MeshScopeDto) -> MeshScopeInfo {
+    MeshScopeInfo {
+        kind: scope.kind,
+        id: scope.id,
+    }
+}
+
+fn remote_node_from_wire(node: RemoteNodeDto) -> RemoteNodeInfo {
+    RemoteNodeInfo {
+        id: node.id,
+        label: node.label,
+        capabilities: node.capabilities,
+        active_sessions: node.active_sessions,
+        transport: node.transport,
+        last_seen_at: node.last_seen_at,
+    }
+}
+
+fn mesh_nodes_from_wire(nodes: MeshNodesDto) -> MeshNodesInfo {
+    MeshNodesInfo {
+        nodes: nodes.nodes.into_iter().map(remote_node_from_wire).collect(),
+    }
+}
+
+fn remote_session_from_wire(session: RemoteSessionDto) -> RemoteSessionInfo {
+    RemoteSessionInfo {
+        id: session.id,
+        node_id: session.node_id,
+        node_label: session.node_label,
+        title: session.title,
+        cwd: session.cwd,
+        updated_at: session.updated_at,
+        profile_id: session.profile_id,
+        model_id: session.model_id,
+    }
+}
+
+fn remote_session_list_from_wire(list: RemoteSessionListDto) -> RemoteSessionListInfo {
+    RemoteSessionListInfo {
+        node_id: list.node_id,
+        sessions: list
+            .sessions
+            .into_iter()
+            .map(remote_session_from_wire)
+            .collect(),
+        next_offset: list.next_offset,
+        total_count: list.total_count,
+    }
+}
+
+fn remote_session_attach_from_wire(attached: RemoteSessionAttachDto) -> RemoteSessionAttachInfo {
+    RemoteSessionAttachInfo {
+        session_id: attached.session_id,
+        node_id: attached.node_id,
+        attached: attached.attached,
+        config_options: attached.config_options,
+        snapshot: attached.snapshot,
+    }
+}
+
+fn mesh_invite_created_from_wire(invite: MeshInviteCreatedDto) -> MeshInviteCreatedInfo {
+    MeshInviteCreatedInfo {
+        invite_id: invite.invite_id,
+        url: invite.url,
+        qr_code: invite.qr_code,
+        expires_at: invite.expires_at,
+        max_uses: invite.max_uses,
+        mesh_name: invite.mesh_name,
+    }
 }
 
 fn oauth_flow_from_wire(flow: OAuthFlowDto) -> OAuthFlow {
@@ -1623,9 +1729,9 @@ async fn post_connect_diagnostics<C: AcpConnection>(
                 && let Ok(nodes_resp) =
                     call_querymt_ext(connection, "querymt/mesh/nodes", json!({})).await
                 && let Ok(nodes) =
-                    serde_json::from_value::<MeshNodesInfo>(ext_payload(&nodes_resp).clone())
+                    serde_json::from_value::<MeshNodesDto>(ext_payload(&nodes_resp).clone())
             {
-                send_acp(srv_tx, AcpAppEvent::MeshNodes(nodes));
+                send_acp(srv_tx, AcpAppEvent::MeshNodes(mesh_nodes_from_wire(nodes)));
             }
             if methods.iter().any(|m| m == "querymt/profiles") {
                 match load_acp_profiles(connection).await {
@@ -2925,6 +3031,106 @@ mod tests {
                 && link.name == "main.rs"
                 && link.uri == "file:///repo/src/main.rs"
         ));
+    }
+
+    #[test]
+    fn mesh_wire_adapters_preserve_every_semantic_field() {
+        let status = mesh_status_from_wire(MeshStatusDto {
+            enabled: true,
+            peer_id: Some("peer-1".into()),
+            transport: Some("webrtc".into()),
+            known_peer_count: 2,
+            has_invite_store: true,
+            has_mesh_state_store: true,
+            scopes: vec![MeshScopeDto {
+                kind: "team".into(),
+                id: "scope-1".into(),
+            }],
+        });
+        assert!(status.enabled);
+        assert_eq!(status.peer_id.as_deref(), Some("peer-1"));
+        assert_eq!(status.transport.as_deref(), Some("webrtc"));
+        assert_eq!(status.known_peer_count, 2);
+        assert!(status.has_invite_store);
+        assert!(status.has_mesh_state_store);
+        assert_eq!(status.scopes[0].kind, "team");
+        assert_eq!(status.scopes[0].id, "scope-1");
+
+        let nodes = mesh_nodes_from_wire(MeshNodesDto {
+            nodes: vec![RemoteNodeDto {
+                id: "node-1".into(),
+                label: "Framework".into(),
+                capabilities: vec!["sessions".into(), "attach".into()],
+                active_sessions: 3,
+                transport: "relay".into(),
+                last_seen_at: Some("2025-01-01T00:00:00Z".into()),
+            }],
+        });
+        let node = &nodes.nodes[0];
+        assert_eq!(node.id, "node-1");
+        assert_eq!(node.label, "Framework");
+        assert_eq!(node.capabilities, ["sessions", "attach"]);
+        assert_eq!(node.active_sessions, 3);
+        assert_eq!(node.transport, "relay");
+        assert_eq!(node.last_seen_at.as_deref(), Some("2025-01-01T00:00:00Z"));
+
+        let list = remote_session_list_from_wire(RemoteSessionListDto {
+            node_id: "node-1".into(),
+            sessions: vec![RemoteSessionDto {
+                id: "session-1".into(),
+                node_id: "node-1".into(),
+                node_label: Some("Framework".into()),
+                title: Some("Fix boundary".into()),
+                cwd: Some("/repo".into()),
+                updated_at: Some("now".into()),
+                profile_id: Some("profile-1".into()),
+                model_id: Some("model-1".into()),
+            }],
+            next_offset: Some(50),
+            total_count: 51,
+        });
+        let session = &list.sessions[0];
+        assert_eq!(list.node_id, "node-1");
+        assert_eq!(list.next_offset, Some(50));
+        assert_eq!(list.total_count, 51);
+        assert_eq!(session.id, "session-1");
+        assert_eq!(session.node_id, "node-1");
+        assert_eq!(session.node_label.as_deref(), Some("Framework"));
+        assert_eq!(session.title.as_deref(), Some("Fix boundary"));
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
+        assert_eq!(session.updated_at.as_deref(), Some("now"));
+        assert_eq!(session.profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(session.model_id.as_deref(), Some("model-1"));
+
+        let config_options = vec![json!({ "id": "profile", "value": { "nested": [1, 2] } })];
+        let snapshot = json!({ "events": [{ "kind": "message" }] });
+        let attached = remote_session_attach_from_wire(RemoteSessionAttachDto {
+            session_id: "session-1".into(),
+            node_id: "node-1".into(),
+            attached: true,
+            config_options: config_options.clone(),
+            snapshot: snapshot.clone(),
+        });
+        assert_eq!(attached.session_id, "session-1");
+        assert_eq!(attached.node_id, "node-1");
+        assert!(attached.attached);
+        assert_eq!(attached.config_options, config_options);
+        assert_eq!(attached.snapshot, snapshot);
+
+        let invite = mesh_invite_created_from_wire(MeshInviteCreatedDto {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR".into()),
+            expires_at: 123,
+            max_uses: 2,
+            mesh_name: Some("Team".into()),
+        });
+        assert_eq!(invite.invite_id, "invite-1");
+        assert_eq!(invite.url, "qmt://mesh/join/token");
+        assert_eq!(invite.qr_code.as_deref(), Some("QR"));
+        assert_eq!(invite.expires_at, 123);
+        assert_eq!(invite.max_uses, 2);
+        assert_eq!(invite.mesh_name.as_deref(), Some("Team"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub(crate) mod activity;
 pub(crate) mod auth;
 pub(crate) mod chat;
 pub(crate) mod elicitation;
+pub(crate) mod mesh;
 pub(crate) mod model;
 pub(crate) mod profile;
 pub(crate) mod session;

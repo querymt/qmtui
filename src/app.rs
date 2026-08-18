@@ -12,6 +12,9 @@ use crate::domain::activity::{
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
+use crate::domain::mesh::{
+    MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
+};
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
@@ -21,9 +24,7 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
-use crate::protocol::{
-    EventKind, MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
-};
+use crate::protocol::EventKind;
 use crate::ui::{CardCache, ElicitationUiState};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
