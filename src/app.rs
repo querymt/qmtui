@@ -2875,7 +2875,14 @@ mod session_mode_tests {
 mod tests {
     use super::*;
     use crate::domain::chat::OUTCOME_BULLET;
-    use crate::protocol::{AgentEvent, ProgressKind};
+    use crate::protocol::ProgressKind;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct TestAgentEvent {
+        kind: EventKind,
+        timestamp: Option<i64>,
+    }
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {
@@ -2898,7 +2905,7 @@ mod tests {
                 "type": "session_queued",
                 "data": { "reason": "waiting for previous operation to complete" }
             },
-            "timestamp": null
+            "timestamp": 123
         });
         let session_configured = serde_json::json!({
             "kind": {
@@ -2948,22 +2955,23 @@ mod tests {
             "timestamp": null
         });
 
-        let queued: AgentEvent = serde_json::from_value(session_queued).unwrap();
+        let queued: TestAgentEvent = serde_json::from_value(session_queued).unwrap();
+        assert_eq!(queued.timestamp, Some(123));
         assert!(
             matches!(queued.kind, EventKind::SessionQueued { reason } if reason == "waiting for previous operation to complete")
         );
 
-        let configured: AgentEvent = serde_json::from_value(session_configured).unwrap();
+        let configured: TestAgentEvent = serde_json::from_value(session_configured).unwrap();
         assert!(
             matches!(configured.kind, EventKind::SessionConfigured { cwd, mcp_servers, limits } if cwd.as_deref() == Some("/workspace/project") && mcp_servers.is_empty() && limits.as_ref().and_then(|l| l.max_steps) == Some(200))
         );
 
-        let available: AgentEvent = serde_json::from_value(tools_available).unwrap();
+        let available: TestAgentEvent = serde_json::from_value(tools_available).unwrap();
         assert!(
             matches!(available.kind, EventKind::ToolsAvailable { tools, tools_hash } if tools.first().and_then(|tool| tool.function.as_ref()).map(|function| function.name.as_str()) == Some("search_text") && tools_hash.is_some())
         );
 
-        let artifact: AgentEvent = serde_json::from_value(artifact_recorded).unwrap();
+        let artifact: TestAgentEvent = serde_json::from_value(artifact_recorded).unwrap();
         assert!(
             matches!(artifact.kind, EventKind::ArtifactRecorded { artifact } if artifact.kind == "file" && artifact.path.as_deref() == Some("src/generated.txt") && artifact.summary.as_deref() == Some("Produced by write_file"))
         );
@@ -3000,15 +3008,15 @@ mod tests {
             "timestamp": null
         });
 
-        let start: AgentEvent = serde_json::from_value(snapshot_start).unwrap();
+        let start: TestAgentEvent = serde_json::from_value(snapshot_start).unwrap();
         assert!(matches!(start.kind, EventKind::SnapshotStart { policy } if policy == "diff"));
 
-        let end: AgentEvent = serde_json::from_value(snapshot_end).unwrap();
+        let end: TestAgentEvent = serde_json::from_value(snapshot_end).unwrap();
         assert!(
             matches!(end.kind, EventKind::SnapshotEnd { summary } if summary.as_deref() == Some("1 modified"))
         );
 
-        let progress: AgentEvent = serde_json::from_value(progress_recorded).unwrap();
+        let progress: TestAgentEvent = serde_json::from_value(progress_recorded).unwrap();
         assert!(
             matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
         );
