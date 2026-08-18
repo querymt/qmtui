@@ -100,7 +100,6 @@ mod session_mutation_data_tests {
     }
 }
 
-#[allow(dead_code)] // Active event wire contract retains fields consumed across targets.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
@@ -240,7 +239,6 @@ pub enum EventKind {
     Unknown,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProgressEntry {
     pub kind: ProgressKind,
@@ -249,7 +247,6 @@ pub struct ProgressEntry {
     pub created_at: String,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtifactInfo {
     pub kind: String,
@@ -259,7 +256,6 @@ pub struct ArtifactInfo {
     pub created_at: String,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressKind {
@@ -269,7 +265,6 @@ pub enum ProgressKind {
     Checkpoint,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionLimits {
     pub max_steps: Option<u32>,
@@ -277,7 +272,6 @@ pub struct SessionLimits {
     pub max_cost_usd: Option<f64>,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolInfo {
     #[serde(rename = "type", default)]
@@ -286,7 +280,6 @@ pub struct ToolInfo {
     pub function: Option<FunctionToolInfo>,
 }
 
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FunctionToolInfo {
     #[serde(default)]
@@ -298,7 +291,6 @@ pub struct FunctionToolInfo {
 }
 
 /// Subset of the server-side `Delegation` struct that we care about.
-#[allow(dead_code)] // Nested active EventKind payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DelegationData {
     pub public_id: String,
@@ -308,7 +300,6 @@ pub struct DelegationData {
     pub objective: Option<String>,
 }
 
-#[allow(dead_code)] // Mesh status preserves server fields not currently rendered.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MeshStatusInfo {
     pub enabled: bool,
@@ -326,14 +317,12 @@ pub struct MeshStatusInfo {
     pub scopes: Vec<MeshScopeInfo>,
 }
 
-#[allow(dead_code)] // Nested active mesh status payload.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MeshScopeInfo {
     pub kind: String,
     pub id: String,
 }
 
-#[allow(dead_code)] // Remote node DTO preserves active mesh metadata.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RemoteNodeInfo {
     pub id: String,
@@ -354,7 +343,6 @@ pub struct MeshNodesInfo {
     pub nodes: Vec<RemoteNodeInfo>,
 }
 
-#[allow(dead_code)] // Remote session DTO preserves active mesh metadata.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RemoteSessionInfo {
     pub id: String,
@@ -373,7 +361,6 @@ pub struct RemoteSessionInfo {
     pub model_id: Option<String>,
 }
 
-#[allow(dead_code)] // Active paged remote-session response boundary.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RemoteSessionListInfo {
     pub node_id: String,
@@ -385,7 +372,6 @@ pub struct RemoteSessionListInfo {
     pub total_count: u32,
 }
 
-#[allow(dead_code)] // Active attach response preserves snapshot and config metadata.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoteSessionAttachInfo {
     pub session_id: String,
@@ -398,7 +384,6 @@ pub struct RemoteSessionAttachInfo {
     pub snapshot: serde_json::Value,
 }
 
-#[allow(dead_code)] // Active invite response preserves server metadata.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MeshInviteCreatedInfo {
     pub invite_id: String,
