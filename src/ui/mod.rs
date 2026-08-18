@@ -2083,7 +2083,7 @@ mod tests {
     fn draw_mesh_popup_shows_nodes_sessions_and_hints() {
         let mut app = App::new();
         app.popup = Popup::Mesh;
-        app.mesh_nodes = vec![crate::protocol::RemoteNodeInfo {
+        app.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
             active_sessions: 1,
@@ -2091,7 +2091,7 @@ mod tests {
         }];
         app.remote_sessions_by_node.insert(
             "node-1".into(),
-            vec![crate::protocol::RemoteSessionInfo {
+            vec![crate::domain::mesh::RemoteSessionInfo {
                 id: "remote-1".into(),
                 node_id: "node-1".into(),
                 title: Some("Fix bug".into()),
@@ -2132,7 +2132,7 @@ mod tests {
     fn draw_mesh_popup_shows_invite_url_and_qr() {
         let mut app = App::new();
         app.popup = Popup::Mesh;
-        app.apply_mesh_invite_created(crate::protocol::MeshInviteCreatedInfo {
+        app.apply_mesh_invite_created(crate::domain::mesh::MeshInviteCreatedInfo {
             invite_id: "invite-1".into(),
             url: "qmt://mesh/join/token".into(),
             qr_code: Some("QR-LINE".into()),

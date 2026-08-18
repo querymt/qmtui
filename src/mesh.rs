@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::app::{App, LogLevel, Popup};
 use crate::command::Command;
-use crate::protocol::{
-    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionInfo, RemoteSessionListInfo,
+use crate::domain::mesh::{
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
+    RemoteSessionInfo, RemoteSessionListInfo,
 };
 
 const INVITE_ERROR_TTL: Duration = Duration::from_secs(5);
@@ -189,16 +190,14 @@ impl App {
 
     pub fn apply_remote_session_attached(
         &mut self,
-        session_id: &str,
-        node_id: &str,
-        attached: bool,
+        attached: RemoteSessionAttachInfo,
     ) -> Vec<Command> {
-        self.remember_remote_session_node(session_id, node_id);
-        if attached {
+        self.remember_remote_session_node(&attached.session_id, &attached.node_id);
+        if attached.attached {
             self.popup = Popup::None;
             self.set_status(LogLevel::Info, "mesh", "remote session attached");
             Command::load_session_commands(
-                session_id.to_string(),
+                attached.session_id,
                 self.current_session_cwd(),
                 self.agent_id.clone(),
             )
@@ -206,7 +205,7 @@ impl App {
         } else {
             self.set_status(LogLevel::Info, "mesh", "remote session created");
             vec![Command::ListRemoteSessions {
-                node_id: node_id.to_string(),
+                node_id: attached.node_id,
                 offset: 0,
                 limit: 50,
             }]
