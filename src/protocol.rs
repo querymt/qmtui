@@ -381,7 +381,7 @@ pub struct RemoteSessionAttachDto {
     #[serde(default)]
     pub config_options: Vec<serde_json::Value>,
     #[serde(default)]
-    pub snapshot: serde_json::Value,
+    pub snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -404,7 +404,7 @@ mod mesh_dto_tests {
         MeshInviteCreatedDto, MeshNodesDto, MeshStatusDto, RemoteNodeDto, RemoteSessionAttachDto,
         RemoteSessionDto, RemoteSessionListDto,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     #[test]
     fn mesh_dtos_deserialize_representative_values_and_ignore_unknown_fields() {
@@ -481,12 +481,32 @@ mod mesh_dto_tests {
             "session_id": "session-1",
             "node_id": "node-1",
             "attached": true,
-            "config_options": [{ "id": "profile", "value": { "nested": [1, 2] } }],
-            "snapshot": { "events": [{ "kind": "message" }] }
+            "config_options": [],
+            "snapshot": {
+                "audit": [{ "kind": "message", "data": { "nested": [1, 2] } }],
+                "cursor": { "position": 1 },
+                "delegationUpdates": [{ "id": "delegate-1" }]
+            }
         }))
         .unwrap();
-        assert_eq!(attach.config_options[0]["value"]["nested"], json!([1, 2]));
-        assert_eq!(attach.snapshot["events"][0]["kind"], "message");
+        assert!(attach.config_options.is_empty());
+        assert_eq!(
+            attach.snapshot.as_ref().unwrap()["audit"][0]["data"]["nested"],
+            json!([1, 2])
+        );
+        assert_eq!(
+            attach.snapshot.as_ref().unwrap()["delegationUpdates"][0]["id"],
+            "delegate-1"
+        );
+
+        let detached: RemoteSessionAttachDto = serde_json::from_value(json!({
+            "session_id": "session-2",
+            "node_id": "node-1",
+            "attached": false,
+            "config_options": []
+        }))
+        .unwrap();
+        assert_eq!(detached.snapshot, None);
 
         let invite: MeshInviteCreatedDto = serde_json::from_value(json!({
             "invite_id": "invite-1",
@@ -520,7 +540,7 @@ mod mesh_dto_tests {
                 .unwrap();
         assert!(!attach.attached);
         assert!(attach.config_options.is_empty());
-        assert_eq!(attach.snapshot, Value::Null);
+        assert_eq!(attach.snapshot, None);
 
         let invite: MeshInviteCreatedDto = serde_json::from_value(json!({
             "invite_id": "invite-1",

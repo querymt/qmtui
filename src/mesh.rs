@@ -176,6 +176,13 @@ impl App {
 
     pub fn apply_remote_sessions(&mut self, list: RemoteSessionListInfo) {
         let count = list.sessions.len();
+        for session in &list.sessions {
+            self.remember_remote_session_location(
+                &session.id,
+                &session.node_id,
+                session.cwd.clone(),
+            );
+        }
         self.remote_sessions_by_node
             .insert(list.node_id.clone(), list.sessions);
         if self.remote_session_cursor >= count {
@@ -192,13 +199,15 @@ impl App {
         &mut self,
         attached: RemoteSessionAttachInfo,
     ) -> Vec<Command> {
+        // ACP session/load is authoritative for history and typed config; applying this
+        // extension snapshot/config directly would duplicate replay or configuration.
         self.remember_remote_session_node(&attached.session_id, &attached.node_id);
         if attached.attached {
             self.popup = Popup::None;
             self.set_status(LogLevel::Info, "mesh", "remote session attached");
             Command::load_session_commands(
-                attached.session_id,
-                self.current_session_cwd(),
+                attached.session_id.clone(),
+                self.session_remote_cwd(&attached.session_id),
                 self.agent_id.clone(),
             )
             .into()

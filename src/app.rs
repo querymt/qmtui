@@ -13,7 +13,7 @@ use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::{
-    MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
+    MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo, RemoteSessionLocation,
 };
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
@@ -606,8 +606,8 @@ pub struct App {
     pub new_session_cursor: usize,
     pub new_session_completion: Option<PathCompletionState>,
     pub session_activity: HashMap<String, SessionActivity>,
-    /// Remote sessions the user attached/dismissed before the refreshed list arrives.
-    pub remote_session_nodes: HashMap<String, String>,
+    /// Remote locations retained from ACP and mesh session metadata.
+    pub remote_session_locations: HashMap<String, RemoteSessionLocation>,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -882,7 +882,7 @@ impl App {
             new_session_cursor: 0,
             new_session_completion: None,
             session_activity: HashMap::new(),
-            remote_session_nodes: HashMap::new(),
+            remote_session_locations: HashMap::new(),
             messages: Vec::new(),
             pending_prompt_seq: 0,
             input: String::new(),

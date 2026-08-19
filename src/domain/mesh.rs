@@ -52,13 +52,19 @@ pub struct RemoteSessionListInfo {
     pub total_count: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RemoteSessionLocation {
+    pub node_id: String,
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteSessionAttachInfo {
     pub session_id: String,
     pub node_id: String,
     pub attached: bool,
     pub config_options: Vec<Value>,
-    pub snapshot: Value,
+    pub snapshot: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
