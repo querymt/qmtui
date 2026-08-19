@@ -96,18 +96,48 @@ impl App {
             .and_then(|session| session.parent_session_id.as_deref())
     }
 
+    pub fn remember_remote_session_location(
+        &mut self,
+        session_id: &str,
+        node_id: &str,
+        cwd: Option<String>,
+    ) {
+        let location = self
+            .remote_session_locations
+            .entry(session_id.to_string())
+            .or_default();
+        location.node_id = node_id.to_string();
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
+            location.cwd = Some(cwd);
+        }
+    }
+
     pub fn remember_remote_session_node(&mut self, session_id: &str, node_id: &str) {
-        self.remote_session_nodes
-            .insert(session_id.to_string(), node_id.to_string());
+        self.remember_remote_session_location(session_id, node_id, None);
     }
 
     pub fn session_remote_node_id(&self, session_id: &str) -> Option<&str> {
         self.session_summary_by_id(session_id)
             .and_then(|session| session.node_id.as_deref())
             .or_else(|| {
-                self.remote_session_nodes
+                self.remote_session_locations
                     .get(session_id)
-                    .map(String::as_str)
+                    .map(|location| location.node_id.as_str())
+            })
+    }
+
+    pub fn session_remote_cwd(&self, session_id: &str) -> Option<String> {
+        self.session_summary_by_id(session_id)
+            .filter(|session| session.node_id.is_some() || session.node.is_some())
+            .and_then(|session| session.cwd.as_deref())
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.remote_session_locations
+                    .get(session_id)
+                    .and_then(|location| location.cwd.as_deref())
+                    .filter(|cwd| !cwd.trim().is_empty())
+                    .map(str::to_string)
             })
     }
 
@@ -194,6 +224,21 @@ impl App {
     }
 
     pub fn merge_session_children(&mut self, data: SessionChildrenPage) {
+        let remote_locations: Vec<(String, String, Option<String>)> = data
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                Some((
+                    session.session_id.clone(),
+                    session.node_id.clone()?,
+                    session.cwd.clone(),
+                ))
+            })
+            .collect();
+        for (session_id, node_id, cwd) in remote_locations {
+            self.remember_remote_session_location(&session_id, &node_id, cwd);
+        }
+
         let had_pending_request = self
             .pending_session_child_loads
             .remove(&data.parent_session_id);
@@ -207,18 +252,6 @@ impl App {
                 .into_iter()
                 .filter(fork_browsing_child)
                 .collect();
-            let remote_nodes: Vec<(String, String)> = sessions
-                .iter()
-                .filter_map(|session| {
-                    Some((
-                        session.session_id.clone(),
-                        session.node_id.as_ref()?.clone(),
-                    ))
-                })
-                .collect();
-            for (session_id, node_id) in remote_nodes {
-                self.remote_session_nodes.insert(session_id, node_id);
-            }
             let append = had_pending_request
                 && !parent.children.is_empty()
                 && parent.children_next_cursor.is_some();
@@ -731,6 +764,19 @@ mod tests {
     }
 
     #[test]
+    fn remote_session_location_preserves_cwd_across_node_only_refreshes() {
+        let mut app = App::new();
+        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        app.remember_remote_session_node("remote-1", "node-2");
+
+        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-2"));
+        assert_eq!(
+            app.session_remote_cwd("remote-1"),
+            Some("/remote/repo".into())
+        );
+    }
+
+    #[test]
     fn session_parent_id_finds_explicit_parent_at_any_depth() {
         let mut app = App::new();
         let mut grandchild = session("grandchild");
@@ -775,6 +821,7 @@ mod tests {
 
         let mut remote = session("remote-child");
         remote.node_id = Some("node-1".into());
+        remote.cwd = Some("/remote/repo".into());
         let mut delegated = session("delegated-child");
         delegated.fork_origin = Some("delegation".into());
         app.merge_session_children(SessionChildrenPage {
@@ -798,6 +845,10 @@ mod tests {
         assert_eq!(parent.fork_count, 3);
         assert!(parent.has_children);
         assert_eq!(app.session_remote_node_id("remote-child"), Some("node-1"));
+        assert_eq!(
+            app.session_remote_cwd("remote-child"),
+            Some("/remote/repo".into())
+        );
         assert!(app.pending_session_child_loads.is_empty());
 
         app.pending_session_child_loads.insert("parent".into());

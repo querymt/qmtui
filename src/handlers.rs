@@ -402,7 +402,7 @@ pub(crate) fn handle_mesh_popup_key(
             if let Some(node_id) = app.selected_mesh_node_id() {
                 cmd_tx.send(Command::CreateRemoteSession {
                     node_id: node_id.to_string(),
-                    cwd: app.current_session_cwd(),
+                    cwd: None,
                 })?;
             }
         }
@@ -2937,6 +2937,29 @@ mod model_popup_tests {
             Ok(Command::AttachRemoteSession { node_id, session_id })
                 if node_id == "node-1" && session_id == "remote-1"
         ));
+    }
+
+    #[test]
+    fn mesh_popup_create_remote_session_does_not_forward_local_cwd() {
+        let mut app = App::new();
+        app.popup = Popup::Mesh;
+        app.launch_cwd = Some("/local/launch".into());
+        app.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "framework".into(),
+            ..Default::default()
+        }];
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_mesh_popup_key(&mut app, key(KeyCode::Char('n')), &tx).unwrap();
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::CreateRemoteSession {
+                node_id: "node-1".into(),
+                cwd: None,
+            }
+        );
     }
 
     #[test]
