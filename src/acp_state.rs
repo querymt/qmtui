@@ -2,13 +2,12 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::acp_client::{
-    DelegateModelOverrideInfo, DelegationUpdateNotification, DelegationUpdateState,
-};
+use crate::acp_client::DelegateModelOverrideInfo;
 use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::command::{Command, SessionListRequest};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+    DelegationState, DelegationUpdate,
 };
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::ChatEntry;
@@ -153,10 +152,10 @@ pub(crate) enum AcpAppEvent {
         session_id: String,
         updates: Vec<AcpSessionUpdate>,
     },
-    DelegationUpdate(DelegationUpdateNotification),
+    DelegationUpdate(DelegationUpdate),
     DelegationReplay {
         session_id: String,
-        updates: Vec<DelegationUpdateNotification>,
+        updates: Vec<DelegationUpdate>,
     },
     Models {
         models: Vec<ModelEntry>,
@@ -921,8 +920,8 @@ impl crate::app::App {
         self.invalidate_delegate_render_cache();
     }
 
-    fn apply_acp_delegation_update(&mut self, update: DelegationUpdateNotification) {
-        if update.version != 1 || self.session_id.as_deref() != Some(update.session_id.as_str()) {
+    fn apply_acp_delegation_update(&mut self, update: DelegationUpdate) {
+        if self.session_id.as_deref() != Some(update.session_id.as_str()) {
             return;
         }
         let existing_index = self
@@ -948,12 +947,10 @@ impl crate::app::App {
             })
         });
         let status = match update.state {
-            DelegationUpdateState::Requested | DelegationUpdateState::Forked => {
-                DelegateStatus::InProgress
-            }
-            DelegationUpdateState::Completed => DelegateStatus::Completed,
-            DelegationUpdateState::Failed => DelegateStatus::Failed,
-            DelegationUpdateState::Cancelled => DelegateStatus::Cancelled,
+            DelegationState::Requested | DelegationState::Forked => DelegateStatus::InProgress,
+            DelegationState::Completed => DelegateStatus::Completed,
+            DelegationState::Failed => DelegateStatus::Failed,
+            DelegationState::Cancelled => DelegateStatus::Cancelled,
         };
         let index = if let Some(index) = index {
             index
@@ -2088,13 +2085,11 @@ fn message_id_matches(left: Option<&String>, right: Option<&String>) -> bool {
     }
 }
 
-fn delegation_state_rank(state: DelegationUpdateState) -> u8 {
+fn delegation_state_rank(state: DelegationState) -> u8 {
     match state {
-        DelegationUpdateState::Requested => 1,
-        DelegationUpdateState::Forked => 2,
-        DelegationUpdateState::Completed
-        | DelegationUpdateState::Failed
-        | DelegationUpdateState::Cancelled => 3,
+        DelegationState::Requested => 1,
+        DelegationState::Forked => 2,
+        DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled => 3,
     }
 }
 
@@ -2130,31 +2125,25 @@ mod tests {
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
 
-    fn delegation_update(
-        state: DelegationUpdateState,
-        updated_at: i64,
-    ) -> DelegationUpdateNotification {
-        DelegationUpdateNotification {
-            version: 1,
+    fn delegation_update(state: DelegationState, updated_at: i64) -> DelegationUpdate {
+        DelegationUpdate {
             session_id: TEST_SESSION_ID.into(),
             delegation_id: "delegation-1".into(),
             tool_call_id: Some("call-1".into()),
             state,
             target_agent_id: "coder".into(),
             objective: "Implement the feature".into(),
-            child_session_id: (state != DelegationUpdateState::Requested).then(|| "child-1".into()),
+            child_session_id: (state != DelegationState::Requested).then(|| "child-1".into()),
             requested_at: 100,
-            forked_at: (state != DelegationUpdateState::Requested).then_some(110),
+            forked_at: (state != DelegationState::Requested).then_some(110),
             finished_at: matches!(
                 state,
-                DelegationUpdateState::Completed
-                    | DelegationUpdateState::Failed
-                    | DelegationUpdateState::Cancelled
+                DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled
             )
             .then_some(120),
             updated_at,
-            result_summary: (state == DelegationUpdateState::Completed).then(|| "done".into()),
-            error: (state == DelegationUpdateState::Failed).then(|| "boom".into()),
+            result_summary: (state == DelegationState::Completed).then(|| "done".into()),
+            error: (state == DelegationState::Failed).then(|| "boom".into()),
         }
     }
 
@@ -2345,11 +2334,11 @@ mod tests {
         );
 
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
-            DelegationUpdateState::Completed,
+            DelegationState::Completed,
             120,
         )));
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
-            DelegationUpdateState::Forked,
+            DelegationState::Forked,
             110,
         )));
 
@@ -2359,6 +2348,78 @@ mod tests {
         assert_eq!(entry.child_session_id.as_deref(), Some("child-1"));
         assert_eq!(entry.status, DelegateStatus::Completed);
         assert_eq!(app.delegation_result_summaries["delegation-1"], "done");
+    }
+
+    #[test]
+    fn delegation_equal_timestamp_does_not_regress_lifecycle_rank() {
+        let mut app = app_with_active_session();
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationState::Completed,
+            120,
+        )));
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationState::Forked,
+            120,
+        )));
+
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Completed);
+        assert_eq!(app.delegation_result_summaries["delegation-1"], "done");
+    }
+
+    #[test]
+    fn delegation_updates_insert_and_remove_summary_and_error() {
+        let mut app = app_with_active_session();
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationState::Completed,
+            120,
+        )));
+        assert_eq!(app.delegation_result_summaries["delegation-1"], "done");
+        assert!(!app.delegation_errors.contains_key("delegation-1"));
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationState::Failed,
+            130,
+        )));
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Failed);
+        assert!(!app.delegation_result_summaries.contains_key("delegation-1"));
+        assert_eq!(app.delegation_errors["delegation-1"], "boom");
+
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
+            DelegationState::Cancelled,
+            140,
+        )));
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::Cancelled);
+        assert!(!app.delegation_errors.contains_key("delegation-1"));
+    }
+
+    #[test]
+    fn delegation_live_and_replay_updates_filter_inactive_parent_sessions() {
+        let mut app = app_with_active_session();
+        let valid_update = delegation_update(DelegationState::Requested, 100);
+
+        app.handle_acp_event(AcpAppEvent::DelegationReplay {
+            session_id: "session-2".into(),
+            updates: vec![valid_update.clone()],
+        });
+        assert!(app.delegate_entries.is_empty());
+
+        let mut wrong_parent_update = valid_update.clone();
+        wrong_parent_update.session_id = "session-2".into();
+        app.handle_acp_event(AcpAppEvent::DelegationReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: vec![wrong_parent_update.clone()],
+        });
+        app.handle_acp_event(AcpAppEvent::DelegationUpdate(wrong_parent_update));
+        assert!(app.delegate_entries.is_empty());
+
+        app.handle_acp_event(AcpAppEvent::DelegationReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: vec![valid_update],
+        });
+        assert_eq!(app.delegate_entries.len(), 1);
+        assert_eq!(app.delegate_entries[0].status, DelegateStatus::InProgress);
     }
 
     #[test]
@@ -2383,7 +2444,7 @@ mod tests {
         });
 
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
-            DelegationUpdateState::Forked,
+            DelegationState::Forked,
             110,
         )));
 
@@ -2400,7 +2461,7 @@ mod tests {
         app.activity = ActivityState::Streaming;
 
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
-            DelegationUpdateState::Completed,
+            DelegationState::Completed,
             120,
         )));
 
