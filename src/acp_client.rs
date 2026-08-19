@@ -32,12 +32,13 @@ use crate::domain::session::{
     ForkResult, RedoResult, SessionGroup, SessionListPage, SessionSummary, UndoResult,
     UndoStackSnapshot,
 };
-use crate::protocol::{
-    AuthProvidersData, DelegationUpdateDto, DelegationUpdateStateDto, MeshInviteCreatedDto,
-    MeshNodesDto, MeshScopeDto, MeshStatusDto, OAuthFlowDto, OAuthResultDto, RedoResultData,
-    RemoteNodeDto, RemoteSessionAttachDto, RemoteSessionDto, RemoteSessionListDto, UndoResultData,
-    UndoStackFrame,
+use crate::protocol::auth::{AuthProvidersDto, OAuthFlowDto, OAuthResultDto};
+use crate::protocol::delegation::{DelegationUpdateDto, DelegationUpdateStateDto};
+use crate::protocol::mesh::{
+    MeshInviteCreatedDto, MeshNodesDto, MeshScopeDto, MeshStatusDto, RemoteNodeDto,
+    RemoteSessionAttachDto, RemoteSessionDto, RemoteSessionListDto,
 };
+use crate::protocol::session::{RedoResultDto, UndoResultDto, UndoStackFrameDto};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpEndpoint {
@@ -1177,7 +1178,7 @@ async fn handle_command<C: AcpConnection>(
         Command::ListAuthProviders => {
             let response = call_querymt_ext(connection, "querymt/auth/status", json!({})).await?;
             if let Ok(auth) =
-                serde_json::from_value::<AuthProvidersData>(ext_payload(&response).clone())
+                serde_json::from_value::<AuthProvidersDto>(ext_payload(&response).clone())
             {
                 send_acp(srv_tx, AcpAppEvent::AuthProviders(auth.providers));
             }
@@ -1288,7 +1289,7 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(result) =
-                serde_json::from_value::<UndoResultData>(ext_payload(&response).clone())
+                serde_json::from_value::<UndoResultDto>(ext_payload(&response).clone())
             {
                 send_acp(
                     srv_tx,
@@ -1308,7 +1309,7 @@ async fn handle_command<C: AcpConnection>(
             )
             .await?;
             if let Ok(result) =
-                serde_json::from_value::<RedoResultData>(ext_payload(&response).clone())
+                serde_json::from_value::<RedoResultDto>(ext_payload(&response).clone())
             {
                 send_acp(
                     srv_tx,
@@ -1644,13 +1645,13 @@ fn oauth_result_from_wire(result: OAuthResultDto) -> OAuthResult {
     }
 }
 
-fn undo_stack_snapshot_from_wire(frames: Vec<UndoStackFrame>) -> UndoStackSnapshot {
+fn undo_stack_snapshot_from_wire(frames: Vec<UndoStackFrameDto>) -> UndoStackSnapshot {
     UndoStackSnapshot {
         message_ids: frames.into_iter().map(|frame| frame.message_id).collect(),
     }
 }
 
-fn undo_result_from_wire(result: UndoResultData) -> UndoResult {
+fn undo_result_from_wire(result: UndoResultDto) -> UndoResult {
     let stack = undo_stack_snapshot_from_wire(result.undo_stack);
     if result.success {
         UndoResult::Applied {
@@ -1668,7 +1669,7 @@ fn undo_result_from_wire(result: UndoResultData) -> UndoResult {
     }
 }
 
-fn redo_result_from_wire(result: RedoResultData) -> RedoResult {
+fn redo_result_from_wire(result: RedoResultDto) -> RedoResult {
     let stack = undo_stack_snapshot_from_wire(result.undo_stack);
     if result.success {
         RedoResult::Applied {
@@ -1699,7 +1700,7 @@ async fn fetch_undo_stack<C: AcpConnection>(
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| serde_json::from_value::<UndoStackFrame>(item.clone()).ok())
+                .filter_map(|item| serde_json::from_value::<UndoStackFrameDto>(item.clone()).ok())
                 .collect()
         })
         .unwrap_or_default();
@@ -3000,9 +3001,9 @@ mod tests {
         })
     }
 
-    fn wire_stack(ids: &[&str]) -> Vec<UndoStackFrame> {
+    fn wire_stack(ids: &[&str]) -> Vec<UndoStackFrameDto> {
         ids.iter()
-            .map(|message_id| UndoStackFrame {
+            .map(|message_id| UndoStackFrameDto {
                 message_id: (*message_id).into(),
             })
             .collect()
@@ -3245,7 +3246,7 @@ mod tests {
 
     #[test]
     fn undo_result_from_wire_maps_applied_details() {
-        let result = undo_result_from_wire(UndoResultData {
+        let result = undo_result_from_wire(UndoResultDto {
             success: true,
             message_id: Some("message-2".into()),
             reverted_files: vec!["src/a.rs".into()],
@@ -3268,7 +3269,7 @@ mod tests {
 
     #[test]
     fn undo_result_from_wire_preserves_rejected_target_and_discards_files() {
-        let result = undo_result_from_wire(UndoResultData {
+        let result = undo_result_from_wire(UndoResultDto {
             success: false,
             message_id: Some("message-1".into()),
             reverted_files: vec!["ignored.rs".into()],
@@ -3290,7 +3291,7 @@ mod tests {
 
     #[test]
     fn redo_result_from_wire_maps_applied_and_rejected_results() {
-        let applied = redo_result_from_wire(RedoResultData {
+        let applied = redo_result_from_wire(RedoResultDto {
             success: true,
             message: Some("redone".into()),
             undo_stack: wire_stack(&["message-1", "message-2"]),
@@ -3305,7 +3306,7 @@ mod tests {
             }
         );
 
-        let rejected = redo_result_from_wire(RedoResultData {
+        let rejected = redo_result_from_wire(RedoResultDto {
             success: false,
             message: Some("redo rejected".into()),
             undo_stack: wire_stack(&["message-1"]),
