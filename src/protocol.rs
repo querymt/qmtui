@@ -508,6 +508,14 @@ mod mesh_dto_tests {
         .unwrap();
         assert_eq!(detached.snapshot, None);
 
+        let null_snapshot: RemoteSessionAttachDto = serde_json::from_value(json!({
+            "session_id": "session-3",
+            "node_id": "node-1",
+            "snapshot": null
+        }))
+        .unwrap();
+        assert_eq!(null_snapshot.snapshot, None);
+
         let invite: MeshInviteCreatedDto = serde_json::from_value(json!({
             "invite_id": "invite-1",
             "url": "qmt://mesh/join/token",

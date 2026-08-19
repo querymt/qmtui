@@ -2646,25 +2646,6 @@ fn session_list_page_from_acp(
 
     for session in response.sessions {
         let cwd = session.cwd.to_string_lossy().to_string();
-        let metadata = session.meta.as_ref();
-        let node = metadata
-            .and_then(|meta| meta.get("node"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let node_id = metadata
-            .and_then(|meta| meta.get("nodeId").or_else(|| meta.get("node_id")))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let attached = metadata
-            .and_then(|meta| meta.get("attached"))
-            .and_then(Value::as_bool);
-        let runtime_state = metadata
-            .and_then(|meta| {
-                meta.get("runtimeState")
-                    .or_else(|| meta.get("runtime_state"))
-            })
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let group_key = request
             .cwd()
             .map(str::to_string)
@@ -2684,10 +2665,10 @@ fn session_list_page_from_acp(
             children: Vec::new(),
             children_next_cursor: None,
             children_total_count: None,
-            node,
-            node_id,
-            attached,
-            runtime_state,
+            node: None,
+            node_id: None,
+            attached: None,
+            runtime_state: None,
         });
     }
 
@@ -3374,27 +3355,6 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
-    }
-
-    #[test]
-    fn acp_session_list_preserves_remote_location_metadata() {
-        let mut metadata = acp::Meta::new();
-        metadata.insert("node".into(), Value::String("remote".into()));
-        metadata.insert("nodeId".into(), Value::String("node-1".into()));
-        metadata.insert("attached".into(), Value::Bool(false));
-        metadata.insert("runtimeState".into(), Value::String("stopped".into()));
-        let response = acp::ListSessionsResponse::new(vec![
-            acp::SessionInfo::new(acp::SessionId::from("remote-1"), Path::new("/remote/repo"))
-                .meta(metadata),
-        ]);
-
-        let page = session_list_page_from_acp(&SessionListRequest::Discovery, response);
-        let session = &page.groups[0].sessions[0];
-        assert_eq!(session.node.as_deref(), Some("remote"));
-        assert_eq!(session.node_id.as_deref(), Some("node-1"));
-        assert_eq!(session.cwd.as_deref(), Some("/remote/repo"));
-        assert_eq!(session.attached, Some(false));
-        assert_eq!(session.runtime_state.as_deref(), Some("stopped"));
     }
 
     #[test]
