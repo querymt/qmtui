@@ -28,6 +28,30 @@ fn send_command(cmd_tx: &mpsc::UnboundedSender<Command>, command: Command) -> an
     Ok(())
 }
 
+fn reconnect_session_commands(app: &mut App) -> Vec<Command> {
+    let Some(session_id) = app.session_id.clone() else {
+        return Vec::new();
+    };
+
+    if let Some(node_id) = app.session_remote_node_id(&session_id) {
+        return vec![Command::AttachRemoteSession {
+            node_id: node_id.to_string(),
+            session_id,
+        }];
+    }
+    if app.is_remote_session_id(&session_id) {
+        app.set_status(
+            app::LogLevel::Warn,
+            "session",
+            "remote session is missing node id; reconnect attach skipped",
+        );
+        return Vec::new();
+    }
+
+    Command::load_session_commands(session_id, app.current_session_cwd(), app.agent_id.clone())
+        .into()
+}
+
 pub(super) async fn run_loop(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -54,27 +78,8 @@ pub(super) async fn run_loop(
                             cmd_tx.send(Command::Init)?;
                             cmd_tx.send(Command::list_sessions_browse())?;
                             cmd_tx.send(Command::ListAllModels { refresh: false })?;
-                            if let Some(session_id) = app.session_id.clone() {
-                                if let Some(node_id) = app.session_remote_node_id(&session_id) {
-                                    cmd_tx.send(Command::AttachRemoteSession {
-                                        node_id: node_id.to_string(),
-                                        session_id,
-                                    })?;
-                                } else if app.is_remote_session_id(&session_id) {
-                                    app.set_status(
-                                        app::LogLevel::Warn,
-                                        "session",
-                                        "remote session is missing node id; reconnect attach skipped",
-                                    );
-                                } else {
-                                    for command in Command::load_session_commands(
-                                        session_id,
-                                        app.current_session_cwd(),
-                                        app.agent_id.clone(),
-                                    ) {
-                                        cmd_tx.send(command)?;
-                                    }
-                                }
+                            for command in reconnect_session_commands(app) {
+                                cmd_tx.send(command)?;
                             }
                         } else if was_connected && app.conn == app::ConnState::Disconnected {
                             app.set_status(
@@ -182,7 +187,8 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{send_command, tick_from_elapsed};
+    use super::{reconnect_session_commands, send_command, tick_from_elapsed};
+    use crate::app::App;
     use crate::command::Command;
 
     #[test]
@@ -206,6 +212,65 @@ mod tests {
             } if session_id == "session-1" && cwd == "/repo"
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_attaches_remembered_remote_session_without_loading() {
+        let mut app = App::new();
+        app.session_id = Some("remote-1".into());
+        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+
+        assert_eq!(
+            reconnect_session_commands(&mut app),
+            vec![Command::AttachRemoteSession {
+                node_id: "node-1".into(),
+                session_id: "remote-1".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reconnect_warns_for_remote_session_missing_node() {
+        let mut app = App::new();
+        app.session_id = Some("remote-1".into());
+        app.session_groups = vec![crate::domain::session::SessionGroup {
+            sessions: vec![crate::domain::session::SessionSummary {
+                session_id: "remote-1".into(),
+                node: Some("remote".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        assert!(reconnect_session_commands(&mut app).is_empty());
+        assert!(app.status.contains("missing node id"));
+    }
+
+    #[test]
+    fn reconnect_loads_and_subscribes_local_session() {
+        let mut app = App::new();
+        app.session_id = Some("local-1".into());
+        app.agent_id = Some("agent-1".into());
+        app.launch_cwd = Some("/local/repo".into());
+
+        assert_eq!(
+            reconnect_session_commands(&mut app),
+            vec![
+                Command::LoadSession {
+                    session_id: "local-1".into(),
+                    cwd: Some("/local/repo".into()),
+                },
+                Command::SubscribeSession {
+                    session_id: "local-1".into(),
+                    agent_id: Some("agent-1".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_without_active_session_does_nothing() {
+        assert!(reconnect_session_commands(&mut App::new()).is_empty());
     }
 
     #[test]

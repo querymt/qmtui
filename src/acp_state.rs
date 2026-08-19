@@ -627,9 +627,24 @@ impl crate::app::App {
         } = page;
         for group in &mut groups {
             group.total_count = None;
-            for session in &group.sessions {
-                if let Some(node_id) = session.node_id.as_deref() {
-                    self.remember_remote_session_node(&session.session_id, node_id);
+            let session_metadata: Vec<(String, Option<String>, Option<String>)> = group
+                .sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.node_id.clone(),
+                        session.cwd.clone(),
+                    )
+                })
+                .collect();
+            for (session_id, node_id, cwd) in session_metadata {
+                if let Some(node_id) = node_id.or_else(|| {
+                    self.remote_session_locations
+                        .get(&session_id)
+                        .map(|location| location.node_id.clone())
+                }) {
+                    self.remember_remote_session_location(&session_id, &node_id, cwd);
                 }
             }
             group.sessions.sort_by(|a, b| {
@@ -2529,6 +2544,7 @@ mod tests {
                 id: "session-1".into(),
                 node_id: "node-1".into(),
                 title: Some("Boundary".into()),
+                cwd: Some("/remote/repo".into()),
                 ..Default::default()
             }],
             next_offset: Some(50),
@@ -2541,6 +2557,11 @@ mod tests {
         assert_eq!(
             app.selected_remote_sessions()[0].title.as_deref(),
             Some("Boundary")
+        );
+        assert_eq!(app.session_remote_node_id("session-1"), Some("node-1"));
+        assert_eq!(
+            app.session_remote_cwd("session-1"),
+            Some("/remote/repo".into())
         );
     }
 
@@ -2572,7 +2593,11 @@ mod tests {
                 node_id: "node-1".into(),
                 attached: true,
                 config_options: Vec::new(),
-                snapshot: Value::Null,
+                snapshot: Some(serde_json::json!({
+                    "audit": [{ "kind": "message" }],
+                    "cursor": { "position": 1 },
+                    "delegationUpdates": []
+                })),
             },
         ));
 
@@ -2580,7 +2605,7 @@ mod tests {
         assert!(matches!(
             replies.as_slice(),
             [
-                Command::LoadSession { session_id: load_id, .. },
+                Command::LoadSession { session_id: load_id, cwd: None },
                 Command::SubscribeSession { session_id: subscribe_id, agent_id },
             ] if load_id == "remote-1"
                 && subscribe_id == "remote-1"
@@ -2589,10 +2614,11 @@ mod tests {
     }
 
     #[test]
-    fn native_remote_attach_uses_current_cwd_and_detached_refreshes_sessions() {
+    fn native_remote_attach_uses_remote_cwd_and_detached_refreshes_sessions() {
         let mut app = App::new();
         app.agent_id = Some("agent-1".into());
         app.launch_cwd = Some("/launch".into());
+        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
 
         let attached = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
             RemoteSessionAttachInfo {
@@ -2600,7 +2626,7 @@ mod tests {
                 node_id: "node-1".into(),
                 attached: true,
                 config_options: vec![Value::String("retained but unused".into())],
-                snapshot: serde_json::json!({ "retained": true }),
+                snapshot: Some(serde_json::json!({ "retained": true })),
             },
         ));
         assert!(matches!(
@@ -2609,7 +2635,7 @@ mod tests {
                 Command::LoadSession { session_id, cwd: Some(cwd) },
                 Command::SubscribeSession { session_id: subscribed_id, agent_id },
             ] if session_id == "remote-1"
-                && cwd == "/launch"
+                && cwd == "/remote/repo"
                 && subscribed_id == "remote-1"
                 && agent_id.as_deref() == Some("agent-1")
         ));
@@ -2620,15 +2646,51 @@ mod tests {
                 node_id: "node-2".into(),
                 attached: false,
                 config_options: Vec::new(),
-                snapshot: Value::Null,
+                snapshot: None,
             },
         ));
         assert_eq!(app.session_remote_node_id("remote-2"), Some("node-2"));
-        assert!(matches!(
-            detached.as_slice(),
-            [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
-                if node_id == "node-2"
-        ));
+        assert_eq!(app.session_remote_cwd("remote-2"), None);
+        assert_eq!(
+            detached,
+            vec![Command::ListRemoteSessions {
+                node_id: "node-2".into(),
+                offset: 0,
+                limit: 50,
+            }]
+        );
+    }
+
+    #[test]
+    fn acp_session_list_preserves_remote_summary_cwd() {
+        let mut app = App::new();
+        let replies = app.handle_acp_event(AcpAppEvent::SessionList {
+            request: SessionListRequest::Discovery,
+            page: session_list_page(
+                vec![SessionGroup {
+                    cwd: Some("/remote/repo".into()),
+                    sessions: vec![SessionSummary {
+                        session_id: "remote-1".into(),
+                        node_id: Some("node-1".into()),
+                        cwd: Some("/remote/repo".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                None,
+            ),
+        });
+
+        assert!(
+            replies
+                .iter()
+                .any(|command| matches!(command, Command::ListSessions { .. }))
+        );
+        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
+        assert_eq!(
+            app.session_remote_cwd("remote-1"),
+            Some("/remote/repo".into())
+        );
     }
 
     #[test]
