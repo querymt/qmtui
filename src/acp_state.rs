@@ -627,24 +627,17 @@ impl crate::app::App {
         } = page;
         for group in &mut groups {
             group.total_count = None;
-            let session_metadata: Vec<(String, Option<String>, Option<String>)> = group
-                .sessions
-                .iter()
-                .map(|session| {
-                    (
-                        session.session_id.clone(),
-                        session.node_id.clone(),
+            for session in &group.sessions {
+                if let Some(node_id) = session
+                    .node_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    self.remember_remote_session_location(
+                        &session.session_id,
+                        node_id,
                         session.cwd.clone(),
-                    )
-                })
-                .collect();
-            for (session_id, node_id, cwd) in session_metadata {
-                if let Some(node_id) = node_id.or_else(|| {
-                    self.remote_session_locations
-                        .get(&session_id)
-                        .map(|location| location.node_id.clone())
-                }) {
-                    self.remember_remote_session_location(&session_id, &node_id, cwd);
+                    );
                 }
             }
             group.sessions.sort_by(|a, b| {
@@ -2662,17 +2655,18 @@ mod tests {
     }
 
     #[test]
-    fn acp_session_list_preserves_remote_summary_cwd() {
+    fn acp_node_less_session_page_does_not_overwrite_remote_location() {
         let mut app = App::new();
-        let replies = app.handle_acp_event(AcpAppEvent::SessionList {
+        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+
+        app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
             page: session_list_page(
                 vec![SessionGroup {
-                    cwd: Some("/remote/repo".into()),
+                    cwd: Some("/local/repo".into()),
                     sessions: vec![SessionSummary {
                         session_id: "remote-1".into(),
-                        node_id: Some("node-1".into()),
-                        cwd: Some("/remote/repo".into()),
+                        cwd: Some("/local/repo".into()),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -2681,16 +2675,9 @@ mod tests {
             ),
         });
 
-        assert!(
-            replies
-                .iter()
-                .any(|command| matches!(command, Command::ListSessions { .. }))
-        );
-        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
-        assert_eq!(
-            app.session_remote_cwd("remote-1"),
-            Some("/remote/repo".into())
-        );
+        let location = &app.remote_session_locations["remote-1"];
+        assert_eq!(location.node_id, "node-1");
+        assert_eq!(location.cwd.as_deref(), Some("/remote/repo"));
     }
 
     #[test]
