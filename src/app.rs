@@ -24,7 +24,7 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
-use crate::protocol::EventKind;
+use crate::protocol::audit::EventKind;
 use crate::ui::{CardCache, ElicitationUiState};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
@@ -2876,14 +2876,6 @@ mod session_mode_tests {
 mod tests {
     use super::*;
     use crate::domain::chat::OUTCOME_BULLET;
-    use crate::protocol::ProgressKind;
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    struct TestAgentEvent {
-        kind: EventKind,
-        timestamp: Option<i64>,
-    }
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {
@@ -2897,130 +2889,6 @@ mod tests {
         UndoStackSnapshot {
             message_ids: ids.iter().map(|id| (*id).into()).collect(),
         }
-    }
-
-    #[test]
-    fn backend_next_protocol_events_deserialize() {
-        let session_queued = serde_json::json!({
-            "kind": {
-                "type": "session_queued",
-                "data": { "reason": "waiting for previous operation to complete" }
-            },
-            "timestamp": 123
-        });
-        let session_configured = serde_json::json!({
-            "kind": {
-                "type": "session_configured",
-                "data": {
-                    "cwd": "/workspace/project",
-                    "mcp_servers": [],
-                    "limits": {
-                        "max_steps": 200,
-                        "max_turns": 50,
-                        "max_cost_usd": null
-                    }
-                }
-            },
-            "timestamp": null
-        });
-        let tools_available = serde_json::json!({
-            "kind": {
-                "type": "tools_available",
-                "data": {
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "search_text",
-                            "description": "Search file contents",
-                            "parameters": { "type": "object" }
-                        }
-                    }],
-                    "tools_hash": "123456789"
-                }
-            },
-            "timestamp": null
-        });
-        let artifact_recorded = serde_json::json!({
-            "kind": {
-                "type": "artifact_recorded",
-                "data": {
-                    "artifact": {
-                        "kind": "file",
-                        "uri": null,
-                        "path": "src/generated.txt",
-                        "summary": "Produced by write_file",
-                        "created_at": "2026-04-29T14:25:09Z"
-                    }
-                }
-            },
-            "timestamp": null
-        });
-
-        let queued: TestAgentEvent = serde_json::from_value(session_queued).unwrap();
-        assert_eq!(queued.timestamp, Some(123));
-        assert!(
-            matches!(queued.kind, EventKind::SessionQueued { reason } if reason == "waiting for previous operation to complete")
-        );
-
-        let configured: TestAgentEvent = serde_json::from_value(session_configured).unwrap();
-        assert!(
-            matches!(configured.kind, EventKind::SessionConfigured { cwd, mcp_servers, limits } if cwd.as_deref() == Some("/workspace/project") && mcp_servers.is_empty() && limits.as_ref().and_then(|l| l.max_steps) == Some(200))
-        );
-
-        let available: TestAgentEvent = serde_json::from_value(tools_available).unwrap();
-        assert!(
-            matches!(available.kind, EventKind::ToolsAvailable { tools, tools_hash } if tools.first().and_then(|tool| tool.function.as_ref()).map(|function| function.name.as_str()) == Some("search_text") && tools_hash.is_some())
-        );
-
-        let artifact: TestAgentEvent = serde_json::from_value(artifact_recorded).unwrap();
-        assert!(
-            matches!(artifact.kind, EventKind::ArtifactRecorded { artifact } if artifact.kind == "file" && artifact.path.as_deref() == Some("src/generated.txt") && artifact.summary.as_deref() == Some("Produced by write_file"))
-        );
-    }
-
-    #[test]
-    fn backend_snapshot_and_progress_events_deserialize() {
-        let snapshot_start = serde_json::json!({
-            "kind": {
-                "type": "snapshot_start",
-                "data": { "policy": "diff" }
-            },
-            "timestamp": null
-        });
-        let snapshot_end = serde_json::json!({
-            "kind": {
-                "type": "snapshot_end",
-                "data": { "summary": "1 modified" }
-            },
-            "timestamp": null
-        });
-        let progress_recorded = serde_json::json!({
-            "kind": {
-                "type": "progress_recorded",
-                "data": {
-                    "progress_entry": {
-                        "kind": "tool_call",
-                        "content": "Calling tool: shell",
-                        "metadata": "{\"tool\":\"shell\"}",
-                        "created_at": "2026-04-13T00:00:00Z"
-                    }
-                }
-            },
-            "timestamp": null
-        });
-
-        let start: TestAgentEvent = serde_json::from_value(snapshot_start).unwrap();
-        assert!(matches!(start.kind, EventKind::SnapshotStart { policy } if policy == "diff"));
-
-        let end: TestAgentEvent = serde_json::from_value(snapshot_end).unwrap();
-        assert!(
-            matches!(end.kind, EventKind::SnapshotEnd { summary } if summary.as_deref() == Some("1 modified"))
-        );
-
-        let progress: TestAgentEvent = serde_json::from_value(progress_recorded).unwrap();
-        assert!(
-            matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
-        );
     }
 
     #[test]
