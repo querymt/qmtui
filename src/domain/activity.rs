@@ -43,6 +43,32 @@ pub enum DelegateChildState {
     OtherProgress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationState {
+    Requested,
+    Forked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationUpdate {
+    pub session_id: String,
+    pub delegation_id: String,
+    pub tool_call_id: Option<String>,
+    pub state: DelegationState,
+    pub target_agent_id: String,
+    pub objective: String,
+    pub child_session_id: Option<String>,
+    pub requested_at: i64,
+    pub forked_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub updated_at: i64,
+    pub result_summary: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DelegateEntry {
     pub delegation_id: String,

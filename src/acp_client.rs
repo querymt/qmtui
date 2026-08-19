@@ -20,6 +20,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::ServerChannelMsg;
 use crate::acp_state::{AcpAppEvent, AcpModelsMetaInfo, AcpSessionUpdate};
 use crate::command::{Command, PromptBlock, SessionListRequest};
+use crate::domain::activity::{DelegationState, DelegationUpdate};
 use crate::domain::auth::{OAuthFlow, OAuthResult, OAuthResultStatus};
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshScopeInfo, MeshStatusInfo, RemoteNodeInfo,
@@ -32,9 +33,10 @@ use crate::domain::session::{
     UndoStackSnapshot,
 };
 use crate::protocol::{
-    AuthProvidersData, MeshInviteCreatedDto, MeshNodesDto, MeshScopeDto, MeshStatusDto,
-    OAuthFlowDto, OAuthResultDto, RedoResultData, RemoteNodeDto, RemoteSessionAttachDto,
-    RemoteSessionDto, RemoteSessionListDto, UndoResultData, UndoStackFrame,
+    AuthProvidersData, DelegationUpdateDto, DelegationUpdateStateDto, MeshInviteCreatedDto,
+    MeshNodesDto, MeshScopeDto, MeshStatusDto, OAuthFlowDto, OAuthResultDto, RedoResultData,
+    RemoteNodeDto, RemoteSessionAttachDto, RemoteSessionDto, RemoteSessionListDto, UndoResultData,
+    UndoStackFrame,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,41 +137,6 @@ struct AcpDelegateModelResponse {
     agent_id: String,
     #[serde(default)]
     model: Option<DelegateModelOverrideInfo>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DelegationUpdateState {
-    Requested,
-    Forked,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DelegationUpdateNotification {
-    pub version: u32,
-    pub session_id: String,
-    pub delegation_id: String,
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-    pub state: DelegationUpdateState,
-    pub target_agent_id: String,
-    pub objective: String,
-    #[serde(default)]
-    pub child_session_id: Option<String>,
-    pub requested_at: i64,
-    #[serde(default)]
-    pub forked_at: Option<i64>,
-    #[serde(default)]
-    pub finished_at: Option<i64>,
-    pub updated_at: i64,
-    #[serde(default)]
-    pub result_summary: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
 }
 
 fn normalize_profile_agents_response(
@@ -699,17 +666,20 @@ fn is_delegation_notification_method(method: &str) -> bool {
 }
 
 fn handle_delegation_notification(srv_tx: &mpsc::UnboundedSender<ServerChannelMsg>, params: Value) {
-    match serde_json::from_value::<DelegationUpdateNotification>(params) {
-        Ok(update) if update.version == 1 => {
-            send_acp(srv_tx, AcpAppEvent::DelegationUpdate(update));
+    match serde_json::from_value::<DelegationUpdateDto>(params) {
+        Ok(update) => {
+            let version = update.version;
+            match delegation_update_from_wire(update) {
+                Some(update) => send_acp(srv_tx, AcpAppEvent::DelegationUpdate(update)),
+                None => send_acp(
+                    srv_tx,
+                    AcpAppEvent::InfoLog {
+                        target: "delegation",
+                        message: format!("ignored delegation notification version {version}"),
+                    },
+                ),
+            }
         }
-        Ok(update) => send_acp(
-            srv_tx,
-            AcpAppEvent::InfoLog {
-                target: "delegation",
-                message: format!("ignored delegation notification version {}", update.version),
-            },
-        ),
         Err(err) => send_acp(
             srv_tx,
             AcpAppEvent::InfoLog {
@@ -1625,6 +1595,34 @@ fn mesh_invite_created_from_wire(invite: MeshInviteCreatedDto) -> MeshInviteCrea
     }
 }
 
+fn delegation_update_from_wire(update: DelegationUpdateDto) -> Option<DelegationUpdate> {
+    if update.version != 1 {
+        return None;
+    }
+
+    Some(DelegationUpdate {
+        session_id: update.session_id,
+        delegation_id: update.delegation_id,
+        tool_call_id: update.tool_call_id,
+        state: match update.state {
+            DelegationUpdateStateDto::Requested => DelegationState::Requested,
+            DelegationUpdateStateDto::Forked => DelegationState::Forked,
+            DelegationUpdateStateDto::Completed => DelegationState::Completed,
+            DelegationUpdateStateDto::Failed => DelegationState::Failed,
+            DelegationUpdateStateDto::Cancelled => DelegationState::Cancelled,
+        },
+        target_agent_id: update.target_agent_id,
+        objective: update.objective,
+        child_session_id: update.child_session_id,
+        requested_at: update.requested_at,
+        forked_at: update.forked_at,
+        finished_at: update.finished_at,
+        updated_at: update.updated_at,
+        result_summary: update.result_summary,
+        error: update.error,
+    })
+}
+
 fn oauth_flow_from_wire(flow: OAuthFlowDto) -> OAuthFlow {
     OAuthFlow {
         flow_id: flow.flow_id,
@@ -1811,14 +1809,14 @@ fn session_load_audit_from_load_value(response: &Value) -> Value {
     }
 }
 
-fn delegation_updates_from_load_value(response: &Value) -> Vec<DelegationUpdateNotification> {
+fn delegation_updates_from_load_value(response: &Value) -> Vec<DelegationUpdate> {
     session_load_snapshot_from_load_value(response)
         .and_then(|snapshot| snapshot.get("delegationUpdates"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|update| serde_json::from_value(update.clone()).ok())
-        .filter(|update: &DelegationUpdateNotification| update.version == 1)
+        .filter_map(|update| serde_json::from_value::<DelegationUpdateDto>(update.clone()).ok())
+        .filter_map(delegation_update_from_wire)
         .collect()
 }
 
@@ -3010,6 +3008,43 @@ mod tests {
             .collect()
     }
 
+    fn delegation_wire_value(version: u32) -> Value {
+        json!({
+            "version": version,
+            "sessionId": "parent",
+            "delegationId": "delegation-1",
+            "toolCallId": "call-1",
+            "state": "completed",
+            "targetAgentId": "coder",
+            "objective": "Implement it",
+            "childSessionId": "child-1",
+            "requestedAt": 100,
+            "forkedAt": 110,
+            "finishedAt": 120,
+            "updatedAt": 120,
+            "resultSummary": "done",
+            "error": "reported after completion"
+        })
+    }
+
+    fn expected_delegation_update() -> DelegationUpdate {
+        DelegationUpdate {
+            session_id: "parent".into(),
+            delegation_id: "delegation-1".into(),
+            tool_call_id: Some("call-1".into()),
+            state: DelegationState::Completed,
+            target_agent_id: "coder".into(),
+            objective: "Implement it".into(),
+            child_session_id: Some("child-1".into()),
+            requested_at: 100,
+            forked_at: Some(110),
+            finished_at: Some(120),
+            updated_at: 120,
+            result_summary: Some("done".into()),
+            error: Some("reported after completion".into()),
+        }
+    }
+
     #[test]
     fn prompt_blocks_convert_semantic_text_and_resource_links() {
         let blocks = prompt_blocks(vec![
@@ -3144,6 +3179,22 @@ mod tests {
         assert_eq!(invite.expires_at, 123);
         assert_eq!(invite.max_uses, 2);
         assert_eq!(invite.mesh_name.as_deref(), Some("Team"));
+    }
+
+    #[test]
+    fn delegation_update_from_wire_maps_every_semantic_field() {
+        let wire = serde_json::from_value(delegation_wire_value(1)).expect("wire update");
+
+        let update = delegation_update_from_wire(wire).expect("supported update");
+
+        assert_eq!(update, expected_delegation_update());
+    }
+
+    #[test]
+    fn delegation_update_from_wire_rejects_unsupported_version() {
+        let wire = serde_json::from_value(delegation_wire_value(2)).expect("wire update");
+
+        assert_eq!(delegation_update_from_wire(wire), None);
     }
 
     #[test]
@@ -3490,36 +3541,23 @@ mod tests {
     }
 
     #[test]
-    fn session_load_delegation_updates_parse_latest_snapshots() {
+    fn session_load_delegation_updates_skip_malformed_and_unsupported_snapshots() {
         let response = json!({
             "_meta": {
                 "querymt/sessionLoadSnapshot.v1": {
                     "audit": { "events": [] },
-                    "delegationUpdates": [{
-                        "version": 1,
-                        "sessionId": "parent",
-                        "delegationId": "delegation-1",
-                        "toolCallId": "call-1",
-                        "state": "completed",
-                        "targetAgentId": "coder",
-                        "objective": "Implement it",
-                        "childSessionId": "child-1",
-                        "requestedAt": 100,
-                        "forkedAt": 110,
-                        "finishedAt": 120,
-                        "updatedAt": 120,
-                        "resultSummary": "done",
-                        "error": null
-                    }]
+                    "delegationUpdates": [
+                        delegation_wire_value(1),
+                        { "version": 1, "sessionId": "malformed" },
+                        delegation_wire_value(2)
+                    ]
                 }
             }
         });
 
         let updates = delegation_updates_from_load_value(&response);
 
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].state, DelegationUpdateState::Completed);
-        assert_eq!(updates[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(updates, [expected_delegation_update()]);
     }
 
     #[test]
@@ -3531,6 +3569,47 @@ mod tests {
             "_querymt/session/delegationUpdate"
         ));
         assert!(!is_delegation_notification_method("session/update"));
+    }
+
+    #[test]
+    fn delegation_notification_handler_emits_domain_update() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_delegation_notification(&tx, delegation_wire_value(1));
+
+        assert!(matches!(
+            rx.try_recv().expect("delegation event"),
+            ServerChannelMsg::Acp(AcpAppEvent::DelegationUpdate(update))
+                if update == expected_delegation_update()
+        ));
+    }
+
+    #[test]
+    fn delegation_notification_handler_logs_unsupported_version() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_delegation_notification(&tx, delegation_wire_value(2));
+
+        assert!(matches!(
+            rx.try_recv().expect("delegation version log"),
+            ServerChannelMsg::Acp(AcpAppEvent::InfoLog { target, message })
+                if target == "delegation"
+                    && message == "ignored delegation notification version 2"
+        ));
+    }
+
+    #[test]
+    fn delegation_notification_handler_logs_malformed_payload() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_delegation_notification(&tx, json!({ "version": 1 }));
+
+        assert!(matches!(
+            rx.try_recv().expect("invalid delegation log"),
+            ServerChannelMsg::Acp(AcpAppEvent::InfoLog { target, message })
+                if target == "delegation"
+                    && message.starts_with("invalid delegation notification: ")
+        ));
     }
 
     #[test]
@@ -3980,30 +4059,6 @@ mod tests {
         assert!(empty.profiles.is_empty());
         assert!(empty.active_profile_id.is_none());
         assert!(normalize_profiles_response(json!({})).is_err());
-    }
-
-    #[test]
-    fn delegation_update_payload_uses_camel_case_contract() {
-        let update: DelegationUpdateNotification = serde_json::from_value(json!({
-            "version": 1,
-            "sessionId": "parent",
-            "delegationId": "delegation-1",
-            "toolCallId": "call-1",
-            "state": "forked",
-            "targetAgentId": "coder",
-            "objective": "Implement it",
-            "childSessionId": "child-1",
-            "requestedAt": 100,
-            "forkedAt": 110,
-            "finishedAt": null,
-            "updatedAt": 110,
-            "resultSummary": null,
-            "error": null
-        }))
-        .expect("delegation update");
-
-        assert_eq!(update.state, DelegationUpdateState::Forked);
-        assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
     }
 
     #[test]
