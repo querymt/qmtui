@@ -14,6 +14,7 @@ mod input;
 mod markdown;
 mod mesh;
 mod mesh_state;
+mod models_state;
 mod navigation_state;
 mod profiles_state;
 mod protocol;

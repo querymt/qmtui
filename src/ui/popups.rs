@@ -14,6 +14,7 @@ use crate::domain::activity::DelegateStats;
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::ProfileInfo;
+use crate::models_state::ModelPopupItem;
 use crate::theme::Theme;
 
 use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
@@ -89,7 +90,10 @@ fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
 /// Whether the given model matches a delegate agent's preferred model.
 fn popup_delegate_marker(app: &App, model: &ModelEntry, agent_id: &str) -> bool {
     app.delegate_preference_profile_id()
-        .and_then(|profile_id| app.get_delegate_model_preference(profile_id, agent_id))
+        .and_then(|profile_id| {
+            app.models
+                .get_delegate_model_preference(profile_id, agent_id)
+        })
         .is_some_and(|preference| {
             preference.model_id == model.id && preference.node_id == model.node_id
         })
@@ -98,14 +102,12 @@ fn popup_delegate_marker(app: &App, model: &ModelEntry, agent_id: &str) -> bool 
 // ── Model popup ───────────────────────────────────────────────────────────────
 
 pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
-    use crate::app::ModelPopupItem;
-
     const MODEL_MARKER_COL_W: u16 = 4;
     const MODEL_LABEL_MAX_W: u16 = 48;
     const MODEL_POPUP_MAX_W: u16 = MODEL_MARKER_COL_W + MODEL_LABEL_MAX_W + 2;
     const MODEL_POPUP_MIN_W: u16 = 30;
 
-    let has_tabs = app.model_popup_has_tabs();
+    let has_tabs = app.models.model_popup_has_tabs();
 
     let area = f.area();
     let popup_width = area
@@ -169,9 +171,9 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     // Tab bar (multi-agent only)
     if let Some(ti) = tab_idx {
         let mut tab_spans = Vec::new();
-        for i in 0..app.model_popup_tab_count() {
-            let label = app.model_popup_tab_label(i);
-            let is_active = i == app.model_popup_agent_tab;
+        for i in 0..app.models.model_popup_tab_count() {
+            let label = app.models.model_popup_tab_label(i);
+            let is_active = i == app.models.model_popup_agent_tab;
             let style = if is_active {
                 Theme::popup_title().add_modifier(Modifier::UNDERLINED)
             } else {
@@ -191,8 +193,11 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     // Filter input
     let filter_area = chunks[filter_idx];
     let avail = filter_area.width.saturating_sub(2) as usize;
-    let (model_filter_display, model_filter_cur) =
-        scroll_input(&app.model_filter, app.model_filter.len(), avail);
+    let (model_filter_display, model_filter_cur) = scroll_input(
+        &app.models.model_filter,
+        app.models.model_filter.len(),
+        avail,
+    );
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(model_filter_display, Theme::popup_bg()),
@@ -203,15 +208,19 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
 
-    let on_session_tab = app.model_popup_is_session_tab(app.model_popup_agent_tab);
+    let on_session_tab = app
+        .models
+        .model_popup_is_session_tab(app.models.model_popup_agent_tab);
     let active_agent_id = app
-        .model_popup_tab_agent_id(app.model_popup_agent_tab)
+        .models
+        .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
         .map(str::to_string);
 
     let list_area = chunks[list_idx];
     let list_w = list_area.width as usize;
 
     let items: Vec<ListItem> = app
+        .models
         .visible_model_popup_items()
         .iter()
         .enumerate()
@@ -221,7 +230,7 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 model_count,
                 node_suffix,
             } => {
-                let selected = i == app.model_cursor;
+                let selected = i == app.models.model_cursor;
                 let marker = COLLAPSE_CLOSED;
                 let count = format!(" {model_count}");
                 let marker_style = if selected {
@@ -263,10 +272,11 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
                 ListItem::new(Line::from(line_spans))
             }
             ModelPopupItem::Model { model_idx } => {
-                let selected = i == app.model_cursor;
-                let model = &app.models[*model_idx];
+                let selected = i == app.models.model_cursor;
+                let model = &app.models.models[*model_idx];
 
-                let show_live = on_session_tab && app.live_model_selection_matches_entry(model);
+                let show_live =
+                    on_session_tab && app.models.live_model_selection_matches_entry(model);
                 let show_delegate = active_agent_id
                     .as_deref()
                     .is_some_and(|aid| popup_delegate_marker(app, model, aid));
@@ -322,11 +332,12 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
     let visible_rows = list_area.height as usize;
     let offset = app
+        .models
         .model_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
-        .with_selected(Some(app.model_cursor));
+        .with_selected(Some(app.models.model_cursor));
     f.render_stateful_widget(list, list_area, &mut state);
 
     let mut hint_spans = vec![

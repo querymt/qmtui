@@ -776,8 +776,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.session_id = Some("session-a".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
         app.session_activity.insert(
             "session-a".into(),
             SessionActivity {
@@ -844,8 +844,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
 
         // No delegates → no badge
         let buffer = render_chat_buffer(&mut app, 100, 8);
@@ -905,8 +905,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: Some("c1".into()),
@@ -948,8 +948,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: Some("c1".into()),
@@ -2033,10 +2033,10 @@ mod tests {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.models = vec![
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.models = vec![
             ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
                 label: "Claude Sonnet".into(),
@@ -2111,10 +2111,10 @@ mod tests {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.models = vec![
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.models = vec![
             ModelEntry {
                 id: "anthropic/claude-sonnet".into(),
                 label: "Claude Sonnet".into(),
@@ -2160,11 +2160,11 @@ mod tests {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("codex".into());
-        app.current_model = Some("gpt-5".into());
-        app.current_model_node_id = Some("node-1".into());
-        app.models = vec![
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("codex".into());
+        app.models.current_model = Some("gpt-5".into());
+        app.models.current_model_node_id = Some("node-1".into());
+        app.models.models = vec![
             ModelEntry {
                 id: "codex/gpt-5".into(),
                 label: "gpt-5".into(),
@@ -2344,7 +2344,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.models = (0..12)
+        app.models.models = (0..12)
             .map(|i| ModelEntry {
                 id: format!("anthropic/model-{i}"),
                 label: format!("Model {i}"),
@@ -2356,9 +2356,9 @@ mod tests {
                 quant: None,
             })
             .collect();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("model-8".into());
-        app.model_cursor = app.model_popup_open_cursor();
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("model-8".into());
+        app.models.model_cursor = app.models.model_popup_open_cursor();
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

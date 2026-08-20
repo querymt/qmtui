@@ -156,10 +156,10 @@ impl TuiConfig {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
         merged.show_thinking = Some(app.show_thinking);
-        merged.profile_delegate_models = app.delegate_model_preferences.clone();
+        merged.profile_delegate_models = app.models.delegate_model_preferences.clone();
         merged.profile.id = app.profiles.active_profile_id.clone();
         if let Some(profile_id) = app.profiles.active_profile_id.as_deref()
-            && let Some(preferences) = app.delegate_model_preferences.get(profile_id)
+            && let Some(preferences) = app.models.delegate_model_preferences.get(profile_id)
         {
             merged
                 .delegate_models
@@ -395,8 +395,10 @@ mod tests {
             quant: None,
         };
         app.profiles.active_profile_id = Some("quorum".into());
-        app.set_delegate_model_preference("quorum", "coder", &coder);
-        app.set_delegate_model_preference("quorum", "planner", &planner);
+        app.models
+            .set_delegate_model_preference("quorum", "coder", &coder);
+        app.models
+            .set_delegate_model_preference("quorum", "planner", &planner);
 
         let cfg = TuiConfig::load().with_app_settings(&app);
         cfg.save();

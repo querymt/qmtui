@@ -992,7 +992,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
@@ -1008,7 +1008,7 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
-        app.reasoning_effort = Some("max".into());
+        app.models.reasoning_effort = Some("max".into());
         app.input = "/thinking auto".into();
         app.input_cursor = "/thinking auto".len();
 
@@ -1019,7 +1019,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto"
@@ -1045,7 +1045,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert_eq!(app.models.reasoning_effort, Some("medium".into()));
         assert!(matches!(
             rx.try_recv().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "medium"
@@ -1057,7 +1057,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.reasoning_effort = Some("high".into());
+        app.models.reasoning_effort = Some("high".into());
         app.input = "/thinking".into();
         app.input_cursor = "/thinking".len();
 
@@ -1094,7 +1094,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.reasoning_effort = Some("high".into());
+        app.models.reasoning_effort = Some("high".into());
         app.input = "/thinking max".into();
         app.input_cursor = "/thinking max".len();
 
@@ -1106,7 +1106,7 @@ mod external_editor_tests {
         .unwrap();
 
         // state must not change when disconnected
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
         assert!(app.diagnostics.status.contains("not connected"));
     }
 
@@ -1282,8 +1282,8 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
-        assert_eq!(app.model_filter, "sonnet");
-        assert_eq!(app.model_cursor, 0);
+        assert_eq!(app.models.model_filter, "sonnet");
+        assert_eq!(app.models.model_cursor, 0);
     }
 
     #[test]
@@ -1304,7 +1304,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
-        assert!(app.model_filter.is_empty());
+        assert!(app.models.model_filter.is_empty());
     }
 
     #[test]
@@ -1485,9 +1485,10 @@ pub async fn run() -> anyhow::Result<()> {
     app.launch_cwd = detect_launch_cwd();
     app.profiles.active_profile_id = cfg.profile.id.clone();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
-    app.delegate_model_preferences = cfg.profile_delegate_models.clone();
+    app.models.delegate_model_preferences = cfg.profile_delegate_models.clone();
     if let Some(profile_id) = cfg.profile.id.as_deref() {
         let legacy_preferences = app
+            .models
             .delegate_model_preferences
             .entry(profile_id.to_string())
             .or_default();
@@ -3055,11 +3056,11 @@ mod chord_reasoning_effort_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
 
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.models.reasoning_effort, Some("low".into()));
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
         match msg {
             Command::SetReasoningEffort { reasoning_effort } => {
@@ -3076,11 +3077,11 @@ mod chord_reasoning_effort_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.reasoning_effort = Some("max".into());
+        app.models.reasoning_effort = Some("max".into());
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
 
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
         let msg = rx.try_recv().expect("expected SetReasoningEffort message");
         match msg {
             Command::SetReasoningEffort { reasoning_effort } => {
@@ -3110,12 +3111,12 @@ mod chord_reasoning_effort_tests {
     fn ctrl_t_when_disconnected_does_not_change_state() {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.reasoning_effort = Some("high".into());
+        app.models.reasoning_effort = Some("high".into());
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
 
         // state must not change when disconnected
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
         assert!(app.diagnostics.status.contains("not connected"));
     }
 }
@@ -3164,7 +3165,7 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.models.reasoning_effort, Some("low".into()));
         assert!(matches!(
             rx.try_recv(),
             Ok(Command::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
@@ -3180,15 +3181,15 @@ mod reasoning_effort_integration_tests {
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.reasoning_effort = Some("high".into());
 
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
         assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -3213,17 +3214,17 @@ mod reasoning_effort_integration_tests {
         app.conn = app::ConnState::Connected;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.reasoning_effort = Some("high".into());
         // No plan cache entry
 
         handle_key(&mut app, tab_key(), &tx).unwrap();
 
         // Mode switched but model/effort unchanged (no cache to restore from)
         assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.reasoning_effort, Some("high".into()));
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             !msgs
@@ -3244,10 +3245,10 @@ mod reasoning_effort_integration_tests {
         app.navigation.screen = Screen::Chat;
         app.conn = app::ConnState::Connected;
         app.agent_mode = "plan".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.models = vec![
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.models = vec![
             make_model("anthropic", "claude-sonnet"),
             make_model("openai", "gpt-4o"),
             make_model("openai", "o3-mini"),
@@ -3267,9 +3268,9 @@ mod reasoning_effort_integration_tests {
         .unwrap();
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
-        assert_eq!(app.model_filter, "");
-        let expected = app.model_popup_open_cursor();
-        assert_eq!(app.model_cursor, expected);
+        assert_eq!(app.models.model_filter, "");
+        let expected = app.models.model_popup_open_cursor();
+        assert_eq!(app.models.model_cursor, expected);
     }
 
     #[test]
@@ -3282,15 +3283,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = Some("high".into());
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = app
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.reasoning_effort = Some("high".into());
+        app.models.models = vec![make_model("anthropic", "claude-opus")];
+        app.models.model_cursor = app
+            .models
             .visible_model_popup_items()
             .iter()
-            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
 
         handle_key(
@@ -3300,7 +3302,7 @@ mod reasoning_effort_integration_tests {
         )
         .unwrap();
 
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
 
         let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -3323,15 +3325,16 @@ mod reasoning_effort_integration_tests {
         app.session_id = Some("s1".into());
         app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
-        app.model_popup_agent_tab = 0;
-        app.current_provider = Some("anthropic".into());
-        app.current_model = Some("claude-sonnet".into());
-        app.reasoning_effort = None; // already auto
-        app.models = vec![make_model("anthropic", "claude-opus")];
-        app.model_cursor = app
+        app.models.model_popup_agent_tab = 0;
+        app.models.current_provider = Some("anthropic".into());
+        app.models.current_model = Some("claude-sonnet".into());
+        app.models.reasoning_effort = None; // already auto
+        app.models.models = vec![make_model("anthropic", "claude-opus")];
+        app.models.model_cursor = app
+            .models
             .visible_model_popup_items()
             .iter()
-            .position(|i| matches!(i, app::ModelPopupItem::Model { .. }))
+            .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
 
         handle_key(
@@ -3356,7 +3359,7 @@ mod reasoning_effort_integration_tests {
         app.handle_acp_event(AcpAppEvent::ReasoningEffort {
             reasoning_effort: Some("medium".into()),
         });
-        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert_eq!(app.models.reasoning_effort, Some("medium".into()));
     }
 }
 
