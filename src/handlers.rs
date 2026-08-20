@@ -250,9 +250,7 @@ fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> a
         return Ok(());
     }
     app.navigation.popup = Popup::ModelSelect;
-    app.model_filter.clear();
-    app.model_popup_agent_tab = 0;
-    app.model_cursor = app.model_popup_open_cursor();
+    app.models.reset_for_open();
     cmd_tx.send(Command::ListAllModels { refresh: true })?;
     Ok(())
 }
@@ -555,7 +553,7 @@ pub(crate) fn handle_key(
                 app.set_status(
                     LogLevel::Info,
                     "model",
-                    format!("thinking: {}", app.reasoning_effort_label()),
+                    format!("thinking: {}", app.models.reasoning_effort_label()),
                 );
             }
             None => {
@@ -564,7 +562,7 @@ pub(crate) fn handle_key(
                     "model",
                     format!(
                         "unknown reasoning effort {:?}; cannot cycle",
-                        app.reasoning_effort
+                        app.models.reasoning_effort
                     ),
                 );
             }
@@ -1456,9 +1454,7 @@ pub(crate) fn handle_profile_popup_key(
             {
                 app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
-                    app.agents.clear();
-                    app.agents_profile_id = None;
-                    app.model_popup_agent_tab = 0;
+                    app.models.clear_profile_agents();
                     cmd_tx.send(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
                     })?;
@@ -1826,13 +1822,11 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.navigation.popup = Popup::ModelSelect;
-            app.model_popup_agent_tab = 0;
             if arg.is_empty() {
-                app.model_filter.clear();
-                app.model_cursor = app.model_popup_open_cursor();
+                app.models.reset_for_open();
             } else {
-                app.model_filter = arg;
-                app.model_cursor = 0;
+                app.models.model_popup_agent_tab = 0;
+                app.models.replace_filter(arg);
             }
         }
         "mode" => {
@@ -1883,11 +1877,11 @@ fn try_execute_slash_command(
                 app.set_status(
                     LogLevel::Info,
                     "model",
-                    format!("thinking: {}", app.reasoning_effort_label()),
+                    format!("thinking: {}", app.models.reasoning_effort_label()),
                 );
             } else {
                 let level = arg.to_lowercase();
-                if app::validate_reasoning_effort(Some(&level)).is_none() {
+                if crate::models_state::validate_reasoning_effort(Some(&level)).is_none() {
                     app.set_status(
                         LogLevel::Warn,
                         "model",
@@ -1905,7 +1899,7 @@ fn try_execute_slash_command(
                     app.set_status(
                         LogLevel::Info,
                         "model",
-                        format!("thinking: {}", app.reasoning_effort_label()),
+                        format!("thinking: {}", app.models.reasoning_effort_label()),
                     );
                 }
             }
@@ -1926,9 +1920,7 @@ fn try_execute_slash_command(
             } else if let Some(profile_id) = app.profiles.find_profile_id(&arg) {
                 app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
-                    app.agents.clear();
-                    app.agents_profile_id = None;
-                    app.model_popup_agent_tab = 0;
+                    app.models.clear_profile_agents();
                     cmd_tx.send(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
                     })?;
@@ -2389,63 +2381,57 @@ pub(crate) fn handle_model_popup_key(
             app.navigation.popup = Popup::None;
         }
         KeyCode::Tab | KeyCode::BackTab => {
-            if !app.model_popup_has_tabs() {
+            if !app.models.model_popup_has_tabs() {
                 return Ok(());
             }
-            let n = app.model_popup_tab_count();
-            if key.code == KeyCode::BackTab {
-                app.model_popup_agent_tab = if app.model_popup_agent_tab == 0 {
-                    n - 1
-                } else {
-                    app.model_popup_agent_tab - 1
-                };
-            } else {
-                app.model_popup_agent_tab = (app.model_popup_agent_tab + 1) % n;
-            }
-            app.model_filter.clear();
-            app.model_cursor = if app.model_popup_is_session_tab(app.model_popup_agent_tab) {
-                app.model_popup_open_cursor()
-            } else if let Some(aid) = app
-                .model_popup_tab_agent_id(app.model_popup_agent_tab)
-                .map(str::to_string)
+            let agent_id = app
+                .models
+                .switch_model_popup_tab(key.code == KeyCode::BackTab);
+            app.models.model_cursor = if app
+                .models
+                .model_popup_is_session_tab(app.models.model_popup_agent_tab)
             {
-                app.delegate_model_cursor(&aid)
+                app.models.model_popup_open_cursor()
+            } else if let Some(agent_id) = agent_id {
+                app.delegate_model_cursor(&agent_id)
             } else {
                 0
             };
         }
-        KeyCode::Up => {
-            app.model_cursor = app.model_cursor.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            let max = app.visible_model_popup_items().len().saturating_sub(1);
-            app.model_cursor = (app.model_cursor + 1).min(max);
-        }
+        KeyCode::Up => app.models.move_model_cursor_up(),
+        KeyCode::Down => app.models.move_model_cursor_down(),
         KeyCode::Enter => {
             let selected: Option<ModelEntry> = app
+                .models
                 .visible_model_popup_items()
-                .get(app.model_cursor)
+                .get(app.models.model_cursor)
                 .and_then(|item| match item {
-                    crate::app::ModelPopupItem::Model { model_idx } => app.models.get(*model_idx),
-                    crate::app::ModelPopupItem::ProviderHeader { .. } => None,
+                    crate::models_state::ModelPopupItem::Model { model_idx } => {
+                        app.models.models.get(*model_idx)
+                    }
+                    crate::models_state::ModelPopupItem::ProviderHeader { .. } => None,
                 })
                 .cloned();
             if let Some(model) = selected {
                 let tab_label = app
-                    .model_popup_tab_label(app.model_popup_agent_tab)
+                    .models
+                    .model_popup_tab_label(app.models.model_popup_agent_tab)
                     .to_string();
-                if app.model_popup_is_session_tab(app.model_popup_agent_tab) {
+                if app
+                    .models
+                    .model_popup_is_session_tab(app.models.model_popup_agent_tab)
+                {
                     if !app.current_session_is_remote() {
-                        if let Some(sid) = app.session_id.clone() {
+                        if let Some(session_id) = app.session_id.clone() {
                             cmd_tx.send(Command::SetSessionModel {
-                                session_id: sid,
+                                session_id,
                                 model_id: model.id.clone(),
                                 node_id: model.node_id.clone(),
                             })?;
                         }
-                        app.apply_model_selection_from_entry(&model);
-                        if app.reasoning_effort.is_some() {
-                            app.reasoning_effort = None;
+                        app.models.apply_model_selection_from_entry(&model);
+                        if app.models.reasoning_effort.is_some() {
+                            app.models.reasoning_effort = None;
                             cmd_tx.send(Command::SetReasoningEffort {
                                 reasoning_effort: "auto".into(),
                             })?;
@@ -2453,12 +2439,14 @@ pub(crate) fn handle_model_popup_key(
                     }
                     app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
                 } else if let Some(agent_id) = app
-                    .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                    .models
+                    .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
                     .map(str::to_string)
                     && let Some(profile_id) =
                         app.delegate_preference_profile_id().map(str::to_string)
                 {
-                    app.set_delegate_model_preference(&profile_id, &agent_id, &model);
+                    app.models
+                        .set_delegate_model_preference(&profile_id, &agent_id, &model);
                     if app.parent_session_id.is_none()
                         && let Some(session_id) = app.session_id.clone()
                     {
@@ -2478,13 +2466,19 @@ pub(crate) fn handle_model_popup_key(
                 save_config(app);
             }
         }
-        KeyCode::Delete if !app.model_popup_is_session_tab(app.model_popup_agent_tab) => {
+        KeyCode::Delete
+            if !app
+                .models
+                .model_popup_is_session_tab(app.models.model_popup_agent_tab) =>
+        {
             if let Some(agent_id) = app
-                .model_popup_tab_agent_id(app.model_popup_agent_tab)
+                .models
+                .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
                 .map(str::to_string)
                 && let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string)
             {
-                app.clear_delegate_model_preference(&profile_id, &agent_id);
+                app.models
+                    .clear_delegate_model_preference(&profile_id, &agent_id);
                 if app.parent_session_id.is_none()
                     && let Some(session_id) = app.session_id.clone()
                 {
@@ -2503,13 +2497,9 @@ pub(crate) fn handle_model_popup_key(
                 save_config(app);
             }
         }
-        KeyCode::Backspace => {
-            app.model_filter.pop();
-            app.model_cursor = 0;
-        }
+        KeyCode::Backspace => app.models.model_filter_backspace(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.model_filter.push(c);
-            app.model_cursor = 0;
+            app.models.model_filter_insert(c);
         }
         _ => {}
     }
@@ -3174,21 +3164,21 @@ mod model_popup_tests {
         app.profiles
             .bind_session_profile("s1".into(), "profile".into());
         app.agent_mode = "plan".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        app.models = vec![
+        app.models.current_provider = Some("openai".into());
+        app.models.current_model = Some("gpt-4o".into());
+        app.models.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
+        app.models.models = vec![
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.model_popup_agent_tab = 1; // delegate tab
-        let items = app.visible_model_popup_items();
-        app.model_cursor = items
+        app.models.model_popup_agent_tab = 1; // delegate tab
+        let items = app.models.visible_model_popup_items();
+        app.models.model_cursor = items
             .iter()
             .position(|i| {
                 matches!(
                     i,
-                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].model == "claude-sonnet"
+                    crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].model == "claude-sonnet"
                 )
             })
             .unwrap();
@@ -3207,10 +3197,11 @@ mod model_popup_tests {
                 && agent_id == "coder"
                 && model_id.as_deref() == Some("anthropic/claude-sonnet")
         ));
-        assert_eq!(app.current_provider.as_deref(), Some("openai"));
-        assert_eq!(app.current_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(app.models.current_provider.as_deref(), Some("openai"));
+        assert_eq!(app.models.current_model.as_deref(), Some("gpt-4o"));
         assert_eq!(
-            app.get_delegate_model_preference("profile", "coder")
+            app.models
+                .get_delegate_model_preference("profile", "coder")
                 .map(|preference| preference.model_id.as_str()),
             Some("anthropic/claude-sonnet")
         );
@@ -3225,19 +3216,21 @@ mod model_popup_tests {
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
             .bind_session_profile("s1".into(), "profile".into());
-        app.agents = vec![
+        app.models.agents = vec![
             make_agent("primary", "Session"),
             make_agent("coder", "Coder"),
         ];
-        app.model_popup_agent_tab = 1;
+        app.models.model_popup_agent_tab = 1;
         let model = make_model("anthropic", "claude-sonnet");
-        app.set_delegate_model_preference("profile", "coder", &model);
+        app.models
+            .set_delegate_model_preference("profile", "coder", &model);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Delete), &tx).unwrap();
 
         assert!(
-            app.get_delegate_model_preference("profile", "coder")
+            app.models
+                .get_delegate_model_preference("profile", "coder")
                 .is_none()
         );
         assert!(matches!(
@@ -3261,20 +3254,21 @@ mod model_popup_tests {
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
             .bind_session_profile("child".into(), "profile".into());
-        app.agents = vec![
+        app.models.agents = vec![
             make_agent("primary", "Session"),
             make_agent("coder", "Coder"),
         ];
-        app.models = vec![make_model("anthropic", "claude-sonnet")];
-        app.model_popup_agent_tab = 1;
-        app.model_cursor = 1;
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_popup_agent_tab = 1;
+        app.models.model_cursor = 1;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(rx.try_recv().is_err());
         assert!(
-            app.get_delegate_model_preference("profile", "coder")
+            app.models
+                .get_delegate_model_preference("profile", "coder")
                 .is_some()
         );
     }
@@ -3286,22 +3280,22 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.reasoning_effort = Some("high".into());
+        app.models.current_provider = Some("openai".into());
+        app.models.current_model = Some("gpt-4o".into());
+        app.models.reasoning_effort = Some("high".into());
 
-        app.models = vec![
+        app.models.models = vec![
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.model_popup_agent_tab = 0;
-        let items = app.visible_model_popup_items();
-        app.model_cursor = items
+        app.models.model_popup_agent_tab = 0;
+        let items = app.models.visible_model_popup_items();
+        app.models.model_cursor = items
             .iter()
             .position(|i| {
                 matches!(
                     i,
-                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].model == "claude-sonnet"
+                    crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].model == "claude-sonnet"
                 )
             })
             .unwrap();
@@ -3317,9 +3311,9 @@ mod model_popup_tests {
         );
         assert!(rx.try_recv().is_err());
 
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude-sonnet"));
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(app.models.reasoning_effort, None);
     }
 
     #[test]
@@ -3329,9 +3323,9 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.models = vec![
+        app.models.current_provider = Some("openai".into());
+        app.models.current_model = Some("gpt-4o".into());
+        app.models.models = vec![
             make_model("openai", "gpt-4o"),
             ModelEntry {
                 id: "mesh/anthropic/claude".into(),
@@ -3344,14 +3338,14 @@ mod model_popup_tests {
                 quant: None,
             },
         ];
-        app.model_popup_agent_tab = 0;
-        let items = app.visible_model_popup_items();
-        app.model_cursor = items
+        app.models.model_popup_agent_tab = 0;
+        let items = app.models.visible_model_popup_items();
+        app.models.model_cursor = items
             .iter()
             .position(|i| {
                 matches!(
                     i,
-                    crate::app::ModelPopupItem::Model { model_idx } if app.models[*model_idx].node_id.is_some()
+                    crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].node_id.is_some()
                 )
             })
             .unwrap();
@@ -3369,9 +3363,9 @@ mod model_popup_tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(rx.try_recv().is_err());
-        assert_eq!(app.current_provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.current_model.as_deref(), Some("claude"));
-        assert_eq!(app.current_model_node_id.as_deref(), Some("node-a"));
+        assert_eq!(app.models.current_provider.as_deref(), Some("anthropic"));
+        assert_eq!(app.models.current_model.as_deref(), Some("claude"));
+        assert_eq!(app.models.current_model_node_id.as_deref(), Some("node-a"));
     }
 
     #[test]
@@ -3389,12 +3383,13 @@ mod model_popup_tests {
             }],
             ..Default::default()
         }];
-        app.models = vec![make_model("anthropic", "claude-sonnet")];
-        app.model_popup_agent_tab = 0;
-        app.model_cursor = app
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_popup_agent_tab = 0;
+        app.models.model_cursor = app
+            .models
             .visible_model_popup_items()
             .iter()
-            .position(|i| matches!(i, crate::app::ModelPopupItem::Model { .. }))
+            .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3408,16 +3403,19 @@ mod model_popup_tests {
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.agent_mode = "review".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.models = vec![make_model("openai", "gpt-4o")];
+        app.models.current_provider = Some("openai".into());
+        app.models.current_model = Some("gpt-4o".into());
+        app.models.models = vec![make_model("openai", "gpt-4o")];
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_chord(&mut app, key(KeyCode::Char('m')), &tx).unwrap();
 
         assert!(matches!(app.navigation.popup, Popup::ModelSelect));
-        assert_eq!(app.model_popup_agent_tab, 0);
-        assert_eq!(app.model_cursor, app.model_popup_open_cursor());
+        assert_eq!(app.models.model_popup_agent_tab, 0);
+        assert_eq!(
+            app.models.model_cursor,
+            app.models.model_popup_open_cursor()
+        );
     }
 
     #[test]
@@ -3426,9 +3424,9 @@ mod model_popup_tests {
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.agent_mode = "review".into();
-        app.current_provider = Some("openai".into());
-        app.current_model = Some("gpt-4o".into());
-        app.models = vec![make_model("openai", "gpt-4o")];
+        app.models.current_provider = Some("openai".into());
+        app.models.current_model = Some("gpt-4o".into());
+        app.models.models = vec![make_model("openai", "gpt-4o")];
         app.input = "/model".into();
         app.input_cursor = app.input.len();
 
@@ -3437,8 +3435,11 @@ mod model_popup_tests {
 
         assert!(matches!(action, AppAction::None));
         assert!(matches!(app.navigation.popup, Popup::ModelSelect));
-        assert_eq!(app.model_popup_agent_tab, 0);
-        assert_eq!(app.model_cursor, app.model_popup_open_cursor());
+        assert_eq!(app.models.model_popup_agent_tab, 0);
+        assert_eq!(
+            app.models.model_cursor,
+            app.models.model_popup_open_cursor()
+        );
     }
 
     #[test]
