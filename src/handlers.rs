@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, App, AuthUiNotice, CommandPaletteAction, LogLevel, Popup, Screen};
+use crate::app::{self, App, AuthUiNotice, CommandPaletteAction, Popup, Screen};
+use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
@@ -25,7 +26,7 @@ pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
         true
     } else {
         app.set_status(
-            app::LogLevel::Warn,
+            LogLevel::Warn,
             "connection",
             "not connected - waiting to reconnect",
         );
@@ -237,7 +238,7 @@ pub(crate) fn handle_elicitation_key(
 fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> anyhow::Result<()> {
     if app.screen != Screen::Chat {
         app.set_status(
-            app::LogLevel::Warn,
+            LogLevel::Warn,
             "model",
             "model select is only available in chat",
         );
@@ -273,8 +274,8 @@ fn open_session_popup(
 
 fn open_log_popup(app: &mut App) {
     app.popup = Popup::Log;
-    app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-    app.log_filter.clear();
+    app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
+    app.diagnostics.log_filter.clear();
 }
 
 fn execute_command_palette_action(
@@ -455,7 +456,7 @@ pub(crate) fn handle_mesh_invite_popup_key(
         KeyCode::Enter => {
             if let Some(msg) = app.mesh_invite_form_command() {
                 cmd_tx.send(msg)?;
-                app.set_status(app::LogLevel::Info, "mesh", "creating invite...");
+                app.set_status(LogLevel::Info, "mesh", "creating invite...");
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -489,7 +490,7 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> a
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(url) = app.mesh_invite_url().map(str::to_string) {
                 if copy_text_to_clipboard(&url) {
-                    app.set_status(app::LogLevel::Info, "mesh", "invite URL copied");
+                    app.set_status(LogLevel::Info, "mesh", "invite URL copied");
                 } else {
                     app.mesh_clipboard_fallback = Some(url);
                 }
@@ -557,11 +558,11 @@ pub(crate) fn handle_key(
     // chord second key: ctrl+x was pressed, now handle the follow-up
     if app.chord {
         app.chord = false;
-        app.set_status(app::LogLevel::Debug, "input", "ready");
+        app.set_status(LogLevel::Debug, "input", "ready");
         if key.code == KeyCode::Char('e') {
             if app.screen != Screen::Chat {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "editor",
                     "external editor is only available in chat",
                 );
@@ -588,14 +589,14 @@ pub(crate) fn handle_key(
             Some(msg) => {
                 cmd_tx.send(msg)?;
                 app.set_status(
-                    app::LogLevel::Info,
+                    LogLevel::Info,
                     "model",
                     format!("thinking: {}", app.reasoning_effort_label()),
                 );
             }
             None => {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "model",
                     format!(
                         "unknown reasoning effort {:?}; cannot cycle",
@@ -618,7 +619,7 @@ pub(crate) fn handle_key(
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.chord = true;
-        app.set_status(app::LogLevel::Debug, "input", "C-x ...");
+        app.set_status(LogLevel::Debug, "input", "C-x ...");
         return Ok(AppAction::None);
     }
 
@@ -747,11 +748,7 @@ pub(crate) fn handle_chord(
             app.should_quit = true;
         }
         KeyCode::Char('e') => {
-            app.set_status(
-                app::LogLevel::Warn,
-                "editor",
-                "external editor unavailable here",
-            );
+            app.set_status(LogLevel::Warn, "editor", "external editor unavailable here");
         }
 
         KeyCode::Char('t') => {
@@ -780,7 +777,7 @@ pub(crate) fn handle_chord(
         KeyCode::Char('j') => {
             if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "session",
                     "parent jump only available in chat",
                 );
@@ -797,7 +794,7 @@ pub(crate) fn handle_chord(
                     app.agent_id.clone(),
                 )?;
             } else {
-                app.set_status(app::LogLevel::Info, "session", "no parent session");
+                app.set_status(LogLevel::Info, "session", "no parent session");
             }
         }
         KeyCode::Char('?') => {
@@ -807,7 +804,7 @@ pub(crate) fn handle_chord(
         KeyCode::Char('f') => {
             if app.screen != Screen::Chat {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "fork",
                     "fork selector is only available in chat",
                 );
@@ -821,12 +818,12 @@ pub(crate) fn handle_chord(
             }
             if app.is_turn_active() {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
+                app.set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.current_undo_target().cloned() {
                 if app.input.trim().is_empty() && !turn.text.is_empty() {
                     app.input = turn.text.clone();
@@ -835,12 +832,12 @@ pub(crate) fn handle_chord(
                 }
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
-                app.set_status(app::LogLevel::Info, "session", "undoing...");
+                app.set_status(LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
                 })?;
             } else {
-                app.set_status(app::LogLevel::Warn, "session", "nothing to undo");
+                app.set_status(LogLevel::Warn, "session", "nothing to undo");
             }
         }
         KeyCode::Char('r') => {
@@ -849,22 +846,22 @@ pub(crate) fn handle_chord(
             }
             if app.is_turn_active() {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
+                app.set_status(LogLevel::Warn, "session", "undo already pending");
             } else if app.can_redo() {
                 app.activity = ActivityState::SessionOp(SessionOp::Redo);
-                app.set_status(app::LogLevel::Info, "session", "redoing...");
+                app.set_status(LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(Command::Redo)?;
             } else {
-                app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
+                app.set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
         _ => {
-            app.set_status(app::LogLevel::Debug, "input", "unknown chord");
+            app.set_status(LogLevel::Debug, "input", "unknown chord");
         }
     }
     Ok(())
@@ -1111,7 +1108,7 @@ pub(crate) fn apply_popup_session_key(
                             }
                             if app.is_remote_session_id(&session_id) {
                                 app.set_status(
-                                    app::LogLevel::Warn,
+                                    LogLevel::Warn,
                                     "session",
                                     "remote session is missing node id; refresh sessions and try again",
                                 );
@@ -1359,7 +1356,7 @@ pub(crate) fn apply_delegate_popup_key(
                     };
                 } else {
                     app.set_status(
-                        app::LogLevel::Warn,
+                        LogLevel::Warn,
                         "delegates",
                         "delegation still pending — no session to load",
                     );
@@ -1438,36 +1435,36 @@ pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Resu
             app.popup = Popup::None;
         }
         KeyCode::Up => {
-            app.log_cursor = app.log_cursor.saturating_sub(1);
+            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(1);
         }
         KeyCode::Down => {
             let max = app.filtered_logs().len().saturating_sub(1);
-            app.log_cursor = (app.log_cursor + 1).min(max);
+            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 1).min(max);
         }
         KeyCode::PageUp => {
-            app.log_cursor = app.log_cursor.saturating_sub(10);
+            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(10);
         }
         KeyCode::PageDown => {
             let max = app.filtered_logs().len().saturating_sub(1);
-            app.log_cursor = (app.log_cursor + 10).min(max);
+            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 10).min(max);
         }
         KeyCode::Home => {
-            app.log_cursor = 0;
+            app.diagnostics.log_cursor = 0;
         }
         KeyCode::End => {
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
         }
         KeyCode::Backspace => {
-            app.log_filter.pop();
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.diagnostics.log_filter.pop();
+            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
         }
         KeyCode::Tab => {
             app.cycle_log_level_filter();
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.log_filter.push(c);
-            app.log_cursor = 0;
+            app.diagnostics.log_filter.push(c);
+            app.diagnostics.log_cursor = 0;
         }
         _ => {}
     }
@@ -1509,13 +1506,13 @@ pub(crate) fn handle_profile_popup_key(
                 }
                 app.popup = Popup::None;
                 app.set_status(
-                    app::LogLevel::Info,
+                    LogLevel::Info,
                     "profile",
                     format!("new sessions will use {profile_id}"),
                 );
                 save_config(app);
             } else {
-                app.set_status(app::LogLevel::Warn, "profile", "no matching profile");
+                app.set_status(LogLevel::Warn, "profile", "no matching profile");
             }
         }
         _ => {}
@@ -1673,7 +1670,7 @@ pub(crate) fn handle_chat_key(
             } else if app.has_cancellable_activity() {
                 if app.cancel_confirm_active() {
                     app.clear_cancel_confirm();
-                    app.set_status(app::LogLevel::Warn, "activity", "stopping...");
+                    app.set_status(LogLevel::Warn, "activity", "stopping...");
                     cmd_tx.send(Command::CancelSession)?;
                 } else {
                     app.arm_cancel_confirm();
@@ -1886,7 +1883,7 @@ fn try_execute_slash_command(
             app.take_input();
             if app.screen != crate::app::Screen::Chat {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "model",
                     "model select is only available in chat",
                 );
@@ -1918,7 +1915,7 @@ fn try_execute_slash_command(
                     "build" | "plan" => {
                         if app.agent_mode == arg {
                             app.set_status(
-                                app::LogLevel::Info,
+                                LogLevel::Info,
                                 "mode",
                                 format!("already in {} mode", arg),
                             );
@@ -1928,7 +1925,7 @@ fn try_execute_slash_command(
                     }
                     _ => {
                         app.set_status(
-                            app::LogLevel::Warn,
+                            LogLevel::Warn,
                             "mode",
                             format!("unknown mode: {} (try build or plan)", arg),
                         );
@@ -1942,7 +1939,7 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             if app.agent_mode == "review" {
-                app.set_status(app::LogLevel::Info, "mode", "already in review mode");
+                app.set_status(LogLevel::Info, "mode", "already in review mode");
             } else {
                 switch_mode(app, cmd_tx, "review")?;
             }
@@ -1951,7 +1948,7 @@ fn try_execute_slash_command(
             app.take_input();
             if arg.is_empty() {
                 app.set_status(
-                    app::LogLevel::Info,
+                    LogLevel::Info,
                     "model",
                     format!("thinking: {}", app.reasoning_effort_label()),
                 );
@@ -1959,7 +1956,7 @@ fn try_execute_slash_command(
                 let level = arg.to_lowercase();
                 if app::validate_reasoning_effort(Some(&level)).is_none() {
                     app.set_status(
-                        app::LogLevel::Warn,
+                        LogLevel::Warn,
                         "model",
                         format!(
                             "unknown level: {} (try auto, low, medium, high, max)",
@@ -1973,7 +1970,7 @@ fn try_execute_slash_command(
                     let msg = app.set_reasoning_effort(Some(&level)).unwrap();
                     cmd_tx.send(msg)?;
                     app.set_status(
-                        app::LogLevel::Info,
+                        LogLevel::Info,
                         "model",
                         format!("thinking: {}", app.reasoning_effort_label()),
                     );
@@ -2005,14 +2002,14 @@ fn try_execute_slash_command(
                     })?;
                 }
                 app.set_status(
-                    app::LogLevel::Info,
+                    LogLevel::Info,
                     "profile",
                     format!("new sessions will use {profile_id}"),
                 );
                 save_config(app);
             } else {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "profile",
                     format!("unknown profile: {}", arg),
                 );
@@ -2035,7 +2032,7 @@ fn try_execute_slash_command(
             app.take_input();
             if app.screen != crate::app::Screen::Chat {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "delegates",
                     "delegates only available in chat",
                 );
@@ -2061,8 +2058,8 @@ fn try_execute_slash_command(
         "logs" => {
             app.take_input();
             app.popup = crate::app::Popup::Log;
-            app.log_cursor = app.filtered_logs().len().saturating_sub(1);
-            app.log_filter.clear();
+            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
+            app.diagnostics.log_filter.clear();
         }
         "auth" => {
             app.take_input();
@@ -2075,34 +2072,22 @@ fn try_execute_slash_command(
         "fork" => {
             app.take_input();
             if app.screen != crate::app::Screen::Chat {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "fork",
-                    "forking is only available in chat",
-                );
+                app.set_status(LogLevel::Warn, "fork", "forking is only available in chat");
                 return Ok(SlashResult::Handled);
             }
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
             if app.pending_fork_message_id.is_some() {
-                app.set_status(app::LogLevel::Warn, "fork", "fork already pending");
+                app.set_status(LogLevel::Warn, "fork", "fork already pending");
             } else if app.has_pending_session_op() {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "fork",
-                    "session operation already pending",
-                );
+                app.set_status(LogLevel::Warn, "fork", "session operation already pending");
             } else if app.is_turn_active() {
-                app.set_status(
-                    app::LogLevel::Warn,
-                    "fork",
-                    "cannot fork while agent is active",
-                );
+                app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
             } else if let Some(turn) = app.latest_fork_boundary() {
                 begin_fork_session(app, turn.message_id, cmd_tx)?;
             } else {
-                app.set_status(app::LogLevel::Warn, "fork", "no forkable turns");
+                app.set_status(LogLevel::Warn, "fork", "no forkable turns");
             }
         }
         "undo" => {
@@ -2114,12 +2099,12 @@ fn try_execute_slash_command(
             }
             if app.is_turn_active() {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.set_status(app::LogLevel::Warn, "session", "undo already pending");
+                app.set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.current_undo_target().cloned() {
                 if app.input.trim().is_empty() && !turn.text.is_empty() {
                     app.input = turn.text.clone();
@@ -2128,12 +2113,12 @@ fn try_execute_slash_command(
                 }
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
-                app.set_status(app::LogLevel::Info, "session", "undoing...");
+                app.set_status(LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
                 })?;
             } else {
-                app.set_status(app::LogLevel::Warn, "session", "nothing to undo");
+                app.set_status(LogLevel::Warn, "session", "nothing to undo");
             }
         }
         "redo" => {
@@ -2143,18 +2128,18 @@ fn try_execute_slash_command(
             }
             if app.is_turn_active() {
                 app.set_status(
-                    app::LogLevel::Warn,
+                    LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
             } else if app.has_pending_session_op() || app.has_pending_undo() {
-                app.set_status(app::LogLevel::Warn, "session", "redo already pending");
+                app.set_status(LogLevel::Warn, "session", "redo already pending");
             } else if app.can_redo() {
                 app.activity = ActivityState::SessionOp(SessionOp::Redo);
-                app.set_status(app::LogLevel::Info, "session", "redoing...");
+                app.set_status(LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(Command::Redo)?;
             } else {
-                app.set_status(app::LogLevel::Warn, "session", "nothing to redo");
+                app.set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
         "editor" => {
@@ -2165,10 +2150,10 @@ fn try_execute_slash_command(
             app.take_input();
             if app.has_cancellable_activity() {
                 app.clear_cancel_confirm();
-                app.set_status(app::LogLevel::Warn, "activity", "stopping...");
+                app.set_status(LogLevel::Warn, "activity", "stopping...");
                 cmd_tx.send(Command::CancelSession)?;
             } else {
-                app.set_status(app::LogLevel::Warn, "activity", "nothing to cancel");
+                app.set_status(LogLevel::Warn, "activity", "nothing to cancel");
             }
         }
         "quit" => {
@@ -2536,11 +2521,7 @@ pub(crate) fn handle_model_popup_key(
                             })?;
                         }
                     }
-                    app.set_status(
-                        app::LogLevel::Info,
-                        "model",
-                        format!("session: {}", model.label),
-                    );
+                    app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
                 } else if let Some(agent_id) = app
                     .model_popup_tab_agent_id(app.model_popup_agent_tab)
                     .map(str::to_string)
@@ -2559,7 +2540,7 @@ pub(crate) fn handle_model_popup_key(
                         })?;
                     }
                     app.set_status(
-                        app::LogLevel::Info,
+                        LogLevel::Info,
                         "model",
                         format!("{tab_label}: {}", model.label),
                     );
@@ -2585,7 +2566,7 @@ pub(crate) fn handle_model_popup_key(
                     })?;
                 }
                 app.set_status(
-                    app::LogLevel::Info,
+                    LogLevel::Info,
                     "model",
                     "delegate model uses profile default",
                 );
@@ -2693,7 +2674,7 @@ pub(crate) fn apply_sessions_key(
                             }
                             if app.is_remote_session_id(&session_id) {
                                 app.set_status(
-                                    app::LogLevel::Warn,
+                                    LogLevel::Warn,
                                     "session",
                                     "remote session is missing node id; refresh sessions and try again",
                                 );
@@ -3522,6 +3503,6 @@ mod model_popup_tests {
         assert_eq!(app.agent_mode, "review");
         assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
         assert!(rx.try_recv().is_err());
-        assert_eq!(app.status, "already in review mode");
+        assert_eq!(app.diagnostics.status, "already in review mode");
     }
 }

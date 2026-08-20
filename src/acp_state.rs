@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::acp_client::DelegateModelOverrideInfo;
-use crate::app::{LogLevel, POPUP_SESSION_PAGE_TARGET, Popup, Screen};
+use crate::app::{POPUP_SESSION_PAGE_TARGET, Popup, Screen};
 use crate::command::{Command, SessionListRequest};
+use crate::diagnostics::LogLevel;
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     DelegationState, DelegationUpdate,
@@ -3551,7 +3552,7 @@ mod tests {
         assert_eq!(app.context_limit, 8192);
         assert_eq!(app.cumulative_cost, Some(0.0123));
         assert!(matches!(
-            app.logs.last(),
+            app.diagnostics.logs.last(),
             Some(entry)
                 if entry.level == LogLevel::Info
                     && entry.target == "usage"
@@ -3575,7 +3576,7 @@ mod tests {
             Some(std::time::Duration::from_secs(42))
         );
         assert!(matches!(
-            app.logs.last(),
+            app.diagnostics.logs.last(),
             Some(entry)
                 if entry.level == LogLevel::Info
                     && entry.target == "usage"
@@ -3771,7 +3772,7 @@ mod tests {
         }));
 
         assert!(matches!(app.activity, ActivityState::Idle));
-        assert_eq!(app.status, "undone - reloading session");
+        assert_eq!(app.diagnostics.status, "undone - reloading session");
         assert!(app.can_redo());
         assert_eq!(
             app.undo_state.as_ref().unwrap().stack[0].reverted_files,
@@ -3826,7 +3827,7 @@ mod tests {
         }));
 
         assert!(matches!(app.activity, ActivityState::Idle));
-        assert_eq!(app.status, "Undo rejected");
+        assert_eq!(app.diagnostics.status, "Undo rejected");
         assert_eq!(app.streaming_content, "keep streaming content");
         assert!(replies.is_empty());
         let undo_state = app.undo_state.as_ref().expect("undo state");
@@ -3892,7 +3893,7 @@ mod tests {
         }));
 
         assert!(matches!(app.activity, ActivityState::Idle));
-        assert_eq!(app.status, "redone - reloading session");
+        assert_eq!(app.diagnostics.status, "redone - reloading session");
         assert!(app.can_redo());
         assert!(matches!(
             replies.as_slice(),
@@ -3919,11 +3920,11 @@ mod tests {
         }));
 
         assert!(matches!(app.activity, ActivityState::Idle));
-        assert_eq!(app.status, "Nothing to redo");
+        assert_eq!(app.diagnostics.status, "Nothing to redo");
         assert!(app.can_redo());
         assert!(replies.is_empty());
         assert!(matches!(
-            app.logs.last(),
+            app.diagnostics.logs.last(),
             Some(entry) if entry.level == LogLevel::Warn && entry.target == "session"
         ));
     }
@@ -3943,7 +3944,7 @@ mod tests {
 
         assert_eq!(app.pending_fork_message_id, None);
         assert_eq!(app.popup, Popup::None);
-        assert_eq!(app.status, "forked - loading session");
+        assert_eq!(app.diagnostics.status, "forked - loading session");
         assert_eq!(replies.len(), 2);
         assert!(matches!(
             replies.as_slice(),
@@ -3969,7 +3970,7 @@ mod tests {
         assert!(replies.is_empty());
         assert_eq!(app.pending_fork_message_id, None);
         assert_eq!(app.popup, Popup::ForkTurnSelect);
-        assert_eq!(app.status, "fork succeeded without session id");
+        assert_eq!(app.diagnostics.status, "fork succeeded without session id");
     }
 
     #[test]
@@ -3986,7 +3987,7 @@ mod tests {
         assert!(replies.is_empty());
         assert_eq!(app.pending_fork_message_id, None);
         assert_eq!(app.popup, Popup::ForkTurnSelect);
-        assert_eq!(app.status, "fork failed");
+        assert_eq!(app.diagnostics.status, "fork failed");
     }
 
     #[test]

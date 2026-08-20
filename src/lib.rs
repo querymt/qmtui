@@ -5,6 +5,7 @@ mod acp_state;
 mod app;
 mod command;
 mod config;
+mod diagnostics;
 mod domain;
 mod handlers;
 mod highlight;

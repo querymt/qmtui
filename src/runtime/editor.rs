@@ -5,7 +5,8 @@ use std::{
     process::Command,
 };
 
-use crate::app::{App, LogLevel};
+use crate::app::App;
+use crate::diagnostics::LogLevel;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EditorCommand {
@@ -161,8 +162,8 @@ mod tests {
 
         assert_eq!(app.input, "revised prompt");
         assert_eq!(app.input_cursor, "revised prompt".len());
-        assert_eq!(app.status, "loaded prompt from external editor");
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
+        assert_eq!(app.diagnostics.status, "loaded prompt from external editor");
+        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "editor"));
     }
 
     #[test]
@@ -173,6 +174,6 @@ mod tests {
         apply_external_editor_outcome(&mut app, Ok(None));
 
         assert_eq!(app.input, "draft");
-        assert_eq!(app.status, "external editor cancelled");
+        assert_eq!(app.diagnostics.status, "external editor cancelled");
     }
 }

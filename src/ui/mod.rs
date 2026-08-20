@@ -471,6 +471,7 @@ mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::{App, Screen};
+    use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
     };
@@ -2420,15 +2421,11 @@ mod tests {
     fn draw_log_popup_shows_filter_level_and_entries() {
         let mut app = App::new();
         app.popup = Popup::Log;
-        app.log_filter = "server".into();
-        app.log_level_filter = crate::app::LogLevel::Info;
-        app.push_log(
-            crate::app::LogLevel::Info,
-            "server",
-            "starting local server",
-        );
-        app.push_log(crate::app::LogLevel::Error, "server", "start failed");
-        app.log_cursor = app.filtered_logs().len().saturating_sub(1);
+        app.diagnostics.log_filter = "server".into();
+        app.diagnostics.log_level_filter = LogLevel::Info;
+        app.push_log(LogLevel::Info, "server", "starting local server");
+        app.push_log(LogLevel::Error, "server", "start failed");
+        app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
 
         let backend = ratatui::backend::TestBackend::new(100, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
