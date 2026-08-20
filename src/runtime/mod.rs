@@ -1479,7 +1479,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.launch_cwd = detect_launch_cwd();
-    app.active_profile_id = cfg.profile.id.clone();
+    app.profiles.active_profile_id = cfg.profile.id.clone();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
     app.delegate_model_preferences = cfg.profile_delegate_models.clone();
     if let Some(profile_id) = cfg.profile.id.as_deref() {

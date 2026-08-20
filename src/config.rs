@@ -157,8 +157,8 @@ impl TuiConfig {
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
         merged.show_thinking = Some(app.show_thinking);
         merged.profile_delegate_models = app.delegate_model_preferences.clone();
-        merged.profile.id = app.active_profile_id.clone();
-        if let Some(profile_id) = app.active_profile_id.as_deref()
+        merged.profile.id = app.profiles.active_profile_id.clone();
+        if let Some(profile_id) = app.profiles.active_profile_id.as_deref()
             && let Some(preferences) = app.delegate_model_preferences.get(profile_id)
         {
             merged
@@ -394,7 +394,7 @@ mod tests {
             family: None,
             quant: None,
         };
-        app.active_profile_id = Some("quorum".into());
+        app.profiles.active_profile_id = Some("quorum".into());
         app.set_delegate_model_preference("quorum", "coder", &coder);
         app.set_delegate_model_preference("quorum", "planner", &planner);
 
@@ -411,6 +411,34 @@ mod tests {
             loaded.profile_delegate_models["quorum"]["planner"].model_id,
             "openai/gpt-4o"
         );
+    }
+
+    #[test]
+    fn with_app_settings_persists_only_active_profile_state() {
+        let mut app = App::new();
+        app.profiles.active_profile_id = Some("fast".into());
+        app.profiles
+            .profiles
+            .push(crate::domain::profile::ProfileInfo {
+                id: "fast".into(),
+                name: "Fast".into(),
+                ..Default::default()
+            });
+        app.profiles
+            .bind_session_profile("session".into(), "fast".into());
+        app.profiles.profile_cursor = 7;
+        app.profiles.profile_filter = "query".into();
+
+        let merged = TuiConfig::default().with_app_settings(&app);
+        let text = toml::to_string_pretty(&merged).unwrap();
+
+        assert_eq!(merged.profile.id.as_deref(), Some("fast"));
+        assert!(text.contains("[profile]"));
+        assert!(text.contains("id = \"fast\""));
+        assert!(!text.contains("session"));
+        assert!(!text.contains("query"));
+        assert!(!text.contains("profile_cursor"));
+        assert!(!text.contains("profile_filter"));
     }
 
     #[test]

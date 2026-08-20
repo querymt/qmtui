@@ -1481,22 +1481,26 @@ pub(crate) fn handle_profile_popup_key(
         KeyCode::Esc => {
             app.popup = Popup::None;
         }
-        KeyCode::Up => app.move_profile_cursor(-1),
-        KeyCode::Down => app.move_profile_cursor(1),
+        KeyCode::Up => app.profiles.move_profile_cursor(-1),
+        KeyCode::Down => app.profiles.move_profile_cursor(1),
         KeyCode::Backspace => {
-            app.profile_filter.pop();
-            app.profile_cursor = 0;
+            app.profiles.profile_filter.pop();
+            app.profiles.profile_cursor = 0;
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.profile_filter.push(c);
-            app.profile_cursor = 0;
+            app.profiles.profile_filter.push(c);
+            app.profiles.profile_cursor = 0;
         }
         KeyCode::Enter => {
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if let Some(profile_id) = app.selected_profile().map(|profile| profile.id.clone()) {
-                app.active_profile_id = Some(profile_id.clone());
+            if let Some(profile_id) = app
+                .profiles
+                .selected_profile()
+                .map(|profile| profile.id.clone())
+            {
+                app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
                     app.agents.clear();
                     app.agents_profile_id = None;
@@ -1576,7 +1580,7 @@ pub(crate) fn handle_new_session_popup_key(
             app.popup = Popup::None;
             cmd_tx.send(Command::NewSession {
                 cwd,
-                profile_id: app.active_profile_id.clone(),
+                profile_id: app.profiles.active_profile_id.clone(),
             })?;
         }
         _ => {}
@@ -1992,8 +1996,8 @@ fn try_execute_slash_command(
             if arg.is_empty() {
                 app.open_profile_popup();
                 cmd_tx.send(Command::ListProfiles)?;
-            } else if let Some(profile_id) = app.find_profile_id(&arg) {
-                app.active_profile_id = Some(profile_id.clone());
+            } else if let Some(profile_id) = app.profiles.find_profile_id(&arg) {
+                app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
                     app.agents.clear();
                     app.agents_profile_id = None;
@@ -3059,11 +3063,17 @@ mod model_popup_tests {
         app.conn = app::ConnState::Connected;
         app.popup = Popup::CommandPalette;
         app.command_palette_filter = "profile".into();
+        app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
+        app.profiles.active_profile_id = Some("deep".into());
+        app.profiles.profile_filter = "stale".into();
+        app.profiles.profile_cursor = 0;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(app.profiles.profile_filter.is_empty());
+        assert_eq!(app.profiles.profile_cursor, 1);
         assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
     }
 
@@ -3089,8 +3099,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.screen = Screen::Chat;
-        app.profiles = vec![make_profile("fast", "Fast")];
-        app.active_profile_id = Some("old".into());
+        app.profiles.profiles = vec![make_profile("fast", "Fast")];
+        app.profiles.active_profile_id = Some("old".into());
         app.input = "/profile Fast".into();
         app.input_cursor = app.input.len();
 
@@ -3101,7 +3111,11 @@ mod model_popup_tests {
             rx.try_recv(),
             Ok(Command::ListProfileAgents { profile_id }) if profile_id == "fast"
         ));
-        assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.current_session_profile_id(), None);
+        let saved = crate::config::TuiConfig::load();
+        assert_eq!(saved.profile.id.as_deref(), Some("fast"));
     }
 
     #[test]
@@ -3110,8 +3124,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.popup = Popup::ProfileSelect;
-        app.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
-        app.profile_cursor = 1;
+        app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
+        app.profiles.profile_cursor = 1;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3121,7 +3135,29 @@ mod model_popup_tests {
             rx.try_recv(),
             Ok(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
         ));
-        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
+        let saved = crate::config::TuiConfig::load();
+        assert_eq!(saved.profile.id.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn profile_selection_with_bound_session_skips_agent_refresh() {
+        let _guard = TestPersistenceGuard::new("profile-bound-session");
+        let mut app = App::new();
+        app.conn = app::ConnState::Connected;
+        app.popup = Popup::ProfileSelect;
+        app.session_id = Some("session".into());
+        app.profiles
+            .bind_session_profile("session".into(), "current".into());
+        app.profiles.profiles = vec![make_profile("fast", "Fast")];
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.current_session_profile_id(), Some("current"));
     }
 
     #[test]
@@ -3131,7 +3167,7 @@ mod model_popup_tests {
         app.popup = Popup::NewSession;
         app.new_session_path = "/repo".into();
         app.new_session_cursor = app.new_session_path.len();
-        app.active_profile_id = Some("coder-delegate".into());
+        app.profiles.active_profile_id = Some("coder-delegate".into());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_new_session_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3149,8 +3185,9 @@ mod model_popup_tests {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
-        app.active_profile_id = Some("profile".into());
-        app.session_profiles.insert("s1".into(), "profile".into());
+        app.profiles.active_profile_id = Some("profile".into());
+        app.profiles
+            .bind_session_profile("s1".into(), "profile".into());
         app.agent_mode = "plan".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
@@ -3200,8 +3237,9 @@ mod model_popup_tests {
         let mut app = App::new();
         app.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
-        app.active_profile_id = Some("profile".into());
-        app.session_profiles.insert("s1".into(), "profile".into());
+        app.profiles.active_profile_id = Some("profile".into());
+        app.profiles
+            .bind_session_profile("s1".into(), "profile".into());
         app.agents = vec![
             make_agent("primary", "Session"),
             make_agent("coder", "Coder"),
@@ -3235,9 +3273,9 @@ mod model_popup_tests {
         app.popup = Popup::ModelSelect;
         app.session_id = Some("child".into());
         app.parent_session_id = Some("parent".into());
-        app.active_profile_id = Some("profile".into());
-        app.session_profiles
-            .insert("child".into(), "profile".into());
+        app.profiles.active_profile_id = Some("profile".into());
+        app.profiles
+            .bind_session_profile("child".into(), "profile".into());
         app.agents = vec![
             make_agent("primary", "Session"),
             make_agent("coder", "Coder"),

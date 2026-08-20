@@ -193,7 +193,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         app,
         outer[0],
         vec![Span::styled(
-            format!(" profile:{} ", app.active_profile_label()),
+            format!(" profile:{} ", app.profiles.active_profile_label()),
             Theme::status(),
         )],
         right,
@@ -498,4 +498,33 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(text_spans)).alignment(Alignment::Center),
         button_rect,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_page_header_uses_active_profile_label() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![crate::domain::profile::ProfileInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            ..Default::default()
+        }];
+        app.profiles.active_profile_id = Some("fast".into());
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw_start(frame, &mut app)).unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("profile:Fast"));
+    }
 }
