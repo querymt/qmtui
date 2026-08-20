@@ -816,7 +816,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
     }
     let profile_label = app.current_profile_label();
-    let active_profile_id = app.active_profile_id.as_deref();
+    let active_profile_id = app.profiles.active_profile_id.as_deref();
     let current_profile_id = app.current_session_profile_id();
     let profile_text = if current_profile_id.is_some()
         && active_profile_id.is_some()
@@ -825,7 +825,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         format!(
             " profile:{} (new:{}) ",
             profile_label,
-            app.active_profile_label()
+            app.profiles.active_profile_label()
         )
     } else {
         format!(" profile:{} ", profile_label)
@@ -2014,5 +2014,42 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         y += card_h as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn chat_header_shows_current_and_distinct_new_profile_labels() {
+        let mut app = App::new();
+        app.session_id = Some("session-1".into());
+        app.agent_id = Some("agent-1".into());
+        app.profiles.profiles = vec![
+            crate::domain::profile::ProfileInfo {
+                id: "current".into(),
+                name: "Current".into(),
+                ..Default::default()
+            },
+            crate::domain::profile::ProfileInfo {
+                id: "next".into(),
+                name: "Next".into(),
+                ..Default::default()
+            },
+        ];
+        app.profiles.active_profile_id = Some("next".into());
+        app.profiles
+            .bind_session_profile("session-1".into(), "current".into());
+        let backend = ratatui::backend::TestBackend::new(100, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw_chat(frame, &mut app)).unwrap();
+
+        assert!(buffer_text(terminal.backend().buffer()).contains("profile:Current (new:Next)"));
     }
 }

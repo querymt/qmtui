@@ -17,7 +17,7 @@ use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo, RemoteSessionLocation,
 };
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
-use crate::domain::profile::{AgentInfo, ProfileInfo};
+use crate::domain::profile::AgentInfo;
 use crate::domain::session::{
     ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoStackSnapshot,
     UndoState, UndoableTurn,
@@ -25,6 +25,7 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh::{MeshFocus, MeshInviteFormField};
+use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
 use crate::ui::{CardCache, ElicitationUiState};
 
@@ -596,11 +597,7 @@ pub struct App {
     /// Matches `reasoningEffort: string | null` in the web UI.
     pub reasoning_effort: Option<String>,
     // profile info
-    pub profiles: Vec<ProfileInfo>,
-    pub active_profile_id: Option<String>,
-    pub session_profiles: HashMap<String, String>,
-    pub profile_cursor: usize,
-    pub profile_filter: String,
+    pub(crate) profiles: ProfilesState,
 
     // model info
     pub current_model: Option<String>,
@@ -835,11 +832,7 @@ impl App {
             elicitation_ui: None,
             show_thinking: true,
             reasoning_effort: None,
-            profiles: Vec::new(),
-            active_profile_id: None,
-            session_profiles: HashMap::new(),
-            profile_cursor: 0,
-            profile_filter: String::new(),
+            profiles: ProfilesState::new(),
             current_model: None,
             current_provider: None,
             current_model_node_id: None,
@@ -1023,118 +1016,27 @@ impl App {
         self.auth.reset_for_open();
     }
 
-    pub fn profile_by_id(&self, profile_id: &str) -> Option<&ProfileInfo> {
-        self.profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-    }
-
-    pub fn active_profile(&self) -> Option<&ProfileInfo> {
-        self.active_profile_id
-            .as_deref()
-            .and_then(|profile_id| self.profile_by_id(profile_id))
-    }
-
     pub fn current_session_profile_id(&self) -> Option<&str> {
         self.session_id
             .as_deref()
-            .and_then(|session_id| self.session_profiles.get(session_id).map(String::as_str))
-    }
-
-    pub fn current_session_profile(&self) -> Option<&ProfileInfo> {
-        self.current_session_profile_id()
-            .and_then(|profile_id| self.profile_by_id(profile_id))
-    }
-
-    pub fn profile_display_name(&self, profile_id: &str) -> String {
-        self.profile_by_id(profile_id)
-            .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| profile_id.to_string())
-    }
-
-    fn profile_label_or(
-        &self,
-        profile_id: Option<&str>,
-        fallback: impl FnOnce() -> String,
-    ) -> String {
-        profile_id
-            .map(|profile_id| self.profile_display_name(profile_id))
-            .unwrap_or_else(fallback)
-    }
-
-    pub fn active_profile_label(&self) -> String {
-        self.profile_label_or(self.active_profile_id.as_deref(), || "default".to_string())
+            .and_then(|session_id| self.profiles.session_profile_id(session_id))
     }
 
     pub fn current_profile_label(&self) -> String {
-        self.profile_label_or(self.current_session_profile_id(), || {
-            if self.current_session_is_remote() {
-                "remote".to_string()
-            } else {
-                self.active_profile_label()
-            }
-        })
-    }
-
-    pub fn filtered_profiles(&self) -> Vec<&ProfileInfo> {
-        if self.profile_filter.is_empty() {
-            self.profiles.iter().collect()
-        } else {
-            let matcher = SkimMatcherV2::default();
-            let mut scored: Vec<(i64, &ProfileInfo)> = self
-                .profiles
-                .iter()
-                .filter_map(|profile| {
-                    let score = [
-                        matcher.fuzzy_match(&profile.name, &self.profile_filter),
-                        matcher.fuzzy_match(&profile.id, &self.profile_filter),
-                        profile.description.as_deref().and_then(|description| {
-                            matcher.fuzzy_match(description, &self.profile_filter)
-                        }),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .max();
-                    score.map(|s| (s, profile))
-                })
-                .collect();
-            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-            scored.into_iter().map(|(_, profile)| profile).collect()
-        }
-    }
-
-    pub fn move_profile_cursor(&mut self, delta: isize) {
-        self.profile_cursor =
-            move_wrapping_cursor(self.profile_cursor, self.filtered_profiles().len(), delta);
-    }
-
-    pub fn selected_profile(&self) -> Option<&ProfileInfo> {
-        self.filtered_profiles().get(self.profile_cursor).copied()
+        self.current_session_profile_id()
+            .map(|profile_id| self.profiles.profile_display_name(profile_id))
+            .unwrap_or_else(|| {
+                if self.current_session_is_remote() {
+                    "remote".to_string()
+                } else {
+                    self.profiles.active_profile_label()
+                }
+            })
     }
 
     pub fn open_profile_popup(&mut self) {
         self.popup = Popup::ProfileSelect;
-        self.profile_filter.clear();
-        self.profile_cursor = self
-            .active_profile_id
-            .as_deref()
-            .and_then(|active_id| {
-                self.profiles
-                    .iter()
-                    .position(|profile| profile.id == active_id)
-            })
-            .unwrap_or(0);
-    }
-
-    pub fn find_profile_id(&self, query: &str) -> Option<String> {
-        let needle = query.trim();
-        if needle.is_empty() {
-            return None;
-        }
-        self.profiles
-            .iter()
-            .find(|profile| profile.id == needle || profile.name.eq_ignore_ascii_case(needle))
-            .map(|profile| profile.id.clone())
+        self.profiles.reset_for_open();
     }
 
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
@@ -1848,7 +1750,7 @@ impl App {
 
     pub fn delegate_preference_profile_id(&self) -> Option<&str> {
         self.current_session_profile_id()
-            .or(self.active_profile_id.as_deref())
+            .or(self.profiles.active_profile_id.as_deref())
     }
 
     pub fn desired_agents_profile_id(&self) -> Option<&str> {
@@ -4506,7 +4408,7 @@ mod delegate_model_preference_tests {
             make_model("openai", "gpt-4o"),
             make_model("anthropic", "claude-sonnet"),
         ];
-        app.active_profile_id = Some("profile".into());
+        app.profiles.active_profile_id = Some("profile".into());
         app.set_delegate_model_preference("profile", "coder", &app.models[1].clone());
         let cursor = app.delegate_model_cursor("coder");
         // Should point to the second item (index 1 in models, but popup items

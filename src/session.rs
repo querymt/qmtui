@@ -158,10 +158,10 @@ impl App {
 
     pub fn apply_session_profile_binding(&mut self, session_id: &str, profile_id: Option<String>) {
         if let Some(profile_id) = profile_id {
-            self.session_profiles
-                .insert(session_id.to_string(), profile_id);
+            self.profiles
+                .bind_session_profile(session_id.to_string(), profile_id);
         } else if self.is_remote_session_id(session_id) {
-            self.session_profiles.remove(session_id);
+            self.profiles.remove_session_profile(session_id);
         }
     }
 
@@ -759,6 +759,62 @@ mod tests {
             app.session_remote_cwd("remote-1"),
             Some("/remote/repo".into())
         );
+    }
+
+    #[test]
+    fn current_profile_label_uses_binding_active_fallback_and_remote_fallback() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![crate::domain::profile::ProfileInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            ..Default::default()
+        }];
+        app.profiles.active_profile_id = Some("fast".into());
+        app.session_id = Some("local".into());
+
+        assert_eq!(app.current_profile_label(), "Fast");
+
+        app.profiles
+            .bind_session_profile("local".into(), "unknown".into());
+        assert_eq!(app.current_profile_label(), "unknown");
+
+        app.session_id = Some("remote".into());
+        app.remember_remote_session_node("remote", "node-1");
+        assert_eq!(app.current_profile_label(), "remote");
+    }
+
+    #[test]
+    fn profile_binding_some_inserts_and_overwrites() {
+        let mut app = App::new();
+
+        app.apply_session_profile_binding("session", Some("fast".into()));
+        assert_eq!(app.profiles.session_profile_id("session"), Some("fast"));
+
+        app.apply_session_profile_binding("session", Some("deep".into()));
+        assert_eq!(app.profiles.session_profile_id("session"), Some("deep"));
+    }
+
+    #[test]
+    fn missing_local_profile_preserves_existing_binding() {
+        let mut app = App::new();
+        app.profiles
+            .bind_session_profile("local".into(), "fast".into());
+
+        app.apply_session_profile_binding("local", None);
+
+        assert_eq!(app.profiles.session_profile_id("local"), Some("fast"));
+    }
+
+    #[test]
+    fn missing_remote_profile_removes_existing_binding() {
+        let mut app = App::new();
+        app.remember_remote_session_node("remote", "node-1");
+        app.profiles
+            .bind_session_profile("remote".into(), "fast".into());
+
+        app.apply_session_profile_binding("remote", None);
+
+        assert!(app.profiles.session_profile_id("remote").is_none());
     }
 
     #[test]
