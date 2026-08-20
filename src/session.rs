@@ -280,21 +280,6 @@ impl App {
         }
     }
 
-    /// Flat list of sessions that match the current filter, across all groups.
-    ///
-    /// Used by the session popup (which shows a flat list) for backward compatibility.
-    pub fn filtered_sessions(&self) -> Vec<&SessionSummary> {
-        let q = self.session_filter.to_lowercase();
-        self.session_groups
-            .iter()
-            .flat_map(|g| {
-                matching_session_indices(g, &q)
-                    .into_iter()
-                    .map(move |i| &g.sessions[i])
-            })
-            .collect()
-    }
-
     /// Build the flat list of visible rows for the start-page session list.
     ///
     /// Each call re-evaluates the current `session_filter` and `collapsed_groups`.
