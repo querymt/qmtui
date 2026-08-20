@@ -3,6 +3,7 @@
 mod acp_client;
 mod acp_state;
 mod app;
+mod auth_state;
 mod command;
 mod config;
 mod diagnostics;

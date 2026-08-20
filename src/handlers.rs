@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, App, AuthUiNotice, CommandPaletteAction, Popup, Screen};
+use crate::app::{self, App, CommandPaletteAction, Popup, Screen};
+use crate::auth_state::{AuthPanel, AuthUiNotice};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
@@ -2173,63 +2174,61 @@ pub(crate) fn handle_auth_popup_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
-    use crate::app::AuthPanel;
-
     // Clipboard fallback popup: any key dismisses it
-    if app.auth_clipboard_fallback.is_some() {
-        app.auth_clipboard_fallback = None;
+    if app.auth.clipboard_fallback.is_some() {
+        app.auth.clipboard_fallback = None;
         return Ok(());
     }
 
-    match app.auth_panel {
+    match app.auth.panel {
         AuthPanel::List => match key.code {
             KeyCode::Esc => {
-                if app.auth_selected.is_some() {
-                    app.auth_close_detail();
+                if app.auth.selected.is_some() {
+                    app.auth.close_detail();
                 } else {
                     app.popup = Popup::None;
                 }
             }
             KeyCode::Up => {
-                let max = app.filtered_auth_providers().len().saturating_sub(1);
-                app.auth_cursor = app.auth_cursor.saturating_sub(1).min(max);
+                let max = app.auth.filtered_providers().len().saturating_sub(1);
+                app.auth.cursor = app.auth.cursor.saturating_sub(1).min(max);
             }
             KeyCode::Down => {
-                let max = app.filtered_auth_providers().len().saturating_sub(1);
-                app.auth_cursor = (app.auth_cursor + 1).min(max);
+                let max = app.auth.filtered_providers().len().saturating_sub(1);
+                app.auth.cursor = (app.auth.cursor + 1).min(max);
             }
             KeyCode::Enter => {
-                let filtered = app.filtered_auth_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
-                    let provider = &app.auth_providers[real_idx];
-                    app.auth_last_result = None;
-                    app.auth_ui_notice = None;
+                let filtered = app.auth.filtered_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
+                    let provider = &app.auth.providers[real_idx];
+                    app.auth.last_result = None;
+                    app.auth.ui_notice = None;
                     if provider.is_unconfigurable() {
-                        app.auth_selected = Some(real_idx);
+                        app.auth.selected = Some(real_idx);
                         // Stay in list — the draw fn shows the info message
                     } else if provider.is_api_key_only() {
-                        app.auth_selected = Some(real_idx);
-                        app.auth_panel = AuthPanel::ApiKeyInput;
-                        app.auth_api_key_input.clear();
-                        app.auth_api_key_cursor = 0;
+                        app.auth.selected = Some(real_idx);
+                        app.auth.panel = AuthPanel::ApiKeyInput;
+                        app.auth.api_key_input.clear();
+                        app.auth.api_key_cursor = 0;
                     } else if provider.is_oauth_only()
                         && provider.oauth_status != Some(OAuthStatus::Connected)
                     {
-                        app.auth_selected = Some(real_idx);
+                        app.auth.selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
                         cmd_tx.send(Command::StartOAuthLogin {
                             provider: provider_id,
                         })?;
                     } else {
                         // Multi-method or connected OAuth-only: select for detail
-                        app.auth_selected = Some(real_idx);
+                        app.auth.selected = Some(real_idx);
                     }
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+D: disconnect/clear credential for selected provider
-                if let Some(idx) = app.auth_selected {
-                    let provider = &app.auth_providers[idx];
+                if let Some(idx) = app.auth.selected {
+                    let provider = &app.auth.providers[idx];
                     if provider.oauth_status == Some(OAuthStatus::Connected) {
                         let provider_id = provider.provider.clone();
                         cmd_tx.send(Command::DisconnectOAuth {
@@ -2245,26 +2244,26 @@ pub(crate) fn handle_auth_popup_key(
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+K: open API key panel for selected provider
-                let filtered = app.filtered_auth_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
-                    let provider = &app.auth_providers[real_idx];
+                let filtered = app.auth.filtered_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
+                    let provider = &app.auth.providers[real_idx];
                     if provider.env_var_name.is_some() || provider.has_stored_api_key {
-                        app.auth_ui_notice = None;
-                        app.auth_selected = Some(real_idx);
-                        app.auth_panel = AuthPanel::ApiKeyInput;
-                        app.auth_api_key_input.clear();
-                        app.auth_api_key_cursor = 0;
+                        app.auth.ui_notice = None;
+                        app.auth.selected = Some(real_idx);
+                        app.auth.panel = AuthPanel::ApiKeyInput;
+                        app.auth.api_key_input.clear();
+                        app.auth.api_key_cursor = 0;
                     }
                 }
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+O: start OAuth for selected provider
-                let filtered = app.filtered_auth_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth_cursor) {
-                    let provider = &app.auth_providers[real_idx];
+                let filtered = app.auth.filtered_providers();
+                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
+                    let provider = &app.auth.providers[real_idx];
                     if provider.supports_oauth {
-                        app.auth_ui_notice = None;
-                        app.auth_selected = Some(real_idx);
+                        app.auth.ui_notice = None;
+                        app.auth.selected = Some(real_idx);
                         let provider_id = provider.provider.clone();
                         cmd_tx.send(Command::StartOAuthLogin {
                             provider: provider_id,
@@ -2273,26 +2272,26 @@ pub(crate) fn handle_auth_popup_key(
                 }
             }
             KeyCode::Backspace => {
-                app.auth_filter.pop();
-                app.auth_cursor = 0;
+                app.auth.filter.pop();
+                app.auth.cursor = 0;
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth_filter.push(c);
-                app.auth_cursor = 0;
+                app.auth.filter.push(c);
+                app.auth.cursor = 0;
             }
             _ => {}
         },
         AuthPanel::ApiKeyInput => match key.code {
             KeyCode::Esc => {
-                app.auth_panel = AuthPanel::List;
-                app.auth_api_key_input.clear();
-                app.auth_api_key_cursor = 0;
+                app.auth.panel = AuthPanel::List;
+                app.auth.api_key_input.clear();
+                app.auth.api_key_cursor = 0;
             }
             KeyCode::Enter => {
-                if let Some(idx) = app.auth_selected {
-                    let trimmed = app.auth_api_key_input.trim().to_string();
+                if let Some(idx) = app.auth.selected {
+                    let trimmed = app.auth.api_key_input.trim().to_string();
                     if !trimmed.is_empty() {
-                        let provider = app.auth_providers[idx].provider.clone();
+                        let provider = app.auth.providers[idx].provider.clone();
                         cmd_tx.send(Command::SetApiToken {
                             provider,
                             api_key: trimmed,
@@ -2301,67 +2300,67 @@ pub(crate) fn handle_auth_popup_key(
                 }
             }
             KeyCode::Tab => {
-                app.auth_api_key_masked = !app.auth_api_key_masked;
+                app.auth.api_key_masked = !app.auth.api_key_masked;
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Clear stored key
-                if let Some(idx) = app.auth_selected {
-                    let provider = app.auth_providers[idx].provider.clone();
+                if let Some(idx) = app.auth.selected {
+                    let provider = app.auth.providers[idx].provider.clone();
                     cmd_tx.send(Command::ClearApiToken { provider })?;
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth_api_key_input.insert(app.auth_api_key_cursor, c);
-                app.auth_api_key_cursor += c.len_utf8();
+                app.auth.api_key_input.insert(app.auth.api_key_cursor, c);
+                app.auth.api_key_cursor += c.len_utf8();
             }
-            KeyCode::Backspace if app.auth_api_key_cursor > 0 => {
-                let cursor = app.auth_api_key_cursor;
-                let ch = app.auth_api_key_input[..cursor]
+            KeyCode::Backspace if app.auth.api_key_cursor > 0 => {
+                let cursor = app.auth.api_key_cursor;
+                let ch = app.auth.api_key_input[..cursor]
                     .chars()
                     .next_back()
                     .unwrap();
-                app.auth_api_key_input.remove(cursor - ch.len_utf8());
-                app.auth_api_key_cursor -= ch.len_utf8();
+                app.auth.api_key_input.remove(cursor - ch.len_utf8());
+                app.auth.api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Left if app.auth_api_key_cursor > 0 => {
-                let ch = app.auth_api_key_input[..app.auth_api_key_cursor]
+            KeyCode::Left if app.auth.api_key_cursor > 0 => {
+                let ch = app.auth.api_key_input[..app.auth.api_key_cursor]
                     .chars()
                     .next_back()
                     .unwrap();
-                app.auth_api_key_cursor -= ch.len_utf8();
+                app.auth.api_key_cursor -= ch.len_utf8();
             }
-            KeyCode::Right if app.auth_api_key_cursor < app.auth_api_key_input.len() => {
-                let ch = app.auth_api_key_input[app.auth_api_key_cursor..]
+            KeyCode::Right if app.auth.api_key_cursor < app.auth.api_key_input.len() => {
+                let ch = app.auth.api_key_input[app.auth.api_key_cursor..]
                     .chars()
                     .next()
                     .unwrap();
-                app.auth_api_key_cursor += ch.len_utf8();
+                app.auth.api_key_cursor += ch.len_utf8();
             }
             _ => {}
         },
         AuthPanel::OAuthFlow => match key.code {
             KeyCode::Esc => {
-                app.auth_oauth_flow = None;
-                app.auth_panel = AuthPanel::List;
-                app.auth_oauth_response.clear();
-                app.auth_oauth_response_cursor = 0;
+                app.auth.oauth_flow = None;
+                app.auth.panel = AuthPanel::List;
+                app.auth.oauth_response.clear();
+                app.auth.oauth_response_cursor = 0;
             }
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Copy authorization URL to clipboard (C-y to avoid global C-c quit)
-                if let Some(ref flow) = app.auth_oauth_flow {
+                if let Some(ref flow) = app.auth.oauth_flow {
                     let provider = flow.provider.clone();
                     let url = flow.authorization_url.clone();
                     try_copy_to_clipboard(app, &provider, &url);
                 }
             }
             KeyCode::Enter => {
-                if let Some(ref flow) = app.auth_oauth_flow {
+                if let Some(ref flow) = app.auth.oauth_flow {
                     let flow_id = flow.flow_id.clone();
                     let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
                     let response = if is_device_poll {
                         String::new()
                     } else {
-                        app.auth_oauth_response.trim().to_string()
+                        app.auth.oauth_response.trim().to_string()
                     };
                     if is_device_poll || !response.is_empty() {
                         cmd_tx.send(Command::CompleteOAuthLogin { flow_id, response })?;
@@ -2369,32 +2368,33 @@ pub(crate) fn handle_auth_popup_key(
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth_oauth_response
-                    .insert(app.auth_oauth_response_cursor, c);
-                app.auth_oauth_response_cursor += c.len_utf8();
+                app.auth
+                    .oauth_response
+                    .insert(app.auth.oauth_response_cursor, c);
+                app.auth.oauth_response_cursor += c.len_utf8();
             }
-            KeyCode::Backspace if app.auth_oauth_response_cursor > 0 => {
-                let cursor = app.auth_oauth_response_cursor;
-                let ch = app.auth_oauth_response[..cursor]
+            KeyCode::Backspace if app.auth.oauth_response_cursor > 0 => {
+                let cursor = app.auth.oauth_response_cursor;
+                let ch = app.auth.oauth_response[..cursor]
                     .chars()
                     .next_back()
                     .unwrap();
-                app.auth_oauth_response.remove(cursor - ch.len_utf8());
-                app.auth_oauth_response_cursor -= ch.len_utf8();
+                app.auth.oauth_response.remove(cursor - ch.len_utf8());
+                app.auth.oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Left if app.auth_oauth_response_cursor > 0 => {
-                let ch = app.auth_oauth_response[..app.auth_oauth_response_cursor]
+            KeyCode::Left if app.auth.oauth_response_cursor > 0 => {
+                let ch = app.auth.oauth_response[..app.auth.oauth_response_cursor]
                     .chars()
                     .next_back()
                     .unwrap();
-                app.auth_oauth_response_cursor -= ch.len_utf8();
+                app.auth.oauth_response_cursor -= ch.len_utf8();
             }
-            KeyCode::Right if app.auth_oauth_response_cursor < app.auth_oauth_response.len() => {
-                let ch = app.auth_oauth_response[app.auth_oauth_response_cursor..]
+            KeyCode::Right if app.auth.oauth_response_cursor < app.auth.oauth_response.len() => {
+                let ch = app.auth.oauth_response[app.auth.oauth_response_cursor..]
                     .chars()
                     .next()
                     .unwrap();
-                app.auth_oauth_response_cursor += ch.len_utf8();
+                app.auth.oauth_response_cursor += ch.len_utf8();
             }
             _ => {}
         },
@@ -2435,17 +2435,17 @@ fn copy_text_to_clipboard(text: &str) -> bool {
 }
 
 fn try_copy_to_clipboard(app: &mut App, provider: &str, text: &str) {
-    app.auth_ui_notice = None;
-    app.auth_clipboard_fallback = None;
+    app.auth.ui_notice = None;
+    app.auth.clipboard_fallback = None;
     if copy_text_to_clipboard(text) {
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some(provider.to_string()),
             success: true,
             message: "Copied to clipboard".into(),
         });
     } else {
-        app.auth_ui_notice = None;
-        app.auth_clipboard_fallback = Some(text.to_string());
+        app.auth.ui_notice = None;
+        app.auth.clipboard_fallback = Some(text.to_string());
     }
 }
 

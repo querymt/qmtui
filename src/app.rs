@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
+use crate::auth_state::AuthState;
 use crate::command::Command;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
     SessionActivity, SessionOp, SessionStatsLite,
 };
-use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::{
@@ -501,25 +501,6 @@ pub enum ModelPopupItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthUiNotice {
-    pub provider: Option<String>,
-    pub success: bool,
-    pub message: String,
-}
-
-/// Which sub-panel is active in the provider auth popup.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum AuthPanel {
-    /// Browsing the provider list.
-    #[default]
-    List,
-    /// Editing an API key for the selected provider.
-    ApiKeyInput,
-    /// Active OAuth flow — showing URL and callback/device-poll input.
-    OAuthFlow,
-}
-
 pub struct App {
     pub screen: Screen,
     pub popup: Popup,
@@ -696,21 +677,7 @@ pub struct App {
     pub(crate) card_cache: CardCache,
 
     // auth popup state
-    pub auth_providers: Vec<AuthProviderEntry>,
-    pub auth_cursor: usize,
-    pub auth_filter: String,
-    pub auth_selected: Option<usize>,
-    pub auth_panel: AuthPanel,
-    pub auth_api_key_input: String,
-    pub auth_api_key_cursor: usize,
-    pub auth_api_key_masked: bool,
-    pub auth_oauth_flow: Option<OAuthFlow>,
-    pub auth_oauth_response: String,
-    pub auth_oauth_response_cursor: usize,
-    pub auth_last_result: Option<OAuthResult>,
-    pub auth_ui_notice: Option<AuthUiNotice>,
-    /// When clipboard copy fails, store the URL here for a fallback display popup.
-    pub auth_clipboard_fallback: Option<String>,
+    pub(crate) auth: AuthState,
 
     // delegate session listing (built from event stream)
     pub delegate_entries: Vec<DelegateEntry>,
@@ -915,20 +882,7 @@ impl App {
             server_state: crate::server_manager::ServerState::default(),
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
-            auth_providers: Vec::new(),
-            auth_cursor: 0,
-            auth_filter: String::new(),
-            auth_selected: None,
-            auth_panel: AuthPanel::default(),
-            auth_api_key_input: String::new(),
-            auth_api_key_cursor: 0,
-            auth_api_key_masked: true,
-            auth_oauth_flow: None,
-            auth_oauth_response: String::new(),
-            auth_oauth_response_cursor: 0,
-            auth_last_result: None,
-            auth_ui_notice: None,
-            auth_clipboard_fallback: None,
+            auth: AuthState::new(),
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
             delegate_filter: String::new(),
@@ -1063,69 +1017,10 @@ impl App {
         }
     }
 
-    /// Filtered auth providers matching the current `auth_filter`.
-    pub fn filtered_auth_providers(&self) -> Vec<(usize, &AuthProviderEntry)> {
-        if self.auth_filter.is_empty() {
-            self.auth_providers.iter().enumerate().collect()
-        } else {
-            let q = self.auth_filter.to_lowercase();
-            self.auth_providers
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    p.display_name.to_lowercase().contains(&q)
-                        || p.provider.to_lowercase().contains(&q)
-                })
-                .collect()
-        }
-    }
-
-    /// Reset auth popup state for a fresh open.
+    /// Route to a freshly reset auth popup while preserving provider data.
     pub fn open_auth_popup(&mut self) {
         self.popup = Popup::ProviderAuth;
-        self.auth_cursor = 0;
-        self.auth_filter.clear();
-        self.auth_selected = None;
-        self.auth_panel = AuthPanel::List;
-        self.auth_api_key_input.clear();
-        self.auth_api_key_cursor = 0;
-        self.auth_api_key_masked = true;
-        self.auth_oauth_flow = None;
-        self.auth_oauth_response.clear();
-        self.auth_oauth_response_cursor = 0;
-        self.auth_last_result = None;
-        self.auth_ui_notice = None;
-        self.auth_clipboard_fallback = None;
-    }
-
-    /// Reset auth detail panel state (when switching providers or going back).
-    pub fn auth_close_detail(&mut self) {
-        self.auth_selected = None;
-        self.auth_panel = AuthPanel::List;
-        self.auth_api_key_input.clear();
-        self.auth_api_key_cursor = 0;
-        self.auth_oauth_flow = None;
-        self.auth_oauth_response.clear();
-        self.auth_oauth_response_cursor = 0;
-        self.auth_last_result = None;
-        self.auth_ui_notice = None;
-        self.auth_clipboard_fallback = None;
-    }
-
-    pub fn auth_feedback_for_provider(&self, provider: &str) -> Option<(bool, &str)> {
-        if let Some(notice) = self.auth_ui_notice.as_ref().filter(|notice| {
-            notice
-                .provider
-                .as_deref()
-                .is_none_or(|notice_provider| notice_provider == provider)
-        }) {
-            return Some((notice.success, notice.message.as_str()));
-        }
-
-        self.auth_last_result
-            .as_ref()
-            .filter(|result| result.provider == provider)
-            .map(|result| (result.is_success(), result.message.as_str()))
+        self.auth.reset_for_open();
     }
 
     pub fn profile_by_id(&self, profile_id: &str) -> Option<&ProfileInfo> {

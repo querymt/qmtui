@@ -471,9 +471,13 @@ mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::{App, Screen};
+    use crate::auth_state::{AuthPanel, AuthUiNotice};
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
+    };
+    use crate::domain::auth::{
+        AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
     use crate::domain::chat::ChatEntry;
     use crate::domain::elicitation::{
@@ -535,6 +539,31 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_delegate_view(f, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn auth_provider(id: &str, display_name: &str, supports_oauth: bool) -> AuthProviderEntry {
+        AuthProviderEntry {
+            provider: id.into(),
+            display_name: display_name.into(),
+            oauth_status: supports_oauth.then_some(OAuthStatus::NotAuthenticated),
+            has_stored_api_key: false,
+            has_env_api_key: false,
+            env_var_name: Some(format!("{}_API_KEY", id.to_uppercase())),
+            supports_oauth,
+            preferred_method: None,
+        }
+    }
+
+    fn render_auth_popup(
+        app: &App,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, Position) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_auth_popup(f, app)).unwrap();
+        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+        (terminal.backend().buffer().clone(), cursor)
     }
 
     fn load_session(app: &mut App, session_id: &str, agent_id: &str) {
@@ -1900,6 +1929,116 @@ mod tests {
 
         assert!(rendered.contains('…'));
         assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn draw_auth_popup_filters_provider_rows_and_keeps_filtered_cursor() {
+        let mut app = App::new();
+        app.popup = Popup::ProviderAuth;
+        app.auth.providers = vec![
+            auth_provider("openai", "OpenAI", true),
+            auth_provider("groq", "Groq", false),
+            auth_provider("anthropic", "Anthropic", true),
+        ];
+        app.auth.filter = "a".into();
+        app.auth.cursor = 1;
+
+        let (buffer, _) = render_auth_popup(&app, 80, 24);
+        let rendered = buffer_text(&buffer);
+
+        assert!(rendered.contains("OpenAI"));
+        assert!(!rendered.contains("Groq"));
+        assert!(rendered.contains("Anthropic"));
+        let (anthropic_x, anthropic_y) =
+            find_buffer_text(&buffer, "Anthropic").expect("filtered row missing");
+        assert_eq!(
+            buffer[(anthropic_x, anthropic_y)].style().bg,
+            Theme::selected().bg
+        );
+    }
+
+    #[test]
+    fn draw_auth_popup_masks_api_key_and_uses_utf8_byte_cursor() {
+        let mut app = App::new();
+        app.popup = Popup::ProviderAuth;
+        app.auth.providers = vec![auth_provider("groq", "Groq", false)];
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "éß".into();
+        app.auth.api_key_cursor = "é".len();
+        app.auth.api_key_masked = true;
+
+        let (masked_buffer, masked_cursor) = render_auth_popup(&app, 80, 24);
+        let masked = buffer_text(&masked_buffer);
+        let (bullets_x, bullets_y) =
+            find_buffer_text(&masked_buffer, "••").expect("masked input missing");
+        assert!(!masked.contains("éß"));
+        assert_eq!(masked_cursor, Position::new(bullets_x + 1, bullets_y));
+
+        app.auth.api_key_masked = false;
+        let (plain_buffer, plain_cursor) = render_auth_popup(&app, 80, 24);
+        let (input_x, input_y) = find_buffer_text(&plain_buffer, "éß").expect("input missing");
+        assert_eq!(plain_cursor, Position::new(input_x + 1, input_y));
+    }
+
+    #[test]
+    fn draw_auth_popup_renders_redirect_and_device_oauth_panels() {
+        let mut app = App::new();
+        app.popup = Popup::ProviderAuth;
+        app.auth.providers = vec![auth_provider("codex", "Codex", true)];
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
+            flow_id: "flow-1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://example.com/authorize".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        app.auth.oauth_response = "écode".into();
+        app.auth.oauth_response_cursor = "é".len();
+
+        let (redirect_buffer, redirect_cursor) = render_auth_popup(&app, 80, 24);
+        let redirect = buffer_text(&redirect_buffer);
+        let (response_x, response_y) =
+            find_buffer_text(&redirect_buffer, "écode").expect("OAuth response missing");
+        assert!(redirect.contains("paste callback below"));
+        assert_eq!(redirect_cursor, Position::new(response_x + 1, response_y));
+
+        app.auth.oauth_flow.as_mut().unwrap().flow_kind = OAuthFlowKind::DevicePoll;
+        let (device_buffer, _) = render_auth_popup(&app, 80, 24);
+        let device = buffer_text(&device_buffer);
+        assert!(device.contains("press Enter to check"));
+        assert!(!device.contains("paste callback below"));
+    }
+
+    #[test]
+    fn draw_auth_popup_prefers_notice_and_renders_clipboard_fallback_overlay() {
+        let mut app = App::new();
+        app.popup = Popup::ProviderAuth;
+        app.auth.providers = vec![auth_provider("openai", "OpenAI", true)];
+        app.auth.selected = Some(0);
+        app.auth.last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "authorization denied".into(),
+        });
+        app.auth.ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: true,
+            message: "Copied to clipboard".into(),
+        });
+
+        let (notice_buffer, _) = render_auth_popup(&app, 80, 24);
+        let notice = buffer_text(&notice_buffer);
+        assert!(notice.contains("Copied to clipboard"));
+        assert!(!notice.contains("authorization denied"));
+
+        app.auth.clipboard_fallback = Some("https://example.com/manual".into());
+        let (fallback_buffer, _) = render_auth_popup(&app, 80, 24);
+        let fallback = buffer_text(&fallback_buffer);
+        assert!(fallback.contains("Clipboard not available"));
+        assert!(fallback.contains("https://example.com/manual"));
+        assert!(!fallback.contains("Copied to clipboard"));
     }
 
     #[test]

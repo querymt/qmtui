@@ -3373,7 +3373,7 @@ mod runtime_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    use crate::app::AuthUiNotice;
+    use crate::auth_state::{AuthPanel, AuthUiNotice};
     use crate::command::Command;
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
@@ -3431,7 +3431,7 @@ mod auth_tests {
     fn make_app_with_providers(providers: Vec<AuthProviderEntry>) -> App {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.auth_providers = providers;
+        app.auth.providers = providers;
         app.popup = app::Popup::ProviderAuth;
         app
     }
@@ -3441,126 +3441,30 @@ mod auth_tests {
     #[test]
     fn open_auth_popup_resets_state() {
         let mut app = App::new();
-        app.auth_cursor = 5;
-        app.auth_filter = "test".into();
-        app.auth_selected = Some(2);
-        app.auth_api_key_input = "secret".into();
-        app.auth_last_result = Some(OAuthResult {
+        app.auth.cursor = 5;
+        app.auth.filter = "test".into();
+        app.auth.selected = Some(2);
+        app.auth.api_key_input = "secret".into();
+        app.auth.last_result = Some(OAuthResult {
             provider: "openai".into(),
             status: OAuthResultStatus::Failure,
             message: "old result".into(),
         });
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
         });
         app.open_auth_popup();
         assert_eq!(app.popup, app::Popup::ProviderAuth);
-        assert_eq!(app.auth_cursor, 0);
-        assert!(app.auth_filter.is_empty());
-        assert!(app.auth_selected.is_none());
-        assert!(app.auth_api_key_input.is_empty());
-        assert!(app.auth_last_result.is_none());
-        assert!(app.auth_ui_notice.is_none());
-        assert!(app.auth_api_key_masked);
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
-    }
-
-    #[test]
-    fn filtered_auth_providers_with_empty_filter() {
-        let app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
-        let filtered = app.filtered_auth_providers();
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn filtered_auth_providers_filters_by_name() {
-        let mut app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
-        app.auth_filter = "groq".into();
-        let filtered = app.filtered_auth_providers();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].1.provider, "groq");
-    }
-
-    #[test]
-    fn auth_close_detail_resets_panel_state() {
-        let mut app = App::new();
-        app.auth_selected = Some(1);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
-        app.auth_api_key_input = "secret".into();
-        app.auth_last_result = Some(OAuthResult {
-            provider: "openai".into(),
-            status: OAuthResultStatus::Success,
-            message: "connected".into(),
-        });
-        app.auth_ui_notice = Some(AuthUiNotice {
-            provider: None,
-            success: true,
-            message: "saved".into(),
-        });
-        app.auth_close_detail();
-        assert!(app.auth_selected.is_none());
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
-        assert!(app.auth_api_key_input.is_empty());
-        assert!(app.auth_last_result.is_none());
-        assert!(app.auth_ui_notice.is_none());
-    }
-
-    #[test]
-    fn auth_feedback_scopes_oauth_result_to_its_provider() {
-        let mut app = App::new();
-        app.auth_last_result = Some(OAuthResult {
-            provider: "openai".into(),
-            status: OAuthResultStatus::Failure,
-            message: "authorization denied".into(),
-        });
-
-        assert_eq!(app.auth_feedback_for_provider("anthropic"), None);
-        assert_eq!(
-            app.auth_feedback_for_provider("openai"),
-            Some((false, "authorization denied"))
-        );
-    }
-
-    #[test]
-    fn auth_feedback_scopes_ui_notice_and_takes_precedence() {
-        let mut app = App::new();
-        app.auth_last_result = Some(OAuthResult {
-            provider: "openai".into(),
-            status: OAuthResultStatus::Failure,
-            message: "authorization denied".into(),
-        });
-        app.auth_ui_notice = Some(AuthUiNotice {
-            provider: Some("openai".into()),
-            success: true,
-            message: "Copied to clipboard".into(),
-        });
-
-        assert_eq!(app.auth_feedback_for_provider("anthropic"), None);
-        assert_eq!(
-            app.auth_feedback_for_provider("openai"),
-            Some((true, "Copied to clipboard"))
-        );
-    }
-
-    #[test]
-    fn auth_feedback_supports_generic_ui_notice() {
-        let mut app = App::new();
-        app.auth_ui_notice = Some(AuthUiNotice {
-            provider: None,
-            success: false,
-            message: "Clipboard unavailable".into(),
-        });
-
-        assert_eq!(
-            app.auth_feedback_for_provider("openai"),
-            Some((false, "Clipboard unavailable"))
-        );
-        assert_eq!(
-            app.auth_feedback_for_provider("anthropic"),
-            Some((false, "Clipboard unavailable"))
-        );
+        assert_eq!(app.auth.cursor, 0);
+        assert!(app.auth.filter.is_empty());
+        assert!(app.auth.selected.is_none());
+        assert!(app.auth.api_key_input.is_empty());
+        assert!(app.auth.last_result.is_none());
+        assert!(app.auth.ui_notice.is_none());
+        assert!(app.auth.api_key_masked);
+        assert_eq!(app.auth.panel, AuthPanel::List);
     }
 
     // ── Key handler tests: List panel ─────────────────────────────────────────
@@ -3576,13 +3480,13 @@ mod auth_tests {
     #[test]
     fn auth_list_esc_clears_selection_when_selected() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        app.auth_selected = Some(0);
-        app.auth_last_result = Some(OAuthResult {
+        app.auth.selected = Some(0);
+        app.auth.last_result = Some(OAuthResult {
             provider: "openai".into(),
             status: OAuthResultStatus::Failure,
             message: "old result".into(),
         });
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
@@ -3590,9 +3494,9 @@ mod auth_tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
         assert_eq!(app.popup, app::Popup::ProviderAuth);
-        assert!(app.auth_selected.is_none());
-        assert!(app.auth_last_result.is_none());
-        assert!(app.auth_ui_notice.is_none());
+        assert!(app.auth.selected.is_none());
+        assert!(app.auth.last_result.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
@@ -3603,67 +3507,67 @@ mod auth_tests {
             make_provider("DeepSeek"),
         ]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        assert_eq!(app.auth_cursor, 0);
+        assert_eq!(app.auth.cursor, 0);
         handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        assert_eq!(app.auth_cursor, 1);
+        assert_eq!(app.auth.cursor, 1);
         handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        assert_eq!(app.auth_cursor, 2);
+        assert_eq!(app.auth.cursor, 2);
         handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        assert_eq!(app.auth_cursor, 2); // clamped
+        assert_eq!(app.auth.cursor, 2); // clamped
         handle_auth_popup_key(&mut app, key(KeyCode::Up), &tx).unwrap();
-        assert_eq!(app.auth_cursor, 1);
+        assert_eq!(app.auth.cursor, 1);
     }
 
     #[test]
     fn auth_list_enter_on_api_key_only_opens_api_key_panel() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_last_result = Some(OAuthResult {
+        app.auth.last_result = Some(OAuthResult {
             provider: "openai".into(),
             status: OAuthResultStatus::Failure,
             message: "old result".into(),
         });
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
-        assert_eq!(app.auth_selected, Some(0));
-        assert!(app.auth_last_result.is_none());
-        assert!(app.auth_ui_notice.is_none());
+        assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
+        assert_eq!(app.auth.selected, Some(0));
+        assert!(app.auth.last_result.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
     fn auth_list_enter_on_oauth_only_starts_flow() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("codex".into()),
             success: true,
             message: "old notice".into(),
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert_eq!(app.auth_selected, Some(0));
+        assert_eq!(app.auth.selected, Some(0));
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "codex"));
-        assert!(app.auth_ui_notice.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
     fn auth_list_enter_on_multi_method_selects_provider() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert_eq!(app.auth_selected, Some(0));
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
-        assert!(app.auth_ui_notice.is_none());
+        assert_eq!(app.auth.selected, Some(0));
+        assert_eq!(app.auth.panel, AuthPanel::List);
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
@@ -3671,38 +3575,38 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Char('g')), &tx).unwrap();
-        assert_eq!(app.auth_filter, "g");
-        assert_eq!(app.auth_cursor, 0);
+        assert_eq!(app.auth.filter, "g");
+        assert_eq!(app.auth.cursor, 0);
     }
 
     #[test]
     fn auth_list_backspace_removes_filter() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        app.auth_filter = "op".into();
+        app.auth.filter = "op".into();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        assert_eq!(app.auth_filter, "o");
+        assert_eq!(app.auth.filter, "o");
     }
 
     #[test]
     fn auth_list_ctrl_k_opens_api_key_panel() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         handle_auth_popup_key(&mut app, ctrl('k'), &tx).unwrap();
-        assert_eq!(app.auth_panel, app::AuthPanel::ApiKeyInput);
-        assert_eq!(app.auth_selected, Some(0));
-        assert!(app.auth_ui_notice.is_none());
+        assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
+        assert_eq!(app.auth.selected, Some(0));
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
     fn auth_list_ctrl_o_starts_oauth() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
@@ -3711,22 +3615,45 @@ mod auth_tests {
         handle_auth_popup_key(&mut app, ctrl('o'), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "openai"));
-        assert!(app.auth_ui_notice.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     // ── Key handler tests: API Key panel ──────────────────────────────────────
 
     #[test]
+    fn auth_api_key_cursor_uses_utf8_byte_offsets() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('é')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('ß')), &tx).unwrap();
+        assert_eq!(app.auth.api_key_input, "éß");
+        assert_eq!(app.auth.api_key_cursor, 4);
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Left), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        assert_eq!(app.auth.api_key_input, "éxß");
+        assert_eq!(app.auth.api_key_cursor, 3);
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Right), &tx).unwrap();
+        assert_eq!(app.auth.api_key_input, "éß");
+        assert_eq!(app.auth.api_key_cursor, 4);
+    }
+
+    #[test]
     fn auth_api_key_typing_and_submit() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Char('s')), &tx).unwrap();
         handle_auth_popup_key(&mut app, key(KeyCode::Char('k')), &tx).unwrap();
-        assert_eq!(app.auth_api_key_input, "sk");
-        assert_eq!(app.auth_api_key_cursor, 2);
+        assert_eq!(app.auth.api_key_input, "sk");
+        assert_eq!(app.auth.api_key_cursor, 2);
 
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
@@ -3740,49 +3667,49 @@ mod auth_tests {
     #[test]
     fn auth_api_key_backspace() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
-        app.auth_api_key_input = "abc".into();
-        app.auth_api_key_cursor = 3;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "abc".into();
+        app.auth.api_key_cursor = 3;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        assert_eq!(app.auth_api_key_input, "ab");
-        assert_eq!(app.auth_api_key_cursor, 2);
+        assert_eq!(app.auth.api_key_input, "ab");
+        assert_eq!(app.auth.api_key_cursor, 2);
     }
 
     #[test]
     fn auth_api_key_esc_returns_to_list() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
-        app.auth_api_key_input = "draft".into();
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "draft".into();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
-        assert!(app.auth_api_key_input.is_empty());
+        assert_eq!(app.auth.panel, AuthPanel::List);
+        assert!(app.auth.api_key_input.is_empty());
     }
 
     #[test]
     fn auth_api_key_tab_toggles_mask() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
-        assert!(app.auth_api_key_masked);
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        assert!(app.auth.api_key_masked);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
-        assert!(!app.auth_api_key_masked);
+        assert!(!app.auth.api_key_masked);
         handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
-        assert!(app.auth_api_key_masked);
+        assert!(app.auth.api_key_masked);
     }
 
     #[test]
     fn auth_api_key_ctrl_d_sends_clear() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
@@ -3793,8 +3720,8 @@ mod auth_tests {
     #[test]
     fn auth_api_key_empty_submit_does_nothing() {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::ApiKeyInput;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3806,9 +3733,9 @@ mod auth_tests {
     #[test]
     fn auth_oauth_esc_returns_to_list() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlow {
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com".into(),
@@ -3817,16 +3744,16 @@ mod auth_tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
-        assert!(app.auth_oauth_flow.is_none());
+        assert_eq!(app.auth.panel, AuthPanel::List);
+        assert!(app.auth.oauth_flow.is_none());
     }
 
     #[test]
     fn auth_oauth_redirect_code_typing_and_submit() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlow {
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com".into(),
@@ -3838,7 +3765,7 @@ mod auth_tests {
         handle_auth_popup_key(&mut app, key(KeyCode::Char('o')), &tx).unwrap();
         handle_auth_popup_key(&mut app, key(KeyCode::Char('d')), &tx).unwrap();
         handle_auth_popup_key(&mut app, key(KeyCode::Char('e')), &tx).unwrap();
-        assert_eq!(app.auth_oauth_response, "code");
+        assert_eq!(app.auth.oauth_response, "code");
 
         handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         let msg = rx.try_recv().expect("message sent");
@@ -3852,9 +3779,9 @@ mod auth_tests {
     #[test]
     fn auth_oauth_device_poll_enter_sends_empty_response() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlow {
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://example.com/device".into(),
@@ -3871,12 +3798,47 @@ mod auth_tests {
         ));
     }
 
+    #[test]
+    fn auth_oauth_cursor_uses_utf8_byte_offsets() {
+        let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
+            flow_id: "f1".into(),
+            provider: "codex".into(),
+            authorization_url: "https://example.com".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('é')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('ß')), &tx).unwrap();
+        assert_eq!(app.auth.oauth_response, "éß");
+        assert_eq!(app.auth.oauth_response_cursor, 4);
+
+        handle_auth_popup_key(&mut app, key(KeyCode::Left), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        handle_auth_popup_key(&mut app, key(KeyCode::Right), &tx).unwrap();
+        assert_eq!(app.auth.oauth_response, "éß");
+        assert_eq!(app.auth.oauth_response_cursor, 4);
+    }
+
     // ── Native ACP event handling tests ───────────────────────────────────────
 
     #[test]
     fn native_initialized_event_clears_auth_ui_notice() {
         let mut app = App::new();
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.filter = "keep".into();
+        app.auth.selected = Some(3);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.last_result = Some(OAuthResult {
+            provider: "openai".into(),
+            status: OAuthResultStatus::Failure,
+            message: "old result".into(),
+        });
+        app.auth.clipboard_fallback = Some("https://example.com".into());
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
@@ -3892,12 +3854,22 @@ mod auth_tests {
         });
 
         assert!(cmds.is_empty());
-        assert!(app.auth_ui_notice.is_none());
+        assert!(app.auth.ui_notice.is_none());
+        assert_eq!(app.auth.filter, "keep");
+        assert_eq!(app.auth.selected, Some(3));
+        assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
+        assert!(app.auth.last_result.is_some());
+        assert_eq!(
+            app.auth.clipboard_fallback.as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]
     fn native_auth_providers_event_populates_list() {
         let mut app = App::new();
+        app.auth.cursor = 7;
+        app.auth.selected = Some(9);
         let mut openai = make_provider("OpenAI");
         openai.has_env_api_key = true;
         let mut groq = make_api_key_only("Groq");
@@ -3906,11 +3878,37 @@ mod auth_tests {
         let cmds = app.handle_acp_event(AcpAppEvent::AuthProviders(vec![openai, groq]));
 
         assert!(cmds.is_empty());
-        assert_eq!(app.auth_providers.len(), 2);
-        assert_eq!(app.auth_providers[0].provider, "openai");
-        assert!(app.auth_providers[0].has_env_api_key);
-        assert_eq!(app.auth_providers[1].provider, "groq");
-        assert!(app.auth_providers[1].has_stored_api_key);
+        assert_eq!(app.auth.providers.len(), 2);
+        assert_eq!(app.auth.providers[0].provider, "openai");
+        assert!(app.auth.providers[0].has_env_api_key);
+        assert_eq!(app.auth.providers[1].provider, "groq");
+        assert!(app.auth.providers[1].has_stored_api_key);
+        assert_eq!(app.auth.cursor, 7);
+        assert_eq!(app.auth.selected, Some(9));
+    }
+
+    #[test]
+    fn auth_state_survives_session_load() {
+        let mut app = App::new();
+        app.auth.providers = vec![make_provider("OpenAI")];
+        app.auth.cursor = 4;
+        app.auth.filter = "keep".into();
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "secret".into();
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "session-1".into(),
+            profile_id: None,
+        });
+
+        assert_eq!(app.auth.providers.len(), 1);
+        assert_eq!(app.auth.cursor, 4);
+        assert_eq!(app.auth.filter, "keep");
+        assert_eq!(app.auth.selected, Some(0));
+        assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
+        assert_eq!(app.auth.api_key_input, "secret");
     }
 
     #[test]
@@ -3918,12 +3916,12 @@ mod auth_tests {
         let mut app = App::new();
         app.popup = app::Popup::ProviderAuth;
 
-        app.auth_last_result = Some(OAuthResult {
+        app.auth.last_result = Some(OAuthResult {
             provider: "openai".into(),
             status: OAuthResultStatus::Failure,
             message: "old result".into(),
         });
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "old notice".into(),
@@ -3937,26 +3935,26 @@ mod auth_tests {
         }));
 
         assert!(cmds.is_empty());
-        assert!(app.auth_oauth_flow.is_some());
-        let flow = app.auth_oauth_flow.unwrap();
+        assert!(app.auth.oauth_flow.is_some());
+        let flow = app.auth.oauth_flow.unwrap();
         assert_eq!(flow.flow_id, "flow-123");
         assert_eq!(flow.provider, "openai");
         assert_eq!(flow.flow_kind, OAuthFlowKind::RedirectCode);
-        assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
-        assert!(app.auth_last_result.is_none());
-        assert!(app.auth_ui_notice.is_none());
+        assert_eq!(app.auth.panel, AuthPanel::OAuthFlow);
+        assert!(app.auth.last_result.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     #[test]
     fn native_oauth_result_success_clears_flow() {
         let mut app = App::new();
-        app.auth_oauth_flow = Some(OAuthFlow {
+        app.auth.oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "openai".into(),
             authorization_url: "https://example.com".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         });
-        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth.panel = AuthPanel::OAuthFlow;
 
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(OAuthResult {
             provider: "openai".into(),
@@ -3966,10 +3964,10 @@ mod auth_tests {
 
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Command::ListAuthProviders));
-        assert!(app.auth_oauth_flow.is_none());
-        assert_eq!(app.auth_panel, app::AuthPanel::List);
+        assert!(app.auth.oauth_flow.is_none());
+        assert_eq!(app.auth.panel, AuthPanel::List);
         assert_eq!(
-            app.auth_last_result,
+            app.auth.last_result,
             Some(OAuthResult {
                 provider: "openai".into(),
                 status: OAuthResultStatus::Success,
@@ -3987,8 +3985,8 @@ mod auth_tests {
             authorization_url: "https://example.com".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         };
-        app.auth_oauth_flow = Some(flow.clone());
-        app.auth_panel = app::AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(flow.clone());
+        app.auth.panel = AuthPanel::OAuthFlow;
 
         let result = OAuthResult {
             provider: "anthropic".into(),
@@ -3999,15 +3997,15 @@ mod auth_tests {
 
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Command::ListAuthProviders));
-        assert_eq!(app.auth_oauth_flow, Some(flow));
-        assert_eq!(app.auth_panel, app::AuthPanel::OAuthFlow);
-        assert_eq!(app.auth_last_result, Some(result));
+        assert_eq!(app.auth.oauth_flow, Some(flow));
+        assert_eq!(app.auth.panel, AuthPanel::OAuthFlow);
+        assert_eq!(app.auth.last_result, Some(result));
     }
 
     #[test]
     fn native_oauth_result_clears_auth_ui_notice() {
         let mut app = App::new();
-        app.auth_ui_notice = Some(AuthUiNotice {
+        app.auth.ui_notice = Some(AuthUiNotice {
             provider: Some("openai".into()),
             success: true,
             message: "Copied to clipboard".into(),
@@ -4019,7 +4017,7 @@ mod auth_tests {
             message: "Authorization denied".into(),
         }));
 
-        assert!(app.auth_ui_notice.is_none());
+        assert!(app.auth.ui_notice.is_none());
     }
 
     // ── Disconnect / clear credential tests (C-d in List panel) ─────────────
@@ -4029,7 +4027,7 @@ mod auth_tests {
         let mut provider = make_provider("OpenAI");
         provider.oauth_status = Some(OAuthStatus::Connected);
         let mut app = make_app_with_providers(vec![provider]);
-        app.auth_selected = Some(0);
+        app.auth.selected = Some(0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
@@ -4045,7 +4043,7 @@ mod auth_tests {
         let mut provider = make_api_key_only("Groq");
         provider.has_stored_api_key = true;
         let mut app = make_app_with_providers(vec![provider]);
-        app.auth_selected = Some(0);
+        app.auth.selected = Some(0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
@@ -4060,7 +4058,7 @@ mod auth_tests {
     fn auth_list_ctrl_d_noop_when_no_credential() {
         let app_provider = make_provider("OpenAI"); // not connected, no stored key
         let mut app = make_app_with_providers(vec![app_provider]);
-        app.auth_selected = Some(0);
+        app.auth.selected = Some(0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
@@ -4086,7 +4084,7 @@ mod auth_tests {
         provider.oauth_status = Some(OAuthStatus::Connected);
         provider.has_stored_api_key = true;
         let mut app = make_app_with_providers(vec![provider]);
-        app.auth_selected = Some(0);
+        app.auth.selected = Some(0);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
@@ -4100,9 +4098,9 @@ mod auth_tests {
     #[test]
     fn auth_oauth_ctrl_y_triggers_clipboard_copy() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_selected = Some(0);
-        app.auth_panel = app::AuthPanel::OAuthFlow;
-        app.auth_oauth_flow = Some(OAuthFlow {
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::OAuthFlow;
+        app.auth.oauth_flow = Some(OAuthFlow {
             flow_id: "f1".into(),
             provider: "codex".into(),
             authorization_url: "https://auth.example.com/authorize".into(),
@@ -4120,25 +4118,25 @@ mod auth_tests {
         let expected_url = "https://auth.example.com/authorize";
         assert!(
             matches!(
-                (&app.auth_ui_notice, &app.auth_clipboard_fallback),
+                (&app.auth.ui_notice, &app.auth.clipboard_fallback),
                 (Some(notice), None) if notice == &expected_notice
             ) || matches!(
-                (&app.auth_ui_notice, &app.auth_clipboard_fallback),
+                (&app.auth.ui_notice, &app.auth.clipboard_fallback),
                 (None, Some(url)) if url == expected_url
             ),
             "C-y should show the provider notice or exact fallback URL"
         );
-        assert!(app.auth_last_result.is_none());
+        assert!(app.auth.last_result.is_none());
     }
 
     #[test]
     fn auth_clipboard_fallback_dismisses_on_any_key() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
-        app.auth_clipboard_fallback = Some("https://example.com".into());
+        app.auth.clipboard_fallback = Some("https://example.com".into());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
-        assert!(app.auth_clipboard_fallback.is_none());
+        assert!(app.auth.clipboard_fallback.is_none());
     }
 
     // ── Chord binding test ────────────────────────────────────────────────────
