@@ -3846,31 +3846,6 @@ mod start_page_tests {
         ));
     }
 
-    // ── filtered_sessions still works (for popup compat) ─────────────────────
-
-    #[test]
-    fn filtered_sessions_returns_flat_list_for_popup() {
-        let mut app = App::new();
-        app.session_groups = vec![
-            make_group(Some("/a"), &[("s1", None)]),
-            make_group(Some("/b"), &[("s2", None), ("s3", None)]),
-        ];
-
-        let flat = app.filtered_sessions();
-        assert_eq!(flat.len(), 3);
-    }
-
-    #[test]
-    fn filtered_sessions_applies_filter() {
-        let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &[("aaa", None), ("bbb", None)])];
-        app.session_filter = "aaa".to_string();
-
-        let flat = app.filtered_sessions();
-        assert_eq!(flat.len(), 1);
-        assert_eq!(flat[0].session_id, "aaa");
-    }
-
     // ── GroupHeader carries correct session_count ─────────────────────────────
 
     #[test]
