@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
-use crate::app::{App, LogLevel, Popup};
+use crate::app::{App, Popup};
 use crate::command::Command;
+use crate::diagnostics::LogLevel;
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
     RemoteSessionInfo, RemoteSessionListInfo,

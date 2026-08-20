@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::{
     app::{self, App},
     command::Command,
+    diagnostics::LogLevel,
     handlers::{AppAction, handle_key, handle_mouse},
     server_manager::{self, ServerEvent, ServerState},
     ui,
@@ -41,7 +42,7 @@ fn reconnect_session_commands(app: &mut App) -> Vec<Command> {
     }
     if app.is_remote_session_id(&session_id) {
         app.set_status(
-            app::LogLevel::Warn,
+            LogLevel::Warn,
             "session",
             "remote session is missing node id; reconnect attach skipped",
         );
@@ -63,7 +64,7 @@ pub(super) async fn run_loop(
     let mut term_events = EventStream::new();
 
     loop {
-        app.tick = tick_from_elapsed(app.started_at.elapsed());
+        app.tick = tick_from_elapsed(app.diagnostics.started_at.elapsed());
         app.clear_expired_cancel_confirm();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -83,7 +84,7 @@ pub(super) async fn run_loop(
                             }
                         } else if was_connected && app.conn == app::ConnState::Disconnected {
                             app.set_status(
-                                app::LogLevel::Warn,
+                                LogLevel::Warn,
                                 "connection",
                                 "connection lost - reconnecting...",
                             );
@@ -101,20 +102,20 @@ pub(super) async fn run_loop(
                     ServerEvent::Starting => {
                         app.server_state = ServerState::Starting;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "acp", "starting qmtcode ACP agent...");
+                            app.set_status(LogLevel::Info, "acp", "starting qmtcode ACP agent...");
                         }
                     }
                     ServerEvent::Started => {
                         app.server_state = ServerState::Running;
                         if app.conn != app::ConnState::Connected {
-                            app.set_status(app::LogLevel::Info, "acp", "qmtcode ACP agent started");
+                            app.set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
                         }
                     }
                     ServerEvent::BinaryNotFound => {
                         app.server_state = ServerState::BinaryNotFound;
                         if app.conn != app::ConnState::Connected {
                             app.set_status(
-                                app::LogLevel::Warn,
+                                LogLevel::Warn,
                                 "acp",
                                 "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
                             );
@@ -123,7 +124,7 @@ pub(super) async fn run_loop(
                     ServerEvent::StartFailed { error } => {
                         app.server_state = ServerState::StartFailed { error: error.clone() };
                         app.set_status(
-                            app::LogLevel::Error,
+                            LogLevel::Error,
                             "acp",
                             format!("ACP start failed: {error}"),
                         );
@@ -131,7 +132,7 @@ pub(super) async fn run_loop(
                     ServerEvent::Stopped { reason } => {
                         app.server_state = ServerState::Restarting { reason: reason.clone() };
                         app.set_status(
-                            app::LogLevel::Warn,
+                            LogLevel::Warn,
                             "acp",
                             format!("ACP agent stopped ({reason})"),
                         );
@@ -243,7 +244,7 @@ mod tests {
         }];
 
         assert!(reconnect_session_commands(&mut app).is_empty());
-        assert!(app.status.contains("missing node id"));
+        assert!(app.diagnostics.status.contains("missing node id"));
     }
 
     #[test]

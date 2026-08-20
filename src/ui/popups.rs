@@ -7,7 +7,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, AuthPanel, LogLevel, session_group_count_text};
+use crate::app::{App, AuthPanel, session_group_count_text};
+use crate::diagnostics::LogLevel;
 use crate::domain::activity::DelegateStats;
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
@@ -2201,8 +2202,11 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
     );
 
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (log_filter_display, log_filter_cur) =
-        scroll_input(&app.log_filter, app.log_filter.len(), avail);
+    let (log_filter_display, log_filter_cur) = scroll_input(
+        &app.diagnostics.log_filter,
+        app.diagnostics.log_filter.len(),
+        avail,
+    );
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(log_filter_display, Theme::popup_bg()),
@@ -2216,8 +2220,8 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
     let level_line = Line::from(vec![
         Span::styled("level: ", Theme::status()),
         Span::styled(
-            format!("{}+", app.log_level_filter.label()),
-            popup_log_level_style(app.log_level_filter),
+            format!("{}+", app.diagnostics.log_level_filter.label()),
+            popup_log_level_style(app.diagnostics.log_level_filter),
         ),
     ]);
     f.render_widget(
@@ -2268,8 +2272,11 @@ pub(super) fn draw_log_popup(f: &mut Frame, app: &App) {
     };
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let selected =
-        (!filtered.is_empty()).then_some(app.log_cursor.min(filtered.len().saturating_sub(1)));
+    let selected = (!filtered.is_empty()).then_some(
+        app.diagnostics
+            .log_cursor
+            .min(filtered.len().saturating_sub(1)),
+    );
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, chunks[3], &mut state);
 
