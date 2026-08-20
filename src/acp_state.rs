@@ -575,24 +575,11 @@ impl crate::app::App {
         profiles: Vec<ProfileInfo>,
         backend_active_profile_id: Option<String>,
     ) -> Vec<Command> {
-        let previous_profile_id = self.active_profile_id.clone();
-        let is_available =
-            |profile_id: &str| profiles.iter().any(|profile| profile.id == profile_id);
-        let selected = self
-            .active_profile_id
-            .take()
-            .filter(|profile_id| is_available(profile_id));
-        let backend_default =
-            backend_active_profile_id.filter(|profile_id| is_available(profile_id));
-        self.active_profile_id = selected
-            .or(backend_default)
-            .or_else(|| profiles.first().map(|profile| profile.id.clone()));
-        self.profiles = profiles;
-        if self.profile_cursor >= self.profiles.len() {
-            self.profile_cursor = self.profiles.len().saturating_sub(1);
-        }
+        let active_profile_changed = self
+            .profiles
+            .apply_catalog(profiles, backend_active_profile_id);
         let desired_profile_id = self.desired_agents_profile_id().map(str::to_string);
-        if self.active_profile_id != previous_profile_id
+        if active_profile_changed
             || self.agents_profile_id.as_deref() != desired_profile_id.as_deref()
             || self.agents.len() <= 1
         {
@@ -2227,56 +2214,113 @@ mod tests {
     }
 
     #[test]
+    fn initialized_placeholder_empty_catalog_preserves_profiles_and_discards_catalog_commands() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![profile("fast")];
+        app.profiles.active_profile_id = Some("fast".into());
+        app.agents.clear();
+
+        let commands = app.handle_acp_event(AcpAppEvent::Initialized {
+            agent_id: "agent-1".into(),
+            agent_name: "Agent".into(),
+            profiles: Vec::new(),
+            active_profile_id: None,
+            agent_mode: None,
+            reasoning_effort: None,
+        });
+
+        assert!(commands.is_empty());
+        assert_eq!(app.profiles.profiles.len(), 1);
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents_profile_id, None);
+    }
+
+    #[test]
+    fn initialized_non_empty_catalog_keeps_discarded_catalog_command_behavior() {
+        let mut app = App::new();
+
+        let commands = app.handle_acp_event(AcpAppEvent::Initialized {
+            agent_id: "agent-1".into(),
+            agent_name: "Agent".into(),
+            profiles: vec![profile("fast")],
+            active_profile_id: Some("fast".into()),
+            agent_mode: None,
+            reasoning_effort: None,
+        });
+
+        assert!(commands.is_empty());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents_profile_id, None);
+    }
+
+    #[test]
     fn profile_catalog_preserves_valid_local_selection() {
         let mut app = App::new();
-        app.active_profile_id = Some("deep".into());
+        app.profiles.active_profile_id = Some("deep".into());
 
         app.handle_acp_event(AcpAppEvent::Profiles {
             profiles: vec![profile("fast"), profile("deep")],
             active_profile_id: Some("fast".into()),
         });
 
-        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
     }
 
     #[test]
     fn profile_catalog_falls_back_to_backend_default_then_first_profile() {
         let mut app = App::new();
-        app.active_profile_id = Some("removed".into());
+        app.profiles.active_profile_id = Some("removed".into());
 
         app.handle_acp_event(AcpAppEvent::Profiles {
             profiles: vec![profile("fast"), profile("deep")],
             active_profile_id: Some("deep".into()),
         });
-        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
 
-        app.active_profile_id = Some("removed-again".into());
+        app.profiles.active_profile_id = Some("removed-again".into());
         app.handle_acp_event(AcpAppEvent::Profiles {
             profiles: vec![profile("fast"), profile("deep")],
             active_profile_id: Some("missing".into()),
         });
-        assert_eq!(app.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
     }
 
     #[test]
     fn empty_profile_catalog_clears_stale_selection() {
         let mut app = App::new();
-        app.profiles = vec![profile("fast")];
-        app.active_profile_id = Some("fast".into());
+        app.profiles.profiles = vec![profile("fast")];
+        app.profiles.active_profile_id = Some("fast".into());
 
         app.handle_acp_event(AcpAppEvent::Profiles {
             profiles: Vec::new(),
             active_profile_id: None,
         });
 
-        assert!(app.profiles.is_empty());
-        assert!(app.active_profile_id.is_none());
+        assert!(app.profiles.profiles.is_empty());
+        assert!(app.profiles.active_profile_id.is_none());
+    }
+
+    #[test]
+    fn profile_catalog_command_order_remains_list_agents_only() {
+        let mut app = App::new();
+
+        let commands = app.handle_acp_event(AcpAppEvent::Profiles {
+            profiles: vec![profile("fast")],
+            active_profile_id: Some("fast".into()),
+        });
+
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::ListProfileAgents { profile_id }] if profile_id == "fast"
+        ));
     }
 
     #[test]
     fn loading_session_profile_does_not_replace_new_session_selection() {
         let mut app = App::new();
-        app.active_profile_id = Some("deep".into());
+        app.profiles.active_profile_id = Some("deep".into());
 
         app.handle_acp_event(AcpAppEvent::SessionLoaded {
             agent_id: "agent-1".into(),
@@ -2284,8 +2328,50 @@ mod tests {
             profile_id: Some("fast".into()),
         });
 
-        assert_eq!(app.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
         assert_eq!(app.current_session_profile_id(), Some("fast"));
+    }
+
+    #[test]
+    fn loading_missing_local_profile_preserves_binding_and_command_order() {
+        let mut app = App::new();
+        app.profiles
+            .bind_session_profile("session-1".into(), "fast".into());
+
+        let commands = app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "session-1".into(),
+            profile_id: None,
+        });
+
+        assert_eq!(app.current_session_profile_id(), Some("fast"));
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::SetAgentMode { mode },
+                Command::ListProfileAgents { profile_id },
+            ] if mode == "build" && profile_id == "fast"
+        ));
+    }
+
+    #[test]
+    fn loading_missing_remote_profile_removes_stale_binding() {
+        let mut app = App::new();
+        app.remember_remote_session_node("remote-1", "node-1");
+        app.profiles
+            .bind_session_profile("remote-1".into(), "fast".into());
+
+        let commands = app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "remote-1".into(),
+            profile_id: None,
+        });
+
+        assert!(app.current_session_profile_id().is_none());
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::SetAgentMode { mode }] if mode == "build"
+        ));
     }
 
     #[test]
@@ -2464,7 +2550,7 @@ mod tests {
     #[test]
     fn profile_agents_populate_delegate_tabs_and_ignore_stale_responses() {
         let mut app = App::new();
-        app.active_profile_id = Some("quorum".into());
+        app.profiles.active_profile_id = Some("quorum".into());
 
         app.handle_acp_event(AcpAppEvent::ProfileAgents {
             profile_id: "old".into(),
@@ -2503,8 +2589,8 @@ mod tests {
     fn profile_agents_reapply_profile_scoped_preferences_to_parent_session() {
         let mut app = App::new();
         app.session_id = Some("parent".into());
-        app.session_profiles
-            .insert("parent".into(), "quorum".into());
+        app.profiles
+            .bind_session_profile("parent".into(), "quorum".into());
         app.delegate_model_preferences.insert(
             "quorum".into(),
             [(

@@ -963,7 +963,7 @@ pub(crate) fn profile_source_symbol(profile: &ProfileInfo) -> &'static str {
 }
 
 pub(crate) fn profile_empty_text(app: &App) -> &'static str {
-    if app.profiles.is_empty() {
+    if app.profiles.profiles.is_empty() {
         "No profiles available"
     } else {
         "No profiles match filter"
@@ -1113,8 +1113,11 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
         chunks[0],
     );
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (filter_display, filter_cur) =
-        scroll_input(&app.profile_filter, app.profile_filter.len(), avail);
+    let (filter_display, filter_cur) = scroll_input(
+        &app.profiles.profile_filter,
+        app.profiles.profile_filter.len(),
+        avail,
+    );
     let input_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(filter_display, Theme::popup_bg()),
@@ -1125,9 +1128,9 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
 
-    let active_id = app.active_profile_id.as_deref();
+    let active_id = app.profiles.active_profile_id.as_deref();
     let current_session_id = app.current_session_profile_id();
-    let profiles = app.filtered_profiles();
+    let profiles = app.profiles.filtered_profiles();
     let has_matches = !profiles.is_empty();
     let row_data: Vec<(String, String, String, String)> = profiles
         .into_iter()
@@ -1209,7 +1212,7 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
     .block(Block::default().style(Theme::popup_bg()))
     .style(Theme::popup_bg())
     .row_highlight_style(Theme::selected());
-    let selected = has_matches.then_some(app.profile_cursor);
+    let selected = has_matches.then_some(app.profiles.profile_cursor);
     let mut state = TableState::default().with_selected(selected);
     f.render_stateful_widget(table, chunks[2], &mut state);
 
@@ -3011,6 +3014,77 @@ mod tests {
         }
     }
 
+    fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn find_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buffer.area.height {
+            let line = buffer_line(buffer, y);
+            if let Some(byte_idx) = line.find(needle) {
+                return Some((line[..byte_idx].chars().count() as u16, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn profile_popup_marks_active_before_current_and_highlights_filtered_row() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![
+            ProfileInfo {
+                id: "active".into(),
+                name: "Active".into(),
+                description: Some("selected".into()),
+                ..Default::default()
+            },
+            profile("other", "Other"),
+        ];
+        app.profiles.active_profile_id = Some("active".into());
+        app.session_id = Some("session".into());
+        app.profiles
+            .bind_session_profile("session".into(), "active".into());
+        app.profiles.profile_filter = "selected".into();
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_profile_popup(frame, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let active = find_buffer_text(buffer, "Active").expect("active row");
+        let active_line = buffer_line(buffer, active.1);
+        assert!(active_line.contains('*'));
+        assert!(!active_line.contains('@'));
+        assert_eq!(buffer[active].bg, Theme::selected().bg.unwrap());
+        assert!(find_buffer_text(buffer, "Other").is_none());
+    }
+
+    #[test]
+    fn profile_popup_marks_distinct_current_session_with_at_symbol() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![profile("active", "Active"), profile("current", "Current")];
+        app.profiles.active_profile_id = Some("active".into());
+        app.session_id = Some("session".into());
+        app.profiles
+            .bind_session_profile("session".into(), "current".into());
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_profile_popup(frame, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let active_y = find_buffer_text(buffer, "Active").unwrap().1;
+        let current_y = find_buffer_text(buffer, "Current").unwrap().1;
+        assert!(buffer_line(buffer, active_y).contains('*'));
+        assert!(buffer_line(buffer, current_y).contains('@'));
+    }
+
     #[test]
     fn profile_source_symbol_maps_known_sources() {
         let mut profile = profile("fast", "Fast");
@@ -3037,9 +3111,11 @@ mod tests {
         let mut app = App::new();
         assert_eq!(profile_empty_text(&app), "No profiles available");
 
-        app.profiles = vec![profile("fast", "Fast")];
-        app.profile_filter = "missing".into();
-        assert!(app.filtered_profiles().is_empty());
+        app.profiles.profiles = vec![profile("fast", "Fast")];
+        app.profiles.profile_filter = "missing".into();
+
+        assert!(app.profiles.filtered_profiles().is_empty());
+
         assert_eq!(profile_empty_text(&app), "No profiles match filter");
     }
 
