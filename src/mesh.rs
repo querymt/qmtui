@@ -1,26 +1,27 @@
-use crate::app::{App, Popup};
+use crate::app::App;
 use crate::command::Command;
 use crate::diagnostics::LogLevel;
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
     RemoteSessionListInfo,
 };
+use crate::navigation_state::Popup;
 
 impl App {
     pub fn open_mesh_popup(&mut self) {
-        self.popup = Popup::Mesh;
+        self.navigation.popup = Popup::Mesh;
         self.mesh.reset_for_popup();
         self.set_status(LogLevel::Debug, "mesh", "refreshing mesh");
     }
 
     pub fn open_mesh_invite_form(&mut self) {
-        self.popup = Popup::MeshInvite;
+        self.navigation.popup = Popup::MeshInvite;
         self.mesh.reset_invite_form();
     }
 
     pub fn apply_mesh_invite_created(&mut self, invite: MeshInviteCreatedInfo) {
         let url = self.mesh.store_invite(invite);
-        self.popup = Popup::MeshInviteQr;
+        self.navigation.popup = Popup::MeshInviteQr;
         self.set_status(LogLevel::Info, "mesh", "mesh invite created");
         self.push_log(LogLevel::Info, "mesh", format!("mesh invite: {url}"));
     }
@@ -82,7 +83,7 @@ impl App {
         // extension snapshot/config directly would duplicate replay or configuration.
         self.remember_remote_session_node(&attached.session_id, &attached.node_id);
         if attached.attached {
-            self.popup = Popup::None;
+            self.navigation.popup = Popup::None;
             self.set_status(LogLevel::Info, "mesh", "remote session attached");
             Command::load_session_commands(
                 attached.session_id.clone(),
