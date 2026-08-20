@@ -690,13 +690,21 @@ fn format_status_duration(duration: std::time::Duration) -> String {
 
 /// Build left + right span vectors for the chat/delegate header bar.
 fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-    let model_str = match (&app.current_provider, &app.current_model) {
+    let model_str = match (&app.models.current_provider, &app.models.current_model) {
         (Some(p), Some(m)) => {
-            if let Some(node_id) = app.current_model_node_id.as_deref() {
+            if let Some(node_id) = app.models.current_model_node_id.as_deref() {
                 let label = app
                     .models
+                    .models
                     .iter()
-                    .find(|e| App::model_entry_matches_node(e, p, m, Some(node_id)))
+                    .find(|entry| {
+                        crate::models_state::ModelsState::model_entry_matches_node(
+                            entry,
+                            p,
+                            m,
+                            Some(node_id),
+                        )
+                    })
                     .and_then(|e| e.node_label.as_deref())
                     .unwrap_or(node_id);
                 format!("{p}/{m}@{label}")
@@ -789,7 +797,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         right_spans.push(span);
     }
 
-    let effort_label = app.reasoning_effort_label().to_string();
+    let effort_label = app.models.reasoning_effort_label().to_string();
     right_spans.push(Span::styled(
         format!(" {model_str}"),
         Theme::status_accent(),

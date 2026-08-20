@@ -200,13 +200,12 @@ impl crate::app::App {
                     self.apply_profile_catalog(profiles, active_profile_id);
                 }
                 self.agent_id = Some(agent_id.clone());
-                self.agents = vec![AgentInfo {
+                self.models.initialize_primary_agent(AgentInfo {
                     id: agent_id,
                     name: agent_name,
                     description: None,
                     capabilities: Vec::new(),
-                }];
-                self.agents_profile_id = None;
+                });
                 if let Some(mode) = agent_mode {
                     self.agent_mode = mode;
                     if self.agent_mode != "review" {
@@ -214,7 +213,7 @@ impl crate::app::App {
                     }
                 }
                 if let Some(effort) = reasoning_effort {
-                    self.reasoning_effort = effort;
+                    self.models.reasoning_effort = effort;
                 }
                 self.auth.ui_notice = None;
                 self.set_status(LogLevel::Info, "connection", "connected");
@@ -229,9 +228,9 @@ impl crate::app::App {
             }
             AcpAppEvent::ReasoningEffort { reasoning_effort } => {
                 if let Some(validated) =
-                    crate::app::validate_reasoning_effort(reasoning_effort.as_deref())
+                    crate::models_state::validate_reasoning_effort(reasoning_effort.as_deref())
                 {
-                    self.reasoning_effort = validated;
+                    self.models.reasoning_effort = validated;
                 }
                 vec![]
             }
@@ -241,15 +240,11 @@ impl crate::app::App {
             } => self.apply_profile_catalog(profiles, active_profile_id),
             AcpAppEvent::ProfileAgents { profile_id, agents } => {
                 if self.desired_agents_profile_id() == Some(profile_id.as_str()) {
-                    self.agents = agents;
-                    self.agents_profile_id = Some(profile_id);
-                    self.model_popup_agent_tab = self
-                        .model_popup_agent_tab
-                        .min(self.model_popup_tab_count().saturating_sub(1));
+                    self.models.replace_profile_agents(profile_id, agents);
                     if self.parent_session_id.is_none()
                         && let (Some(session_id), Some(profile_id)) = (
                             self.session_id.as_deref(),
-                            self.agents_profile_id.as_deref(),
+                            self.models.agents_profile_id.as_deref(),
                         )
                     {
                         return self.delegate_model_commands_for_session(session_id, profile_id);
@@ -281,9 +276,8 @@ impl crate::app::App {
                 context_limit,
                 provider_node_id,
             } => {
-                self.current_provider = Some(provider);
-                self.current_model = Some(model);
-                self.current_model_node_id = provider_node_id;
+                self.models
+                    .replace_live_selection(provider, model, provider_node_id);
                 if let Some(limit) = context_limit {
                     self.context_limit = limit;
                 }
@@ -495,15 +489,10 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::Models { models, meta } => {
-                self.models = models;
-                let remote_models = self.models.iter().filter(|m| m.node_id.is_some()).count();
+                let (total_models, remote_models) = self.models.replace_catalog(models);
                 let remote_nodes = meta.as_ref().map(|m| m.remote_node_count).unwrap_or(0);
                 let timeouts = meta.as_ref().map(|m| m.remote_timeout_count).unwrap_or(0);
-                let mut line = format!(
-                    "models: {} total, {} remote",
-                    self.models.len(),
-                    remote_models
-                );
+                let mut line = format!("models: {total_models} total, {remote_models} remote");
                 if remote_nodes > 0 || timeouts > 0 {
                     line.push_str(&format!(
                         " (inventory nodes={remote_nodes}, timeouts={timeouts})"
@@ -581,12 +570,10 @@ impl crate::app::App {
             .apply_catalog(profiles, backend_active_profile_id);
         let desired_profile_id = self.desired_agents_profile_id().map(str::to_string);
         if active_profile_changed
-            || self.agents_profile_id.as_deref() != desired_profile_id.as_deref()
-            || self.agents.len() <= 1
+            || self.models.agents_profile_id.as_deref() != desired_profile_id.as_deref()
+            || self.models.agents.len() <= 1
         {
-            self.agents.clear();
-            self.agents_profile_id = None;
-            self.model_popup_agent_tab = 0;
+            self.models.clear_profile_agents();
             return desired_profile_id
                 .map(|profile_id| vec![Command::ListProfileAgents { profile_id }])
                 .unwrap_or_default();
@@ -778,7 +765,7 @@ impl crate::app::App {
             agent_id: self.agent_id.clone(),
         }];
         if let Some(profile_id) = self.current_session_profile_id().map(str::to_string) {
-            if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
+            if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
                 commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
             } else {
                 commands.push(Command::ListProfileAgents { profile_id });
@@ -814,7 +801,7 @@ impl crate::app::App {
         if self.parent_session_id.is_none()
             && let Some(profile_id) = self.current_session_profile_id().map(str::to_string)
         {
-            if self.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
+            if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
                 commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
             } else {
                 commands.push(Command::ListProfileAgents { profile_id });
@@ -2219,7 +2206,15 @@ mod tests {
         let mut app = App::new();
         app.profiles.profiles = vec![profile("fast")];
         app.profiles.active_profile_id = Some("fast".into());
-        app.agents.clear();
+        app.models.agents.clear();
+        app.models.model_popup_agent_tab = 3;
+        app.models.model_filter = "keep".into();
+        app.models.delegate_model_preferences.insert(
+            "fast".into(),
+            [("coder".into(), DelegateModelPreference::default())]
+                .into_iter()
+                .collect(),
+        );
 
         let commands = app.handle_acp_event(AcpAppEvent::Initialized {
             agent_id: "agent-1".into(),
@@ -2233,8 +2228,15 @@ mod tests {
         assert!(commands.is_empty());
         assert_eq!(app.profiles.profiles.len(), 1);
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
-        assert_eq!(app.agents.len(), 1);
-        assert_eq!(app.agents_profile_id, None);
+        assert_eq!(app.models.agents.len(), 1);
+        assert_eq!(app.models.agents_profile_id, None);
+        assert_eq!(app.models.model_popup_agent_tab, 3);
+        assert_eq!(app.models.model_filter, "keep");
+        assert!(
+            app.models
+                .get_delegate_model_preference("fast", "coder")
+                .is_some()
+        );
     }
 
     #[test]
@@ -2252,8 +2254,8 @@ mod tests {
 
         assert!(commands.is_empty());
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
-        assert_eq!(app.agents.len(), 1);
-        assert_eq!(app.agents_profile_id, None);
+        assert_eq!(app.models.agents.len(), 1);
+        assert_eq!(app.models.agents_profile_id, None);
     }
 
     #[test]
@@ -2562,7 +2564,7 @@ mod tests {
                 capabilities: Vec::new(),
             }],
         });
-        assert!(app.agents.is_empty());
+        assert!(app.models.agents.is_empty());
 
         app.handle_acp_event(AcpAppEvent::ProfileAgents {
             profile_id: "quorum".into(),
@@ -2581,9 +2583,9 @@ mod tests {
                 },
             ],
         });
-        assert_eq!(app.agents_profile_id.as_deref(), Some("quorum"));
-        assert_eq!(app.model_popup_tab_count(), 2);
-        assert_eq!(app.model_popup_tab_agent_id(1), Some("coder"));
+        assert_eq!(app.models.agents_profile_id.as_deref(), Some("quorum"));
+        assert_eq!(app.models.model_popup_tab_count(), 2);
+        assert_eq!(app.models.model_popup_tab_agent_id(1), Some("coder"));
     }
 
     #[test]
@@ -2592,7 +2594,7 @@ mod tests {
         app.session_id = Some("parent".into());
         app.profiles
             .bind_session_profile("parent".into(), "quorum".into());
-        app.delegate_model_preferences.insert(
+        app.models.delegate_model_preferences.insert(
             "quorum".into(),
             [(
                 "coder".into(),
@@ -3029,6 +3031,32 @@ mod tests {
         assert!(app.pending_session_group_loads.is_empty());
     }
 
+    fn seed_model_state(app: &mut App) {
+        app.models.current_provider = Some("provider".into());
+        app.models.current_model = Some("model".into());
+        app.models.reasoning_effort = Some("high".into());
+        app.models.models = vec![crate::models_state::ModelsState::test_model_entry(
+            "provider/model",
+            "provider",
+            "model",
+            None,
+            None,
+        )];
+        app.models.model_filter = "filter".into();
+        app.models.model_cursor = 5;
+        app.models.model_popup_agent_tab = 2;
+    }
+
+    fn assert_seeded_model_state(app: &App) {
+        assert_eq!(app.models.current_provider.as_deref(), Some("provider"));
+        assert_eq!(app.models.current_model.as_deref(), Some("model"));
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(app.models.models.len(), 1);
+        assert_eq!(app.models.model_filter, "filter");
+        assert_eq!(app.models.model_cursor, 5);
+        assert_eq!(app.models.model_popup_agent_tab, 2);
+    }
+
     #[test]
     fn native_session_created_resets_view_and_subscribes() {
         let mut app = App::new();
@@ -3049,6 +3077,7 @@ mod tests {
         }];
         app.mesh.mesh_node_count = Some(1);
         app.mesh.mesh_invite_name = "preserved".into();
+        seed_model_state(&mut app);
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionCreated {
             agent_id: "agent-1".into(),
@@ -3068,6 +3097,7 @@ mod tests {
         assert_eq!(app.mesh.mesh_node_count, Some(1));
         assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
         assert_eq!(app.mesh.mesh_invite_name, "preserved");
+        assert_seeded_model_state(&app);
         assert!(matches!(
             replies.as_slice(),
             [
@@ -3117,6 +3147,7 @@ mod tests {
         app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
         app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app.session_stats.total_tool_calls = 2;
+        seed_model_state(&mut app);
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "delegate-1".into(),
             child_session_id: Some("child".into()),
@@ -3150,6 +3181,7 @@ mod tests {
         assert!(app.elicitation.is_none());
         assert_eq!(app.session_stats.total_tool_calls, 0);
         assert_eq!(app.delegate_entries.len(), 1);
+        assert_seeded_model_state(&app);
         assert!(matches!(
             replies.as_slice(),
             [Command::SetAgentMode { mode }] if mode == "plan"
@@ -3199,6 +3231,71 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_events_preserve_state_and_log_exact_inventory_summary() {
+        let mut app = App::new();
+        app.models.current_provider = Some("old-provider".into());
+        app.models.current_model = Some("old-model".into());
+        app.models.current_model_node_id = Some("old-node".into());
+        app.models.model_cursor = 9;
+        app.models.model_filter = "stale".into();
+        app.models.model_popup_agent_tab = 3;
+        app.models.reasoning_effort = Some("high".into());
+
+        app.handle_acp_event(AcpAppEvent::Models {
+            models: vec![
+                crate::models_state::ModelsState::test_model_entry(
+                    "local", "provider", "local", None, None,
+                ),
+                crate::models_state::ModelsState::test_model_entry(
+                    "remote",
+                    "provider",
+                    "remote",
+                    Some("node-1"),
+                    Some("peer"),
+                ),
+            ],
+            meta: Some(AcpModelsMetaInfo {
+                remote_node_count: 2,
+                remote_timeout_count: 1,
+            }),
+        });
+
+        assert_eq!(app.models.models.len(), 2);
+        assert_eq!(app.models.current_provider.as_deref(), Some("old-provider"));
+        assert_eq!(app.models.current_model.as_deref(), Some("old-model"));
+        assert_eq!(
+            app.models.current_model_node_id.as_deref(),
+            Some("old-node")
+        );
+        assert_eq!(app.models.model_cursor, 9);
+        assert_eq!(app.models.model_filter, "stale");
+        assert_eq!(app.models.model_popup_agent_tab, 3);
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            app.diagnostics
+                .logs
+                .last()
+                .map(|entry| entry.message.as_str()),
+            Some("models: 2 total, 1 remote (inventory nodes=2, timeouts=1)")
+        );
+
+        app.handle_acp_event(AcpAppEvent::Models {
+            models: Vec::new(),
+            meta: Some(AcpModelsMetaInfo::default()),
+        });
+        assert!(app.models.models.is_empty());
+        assert_eq!(
+            app.diagnostics
+                .logs
+                .last()
+                .map(|entry| entry.message.as_str()),
+            Some("models: 0 total, 0 remote")
+        );
+        assert_eq!(app.models.model_cursor, 9);
+        assert_eq!(app.models.model_filter, "stale");
+    }
+
+    #[test]
     fn native_provider_changed_updates_selection_and_preserves_limit_when_absent() {
         let mut app = App::new();
         app.context_limit = 4_096;
@@ -3209,10 +3306,13 @@ mod tests {
             context_limit: Some(128_000),
             provider_node_id: Some("node-1".into()),
         });
-        assert_eq!(app.current_provider.as_deref(), Some("remote-provider"));
-        assert_eq!(app.current_model.as_deref(), Some("model-1"));
+        assert_eq!(
+            app.models.current_provider.as_deref(),
+            Some("remote-provider")
+        );
+        assert_eq!(app.models.current_model.as_deref(), Some("model-1"));
         assert_eq!(app.context_limit, 128_000);
-        assert_eq!(app.current_model_node_id.as_deref(), Some("node-1"));
+        assert_eq!(app.models.current_model_node_id.as_deref(), Some("node-1"));
 
         app.handle_acp_event(AcpAppEvent::ProviderChanged {
             provider: "local-provider".into(),
@@ -3220,10 +3320,13 @@ mod tests {
             context_limit: None,
             provider_node_id: None,
         });
-        assert_eq!(app.current_provider.as_deref(), Some("local-provider"));
-        assert_eq!(app.current_model.as_deref(), Some("model-2"));
+        assert_eq!(
+            app.models.current_provider.as_deref(),
+            Some("local-provider")
+        );
+        assert_eq!(app.models.current_model.as_deref(), Some("model-2"));
         assert_eq!(app.context_limit, 128_000);
-        assert_eq!(app.current_model_node_id, None);
+        assert_eq!(app.models.current_model_node_id, None);
     }
 
     #[test]

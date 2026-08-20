@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
-
 use crate::auth_state::AuthState;
 use crate::command::Command;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
@@ -14,8 +11,6 @@ use crate::domain::activity::{
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::RemoteSessionLocation;
-use crate::domain::model::{DelegateModelPreference, ModelEntry};
-use crate::domain::profile::AgentInfo;
 use crate::domain::session::{
     ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoStackSnapshot,
     UndoState, UndoableTurn,
@@ -23,6 +18,7 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh_state::MeshState;
+use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
@@ -334,19 +330,6 @@ pub fn session_group_count_text(session_count: usize, session_total: Option<u64>
         .unwrap_or_else(|| session_count.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelPopupItem {
-    ProviderHeader {
-        provider: String,
-        model_count: usize,
-        /// When set, header shows `@ {node}` right-aligned (remote mesh group).
-        node_suffix: Option<String>,
-    },
-    Model {
-        model_idx: usize,
-    },
-}
-
 pub struct App {
     pub(crate) navigation: NavigationState,
 
@@ -433,30 +416,11 @@ pub struct App {
     // thinking display
     pub show_thinking: bool,
 
-    // reasoning effort
-    /// Current reasoning-effort level. `None` = "auto" (server default).
-    /// Matches `reasoningEffort: string | null` in the web UI.
-    pub reasoning_effort: Option<String>,
     // profile info
     pub(crate) profiles: ProfilesState,
 
-    // model info
-    pub current_model: Option<String>,
-    pub current_provider: Option<String>,
-    /// Mesh node for the active catalog model (`None` = local provider host).
-    pub current_model_node_id: Option<String>,
-    pub models: Vec<ModelEntry>,
-    pub model_cursor: usize,
-    pub model_filter: String,
-
-    // delegate agent model preferences
-    /// Agents for `agents_profile_id`. Index zero is the primary session agent.
-    pub agents: Vec<AgentInfo>,
-    pub agents_profile_id: Option<String>,
-    /// Currently selected tab index: zero is the session, remaining tabs are delegates.
-    pub model_popup_agent_tab: usize,
-    /// Explicit model preferences scoped by profile ID and delegate agent ID.
-    pub delegate_model_preferences: HashMap<String, HashMap<String, DelegateModelPreference>>,
+    // model, reasoning effort, and profile-agent state
+    pub(crate) models: ModelsState,
 
     // in-memory logs popup and status line
     pub(crate) diagnostics: DiagnosticsState,
@@ -522,23 +486,6 @@ pub struct App {
 
     pub tick: u64,
     pub should_quit: bool,
-}
-
-/// Validate and normalize a reasoning-effort string.
-///
-/// * Returns `Some(Some(normalized))` for valid explicit levels:
-///   `"low"`, `"medium"` (also accepts alias `"med"`), `"high"`, `"max"`.
-/// * Returns `Some(None)` for `"auto"`, empty string, or `None`.
-/// * Returns `None` for any invalid/unrecognized level.
-pub fn validate_reasoning_effort(s: Option<&str>) -> Option<Option<String>> {
-    match s {
-        None | Some("auto") | Some("") => Some(None),
-        Some("low") => Some(Some("low".to_string())),
-        Some("medium") | Some("med") => Some(Some("medium".to_string())),
-        Some("high") => Some(Some("high".to_string())),
-        Some("max") => Some(Some("max".to_string())),
-        Some(_) => None,
-    }
 }
 
 fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
@@ -646,18 +593,8 @@ impl App {
             elicitation: None,
             elicitation_ui: None,
             show_thinking: true,
-            reasoning_effort: None,
             profiles: ProfilesState::new(),
-            current_model: None,
-            current_provider: None,
-            current_model_node_id: None,
-            models: Vec::new(),
-            model_cursor: 0,
-            model_filter: String::new(),
-            agents: Vec::new(),
-            agents_profile_id: None,
-            model_popup_agent_tab: 0,
-            delegate_model_preferences: HashMap::new(),
+            models: ModelsState::new(),
             diagnostics: DiagnosticsState::new(),
             undo_state: None,
             undoable_turns: Vec::new(),
@@ -709,18 +646,8 @@ impl App {
         self.card_cache.invalidate();
     }
 
-    /// Short display label for the current reasoning effort level.
-    /// Matches the five values used in the web UI: auto / low / medium / high / max.
-    pub fn reasoning_effort_label(&self) -> &str {
-        self.reasoning_effort.as_deref().unwrap_or("auto")
-    }
-
-    /// Valid reasoning effort levels (excluding "auto" which maps to `None`).
-    pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
-
     /// Cycle through `[auto, low, medium, high, max]` (wraps around).
-    /// Updates `self.reasoning_effort` optimistically, saves the new value as
-    /// the preference for the current `(mode, provider, model)` context, and
+    /// Updates the nested reasoning state optimistically and
     /// returns the [`Command`] to forward to the server.
     ///
     /// Returns `None` if the current value is not a recognized level; in that
@@ -728,40 +655,17 @@ impl App {
     /// should surface a warning to the user instead of silently coercing the
     /// unknown value to `low`).
     pub fn cycle_reasoning_effort(&mut self) -> Option<Command> {
-        const LEVELS: &[Option<&str>] =
-            &[None, Some("low"), Some("medium"), Some("high"), Some("max")];
-        let current = self.reasoning_effort.as_deref();
-        let Some(idx) = LEVELS.iter().position(|l| l.as_deref() == current) else {
-            // Unknown current value: leave state unchanged and let the caller
-            // surface a warning to the user instead of silently coercing to low.
-            return None;
-        };
-        let next = LEVELS[(idx + 1) % LEVELS.len()];
-        Some(
-            self.set_reasoning_effort(next)
-                .expect("cycle always produces a valid level"),
-        )
+        let reasoning_effort = self.models.cycle_reasoning_effort()?;
+        Some(Command::SetReasoningEffort { reasoning_effort })
     }
 
     /// Set the reasoning effort to a specific level.
     /// `None` or `Some("auto")` both map to the "auto" (no override) state.
-    /// Updates `self.reasoning_effort` and returns the [`Command`] to forward to the server.
+    /// Updates nested reasoning state and returns the [`Command`] to forward to the server.
     /// Returns `None` if the level is invalid (state is unchanged).
     pub fn set_reasoning_effort(&mut self, level: Option<&str>) -> Option<Command> {
-        match validate_reasoning_effort(level) {
-            Some(normalized) => {
-                self.reasoning_effort = normalized;
-                let effort_str = self
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("auto")
-                    .to_string();
-                Some(Command::SetReasoningEffort {
-                    reasoning_effort: effort_str,
-                })
-            }
-            None => None,
-        }
+        let reasoning_effort = self.models.set_reasoning_effort(level)?;
+        Some(Command::SetReasoningEffort { reasoning_effort })
     }
 
     /// Route to a freshly reset auth popup while preserving provider data.
@@ -791,146 +695,6 @@ impl App {
     pub fn open_profile_popup(&mut self) {
         self.navigation.popup = Popup::ProfileSelect;
         self.profiles.reset_for_open();
-    }
-
-    pub fn filtered_models(&self) -> Vec<&ModelEntry> {
-        if self.model_filter.is_empty() {
-            self.models.iter().collect()
-        } else {
-            let matcher = SkimMatcherV2::default();
-            let mut scored: Vec<(i64, &ModelEntry)> = self
-                .models
-                .iter()
-                .filter_map(|m| {
-                    let score = [&m.label, &m.provider, &m.model]
-                        .iter()
-                        .filter_map(|field| matcher.fuzzy_match(field, &self.model_filter))
-                        .max();
-                    score.map(|s| (s, m))
-                })
-                .collect();
-            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-            scored.into_iter().map(|(_, m)| m).collect()
-        }
-    }
-
-    fn model_index_for_entry(&self, entry: &ModelEntry) -> Option<usize> {
-        self.models
-            .iter()
-            .position(|m| m.id == entry.id && m.node_id == entry.node_id)
-    }
-
-    /// Match catalog row to a provider/model pair, disambiguating local vs mesh.
-    pub fn model_entry_matches_node(
-        entry: &ModelEntry,
-        provider: &str,
-        model: &str,
-        node_id: Option<&str>,
-    ) -> bool {
-        if entry.provider != provider || entry.model != model {
-            return false;
-        }
-        match node_id {
-            Some(node) => entry.node_id.as_deref() == Some(node),
-            None => entry.node_id.is_none(),
-        }
-    }
-
-    pub fn apply_model_selection_from_entry(&mut self, entry: &ModelEntry) {
-        self.current_provider = Some(entry.provider.clone());
-        self.current_model = Some(entry.model.clone());
-        self.current_model_node_id = entry.node_id.clone();
-    }
-
-    pub fn live_model_selection_matches_entry(&self, entry: &ModelEntry) -> bool {
-        let (Some(cp), Some(cm)) = (
-            self.current_provider.as_deref(),
-            self.current_model.as_deref(),
-        ) else {
-            return false;
-        };
-        Self::model_entry_matches_node(entry, cp, cm, self.current_model_node_id.as_deref())
-    }
-
-    pub fn model_popup_open_cursor(&self) -> usize {
-        let items = self.visible_model_popup_items();
-        items
-            .iter()
-            .position(|item| match item {
-                ModelPopupItem::Model { model_idx } => self
-                    .models
-                    .get(*model_idx)
-                    .is_some_and(|e| self.live_model_selection_matches_entry(e)),
-                _ => false,
-            })
-            .or_else(|| {
-                items
-                    .iter()
-                    .position(|item| matches!(item, ModelPopupItem::Model { .. }))
-            })
-            .unwrap_or(0)
-    }
-
-    pub fn visible_model_popup_items(&self) -> Vec<ModelPopupItem> {
-        let filtered = self.filtered_models();
-        let mut items = Vec::new();
-
-        #[derive(Eq, PartialEq, Ord, PartialOrd)]
-        struct GroupKey {
-            provider: String,
-            node_id: Option<String>,
-        }
-
-        let mut groups: std::collections::BTreeMap<GroupKey, Vec<&ModelEntry>> =
-            std::collections::BTreeMap::new();
-        for model in filtered.iter() {
-            let key = GroupKey {
-                provider: model.provider.clone(),
-                node_id: model.node_id.clone(),
-            };
-            groups.entry(key).or_default().push(model);
-        }
-
-        for (key, models_in_group) in groups {
-            let node_suffix = key.node_id.as_ref().map(|nid| {
-                models_in_group
-                    .first()
-                    .and_then(|m| m.node_label.clone())
-                    .unwrap_or_else(|| nid.clone())
-            });
-            items.push(ModelPopupItem::ProviderHeader {
-                provider: key.provider.clone(),
-                model_count: models_in_group.len(),
-                node_suffix,
-            });
-            for model in models_in_group {
-                if let Some(model_idx) = self.model_index_for_entry(model) {
-                    items.push(ModelPopupItem::Model { model_idx });
-                }
-            }
-        }
-
-        items
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_model_entry(
-        id: &str,
-        provider: &str,
-        model: &str,
-        node_id: Option<&str>,
-        node_label: Option<&str>,
-    ) -> ModelEntry {
-        ModelEntry {
-            id: id.into(),
-            label: model.into(),
-            provider: provider.into(),
-            model: model.into(),
-            node_id: node_id.map(str::to_string),
-            node_label: node_label.map(str::to_string),
-            family: None,
-            quant: None,
-        }
     }
 
     // phase 11 compatibility forward
@@ -1458,49 +1222,7 @@ impl App {
         }
     }
 
-    // ── delegate model preferences ───────────────────────────────────────────
-
-    /// Whether there are multiple agents (multi-agent / delegation mode).
-    pub fn is_multi_agent(&self) -> bool {
-        self.agents.len() > 1
-    }
-
-    /// Tabs: 0 = session model; 1.. = delegate agents when `agents.len() > 1`.
-    pub fn model_popup_tab_count(&self) -> usize {
-        if self.agents.len() > 1 {
-            self.agents.len()
-        } else {
-            1
-        }
-    }
-
-    pub fn model_popup_has_tabs(&self) -> bool {
-        self.agents.len() > 1
-    }
-
-    pub fn model_popup_tab_label(&self, tab_idx: usize) -> &str {
-        if tab_idx == 0 {
-            "session"
-        } else {
-            self.agents
-                .get(tab_idx)
-                .map(|a| a.name.as_str())
-                .unwrap_or("???")
-        }
-    }
-
-    /// `None` on session tab; delegate agent id on agent tabs.
-    pub fn model_popup_tab_agent_id(&self, tab_idx: usize) -> Option<&str> {
-        if tab_idx == 0 {
-            None
-        } else {
-            self.agents.get(tab_idx).map(|a| a.id.as_str())
-        }
-    }
-
-    pub fn model_popup_is_session_tab(&self, tab_idx: usize) -> bool {
-        tab_idx == 0
-    }
+    // ── delegate model preference coordination ───────────────────────────────
 
     pub fn delegate_preference_profile_id(&self) -> Option<&str> {
         self.current_session_profile_id()
@@ -1511,53 +1233,20 @@ impl App {
         self.delegate_preference_profile_id()
     }
 
-    pub fn set_delegate_model_preference(
-        &mut self,
-        profile_id: &str,
-        agent_id: &str,
-        model: &ModelEntry,
-    ) {
-        self.delegate_model_preferences
-            .entry(profile_id.to_string())
-            .or_default()
-            .insert(
-                agent_id.to_string(),
-                DelegateModelPreference {
-                    model_id: model.id.clone(),
-                    provider: model.provider.clone(),
-                    model: model.model.clone(),
-                    node_id: model.node_id.clone(),
-                },
-            );
-    }
-
-    pub fn clear_delegate_model_preference(&mut self, profile_id: &str, agent_id: &str) {
-        if let Some(preferences) = self.delegate_model_preferences.get_mut(profile_id) {
-            preferences.remove(agent_id);
-            if preferences.is_empty() {
-                self.delegate_model_preferences.remove(profile_id);
-            }
-        }
-    }
-
-    pub fn get_delegate_model_preference(
-        &self,
-        profile_id: &str,
-        agent_id: &str,
-    ) -> Option<&DelegateModelPreference> {
-        self.delegate_model_preferences
-            .get(profile_id)
-            .and_then(|preferences| preferences.get(agent_id))
-    }
-
     pub fn delegate_model_commands_for_session(
         &self,
         session_id: &str,
         profile_id: &str,
     ) -> Vec<Command> {
-        let known_agents: HashSet<&str> =
-            self.agents.iter().skip(1).map(|a| a.id.as_str()).collect();
-        self.delegate_model_preferences
+        let known_agents: HashSet<&str> = self
+            .models
+            .agents
+            .iter()
+            .skip(1)
+            .map(|agent| agent.id.as_str())
+            .collect();
+        self.models
+            .delegate_model_preferences
             .get(profile_id)
             .into_iter()
             .flat_map(|preferences| preferences.iter())
@@ -1573,122 +1262,58 @@ impl App {
 
     /// Cursor position for a delegate agent's preferred model in the popup list.
     pub fn delegate_model_cursor(&self, agent_id: &str) -> usize {
-        let items = self.visible_model_popup_items();
-        let Some(profile_id) = self.delegate_preference_profile_id() else {
-            return items
-                .iter()
-                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
-                .unwrap_or(0);
-        };
-        let Some(preference) = self.get_delegate_model_preference(profile_id, agent_id) else {
-            return items
-                .iter()
-                .position(|item| matches!(item, ModelPopupItem::Model { .. }))
-                .unwrap_or(0);
-        };
-        items
-            .iter()
-            .position(|item| match item {
-                ModelPopupItem::Model { model_idx } => {
-                    self.models[*model_idx].id == preference.model_id
-                        && self.models[*model_idx].node_id == preference.node_id
-                }
-                _ => false,
-            })
-            .unwrap_or(0)
+        self.models
+            .delegate_model_cursor(self.delegate_preference_profile_id(), agent_id)
     }
 }
 
-// ── reasoning_effort_tests ────────────────────────────────────────────────────
+// ── app coordinator and session tests ─────────────────────────────────────────
 
 #[cfg(test)]
 mod reasoning_effort_tests {
     use super::*;
     use crate::domain::session::SessionSummary;
 
-    // ── reasoning_effort_label ────────────────────────────────────────────────
-
-    #[test]
-    fn label_none_is_auto() {
-        let app = App::new();
-        assert_eq!(app.reasoning_effort_label(), "auto");
-    }
-
-    #[test]
-    fn label_low() {
-        let mut app = App::new();
-        app.reasoning_effort = Some("low".into());
-        assert_eq!(app.reasoning_effort_label(), "low");
-    }
-
-    #[test]
-    fn label_medium() {
-        let mut app = App::new();
-        app.reasoning_effort = Some("medium".into());
-        assert_eq!(app.reasoning_effort_label(), "medium");
-    }
-
-    #[test]
-    fn label_high() {
-        let mut app = App::new();
-        app.reasoning_effort = Some("high".into());
-        assert_eq!(app.reasoning_effort_label(), "high");
-    }
-
-    #[test]
-    fn label_max() {
-        let mut app = App::new();
-        app.reasoning_effort = Some("max".into());
-        assert_eq!(app.reasoning_effort_label(), "max");
-    }
-
-    #[test]
-    fn label_unknown_passes_through() {
-        let mut app = App::new();
-        app.reasoning_effort = Some("ultra".into());
-        assert_eq!(app.reasoning_effort_label(), "ultra");
-    }
-
     // ── cycle_reasoning_effort ────────────────────────────────────────────────
 
     #[test]
     fn cycle_from_auto_to_low() {
         let mut app = App::new();
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
         app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("low".into()));
+        assert_eq!(app.models.reasoning_effort, Some("low".into()));
     }
 
     #[test]
     fn cycle_from_low_to_medium() {
         let mut app = App::new();
-        app.reasoning_effort = Some("low".into());
+        app.models.reasoning_effort = Some("low".into());
         app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert_eq!(app.models.reasoning_effort, Some("medium".into()));
     }
 
     #[test]
     fn cycle_from_medium_to_high() {
         let mut app = App::new();
-        app.reasoning_effort = Some("medium".into());
+        app.models.reasoning_effort = Some("medium".into());
         app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
     }
 
     #[test]
     fn cycle_from_high_to_max() {
         let mut app = App::new();
-        app.reasoning_effort = Some("high".into());
+        app.models.reasoning_effort = Some("high".into());
         app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, Some("max".into()));
+        assert_eq!(app.models.reasoning_effort, Some("max".into()));
     }
 
     #[test]
     fn cycle_from_max_wraps_to_auto() {
         let mut app = App::new();
-        app.reasoning_effort = Some("max".into());
+        app.models.reasoning_effort = Some("max".into());
         app.cycle_reasoning_effort();
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
     }
 
     #[test]
@@ -1698,13 +1323,13 @@ mod reasoning_effort_tests {
         for _ in 0..5 {
             app.cycle_reasoning_effort();
         }
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
     }
 
     #[test]
     fn cycle_reasoning_effort_unknown_value_noop() {
         let mut app = App::new();
-        app.reasoning_effort = Some("invalid_level".into());
+        app.models.reasoning_effort = Some("invalid_level".into());
         let result = app.cycle_reasoning_effort();
         // unknown current value → no-op: returns None and leaves state unchanged
         assert!(
@@ -1712,7 +1337,7 @@ mod reasoning_effort_tests {
             "cycling an unknown value should return None"
         );
         assert_eq!(
-            app.reasoning_effort,
+            app.models.reasoning_effort,
             Some("invalid_level".into()),
             "state must not change when cycling an unknown value"
         );
@@ -1734,7 +1359,7 @@ mod reasoning_effort_tests {
     #[test]
     fn cycle_to_auto_sends_auto_string() {
         let mut app = App::new();
-        app.reasoning_effort = Some("max".into());
+        app.models.reasoning_effort = Some("max".into());
         let msg = app.cycle_reasoning_effort().expect("max is a valid level");
         // max → auto: server expects "auto" string (not null)
         match msg {
@@ -1751,7 +1376,7 @@ mod reasoning_effort_tests {
     fn set_reasoning_effort_high_returns_correct_msg() {
         let mut app = App::new();
         let msg = app.set_reasoning_effort(Some("high"));
-        assert_eq!(app.reasoning_effort, Some("high".into()));
+        assert_eq!(app.models.reasoning_effort, Some("high".into()));
         match msg {
             Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "high");
@@ -1763,9 +1388,9 @@ mod reasoning_effort_tests {
     #[test]
     fn set_reasoning_effort_auto_clears_to_none() {
         let mut app = App::new();
-        app.reasoning_effort = Some("max".into());
+        app.models.reasoning_effort = Some("max".into());
         let msg = app.set_reasoning_effort(Some("auto"));
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
         match msg {
             Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
@@ -1777,9 +1402,9 @@ mod reasoning_effort_tests {
     #[test]
     fn set_reasoning_effort_none_clears_to_auto() {
         let mut app = App::new();
-        app.reasoning_effort = Some("low".into());
+        app.models.reasoning_effort = Some("low".into());
         let msg = app.set_reasoning_effort(None);
-        assert_eq!(app.reasoning_effort, None);
+        assert_eq!(app.models.reasoning_effort, None);
         match msg {
             Some(Command::SetReasoningEffort { reasoning_effort }) => {
                 assert_eq!(reasoning_effort, "auto");
@@ -1791,22 +1416,10 @@ mod reasoning_effort_tests {
     #[test]
     fn set_reasoning_effort_invalid_value_rejected() {
         let mut app = App::new();
-        app.reasoning_effort = Some("medium".into());
+        app.models.reasoning_effort = Some("medium".into());
         let msg = app.set_reasoning_effort(Some("ultra"));
-        assert_eq!(app.reasoning_effort, Some("medium".into()));
+        assert_eq!(app.models.reasoning_effort, Some("medium".into()));
         assert!(msg.is_none());
-    }
-
-    #[test]
-    fn validate_reasoning_effort_normalizes_med() {
-        assert_eq!(
-            validate_reasoning_effort(Some("med")),
-            Some(Some("medium".to_string()))
-        );
-        assert_eq!(
-            validate_reasoning_effort(Some("MED")),
-            None // case-sensitive
-        );
     }
 
     // ── state message populates reasoning_effort ──────────────────────────────
@@ -2281,47 +1894,6 @@ mod delegate_entry_tests {
     // ── delegation result suppression ────────────────────────────────────────
 
     // ── delegation duration tracking ─────────────────────────────────────────
-}
-
-#[cfg(test)]
-mod model_node_selection_tests {
-    use super::*;
-
-    #[test]
-    fn live_selection_matches_only_one_of_local_and_remote_duplicate() {
-        let mut app = App::new();
-        let local = App::test_model_entry("codex/local", "codex", "gpt-5", None, None);
-        let remote = App::test_model_entry(
-            "codex@n1/remote",
-            "codex",
-            "gpt-5",
-            Some("n1"),
-            Some("peer"),
-        );
-        app.models = vec![local.clone(), remote.clone()];
-        app.apply_model_selection_from_entry(&remote);
-
-        assert!(app.live_model_selection_matches_entry(&remote));
-        assert!(!app.live_model_selection_matches_entry(&local));
-    }
-
-    #[test]
-    fn model_popup_open_cursor_points_at_remote_when_node_id_set() {
-        let mut app = App::new();
-        app.models = vec![
-            App::test_model_entry("codex/local", "codex", "gpt-5", None, None),
-            App::test_model_entry("codex@n1/gpt-5", "codex", "gpt-5", Some("n1"), Some("box")),
-        ];
-        let remote = app.models[1].clone();
-        app.apply_model_selection_from_entry(&remote);
-        let items = app.visible_model_popup_items();
-        let cursor = app.model_popup_open_cursor();
-        let item = &items[cursor];
-        assert!(
-            matches!(item, ModelPopupItem::Model { model_idx } if app.models[*model_idx].node_id.is_some()),
-            "cursor should be on remote row"
-        );
-    }
 }
 
 // ── session_mode_tests ────────────────────────────────────────────────────────
@@ -3993,154 +3565,5 @@ mod popup_item_tests {
         app.input_cursor = 6;
         app.slash_state = None;
         assert!(!app.accept_selected_slash_completion());
-    }
-}
-
-// ── delegate_model_preference_tests ──────────────────────────────────────────
-
-#[cfg(test)]
-mod delegate_model_preference_tests {
-    use super::*;
-    use crate::domain::model::ModelEntry;
-    use crate::domain::profile::AgentInfo;
-
-    fn make_agent(id: &str, name: &str) -> AgentInfo {
-        AgentInfo {
-            id: id.into(),
-            name: name.into(),
-            description: None,
-            capabilities: Vec::new(),
-        }
-    }
-
-    fn make_model(provider: &str, model: &str) -> ModelEntry {
-        ModelEntry {
-            id: format!("{provider}/{model}"),
-            label: format!("{provider}/{model}"),
-            provider: provider.into(),
-            model: model.into(),
-            node_id: None,
-            node_label: None,
-            family: None,
-            quant: None,
-        }
-    }
-
-    #[test]
-    fn is_multi_agent_false_when_no_agents() {
-        let app = App::new();
-        assert!(!app.is_multi_agent());
-    }
-
-    #[test]
-    fn is_multi_agent_false_when_single_agent() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main")];
-        assert!(!app.is_multi_agent());
-    }
-
-    #[test]
-    fn is_multi_agent_true_when_two_agents() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert!(app.is_multi_agent());
-    }
-
-    #[test]
-    fn tab_label_session_at_zero() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_label(0), "session");
-    }
-
-    #[test]
-    fn tab_label_delegate_agent_at_one_when_multi_agent() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_label(1), "Coder");
-    }
-
-    #[test]
-    fn tab_agent_id_none_on_session_tab() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_agent_id(0), None);
-    }
-
-    #[test]
-    fn tab_agent_id_some_for_delegate_tab() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_agent_id(1), Some("coder"));
-    }
-
-    #[test]
-    fn tab_count_single_agent_or_empty() {
-        let app = App::new();
-        assert_eq!(app.model_popup_tab_count(), 1);
-        let mut single = App::new();
-        single.agents = vec![make_agent("main", "Main")];
-        assert_eq!(single.model_popup_tab_count(), 1);
-    }
-
-    #[test]
-    fn tab_count_multi_agent_matches_agent_list() {
-        let mut app = App::new();
-        app.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
-        assert_eq!(app.model_popup_tab_count(), 2);
-        assert!(app.model_popup_has_tabs());
-        app.agents.push(make_agent("reviewer", "Reviewer"));
-        assert_eq!(app.model_popup_tab_count(), 3);
-        assert!(app.model_popup_has_tabs());
-    }
-
-    #[test]
-    fn delegate_pref_round_trip() {
-        let mut app = App::new();
-        let model = make_model("anthropic", "claude-sonnet");
-        app.set_delegate_model_preference("profile", "coder", &model);
-        assert_eq!(
-            app.get_delegate_model_preference("profile", "coder")
-                .map(|preference| preference.model_id.as_str()),
-            Some("anthropic/claude-sonnet")
-        );
-    }
-
-    #[test]
-    fn delegate_pref_missing_returns_none() {
-        let app = App::new();
-        assert_eq!(app.get_delegate_model_preference("profile", "coder"), None);
-    }
-
-    #[test]
-    fn delegate_model_cursor_with_preference() {
-        let mut app = App::new();
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        app.profiles.active_profile_id = Some("profile".into());
-        app.set_delegate_model_preference("profile", "coder", &app.models[1].clone());
-        let cursor = app.delegate_model_cursor("coder");
-        // Should point to the second item (index 1 in models, but popup items
-        // include provider headers — exact index depends on visible_model_popup_items).
-        let items = app.visible_model_popup_items();
-        match &items[cursor] {
-            ModelPopupItem::Model { model_idx } => {
-                assert_eq!(app.models[*model_idx].model, "claude-sonnet");
-            }
-            _ => panic!("expected Model item at cursor"),
-        }
-    }
-
-    #[test]
-    fn delegate_model_cursor_without_preference() {
-        let mut app = App::new();
-        app.models = vec![
-            make_model("openai", "gpt-4o"),
-            make_model("anthropic", "claude-sonnet"),
-        ];
-        let cursor = app.delegate_model_cursor("coder");
-        // Should land on the first Model item.
-        let items = app.visible_model_popup_items();
-        assert!(matches!(&items[cursor], ModelPopupItem::Model { .. }));
     }
 }
