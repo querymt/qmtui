@@ -1932,7 +1932,7 @@ pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
     const SHORTCUT_COL_W: usize = 10;
 
     let area = f.area();
-    let commands = app.filtered_command_palette_commands();
+    let commands = app.navigation.filtered_command_palette_commands();
     let desired_h = (commands.len() as u16).saturating_add(7);
     let popup_width = area
         .width
@@ -1985,11 +1985,11 @@ pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
 
     let avail = chunks[1].width.saturating_sub(2) as usize;
     let (filter_display, filter_cur) = scroll_input(
-        &app.command_palette_filter,
-        app.command_palette_filter.len(),
+        &app.navigation.command_palette_filter,
+        app.navigation.command_palette_filter.len(),
         avail,
     );
-    let placeholder = if app.command_palette_filter.is_empty() {
+    let placeholder = if app.navigation.command_palette_filter.is_empty() {
         "type to filter..."
     } else {
         ""
@@ -2017,7 +2017,7 @@ pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
             .iter()
             .enumerate()
             .map(|(i, command)| {
-                let selected = i == app.command_palette_cursor;
+                let selected = i == app.navigation.command_palette_cursor;
                 let row_style = if selected {
                     Theme::selected()
                 } else {
@@ -2051,7 +2051,8 @@ pub(super) fn draw_command_palette_popup(f: &mut Frame, app: &App) {
         .highlight_symbol("");
     let visible_rows = chunks[3].height as usize;
     let selected = (!commands.is_empty()).then_some(
-        app.command_palette_cursor
+        app.navigation
+            .command_palette_cursor
             .min(commands.len().saturating_sub(1)),
     );
     let offset = selected
@@ -2124,8 +2125,11 @@ pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (theme_filter_display, theme_filter_cur) =
-        scroll_input(&app.theme_filter, app.theme_filter.len(), avail);
+    let (theme_filter_display, theme_filter_cur) = scroll_input(
+        &app.navigation.theme_filter,
+        app.navigation.theme_filter.len(),
+        avail,
+    );
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(theme_filter_display, Theme::popup_bg()),
@@ -2138,16 +2142,7 @@ pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
 
     // theme list
     let all_themes = Theme::available_themes();
-    let filter_lower = app.theme_filter.to_lowercase();
-    let filtered: Vec<(usize, &crate::themes_gen::Base16Palette)> = all_themes
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            filter_lower.is_empty()
-                || t.label.to_lowercase().contains(&filter_lower)
-                || t.id.to_lowercase().contains(&filter_lower)
-        })
-        .collect();
+    let filtered = app.navigation.filtered_themes(all_themes);
 
     let current_idx = Theme::current_index();
     let list_w = chunks[3].width as usize;
@@ -2156,18 +2151,25 @@ pub(super) fn draw_theme_popup(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, (orig_idx, t))| {
-            build_theme_list_item(t, *orig_idx, current_idx, list_w, i == app.theme_cursor)
+            build_theme_list_item(
+                t,
+                *orig_idx,
+                current_idx,
+                list_w,
+                i == app.navigation.theme_cursor,
+            )
         })
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
     let visible_rows = chunks[3].height as usize;
     let offset = app
+        .navigation
         .theme_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
-        .with_selected(Some(app.theme_cursor));
+        .with_selected(Some(app.navigation.theme_cursor));
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
@@ -2474,7 +2476,7 @@ pub(super) fn draw_help_popup(f: &mut Frame, app: &App) {
     }
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let mut state = ListState::default().with_offset(app.help_scroll);
+    let mut state = ListState::default().with_offset(app.navigation.help_scroll);
     f.render_stateful_widget(list, chunks[2], &mut state);
 
     // hint
