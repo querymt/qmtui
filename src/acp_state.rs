@@ -215,7 +215,7 @@ impl crate::app::App {
                 if let Some(effort) = reasoning_effort {
                     self.reasoning_effort = effort;
                 }
-                self.auth_ui_notice = None;
+                self.auth.ui_notice = None;
                 self.set_status(LogLevel::Info, "connection", "connected");
                 vec![]
             }
@@ -512,11 +512,11 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::AuthProviders(providers) => {
-                self.auth_providers = providers;
+                self.auth.providers = providers;
                 self.push_log(
                     LogLevel::Debug,
                     "auth",
-                    format!("{} auth provider(s)", self.auth_providers.len()),
+                    format!("{} auth provider(s)", self.auth.providers.len()),
                 );
                 vec![]
             }
@@ -526,12 +526,7 @@ impl crate::app::App {
                     "auth",
                     format!("OAuth flow started for {}", flow.provider),
                 );
-                self.auth_oauth_flow = Some(flow);
-                self.auth_panel = crate::app::AuthPanel::OAuthFlow;
-                self.auth_oauth_response.clear();
-                self.auth_oauth_response_cursor = 0;
-                self.auth_last_result = None;
-                self.auth_ui_notice = None;
+                self.auth.begin_oauth_flow(flow);
                 vec![]
             }
             AcpAppEvent::OAuthResult(result) => {
@@ -542,12 +537,8 @@ impl crate::app::App {
                     LogLevel::Warn
                 };
                 self.push_log(level, "auth", &result.message);
-                self.auth_ui_notice = None;
-                self.auth_last_result = Some(result);
-                if is_success {
-                    self.auth_oauth_flow = None;
-                    self.auth_panel = crate::app::AuthPanel::List;
-                }
+                let applied_success = self.auth.apply_oauth_result(result);
+                debug_assert_eq!(applied_success, is_success);
                 vec![Command::ListAuthProviders]
             }
             AcpAppEvent::InfoLog { target, message } => {

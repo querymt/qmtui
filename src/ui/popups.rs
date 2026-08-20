@@ -7,7 +7,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, AuthPanel, session_group_count_text};
+use crate::app::{App, session_group_count_text};
+use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::DelegateStats;
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
@@ -2507,15 +2508,15 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
     };
 
     // If clipboard fallback is active, draw a simple URL display popup over everything.
-    if let Some(ref url) = app.auth_clipboard_fallback {
+    if let Some(ref url) = app.auth.clipboard_fallback {
         draw_auth_clipboard_fallback(f, inner, url);
         return;
     }
 
     // Determine detail area height based on panel state.
-    let detail_height: u16 = match app.auth_panel {
+    let detail_height: u16 = match app.auth.panel {
         AuthPanel::List => {
-            if app.auth_selected.is_some() {
+            if app.auth.selected.is_some() {
                 3 // status line + info
             } else {
                 0
@@ -2547,7 +2548,7 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
     let (auth_filter_display, auth_filter_cur) =
-        scroll_input(&app.auth_filter, app.auth_filter.len(), avail);
+        scroll_input(&app.auth.filter, app.auth.filter.len(), avail);
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(auth_filter_display, Theme::popup_bg()),
@@ -2556,19 +2557,19 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    if app.auth_panel == AuthPanel::List {
+    if app.auth.panel == AuthPanel::List {
         f.set_cursor_position((chunks[1].x + 2 + auth_filter_cur as u16, chunks[1].y));
     }
 
     // provider list
-    let filtered = app.filtered_auth_providers();
+    let filtered = app.auth.filtered_providers();
     let list_w = chunks[3].width as usize;
 
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .map(|(i, (_, provider))| {
-            let selected = i == app.auth_cursor;
+            let selected = i == app.auth.cursor;
             let badge = provider.auth_badge_label();
             let badge_active = provider.is_auth_active();
             let is_expired = provider.oauth_status == Some(OAuthStatus::Expired);
@@ -2615,7 +2616,7 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
         .collect();
 
     if items.is_empty() {
-        let msg = if app.auth_filter.is_empty() {
+        let msg = if app.auth.filter.is_empty() {
             "loading providers..."
         } else {
             "no providers match filter"
@@ -2629,11 +2630,12 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
         let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
         let visible_rows = chunks[3].height as usize;
         let offset = app
-            .auth_cursor
+            .auth
+            .cursor
             .saturating_sub(visible_rows.saturating_sub(1));
         let mut state = ListState::default()
             .with_offset(offset)
-            .with_selected(Some(app.auth_cursor));
+            .with_selected(Some(app.auth.cursor));
         f.render_stateful_widget(list, chunks[3], &mut state);
     }
 
@@ -2643,7 +2645,7 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
     }
 
     // hint
-    let hint = match app.auth_panel {
+    let hint = match app.auth.panel {
         AuthPanel::List => {
             let mut spans = vec![
                 Span::styled(" esc ", Theme::status_accent()),
@@ -2652,8 +2654,8 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
                 Span::styled("select  ", Theme::status()),
             ];
             // Show C-d contextually when a provider with clearable credentials is selected
-            if let Some(idx) = app.auth_selected
-                && let Some(provider) = app.auth_providers.get(idx)
+            if let Some(idx) = app.auth.selected
+                && let Some(provider) = app.auth.providers.get(idx)
             {
                 if provider.oauth_status == Some(OAuthStatus::Connected) {
                     spans.push(Span::styled("C-d ", Theme::status_accent()));
@@ -2692,14 +2694,14 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
 }
 
 fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
-    let Some(idx) = app.auth_selected else {
+    let Some(idx) = app.auth.selected else {
         return;
     };
-    let Some(provider) = app.auth_providers.get(idx) else {
+    let Some(provider) = app.auth.providers.get(idx) else {
         return;
     };
 
-    match app.auth_panel {
+    match app.auth.panel {
         AuthPanel::List => {
             // Show selected provider status summary
             let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2731,7 +2733,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 )));
             }
 
-            if let Some((success, message)) = app.auth_feedback_for_provider(&provider.provider) {
+            if let Some((success, message)) = app.auth.feedback_for_provider(&provider.provider) {
                 let style = if success {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
@@ -2783,13 +2785,13 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             }
 
             // Input line
-            let cursor_chars = app.auth_api_key_input[..app.auth_api_key_cursor]
+            let cursor_chars = app.auth.api_key_input[..app.auth.api_key_cursor]
                 .chars()
                 .count();
-            let display_input = if app.auth_api_key_masked && !app.auth_api_key_input.is_empty() {
-                "\u{2022}".repeat(app.auth_api_key_input.chars().count())
+            let display_input = if app.auth.api_key_masked && !app.auth.api_key_input.is_empty() {
+                "\u{2022}".repeat(app.auth.api_key_input.chars().count())
             } else {
-                app.auth_api_key_input.clone()
+                app.auth.api_key_input.clone()
             };
             let placeholder = if provider.has_stored_api_key {
                 "new key to update..."
@@ -2798,13 +2800,13 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             };
             // " > " prefix = 3 cols
             let avail = area.width.saturating_sub(3) as usize;
-            let (input_text, api_key_cur) = if app.auth_api_key_input.is_empty() {
+            let (input_text, api_key_cur) = if app.auth.api_key_input.is_empty() {
                 (placeholder.to_string(), 0usize)
             } else {
                 let (vis, col) = scroll_input_chars(&display_input, cursor_chars, avail);
                 (vis, col)
             };
-            let input_style = if app.auth_api_key_input.is_empty() {
+            let input_style = if app.auth.api_key_input.is_empty() {
                 Theme::status()
             } else {
                 Theme::popup_bg()
@@ -2814,7 +2816,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(input_text, input_style),
             ]));
 
-            if let Some((success, message)) = app.auth_feedback_for_provider(&provider.provider) {
+            if let Some((success, message)) = app.auth.feedback_for_provider(&provider.provider) {
                 let style = if success {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
@@ -2853,7 +2855,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
         AuthPanel::OAuthFlow => {
             let mut lines: Vec<Line<'static>> = Vec::new();
 
-            if let Some(ref flow) = app.auth_oauth_flow {
+            if let Some(ref flow) = app.auth.oauth_flow {
                 let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
 
                 lines.push(Line::from(Span::styled(
@@ -2884,8 +2886,8 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                     // " > " prefix = 3 cols
                     let avail = area.width.saturating_sub(3) as usize;
                     let (response_display, _) = scroll_input(
-                        &app.auth_oauth_response,
-                        app.auth_oauth_response_cursor,
+                        &app.auth.oauth_response,
+                        app.auth.oauth_response_cursor,
                         avail,
                     );
                     lines.push(Line::from(Span::styled(
@@ -2904,7 +2906,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
                 )));
             }
 
-            if let Some((success, message)) = app.auth_feedback_for_provider(&provider.provider) {
+            if let Some((success, message)) = app.auth.feedback_for_provider(&provider.provider) {
                 let style = if success {
                     ratatui::style::Style::default()
                         .fg(Theme::ok())
@@ -2931,16 +2933,17 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             }
 
             // Position cursor on callback input (non-device-poll only, row 3)
-            if app.auth_oauth_flow.is_some()
+            if app.auth.oauth_flow.is_some()
                 && app
-                    .auth_oauth_flow
+                    .auth
+                    .oauth_flow
                     .as_ref()
                     .is_some_and(|f| f.flow_kind != OAuthFlowKind::DevicePoll)
             {
                 let avail = area.width.saturating_sub(3) as usize;
                 let (_, oauth_cur) = scroll_input(
-                    &app.auth_oauth_response,
-                    app.auth_oauth_response_cursor,
+                    &app.auth.oauth_response,
+                    app.auth.oauth_response_cursor,
                     avail,
                 );
                 if 3 < area.height {
