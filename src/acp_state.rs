@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::acp_client::DelegateModelOverrideInfo;
-use crate::app::{POPUP_SESSION_PAGE_TARGET, Popup, Screen};
+use crate::app::POPUP_SESSION_PAGE_TARGET;
 use crate::command::{Command, SessionListRequest};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{
@@ -24,6 +24,7 @@ use crate::domain::session::{
     UndoStackSnapshot, UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
+use crate::navigation_state::{Popup, Screen};
 use crate::tool_detail;
 
 #[derive(Debug, Clone, Default)]
@@ -449,7 +450,7 @@ impl crate::app::App {
                         forked_session_id: Some(forked_session_id),
                         message: _,
                     } => {
-                        self.popup = Popup::None;
+                        self.navigation.popup = Popup::None;
                         self.set_status(LogLevel::Info, "fork", "forked - loading session");
                         return Command::load_session_commands(
                             forked_session_id,
@@ -770,7 +771,7 @@ impl crate::app::App {
         self.apply_session_profile_binding(&session_id, profile_id);
         self.agent_id = Some(agent_id);
         self.reset_active_session_view();
-        self.screen = Screen::Chat;
+        self.navigation.screen = Screen::Chat;
         self.set_status(LogLevel::Info, "session", "session created");
         let mut commands = vec![Command::SubscribeSession {
             session_id: session_id.clone(),
@@ -801,7 +802,7 @@ impl crate::app::App {
         self.session_id = Some(session_id.clone());
         self.agent_id = Some(agent_id);
         self.reset_active_session_view();
-        self.screen = if self.parent_session_id.is_some() {
+        self.navigation.screen = if self.parent_session_id.is_some() {
             Screen::Delegate
         } else {
             Screen::Chat
@@ -2095,7 +2096,7 @@ fn acp_content_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Screen};
+    use crate::app::App;
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
@@ -2767,7 +2768,7 @@ mod tests {
             mesh_name: Some("Team Mesh".into()),
         }));
 
-        assert!(matches!(app.popup, Popup::MeshInviteQr));
+        assert!(matches!(app.navigation.popup, Popup::MeshInviteQr));
         assert_eq!(app.mesh.invite_url(), Some("qmt://mesh/join/token"));
     }
 
@@ -3057,7 +3058,7 @@ mod tests {
 
         assert_eq!(app.session_id.as_deref(), Some("session-1"));
         assert_eq!(app.agent_id.as_deref(), Some("agent-1"));
-        assert_eq!(app.screen, Screen::Chat);
+        assert_eq!(app.navigation.screen, Screen::Chat);
         assert!(app.messages.is_empty());
         assert!(app.streaming_content.is_empty());
         assert_eq!(app.scroll_offset, 0);
@@ -3136,7 +3137,7 @@ mod tests {
         });
 
         assert_eq!(app.parent_session_id.as_deref(), Some("parent"));
-        assert_eq!(app.screen, Screen::Delegate);
+        assert_eq!(app.navigation.screen, Screen::Delegate);
         assert!(app.messages.is_empty());
         assert!(app.streaming_content.is_empty());
         assert_eq!(app.streaming_content_message_id, None);
@@ -3189,7 +3190,7 @@ mod tests {
         });
 
         assert_eq!(app.parent_session_id, None);
-        assert_eq!(app.screen, Screen::Chat);
+        assert_eq!(app.navigation.screen, Screen::Chat);
         assert!(app.delegate_entries.is_empty());
         assert!(app.pending_delegate_child_states.is_empty());
         assert!(app.pending_delegate_tool_calls.is_empty());
@@ -4081,7 +4082,7 @@ mod tests {
     fn native_fork_result_success_loads_forked_session() {
         let mut app = App::new();
         app.agent_id = Some("agent-1".into());
-        app.popup = Popup::ForkTurnSelect;
+        app.navigation.popup = Popup::ForkTurnSelect;
         app.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Succeeded {
@@ -4091,7 +4092,7 @@ mod tests {
         }));
 
         assert_eq!(app.pending_fork_message_id, None);
-        assert_eq!(app.popup, Popup::None);
+        assert_eq!(app.navigation.popup, Popup::None);
         assert_eq!(app.diagnostics.status, "forked - loading session");
         assert_eq!(replies.len(), 2);
         assert!(matches!(
@@ -4106,7 +4107,7 @@ mod tests {
     #[test]
     fn native_fork_result_success_without_id_warns_and_keeps_popup() {
         let mut app = App::new();
-        app.popup = Popup::ForkTurnSelect;
+        app.navigation.popup = Popup::ForkTurnSelect;
         app.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Succeeded {
@@ -4117,14 +4118,14 @@ mod tests {
 
         assert!(replies.is_empty());
         assert_eq!(app.pending_fork_message_id, None);
-        assert_eq!(app.popup, Popup::ForkTurnSelect);
+        assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.diagnostics.status, "fork succeeded without session id");
     }
 
     #[test]
     fn native_fork_result_failure_clears_pending_and_keeps_popup() {
         let mut app = App::new();
-        app.popup = Popup::ForkTurnSelect;
+        app.navigation.popup = Popup::ForkTurnSelect;
         app.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Failed {
@@ -4134,7 +4135,7 @@ mod tests {
 
         assert!(replies.is_empty());
         assert_eq!(app.pending_fork_message_id, None);
-        assert_eq!(app.popup, Popup::ForkTurnSelect);
+        assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.diagnostics.status, "fork failed");
     }
 

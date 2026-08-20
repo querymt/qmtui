@@ -23,6 +23,7 @@ use crate::domain::session::{
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh_state::MeshState;
+use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
 use crate::ui::{CardCache, ElicitationUiState};
@@ -65,160 +66,6 @@ impl StreamingCache {
         self.blocks.clear();
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Screen {
-    Sessions,
-    Chat,
-    /// Read-only view for delegate child sessions (no input box).
-    Delegate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Popup {
-    None,
-    CommandPalette,
-    Mesh,
-    MeshInvite,
-    MeshInviteQr,
-    ModelSelect,
-    SessionSelect,
-    NewSession,
-    ThemeSelect,
-    Help,
-    Log,
-    ProviderAuth,
-    ForkTurnSelect,
-    ProfileSelect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandPaletteAction {
-    OpenMesh,
-    AttachRemoteSession,
-    CreateRemoteSession,
-    CreateMeshInvite,
-    ModelSelect,
-    SessionSelect,
-    DelegateSessions,
-    NewSession,
-    ThemeSelect,
-    Help,
-    Log,
-    ProviderAuth,
-    ForkTurnSelect,
-    ProfileSelect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandPaletteCommand {
-    pub title: &'static str,
-    pub description: &'static str,
-    pub shortcut: &'static str,
-    pub action: CommandPaletteAction,
-    pub chat_only: bool,
-}
-
-pub const COMMAND_PALETTE_COMMANDS: &[CommandPaletteCommand] = &[
-    CommandPaletteCommand {
-        title: "Open Mesh",
-        description: "View mesh nodes and remote sessions",
-        shortcut: "",
-        action: CommandPaletteAction::OpenMesh,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Attach remote session",
-        description: "Attach an existing session from a mesh node",
-        shortcut: "",
-        action: CommandPaletteAction::AttachRemoteSession,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Create remote session",
-        description: "Start a new session on a mesh node",
-        shortcut: "",
-        action: CommandPaletteAction::CreateRemoteSession,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Create mesh invite",
-        description: "Generate a mesh invite link and QR code",
-        shortcut: "",
-        action: CommandPaletteAction::CreateMeshInvite,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Model selector",
-        description: "Choose the model for this session or delegates",
-        shortcut: "C-x m",
-        action: CommandPaletteAction::ModelSelect,
-        chat_only: true,
-    },
-    CommandPaletteCommand {
-        title: "Session switcher",
-        description: "Browse and load sessions",
-        shortcut: "C-x l",
-        action: CommandPaletteAction::SessionSelect,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Delegate sessions",
-        description: "Browse delegate child sessions",
-        shortcut: "",
-        action: CommandPaletteAction::DelegateSessions,
-        chat_only: true,
-    },
-    CommandPaletteCommand {
-        title: "New session",
-        description: "Start a new session in a directory",
-        shortcut: "C-x n",
-        action: CommandPaletteAction::NewSession,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Theme picker",
-        description: "Change the UI theme",
-        shortcut: "C-x t",
-        action: CommandPaletteAction::ThemeSelect,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Help",
-        description: "Show keyboard shortcuts and commands",
-        shortcut: "C-x ?",
-        action: CommandPaletteAction::Help,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Logs",
-        description: "Show in-memory logs",
-        shortcut: "Ctrl+l",
-        action: CommandPaletteAction::Log,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Provider auth",
-        description: "Manage provider authentication",
-        shortcut: "C-x a",
-        action: CommandPaletteAction::ProviderAuth,
-        chat_only: false,
-    },
-    CommandPaletteCommand {
-        title: "Fork selector",
-        description: "Choose a turn to fork from",
-        shortcut: "C-x f",
-        action: CommandPaletteAction::ForkTurnSelect,
-        chat_only: true,
-    },
-    CommandPaletteCommand {
-        title: "Profile selector",
-        description: "Choose the active profile for new sessions",
-        shortcut: "C-x p",
-        action: CommandPaletteAction::ProfileSelect,
-        chat_only: false,
-    },
-];
 
 // ── Delegation tracking ───────────────────────────────────────────────────────
 
@@ -501,11 +348,7 @@ pub enum ModelPopupItem {
 }
 
 pub struct App {
-    pub screen: Screen,
-    pub popup: Popup,
-    pub chord: bool, // true after ctrl+x pressed, waiting for second key
-    pub command_palette_cursor: usize,
-    pub command_palette_filter: String,
+    pub(crate) navigation: NavigationState,
 
     // sessions
     /// Session groups as received from the server (preserve group structure for start page).
@@ -614,13 +457,6 @@ pub struct App {
     pub model_popup_agent_tab: usize,
     /// Explicit model preferences scoped by profile ID and delegate agent ID.
     pub delegate_model_preferences: HashMap<String, HashMap<String, DelegateModelPreference>>,
-
-    // theme selector
-    pub theme_cursor: usize,
-    pub theme_filter: String,
-
-    // help popup
-    pub help_scroll: usize,
 
     // in-memory logs popup and status line
     pub(crate) diagnostics: DiagnosticsState,
@@ -755,11 +591,7 @@ impl App {
 
     pub fn new() -> Self {
         Self {
-            screen: Screen::Sessions,
-            popup: Popup::None,
-            chord: false,
-            command_palette_cursor: 0,
-            command_palette_filter: String::new(),
+            navigation: NavigationState::new(),
             session_groups: Vec::new(),
             session_cursor: 0,
             session_filter: String::new(),
@@ -826,9 +658,6 @@ impl App {
             agents_profile_id: None,
             model_popup_agent_tab: 0,
             delegate_model_preferences: HashMap::new(),
-            theme_cursor: 0,
-            theme_filter: String::new(),
-            help_scroll: 0,
             diagnostics: DiagnosticsState::new(),
             undo_state: None,
             undoable_turns: Vec::new(),
@@ -862,50 +691,6 @@ impl App {
             tick: 0,
             should_quit: false,
         }
-    }
-
-    pub fn open_command_palette(&mut self) {
-        self.popup = Popup::CommandPalette;
-        self.command_palette_filter.clear();
-        self.command_palette_cursor = 0;
-    }
-
-    pub fn filtered_command_palette_commands(&self) -> Vec<&'static CommandPaletteCommand> {
-        let q = self.command_palette_filter.trim().to_lowercase();
-        COMMAND_PALETTE_COMMANDS
-            .iter()
-            .filter(|command| !command.chat_only || matches!(self.screen, Screen::Chat))
-            .filter(|command| {
-                q.is_empty()
-                    || command.title.to_lowercase().contains(&q)
-                    || command.description.to_lowercase().contains(&q)
-                    || command.shortcut.to_lowercase().contains(&q)
-            })
-            .collect()
-    }
-
-    pub fn move_command_palette_cursor(&mut self, delta: isize) {
-        self.command_palette_cursor = move_wrapping_cursor(
-            self.command_palette_cursor,
-            self.filtered_command_palette_commands().len(),
-            delta,
-        );
-    }
-
-    pub fn selected_command_palette_action(&self) -> Option<CommandPaletteAction> {
-        self.filtered_command_palette_commands()
-            .get(self.command_palette_cursor)
-            .map(|command| command.action)
-    }
-
-    pub fn command_palette_filter_insert(&mut self, c: char) {
-        self.command_palette_filter.push(c);
-        self.command_palette_cursor = 0;
-    }
-
-    pub fn command_palette_filter_backspace(&mut self) {
-        self.command_palette_filter.pop();
-        self.command_palette_cursor = 0;
     }
 
     /// Invalidate both streaming caches and clear the thinking buffer.
@@ -981,7 +766,7 @@ impl App {
 
     /// Route to a freshly reset auth popup while preserving provider data.
     pub fn open_auth_popup(&mut self) {
-        self.popup = Popup::ProviderAuth;
+        self.navigation.popup = Popup::ProviderAuth;
         self.auth.reset_for_open();
     }
 
@@ -1004,7 +789,7 @@ impl App {
     }
 
     pub fn open_profile_popup(&mut self) {
-        self.popup = Popup::ProfileSelect;
+        self.navigation.popup = Popup::ProfileSelect;
         self.profiles.reset_for_open();
     }
 
@@ -1318,7 +1103,7 @@ impl App {
     }
 
     pub fn open_fork_turn_popup(&mut self) {
-        self.popup = Popup::ForkTurnSelect;
+        self.navigation.popup = Popup::ForkTurnSelect;
         self.fork_filter.clear();
         self.fork_cursor = 0;
     }
@@ -2118,7 +1903,7 @@ mod reasoning_effort_tests {
 
         app.open_new_session_popup();
 
-        assert_eq!(app.popup, Popup::NewSession);
+        assert_eq!(app.navigation.popup, Popup::NewSession);
         assert_eq!(app.new_session_path, "/launch");
         assert_eq!(app.new_session_cursor, "/launch".len());
     }
@@ -4069,51 +3854,6 @@ mod popup_item_tests {
         assert!(app.popup_collapsed_groups.contains("/a"));
         // start page collapsed_groups should be untouched
         assert!(!app.collapsed_groups.contains("/a"));
-    }
-
-    // ── command palette ───────────────────────────────────────────────────────
-
-    #[test]
-    fn command_palette_filters_commands_and_hides_chat_only_outside_chat() {
-        let mut app = App::new();
-        app.screen = Screen::Sessions;
-        app.command_palette_filter = "selector".into();
-
-        let titles: Vec<&str> = app
-            .filtered_command_palette_commands()
-            .iter()
-            .map(|command| command.title)
-            .collect();
-
-        assert_eq!(titles, vec!["Profile selector"]);
-    }
-
-    #[test]
-    fn command_palette_includes_chat_only_commands_in_chat() {
-        let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.command_palette_filter = "model".into();
-
-        let actions: Vec<CommandPaletteAction> = app
-            .filtered_command_palette_commands()
-            .iter()
-            .map(|command| command.action)
-            .collect();
-
-        assert!(actions.contains(&CommandPaletteAction::ModelSelect));
-    }
-
-    #[test]
-    fn command_palette_cursor_wraps() {
-        let mut app = App::new();
-        app.screen = Screen::Chat;
-
-        app.move_command_palette_cursor(-1);
-
-        assert_eq!(
-            app.command_palette_cursor,
-            app.filtered_command_palette_commands().len() - 1
-        );
     }
 
     // ── slash completion state ─────────────────────────────────────────────────

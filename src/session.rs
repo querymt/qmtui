@@ -6,11 +6,12 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::app::{
-    App, FileIndexEntryLite, MAX_RECENT_SESSIONS, MAX_VISIBLE_GROUPS, PathCompletionState, Popup,
+    App, FileIndexEntryLite, MAX_RECENT_SESSIONS, MAX_VISIBLE_GROUPS, PathCompletionState,
     PopupItem, StartPageItem,
 };
 use crate::domain::activity::{DelegateEntry, SessionActivity};
 use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionSummary};
+use crate::navigation_state::Popup;
 
 /// Returns indices of sessions in `group` whose title or ID matches `q`.
 /// When `q` is empty every session matches in original order.
@@ -502,14 +503,14 @@ impl App {
     }
 
     pub fn open_delegate_popup(&mut self) {
-        self.popup = Popup::SessionSelect;
+        self.navigation.popup = Popup::SessionSelect;
         self.session_popup_tab = 1;
         self.delegate_cursor = 0;
         self.delegate_filter.clear();
     }
 
     pub fn open_new_session_popup(&mut self) {
-        self.popup = Popup::NewSession;
+        self.navigation.popup = Popup::NewSession;
         self.new_session_path = self.resolve_new_session_default_cwd().unwrap_or_default();
         self.new_session_cursor = self.new_session_path.chars().count();
         self.refresh_new_session_completion();

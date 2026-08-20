@@ -36,7 +36,8 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, ConnState, Popup, Screen};
+use crate::app::{App, ConnState};
+use crate::navigation_state::{Popup, Screen};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Default)]
@@ -389,13 +390,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::default().style(Theme::base()), area);
 
-    match app.screen {
+    match app.navigation.screen {
         Screen::Sessions => draw_start(f, app),
         Screen::Chat => draw_chat(f, app),
         Screen::Delegate => draw_delegate_view(f, app),
     }
 
-    match app.popup {
+    match app.navigation.popup {
         Popup::CommandPalette => draw_command_palette_popup(f, app),
         Popup::Mesh => draw_mesh_popup(f, app),
         Popup::MeshInvite => draw_mesh_invite_popup(f, app),
@@ -446,7 +447,7 @@ fn draw_header(
         Span::styled(" query", Theme::title()),
         Span::styled("mt", Theme::title_accent()),
     ];
-    if app.chord {
+    if app.navigation.chord {
         spans.push(Span::styled(" C-x", Theme::status_accent()));
     }
     spans.extend(left);
@@ -470,7 +471,7 @@ fn draw_header(
 mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
-    use crate::app::{App, Screen};
+    use crate::app::App;
     use crate::auth_state::{AuthPanel, AuthUiNotice};
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
@@ -701,11 +702,9 @@ mod tests {
 
     #[test]
     fn draw_fork_popup_renders_turns_as_table() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::ForkTurnSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::ForkTurnSelect;
         app.messages = vec![
             ChatEntry::User {
                 text: "alpha prompt".into(),
@@ -774,7 +773,7 @@ mod tests {
     #[test]
     fn draw_chat_shows_multi_session_badge_for_other_recent_sessions() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.session_id = Some("session-a".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
@@ -842,7 +841,7 @@ mod tests {
     #[test]
     fn draw_chat_shows_delegate_badge_when_entries_exist() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
@@ -903,7 +902,7 @@ mod tests {
     #[test]
     fn draw_chat_shows_delegate_awaiting_input_badge() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
@@ -946,7 +945,7 @@ mod tests {
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("anthropic".into());
@@ -975,11 +974,9 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.session_id = Some("parent".into());
         app.delegate_entries = vec![
@@ -1040,11 +1037,9 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_shows_question_pending_marker_and_hint() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.delegate_cursor = 1;
         app.delegate_entries = vec![DelegateEntry {
@@ -1090,11 +1085,9 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_hides_cost_column_when_all_rows_have_zero_cost() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.delegate_entries = vec![
             DelegateEntry {
@@ -1159,11 +1152,9 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_truncates_long_objectives_with_unicode_ellipsis() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
@@ -1201,12 +1192,11 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_failed_symbol_uses_dim_surface_background() {
-        use crate::app::Popup;
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.delegate_cursor = 0; // keep first row selected; failed row remains unselected
         app.delegate_entries = vec![
@@ -1250,12 +1240,11 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_highlights_full_selected_row() {
-        use crate::app::Popup;
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.delegate_cursor = 1;
         app.delegate_entries = vec![
@@ -1339,11 +1328,9 @@ mod tests {
 
     #[test]
     fn draw_delegate_popup_shows_agent_name_column() {
-        use crate::app::Popup;
-
         let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.popup = Popup::SessionSelect;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_popup_tab = 1;
         app.session_id = Some("parent".into());
         app.delegate_entries = vec![
@@ -1399,7 +1386,7 @@ mod tests {
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
@@ -1534,7 +1521,7 @@ mod tests {
     #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
@@ -1578,7 +1565,7 @@ mod tests {
     #[test]
     fn draw_chat_preserves_hard_line_breaks_in_input() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.input = "alpha\nbeta".into();
         app.input_cursor = app.input.len();
@@ -1600,7 +1587,7 @@ mod tests {
     #[test]
     fn draw_chat_places_cursor_on_next_row_after_newline() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.input = "alpha\nbeta".into();
         app.input_cursor = "alpha\n".len();
@@ -1646,7 +1633,7 @@ mod tests {
     #[test]
     fn draw_chat_does_not_panic_with_empty_elicitation_fields() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         app.elicitation = Some(ElicitationState::new_for_test(vec![]));
         app.elicitation_ui = Some(ElicitationUiState::default());
@@ -1657,7 +1644,7 @@ mod tests {
     #[test]
     fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "build".into();
         let mut state = ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
@@ -1698,7 +1685,7 @@ mod tests {
     #[test]
     fn draw_chat_wraps_long_elicitation_question() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         let mut state = ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
             title: "Choice".into(),
@@ -1730,7 +1717,7 @@ mod tests {
     #[test]
     fn draw_chat_wraps_long_elicitation_answers() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
             title: "Choice".into(),
@@ -1759,7 +1746,7 @@ mod tests {
     #[test]
     fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
         let mut app = App::new();
-        app.screen = Screen::Delegate;
+        app.navigation.screen = Screen::Delegate;
         app.agent_mode = "build".into();
         app.messages.push(ChatEntry::Assistant {
             content: "Delegate context".into(),
@@ -1813,7 +1800,7 @@ mod tests {
     #[test]
     fn draw_delegate_view_without_elicitation_remains_read_only() {
         let mut app = App::new();
-        app.screen = Screen::Delegate;
+        app.navigation.screen = Screen::Delegate;
         app.agent_mode = "build".into();
         app.messages.push(ChatEntry::Assistant {
             content: "Read-only child output".into(),
@@ -1841,7 +1828,7 @@ mod tests {
     #[test]
     fn draw_session_popup_shows_active_marker_for_current_session() {
         let mut app = App::new();
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_id = Some("s2".into());
         app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
 
@@ -1862,7 +1849,7 @@ mod tests {
     #[test]
     fn draw_session_popup_highlights_active_session_id() {
         let mut app = App::new();
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_id = Some("s2".into());
         app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
 
@@ -1882,7 +1869,7 @@ mod tests {
     #[test]
     fn draw_session_popup_shows_fork_count_marker() {
         let mut app = App::new();
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_groups = vec![make_group(Some("/a"), &["s1"])];
         app.session_groups[0].sessions[0].fork_count = 3;
         app.session_cursor = 1;
@@ -1910,7 +1897,7 @@ mod tests {
     #[test]
     fn draw_session_popup_truncates_long_titles_with_unicode_ellipsis() {
         let mut app = App::new();
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_groups = vec![make_group(Some("/a"), &["session-12345678"])];
         app.session_groups[0].sessions[0].title =
             Some("This is a very long session title that should truncate in the popup".into());
@@ -1934,7 +1921,7 @@ mod tests {
     #[test]
     fn draw_auth_popup_filters_provider_rows_and_keeps_filtered_cursor() {
         let mut app = App::new();
-        app.popup = Popup::ProviderAuth;
+        app.navigation.popup = Popup::ProviderAuth;
         app.auth.providers = vec![
             auth_provider("openai", "OpenAI", true),
             auth_provider("groq", "Groq", false),
@@ -1960,7 +1947,7 @@ mod tests {
     #[test]
     fn draw_auth_popup_masks_api_key_and_uses_utf8_byte_cursor() {
         let mut app = App::new();
-        app.popup = Popup::ProviderAuth;
+        app.navigation.popup = Popup::ProviderAuth;
         app.auth.providers = vec![auth_provider("groq", "Groq", false)];
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
@@ -1984,7 +1971,7 @@ mod tests {
     #[test]
     fn draw_auth_popup_renders_redirect_and_device_oauth_panels() {
         let mut app = App::new();
-        app.popup = Popup::ProviderAuth;
+        app.navigation.popup = Popup::ProviderAuth;
         app.auth.providers = vec![auth_provider("codex", "Codex", true)];
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::OAuthFlow;
@@ -2014,7 +2001,7 @@ mod tests {
     #[test]
     fn draw_auth_popup_prefers_notice_and_renders_clipboard_fallback_overlay() {
         let mut app = App::new();
-        app.popup = Popup::ProviderAuth;
+        app.navigation.popup = Popup::ProviderAuth;
         app.auth.providers = vec![auth_provider("openai", "OpenAI", true)];
         app.auth.selected = Some(0);
         app.auth.last_result = Some(OAuthResult {
@@ -2044,7 +2031,7 @@ mod tests {
     #[test]
     fn draw_model_popup_groups_models_by_provider() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
         app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
@@ -2101,7 +2088,7 @@ mod tests {
     #[test]
     fn draw_model_popup_highlights_hint_keys() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2122,7 +2109,7 @@ mod tests {
     #[test]
     fn draw_model_popup_live_marker_uses_status_accent_on_session_tab() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
         app.model_popup_agent_tab = 0;
         app.current_provider = Some("anthropic".into());
@@ -2171,7 +2158,7 @@ mod tests {
     #[test]
     fn draw_model_popup_marks_only_remote_live_row_when_duplicates() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
         app.model_popup_agent_tab = 0;
         app.current_provider = Some("codex".into());
@@ -2222,7 +2209,7 @@ mod tests {
     #[test]
     fn draw_mesh_popup_shows_nodes_sessions_and_hints() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
@@ -2253,7 +2240,7 @@ mod tests {
     #[test]
     fn draw_mesh_popup_shows_invite_form_defaults() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.open_mesh_invite_form();
 
         let backend = ratatui::backend::TestBackend::new(100, 24);
@@ -2271,7 +2258,7 @@ mod tests {
     #[test]
     fn draw_mesh_popup_shows_invite_url_and_qr() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.apply_mesh_invite_created(crate::domain::mesh::MeshInviteCreatedInfo {
             invite_id: "invite-1".into(),
             url: "qmt://mesh/join/token".into(),
@@ -2299,10 +2286,10 @@ mod tests {
     #[test]
     fn draw_command_palette_popup_aligns_columns_and_highlights_selection() {
         let mut app = App::new();
-        app.popup = Popup::CommandPalette;
-        app.screen = Screen::Chat;
-        app.command_palette_filter = "session switcher".into();
-        app.command_palette_cursor = 0;
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.screen = Screen::Chat;
+        app.navigation.command_palette_filter = "session switcher".into();
+        app.navigation.command_palette_cursor = 0;
 
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2332,7 +2319,7 @@ mod tests {
     #[test]
     fn draw_theme_popup_highlights_hint_keys() {
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
+        app.navigation.popup = Popup::ThemeSelect;
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2355,7 +2342,7 @@ mod tests {
     #[test]
     fn draw_model_popup_shows_current_mode_model_on_short_terminal() {
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.agent_mode = "build".into();
         app.models = (0..12)
             .map(|i| ModelEntry {
@@ -2392,8 +2379,8 @@ mod tests {
     #[test]
     fn draw_theme_popup_truncates_long_labels_with_unicode_ellipsis() {
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
-        app.theme_filter = "Penumbra Dark Contrast Plus Plus".into();
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.theme_filter = "Penumbra Dark Contrast Plus Plus".into();
 
         let backend = ratatui::backend::TestBackend::new(40, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2412,7 +2399,7 @@ mod tests {
     #[test]
     fn draw_theme_popup_uses_bounded_width_on_wide_terminal() {
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
+        app.navigation.popup = Popup::ThemeSelect;
 
         let backend = ratatui::backend::TestBackend::new(120, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2433,8 +2420,8 @@ mod tests {
         crate::theme::Theme::begin_frame();
 
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
-        app.theme_cursor = 20;
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.theme_cursor = 20;
 
         let current_label = crate::theme::Theme::available_themes()[20].label;
         let backend = ratatui::backend::TestBackend::new(80, 10);
@@ -2463,8 +2450,8 @@ mod tests {
         crate::theme::Theme::begin_frame();
 
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
-        app.theme_cursor = 20;
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.theme_cursor = 20;
 
         let current_label = crate::theme::Theme::available_themes()[20].label;
         let backend = ratatui::backend::TestBackend::new(80, 10);
@@ -2489,7 +2476,7 @@ mod tests {
     #[test]
     fn draw_new_session_popup_shows_compact_default_cwd_hint() {
         let mut app = App::new();
-        app.popup = Popup::NewSession;
+        app.navigation.popup = Popup::NewSession;
         app.new_session_path = "/launch".into();
         app.new_session_cursor = app.new_session_path.len();
         app.new_session_completion = Some(crate::app::PathCompletionState {
@@ -2559,7 +2546,7 @@ mod tests {
     #[test]
     fn draw_log_popup_shows_filter_level_and_entries() {
         let mut app = App::new();
-        app.popup = Popup::Log;
+        app.navigation.popup = Popup::Log;
         app.diagnostics.log_filter = "server".into();
         app.diagnostics.log_level_filter = LogLevel::Info;
         app.push_log(LogLevel::Info, "server", "starting local server");
@@ -3208,7 +3195,7 @@ mod tests {
     fn direct_elicitation_fixture_renders_active_popup() {
         // Legacy envelope parsing is covered outside the UI; render an active popup directly.
         let mut app = App::new();
-        app.screen = Screen::Delegate;
+        app.navigation.screen = Screen::Delegate;
         let mut state = ElicitationState::new_for_test(vec![ElicitationField {
             name: "answer".into(),
             title: "Answer".into(),
@@ -3249,7 +3236,7 @@ mod tests {
     #[test]
     fn session_switch_rebuilds_chat_cards_without_parent_bleed() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         load_session(&mut app, "parent-session", "agent-1");
         replay_session(
             &mut app,
@@ -3278,7 +3265,7 @@ mod tests {
     #[test]
     fn session_switch_rebuilds_delegate_view_without_parent_bleed() {
         let mut app = App::new();
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         load_session(&mut app, "parent-session", "agent-1");
         replay_session(
             &mut app,
@@ -3295,7 +3282,7 @@ mod tests {
                 assistant_update("delegate reply 2", "delegate-assistant-2"),
             ],
         );
-        assert_eq!(app.screen, Screen::Delegate);
+        assert_eq!(app.navigation.screen, Screen::Delegate);
         let rendered = buffer_text(&render_delegate_buffer(&mut app, 80, 16));
         assert!(rendered.contains("delegate prompt 1"));
         assert!(rendered.contains("delegate reply 2"));

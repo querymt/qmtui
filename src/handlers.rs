@@ -1,13 +1,14 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, App, CommandPaletteAction, Popup, Screen};
+use crate::app::{self, App};
 use crate::auth_state::{AuthPanel, AuthUiNotice};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::model::ModelEntry;
+use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
@@ -237,7 +238,7 @@ pub(crate) fn handle_elicitation_key(
 }
 
 fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> anyhow::Result<()> {
-    if app.screen != Screen::Chat {
+    if app.navigation.screen != Screen::Chat {
         app.set_status(
             LogLevel::Warn,
             "model",
@@ -248,7 +249,7 @@ fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> a
     if !can_send_server_commands(app) {
         return Ok(());
     }
-    app.popup = Popup::ModelSelect;
+    app.navigation.popup = Popup::ModelSelect;
     app.model_filter.clear();
     app.model_popup_agent_tab = 0;
     app.model_cursor = app.model_popup_open_cursor();
@@ -263,7 +264,7 @@ fn open_session_popup(
     if !can_send_server_commands(app) {
         return Ok(());
     }
-    app.popup = Popup::SessionSelect;
+    app.navigation.popup = Popup::SessionSelect;
     app.session_popup_tab = 0;
     app.session_cursor = 0;
     app.session_filter.clear();
@@ -274,7 +275,7 @@ fn open_session_popup(
 }
 
 fn open_log_popup(app: &mut App) {
-    app.popup = Popup::Log;
+    app.navigation.popup = Popup::Log;
     app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
     app.diagnostics.log_filter.clear();
 }
@@ -320,14 +321,10 @@ fn execute_command_palette_action(
             app.open_new_session_popup();
         }
         CommandPaletteAction::ThemeSelect => {
-            app.popup = Popup::ThemeSelect;
-            app.theme_filter.clear();
-            app.theme_cursor = theme::Theme::current_index();
+            app.navigation
+                .open_theme_selector(theme::Theme::current_index());
         }
-        CommandPaletteAction::Help => {
-            app.popup = Popup::Help;
-            app.help_scroll = 0;
-        }
+        CommandPaletteAction::Help => app.navigation.open_help(),
         CommandPaletteAction::Log => open_log_popup(app),
         CommandPaletteAction::ProviderAuth => {
             if !can_send_server_commands(app) {
@@ -356,7 +353,7 @@ pub(crate) fn handle_mesh_popup_key(
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
-        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.mesh.toggle_focus(),
         KeyCode::Up => match app.mesh.mesh_focus {
             crate::mesh_state::MeshFocus::Nodes => {
@@ -426,7 +423,7 @@ pub(crate) fn handle_mesh_invite_popup_key(
     }
 
     match key.code {
-        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.mesh.move_invite_form_field(-1),
         KeyCode::Down | KeyCode::Tab => app.mesh.move_invite_form_field(1),
         KeyCode::Backspace => app.mesh.invite_form_backspace(),
@@ -450,7 +447,7 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> a
     }
 
     match key.code {
-        KeyCode::Esc => app.popup = Popup::MeshInvite,
+        KeyCode::Esc => app.navigation.popup = Popup::MeshInvite,
         KeyCode::Char('u') => {
             app.mesh.show_invite_url_fallback();
         }
@@ -474,17 +471,17 @@ pub(crate) fn handle_command_palette_key(
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
-        KeyCode::Esc => app.popup = Popup::None,
-        KeyCode::Up => app.move_command_palette_cursor(-1),
-        KeyCode::Down => app.move_command_palette_cursor(1),
-        KeyCode::Backspace => app.command_palette_filter_backspace(),
+        KeyCode::Esc => app.navigation.popup = Popup::None,
+        KeyCode::Up => app.navigation.move_command_palette_cursor(-1),
+        KeyCode::Down => app.navigation.move_command_palette_cursor(1),
+        KeyCode::Backspace => app.navigation.command_palette_filter_backspace(),
         KeyCode::Enter => {
-            if let Some(action) = app.selected_command_palette_action() {
+            if let Some(action) = app.navigation.selected_command_palette_action() {
                 execute_command_palette_action(app, action, cmd_tx)?;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.command_palette_filter_insert(c);
+            app.navigation.command_palette_filter_insert(c);
         }
         _ => {}
     }
@@ -517,17 +514,17 @@ pub(crate) fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
     {
-        app.chord = false;
-        app.open_command_palette();
+        app.navigation.chord = false;
+        app.navigation.open_command_palette();
         return Ok(AppAction::None);
     }
 
     // chord second key: ctrl+x was pressed, now handle the follow-up
-    if app.chord {
-        app.chord = false;
+    if app.navigation.chord {
+        app.navigation.chord = false;
         app.set_status(LogLevel::Debug, "input", "ready");
         if key.code == KeyCode::Char('e') {
-            if app.screen != Screen::Chat {
+            if app.navigation.screen != Screen::Chat {
                 app.set_status(
                     LogLevel::Warn,
                     "editor",
@@ -585,13 +582,13 @@ pub(crate) fn handle_key(
 
     // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
-        app.chord = true;
+        app.navigation.chord = true;
         app.set_status(LogLevel::Debug, "input", "C-x ...");
         return Ok(AppAction::None);
     }
 
     // popup handling
-    match app.popup {
+    match app.navigation.popup {
         Popup::CommandPalette => {
             handle_command_palette_key(app, key, cmd_tx)?;
             return Ok(AppAction::None);
@@ -627,14 +624,10 @@ pub(crate) fn handle_key(
         Popup::Help => {
             match key.code {
                 KeyCode::Esc => {
-                    app.popup = Popup::None;
+                    app.navigation.popup = Popup::None;
                 }
-                KeyCode::Up => {
-                    app.help_scroll = app.help_scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    app.help_scroll = app.help_scroll.saturating_add(1);
-                }
+                KeyCode::Up => app.navigation.scroll_help_up(),
+                KeyCode::Down => app.navigation.scroll_help_down(),
                 _ => {}
             }
             return Ok(AppAction::None);
@@ -668,7 +661,7 @@ pub(crate) fn handle_key(
         return Ok(AppAction::None);
     }
 
-    match app.screen {
+    match app.navigation.screen {
         Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
         Screen::Chat => return handle_chat_key(app, key, cmd_tx),
         Screen::Delegate => return handle_delegate_view_key(app, key, cmd_tx),
@@ -677,7 +670,7 @@ pub(crate) fn handle_key(
 }
 
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    match (mouse.kind, &app.screen, &app.popup) {
+    match (mouse.kind, &app.navigation.screen, &app.navigation.popup) {
         (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
             app.scroll_offset = app.scroll_offset.saturating_add(3);
         }
@@ -718,11 +711,9 @@ pub(crate) fn handle_chord(
             app.set_status(LogLevel::Warn, "editor", "external editor unavailable here");
         }
 
-        KeyCode::Char('t') => {
-            app.popup = Popup::ThemeSelect;
-            app.theme_filter.clear();
-            app.theme_cursor = theme::Theme::current_index();
-        }
+        KeyCode::Char('t') => app
+            .navigation
+            .open_theme_selector(theme::Theme::current_index()),
         KeyCode::Char('l') => {
             open_session_popup(app, cmd_tx)?;
         }
@@ -742,7 +733,7 @@ pub(crate) fn handle_chord(
             cmd_tx.send(Command::ListProfiles)?;
         }
         KeyCode::Char('j') => {
-            if !matches!(app.screen, Screen::Chat | Screen::Delegate) {
+            if !matches!(app.navigation.screen, Screen::Chat | Screen::Delegate) {
                 app.set_status(
                     LogLevel::Warn,
                     "session",
@@ -764,12 +755,9 @@ pub(crate) fn handle_chord(
                 app.set_status(LogLevel::Info, "session", "no parent session");
             }
         }
-        KeyCode::Char('?') => {
-            app.popup = Popup::Help;
-            app.help_scroll = 0;
-        }
+        KeyCode::Char('?') => app.navigation.open_help(),
         KeyCode::Char('f') => {
-            if app.screen != Screen::Chat {
+            if app.navigation.screen != Screen::Chat {
                 app.set_status(
                     LogLevel::Warn,
                     "fork",
@@ -1027,7 +1015,7 @@ pub(crate) fn apply_popup_session_key(
 
     match key {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Up => {
             app.session_cursor = app.session_cursor.saturating_sub(1);
@@ -1062,7 +1050,7 @@ pub(crate) fn apply_popup_session_key(
                     } => {
                         let session = app.session_by_path(group_idx, &path).cloned();
                         if let Some(session) = session {
-                            app.popup = Popup::None;
+                            app.navigation.popup = Popup::None;
                             let session_id = session.session_id;
                             if let Some(node_id) =
                                 app.session_remote_node_id(&session_id).map(str::to_string)
@@ -1280,7 +1268,7 @@ pub(crate) fn apply_delegate_popup_key(
 ) -> SessionKeyAction {
     match key {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Up => {
             app.delegate_cursor = app.delegate_cursor.saturating_sub(1);
@@ -1315,7 +1303,7 @@ pub(crate) fn apply_delegate_popup_key(
                         .parent_session_id
                         .clone()
                         .or_else(|| app.session_id.clone());
-                    app.popup = Popup::None;
+                    app.navigation.popup = Popup::None;
                     return SessionKeyAction::LoadSession {
                         session_id: sid,
                         agent_id: target_agent_id,
@@ -1377,7 +1365,7 @@ pub(crate) fn handle_fork_turn_popup_key(
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
     match key.code {
-        KeyCode::Esc => app.popup = Popup::None,
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.move_fork_cursor(-1),
         KeyCode::Down => app.move_fork_cursor(1),
         KeyCode::Backspace => app.fork_filter_backspace(),
@@ -1399,7 +1387,7 @@ pub(crate) fn handle_fork_turn_popup_key(
 pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Up => {
             app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(1);
@@ -1445,7 +1433,7 @@ pub(crate) fn handle_profile_popup_key(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Up => app.profiles.move_profile_cursor(-1),
         KeyCode::Down => app.profiles.move_profile_cursor(1),
@@ -1475,7 +1463,7 @@ pub(crate) fn handle_profile_popup_key(
                         profile_id: profile_id.clone(),
                     })?;
                 }
-                app.popup = Popup::None;
+                app.navigation.popup = Popup::None;
                 app.set_status(
                     LogLevel::Info,
                     "profile",
@@ -1498,7 +1486,7 @@ pub(crate) fn handle_new_session_popup_key(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Up => {
             app.move_new_session_completion_selection(-1);
@@ -1543,7 +1531,7 @@ pub(crate) fn handle_new_session_popup_key(
                 return Ok(());
             }
             let cwd = app.normalize_new_session_path(&app.new_session_path);
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
             cmd_tx.send(Command::NewSession {
                 cwd,
                 profile_id: app.profiles.active_profile_id.clone(),
@@ -1563,59 +1551,33 @@ pub(crate) fn invalidate_theme_caches(app: &mut App) {
 }
 
 pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    let filtered_len = || -> usize {
-        let q = app.theme_filter.to_lowercase();
-        if q.is_empty() {
-            theme::Theme::available_themes().len()
-        } else {
-            theme::Theme::available_themes()
-                .iter()
-                .filter(|t| t.label.to_lowercase().contains(&q) || t.id.to_lowercase().contains(&q))
-                .count()
-        }
-    };
-
-    let filtered_index = |cursor: usize| -> Option<usize> {
-        let q = app.theme_filter.to_lowercase();
-        let iter = theme::Theme::available_themes().iter().enumerate();
-        if q.is_empty() {
-            Some(cursor)
-        } else {
-            iter.filter(|(_, t)| {
-                t.label.to_lowercase().contains(&q) || t.id.to_lowercase().contains(&q)
-            })
-            .nth(cursor)
-            .map(|(i, _)| i)
-        }
-    };
-
     match key.code {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
-        KeyCode::Up => {
-            app.theme_cursor = app.theme_cursor.saturating_sub(1);
-        }
+        KeyCode::Up => app.navigation.move_theme_cursor_up(),
         KeyCode::Down => {
-            let max = filtered_len().saturating_sub(1);
-            app.theme_cursor = (app.theme_cursor + 1).min(max);
+            let filtered_len = app
+                .navigation
+                .filtered_themes(theme::Theme::available_themes())
+                .len();
+            app.navigation.move_theme_cursor_down(filtered_len);
         }
         KeyCode::Enter => {
-            if let Some(idx) = filtered_index(app.theme_cursor) {
+            if let Some(idx) = app
+                .navigation
+                .selected_theme_index(theme::Theme::available_themes())
+            {
                 theme::Theme::set_by_index(idx);
                 theme::Theme::begin_frame();
                 invalidate_theme_caches(app);
-                app.popup = Popup::None;
+                app.navigation.popup = Popup::None;
                 save_config(app);
             }
         }
-        KeyCode::Backspace => {
-            app.theme_filter.pop();
-            app.theme_cursor = 0;
-        }
+        KeyCode::Backspace => app.navigation.theme_filter_backspace(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.theme_filter.push(c);
-            app.theme_cursor = 0;
+            app.navigation.theme_filter_insert(c);
         }
         _ => {}
     }
@@ -1852,7 +1814,7 @@ fn try_execute_slash_command(
     match cmd.as_str() {
         "model" => {
             app.take_input();
-            if app.screen != crate::app::Screen::Chat {
+            if app.navigation.screen != Screen::Chat {
                 app.set_status(
                     LogLevel::Warn,
                     "model",
@@ -1863,7 +1825,7 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            app.popup = crate::app::Popup::ModelSelect;
+            app.navigation.popup = Popup::ModelSelect;
             app.model_popup_agent_tab = 0;
             if arg.is_empty() {
                 app.model_filter.clear();
@@ -1950,9 +1912,8 @@ fn try_execute_slash_command(
         }
         "theme" => {
             app.take_input();
-            app.popup = crate::app::Popup::ThemeSelect;
-            app.theme_filter.clear();
-            app.theme_cursor = crate::theme::Theme::current_index();
+            app.navigation
+                .open_theme_selector(crate::theme::Theme::current_index());
         }
         "profile" => {
             app.take_input();
@@ -1991,7 +1952,7 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            app.popup = crate::app::Popup::SessionSelect;
+            app.navigation.popup = Popup::SessionSelect;
             app.session_popup_tab = 0;
             app.session_cursor = 0;
             app.session_filter.clear();
@@ -2001,7 +1962,7 @@ fn try_execute_slash_command(
         }
         "delegates" => {
             app.take_input();
-            if app.screen != crate::app::Screen::Chat {
+            if app.navigation.screen != Screen::Chat {
                 app.set_status(
                     LogLevel::Warn,
                     "delegates",
@@ -2023,12 +1984,11 @@ fn try_execute_slash_command(
         }
         "help" => {
             app.take_input();
-            app.popup = crate::app::Popup::Help;
-            app.help_scroll = 0;
+            app.navigation.open_help();
         }
         "logs" => {
             app.take_input();
-            app.popup = crate::app::Popup::Log;
+            app.navigation.popup = Popup::Log;
             app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
             app.diagnostics.log_filter.clear();
         }
@@ -2042,7 +2002,7 @@ fn try_execute_slash_command(
         }
         "fork" => {
             app.take_input();
-            if app.screen != crate::app::Screen::Chat {
+            if app.navigation.screen != Screen::Chat {
                 app.set_status(LogLevel::Warn, "fork", "forking is only available in chat");
                 return Ok(SlashResult::Handled);
             }
@@ -2156,7 +2116,7 @@ pub(crate) fn handle_auth_popup_key(
                 if app.auth.selected.is_some() {
                     app.auth.close_detail();
                 } else {
-                    app.popup = Popup::None;
+                    app.navigation.popup = Popup::None;
                 }
             }
             KeyCode::Up => {
@@ -2426,7 +2386,7 @@ pub(crate) fn handle_model_popup_key(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
-            app.popup = Popup::None;
+            app.navigation.popup = Popup::None;
         }
         KeyCode::Tab | KeyCode::BackTab => {
             if !app.model_popup_has_tabs() {
@@ -2660,7 +2620,7 @@ pub(crate) fn apply_sessions_key(
                         }
                     }
                     StartPageItem::ShowMore { .. } => {
-                        app.popup = Popup::SessionSelect;
+                        app.navigation.popup = Popup::SessionSelect;
                         app.session_popup_tab = 0;
                         app.session_cursor = 0;
                         app.session_filter.clear();
@@ -2722,7 +2682,7 @@ pub(crate) fn apply_sessions_key(
 #[cfg(test)]
 mod model_popup_tests {
     use super::*;
-    use crate::app::{App, Popup};
+    use crate::app::App;
     use crate::config::TestPersistenceGuard;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
@@ -2792,7 +2752,7 @@ mod model_popup_tests {
     #[test]
     fn popup_enter_on_remote_session_attaches_instead_of_loading() {
         let mut app = App::new();
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.session_groups = vec![SessionGroup {
             sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
@@ -2813,13 +2773,18 @@ mod model_popup_tests {
                 session_id: "remote-1".into(),
             }
         );
-        assert!(matches!(app.popup, Popup::None));
+        assert!(matches!(app.navigation.popup, Popup::None));
     }
 
     #[test]
     fn ctrl_p_opens_command_palette_over_existing_popup() {
         let mut app = App::new();
-        app.popup = Popup::ThemeSelect;
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.chord = true;
+        app.navigation.command_palette_cursor = 4;
+        app.navigation.command_palette_filter = "old".into();
+        app.navigation.theme_filter = "keep".into();
+        app.navigation.help_scroll = 9;
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_key(
@@ -2829,41 +2794,90 @@ mod model_popup_tests {
         )
         .unwrap();
 
-        assert!(matches!(app.popup, Popup::CommandPalette));
-        assert_eq!(app.command_palette_cursor, 0);
-        assert!(app.command_palette_filter.is_empty());
+        assert!(matches!(app.navigation.popup, Popup::CommandPalette));
+        assert!(!app.navigation.chord);
+        assert_eq!(app.navigation.command_palette_cursor, 0);
+        assert!(app.navigation.command_palette_filter.is_empty());
+        assert_eq!(app.navigation.theme_filter, "keep");
+        assert_eq!(app.navigation.help_scroll, 9);
+    }
+
+    #[test]
+    fn help_popup_routes_scroll_and_escape_before_screen_keys() {
+        let mut app = App::new();
+        app.navigation.open_help();
+        app.session_filter = "keep".into();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        handle_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        assert_eq!(app.session_filter, "keep");
+        assert_eq!(app.navigation.popup, Popup::Help);
+
+        handle_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        assert_eq!(app.navigation.help_scroll, 1);
+        handle_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        handle_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        assert_eq!(app.navigation.help_scroll, 0);
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        assert_eq!(app.navigation.popup, Popup::None);
+    }
+
+    #[test]
+    fn theme_popup_clamps_cursor_and_keeps_no_match_open() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.theme_filter = "no theme matches this".into();
+        app.navigation.theme_cursor = 8;
+
+        handle_theme_popup_key(&mut app, key(KeyCode::Down)).unwrap();
+        assert_eq!(app.navigation.theme_cursor, 0);
+        handle_theme_popup_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.navigation.popup, Popup::ThemeSelect);
+    }
+
+    #[test]
+    fn empty_theme_filter_out_of_range_enter_still_closes() {
+        let _guard = TestPersistenceGuard::new("theme-out-of-range");
+        let mut app = App::new();
+        app.navigation.popup = Popup::ThemeSelect;
+        app.navigation.theme_cursor = theme::Theme::available_themes().len() + 10;
+
+        handle_theme_popup_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(app.navigation.popup, Popup::None);
     }
 
     #[test]
     fn command_palette_enter_opens_theme_picker() {
         let mut app = App::new();
-        app.popup = Popup::CommandPalette;
-        app.command_palette_filter = "theme".into();
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "theme".into();
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::ThemeSelect));
+        assert!(matches!(app.navigation.popup, Popup::ThemeSelect));
     }
 
     #[test]
     fn command_palette_open_mesh_refreshes_remote_nodes() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::CommandPalette;
-        app.command_palette_filter = "open mesh".into();
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "open mesh".into();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::Mesh));
+        assert!(matches!(app.navigation.popup, Popup::Mesh));
         assert!(matches!(rx.try_recv(), Ok(Command::ListRemoteNodes)));
     }
 
     #[test]
     fn mesh_popup_enter_on_session_attaches_remote_session() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.mesh.mesh_focus = crate::mesh_state::MeshFocus::Sessions;
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
@@ -2893,7 +2907,7 @@ mod model_popup_tests {
     #[test]
     fn mesh_popup_create_remote_session_does_not_forward_local_cwd() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.launch_cwd = Some("/local/launch".into());
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
@@ -2917,13 +2931,13 @@ mod model_popup_tests {
     fn command_palette_create_mesh_invite_opens_prefilled_invite_popup() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::CommandPalette;
-        app.command_palette_filter = "mesh invite".into();
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "mesh invite".into();
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::MeshInvite));
+        assert!(matches!(app.navigation.popup, Popup::MeshInvite));
         assert_eq!(app.mesh.mesh_invite_ttl, "24h");
         assert_eq!(app.mesh.mesh_invite_max_uses, "1");
     }
@@ -2931,12 +2945,12 @@ mod model_popup_tests {
     #[test]
     fn mesh_popup_i_no_longer_opens_invite_popup() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_mesh_popup_key(&mut app, key(KeyCode::Char('i')), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::Mesh));
+        assert!(matches!(app.navigation.popup, Popup::Mesh));
     }
 
     #[test]
@@ -2961,7 +2975,7 @@ mod model_popup_tests {
 
         handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
 
-        assert!(matches!(app.popup, Popup::MeshInviteQr));
+        assert!(matches!(app.navigation.popup, Popup::MeshInviteQr));
         assert!(app.mesh.mesh_clipboard_fallback.is_none());
     }
 
@@ -2994,7 +3008,7 @@ mod model_popup_tests {
     #[test]
     fn mesh_invite_form_enter_sends_create_invite() {
         let mut app = App::new();
-        app.popup = Popup::Mesh;
+        app.navigation.popup = Popup::Mesh;
         app.open_mesh_invite_form();
         app.mesh.mesh_invite_name = "Team Mesh".into();
         app.mesh.mesh_invite_ttl = "1d3h5m".into();
@@ -3025,15 +3039,15 @@ mod model_popup_tests {
 
         handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
 
-        assert!(matches!(app.popup, Popup::MeshInvite));
+        assert!(matches!(app.navigation.popup, Popup::MeshInvite));
     }
 
     #[test]
     fn command_palette_profile_lists_profiles() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::CommandPalette;
-        app.command_palette_filter = "profile".into();
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "profile".into();
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.active_profile_id = Some("deep".into());
         app.profiles.profile_filter = "stale".into();
@@ -3042,7 +3056,7 @@ mod model_popup_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(matches!(app.navigation.popup, Popup::ProfileSelect));
         assert!(app.profiles.profile_filter.is_empty());
         assert_eq!(app.profiles.profile_cursor, 1);
         assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
@@ -3052,7 +3066,7 @@ mod model_popup_tests {
     fn slash_profile_without_arg_opens_selector_and_lists_profiles() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.input = "/profile".into();
         app.input_cursor = app.input.len();
 
@@ -3060,7 +3074,7 @@ mod model_popup_tests {
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(action, AppAction::None));
-        assert!(matches!(app.popup, Popup::ProfileSelect));
+        assert!(matches!(app.navigation.popup, Popup::ProfileSelect));
         assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
     }
 
@@ -3069,7 +3083,7 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("slash-profile");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.profiles.profiles = vec![make_profile("fast", "Fast")];
         app.profiles.active_profile_id = Some("old".into());
         app.input = "/profile Fast".into();
@@ -3094,14 +3108,14 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("profile-popup-enter");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::ProfileSelect;
+        app.navigation.popup = Popup::ProfileSelect;
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.profile_cursor = 1;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::None));
+        assert!(matches!(app.navigation.popup, Popup::None));
         assert!(matches!(
             rx.try_recv(),
             Ok(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
@@ -3117,7 +3131,7 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("profile-bound-session");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::ProfileSelect;
+        app.navigation.popup = Popup::ProfileSelect;
         app.session_id = Some("session".into());
         app.profiles
             .bind_session_profile("session".into(), "current".into());
@@ -3135,7 +3149,7 @@ mod model_popup_tests {
     fn new_session_uses_locally_selected_profile() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.popup = Popup::NewSession;
+        app.navigation.popup = Popup::NewSession;
         app.new_session_path = "/repo".into();
         app.new_session_cursor = app.new_session_path.len();
         app.profiles.active_profile_id = Some("coder-delegate".into());
@@ -3154,7 +3168,7 @@ mod model_popup_tests {
     fn select_model_on_delegate_tab_saves_pref_not_session_model() {
         let _guard = TestPersistenceGuard::new("delegate-tab");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
@@ -3206,7 +3220,7 @@ mod model_popup_tests {
     fn delete_on_delegate_tab_resets_parent_override() {
         let _guard = TestPersistenceGuard::new("delegate-reset");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
@@ -3241,7 +3255,7 @@ mod model_popup_tests {
     fn delegate_child_model_selection_is_saved_without_mutating_child_session() {
         let _guard = TestPersistenceGuard::new("delegate-child-model");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("child".into());
         app.parent_session_id = Some("parent".into());
         app.profiles.active_profile_id = Some("profile".into());
@@ -3269,7 +3283,7 @@ mod model_popup_tests {
     fn select_model_on_session_tab_applies_set_session_model() {
         let _guard = TestPersistenceGuard::new("active-mode");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("openai".into());
@@ -3312,7 +3326,7 @@ mod model_popup_tests {
     fn select_remote_model_on_local_session_sends_node_id() {
         let _guard = TestPersistenceGuard::new("remote-mesh-model");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("s1".into());
         app.agent_mode = "build".into();
         app.current_provider = Some("openai".into());
@@ -3364,7 +3378,7 @@ mod model_popup_tests {
     fn select_model_on_attached_remote_session_does_not_apply() {
         let _guard = TestPersistenceGuard::new("active-remote-mode");
         let mut app = App::new();
-        app.popup = Popup::ModelSelect;
+        app.navigation.popup = Popup::ModelSelect;
         app.session_id = Some("remote-1".into());
         app.agent_mode = "build".into();
         app.session_groups = vec![SessionGroup {
@@ -3392,7 +3406,7 @@ mod model_popup_tests {
     fn opening_model_popup_starts_on_session_tab() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "review".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
@@ -3401,7 +3415,7 @@ mod model_popup_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_chord(&mut app, key(KeyCode::Char('m')), &tx).unwrap();
 
-        assert!(matches!(app.popup, Popup::ModelSelect));
+        assert!(matches!(app.navigation.popup, Popup::ModelSelect));
         assert_eq!(app.model_popup_agent_tab, 0);
         assert_eq!(app.model_cursor, app.model_popup_open_cursor());
     }
@@ -3410,7 +3424,7 @@ mod model_popup_tests {
     fn slash_model_starts_on_session_tab() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "review".into();
         app.current_provider = Some("openai".into());
         app.current_model = Some("gpt-4o".into());
@@ -3422,7 +3436,7 @@ mod model_popup_tests {
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(action, AppAction::None));
-        assert!(matches!(app.popup, Popup::ModelSelect));
+        assert!(matches!(app.navigation.popup, Popup::ModelSelect));
         assert_eq!(app.model_popup_agent_tab, 0);
         assert_eq!(app.model_cursor, app.model_popup_open_cursor());
     }
@@ -3432,7 +3446,7 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("review-cycle");
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "plan".into();
         app.input = "/review".into();
         app.input_cursor = app.input.len();
@@ -3460,14 +3474,13 @@ mod model_popup_tests {
 
     #[test]
     fn delegate_popup_subscribes_with_child_target_agent() {
-        use crate::app::Popup;
         use crate::domain::activity::{
             DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
         };
 
         let mut app = App::new();
         app.agent_id = Some("planner".into());
-        app.popup = Popup::SessionSelect;
+        app.navigation.popup = Popup::SessionSelect;
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
@@ -3500,7 +3513,7 @@ mod model_popup_tests {
     fn review_slash_command_is_noop_when_already_in_review() {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
-        app.screen = Screen::Chat;
+        app.navigation.screen = Screen::Chat;
         app.agent_mode = "review".into();
         app.mode_before_review = Some("plan".into());
         app.input = "/review".into();
