@@ -428,7 +428,7 @@ fn conn_indicator(app: &App) -> Span<'static> {
 }
 
 pub(crate) fn mesh_header_span(app: &App) -> Option<Span<'static>> {
-    let n = app.mesh_node_count.filter(|&n| n > 0)?;
+    let n = app.mesh.mesh_node_count.filter(|&n| n > 0)?;
     Some(Span::styled(
         format!(" {} {n} ", chat::ICON_MESH),
         Theme::status(),
@@ -2223,13 +2223,13 @@ mod tests {
     fn draw_mesh_popup_shows_nodes_sessions_and_hints() {
         let mut app = App::new();
         app.popup = Popup::Mesh;
-        app.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+        app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
             active_sessions: 1,
             ..Default::default()
         }];
-        app.remote_sessions_by_node.insert(
+        app.mesh.remote_sessions_by_node.insert(
             "node-1".into(),
             vec![crate::domain::mesh::RemoteSessionInfo {
                 id: "remote-1".into(),

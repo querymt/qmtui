@@ -13,6 +13,7 @@ mod highlight;
 mod input;
 mod markdown;
 mod mesh;
+mod mesh_state;
 mod profiles_state;
 mod protocol;
 pub mod runtime;
