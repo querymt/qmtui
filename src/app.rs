@@ -13,9 +13,7 @@ use crate::domain::activity::{
 };
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
-use crate::domain::mesh::{
-    MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo, RemoteSessionLocation,
-};
+use crate::domain::mesh::RemoteSessionLocation;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::AgentInfo;
 use crate::domain::session::{
@@ -24,7 +22,7 @@ use crate::domain::session::{
 };
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
-use crate::mesh::{MeshFocus, MeshInviteFormField};
+use crate::mesh_state::MeshState;
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
 use crate::ui::{CardCache, ElicitationUiState};
@@ -642,22 +640,7 @@ pub struct App {
     pub pending_cancel_confirm_until: Option<Instant>,
 
     // mesh / remote (from ACP extensions)
-    /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch.
-    pub mesh_node_count: Option<u32>,
-    pub mesh_status: Option<MeshStatusInfo>,
-    pub mesh_nodes: Vec<RemoteNodeInfo>,
-    pub remote_sessions_by_node: HashMap<String, Vec<RemoteSessionInfo>>,
-    pub mesh_node_cursor: usize,
-    pub remote_session_cursor: usize,
-    pub mesh_focus: MeshFocus,
-    pub mesh_error: Option<String>,
-    pub mesh_error_until: Option<Instant>,
-    pub mesh_invite: Option<MeshInviteCreatedInfo>,
-    pub mesh_invite_name: String,
-    pub mesh_invite_ttl: String,
-    pub mesh_invite_max_uses: String,
-    pub mesh_invite_form_field: MeshInviteFormField,
-    pub mesh_clipboard_fallback: Option<String>,
+    pub(crate) mesh: MeshState,
 
     // connection
     pub conn: ConnState,
@@ -854,21 +837,7 @@ impl App {
             context_limit: 0,
             session_stats: SessionStatsLite::default(),
             pending_cancel_confirm_until: None,
-            mesh_node_count: None,
-            mesh_status: None,
-            mesh_nodes: Vec::new(),
-            remote_sessions_by_node: HashMap::new(),
-            mesh_node_cursor: 0,
-            remote_session_cursor: 0,
-            mesh_focus: MeshFocus::Nodes,
-            mesh_error: None,
-            mesh_error_until: None,
-            mesh_invite: None,
-            mesh_invite_name: String::new(),
-            mesh_invite_ttl: "24h".into(),
-            mesh_invite_max_uses: "1".into(),
-            mesh_invite_form_field: MeshInviteFormField::MeshName,
-            mesh_clipboard_fallback: None,
+            mesh: MeshState::new(),
             conn: ConnState::Connecting,
             reconnect_attempt: 0,
             reconnect_delay_ms: None,
