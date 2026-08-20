@@ -357,33 +357,36 @@ pub(crate) fn handle_mesh_popup_key(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => app.popup = Popup::None,
-        KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
-            app.mesh_focus = match app.mesh_focus {
-                crate::mesh::MeshFocus::Nodes => crate::mesh::MeshFocus::Sessions,
-                crate::mesh::MeshFocus::Sessions => crate::mesh::MeshFocus::Nodes,
-            };
-        }
-        KeyCode::Up => match app.mesh_focus {
-            crate::mesh::MeshFocus::Nodes => {
-                if let Some(msg) = app.move_mesh_node_cursor(-1) {
-                    cmd_tx.send(msg)?;
+        KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.mesh.toggle_focus(),
+        KeyCode::Up => match app.mesh.mesh_focus {
+            crate::mesh_state::MeshFocus::Nodes => {
+                if let Some(node_id) = app.mesh.move_mesh_node_cursor(-1) {
+                    cmd_tx.send(Command::ListRemoteSessions {
+                        node_id,
+                        offset: 0,
+                        limit: 50,
+                    })?;
                 }
             }
-            crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(-1),
+            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(-1),
         },
-        KeyCode::Down => match app.mesh_focus {
-            crate::mesh::MeshFocus::Nodes => {
-                if let Some(msg) = app.move_mesh_node_cursor(1) {
-                    cmd_tx.send(msg)?;
+        KeyCode::Down => match app.mesh.mesh_focus {
+            crate::mesh_state::MeshFocus::Nodes => {
+                if let Some(node_id) = app.mesh.move_mesh_node_cursor(1) {
+                    cmd_tx.send(Command::ListRemoteSessions {
+                        node_id,
+                        offset: 0,
+                        limit: 50,
+                    })?;
                 }
             }
-            crate::mesh::MeshFocus::Sessions => app.move_remote_session_cursor(1),
+            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(1),
         },
         KeyCode::Char('r') => cmd_tx.send(Command::ListRemoteNodes)?,
-        KeyCode::Enter => match app.mesh_focus {
-            crate::mesh::MeshFocus::Nodes => {
-                app.mesh_focus = crate::mesh::MeshFocus::Sessions;
-                if let Some(node_id) = app.selected_mesh_node_id() {
+        KeyCode::Enter => match app.mesh.mesh_focus {
+            crate::mesh_state::MeshFocus::Nodes => {
+                app.mesh.focus_sessions();
+                if let Some(node_id) = app.mesh.selected_mesh_node_id() {
                     cmd_tx.send(Command::ListRemoteSessions {
                         node_id: node_id.to_string(),
                         offset: 0,
@@ -391,8 +394,8 @@ pub(crate) fn handle_mesh_popup_key(
                     })?;
                 }
             }
-            crate::mesh::MeshFocus::Sessions => {
-                if let Some(session) = app.selected_remote_session() {
+            crate::mesh_state::MeshFocus::Sessions => {
+                if let Some(session) = app.mesh.selected_remote_session() {
                     cmd_tx.send(Command::AttachRemoteSession {
                         node_id: session.node_id.clone(),
                         session_id: session.id.clone(),
@@ -401,7 +404,7 @@ pub(crate) fn handle_mesh_popup_key(
             }
         },
         KeyCode::Char('n') => {
-            if let Some(node_id) = app.selected_mesh_node_id() {
+            if let Some(node_id) = app.mesh.selected_mesh_node_id() {
                 cmd_tx.send(Command::CreateRemoteSession {
                     node_id: node_id.to_string(),
                     cwd: None,
@@ -418,42 +421,15 @@ pub(crate) fn handle_mesh_invite_popup_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
-    if app.mesh_clipboard_fallback.is_some() {
-        app.mesh_clipboard_fallback = None;
+    if app.mesh.consume_clipboard_fallback() {
         return Ok(());
     }
 
     match key.code {
         KeyCode::Esc => app.popup = Popup::None,
-        KeyCode::Up => {
-            app.mesh_invite_form_field = match app.mesh_invite_form_field {
-                crate::mesh::MeshInviteFormField::MeshName => {
-                    crate::mesh::MeshInviteFormField::MaxUses
-                }
-                crate::mesh::MeshInviteFormField::Ttl => crate::mesh::MeshInviteFormField::MeshName,
-                crate::mesh::MeshInviteFormField::MaxUses => crate::mesh::MeshInviteFormField::Ttl,
-            };
-        }
-        KeyCode::Down | KeyCode::Tab => {
-            app.mesh_invite_form_field = match app.mesh_invite_form_field {
-                crate::mesh::MeshInviteFormField::MeshName => crate::mesh::MeshInviteFormField::Ttl,
-                crate::mesh::MeshInviteFormField::Ttl => crate::mesh::MeshInviteFormField::MaxUses,
-                crate::mesh::MeshInviteFormField::MaxUses => {
-                    crate::mesh::MeshInviteFormField::MeshName
-                }
-            };
-        }
-        KeyCode::Backspace => match app.mesh_invite_form_field {
-            crate::mesh::MeshInviteFormField::MeshName => {
-                app.mesh_invite_name.pop();
-            }
-            crate::mesh::MeshInviteFormField::Ttl => {
-                app.mesh_invite_ttl.pop();
-            }
-            crate::mesh::MeshInviteFormField::MaxUses => {
-                app.mesh_invite_max_uses.pop();
-            }
-        },
+        KeyCode::Up => app.mesh.move_invite_form_field(-1),
+        KeyCode::Down | KeyCode::Tab => app.mesh.move_invite_form_field(1),
+        KeyCode::Backspace => app.mesh.invite_form_backspace(),
         KeyCode::Enter => {
             if let Some(msg) = app.mesh_invite_form_command() {
                 cmd_tx.send(msg)?;
@@ -461,14 +437,7 @@ pub(crate) fn handle_mesh_invite_popup_key(
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            match app.mesh_invite_form_field {
-                crate::mesh::MeshInviteFormField::MeshName => app.mesh_invite_name.push(c),
-                crate::mesh::MeshInviteFormField::Ttl => app.mesh_invite_ttl.push(c),
-                crate::mesh::MeshInviteFormField::MaxUses if c.is_ascii_digit() => {
-                    app.mesh_invite_max_uses.push(c)
-                }
-                crate::mesh::MeshInviteFormField::MaxUses => {}
-            }
+            app.mesh.invite_form_insert(c);
         }
         _ => {}
     }
@@ -476,24 +445,21 @@ pub(crate) fn handle_mesh_invite_popup_key(
 }
 
 pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    if app.mesh_clipboard_fallback.is_some() {
-        app.mesh_clipboard_fallback = None;
+    if app.mesh.consume_clipboard_fallback() {
         return Ok(());
     }
 
     match key.code {
         KeyCode::Esc => app.popup = Popup::MeshInvite,
         KeyCode::Char('u') => {
-            if let Some(url) = app.mesh_invite_url().map(str::to_string) {
-                app.mesh_clipboard_fallback = Some(url);
-            }
+            app.mesh.show_invite_url_fallback();
         }
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(url) = app.mesh_invite_url().map(str::to_string) {
+            if let Some(url) = app.mesh.invite_url().map(str::to_string) {
                 if copy_text_to_clipboard(&url) {
                     app.set_status(LogLevel::Info, "mesh", "invite URL copied");
                 } else {
-                    app.mesh_clipboard_fallback = Some(url);
+                    app.mesh.set_clipboard_fallback(url);
                 }
             }
         }
@@ -2898,13 +2864,13 @@ mod model_popup_tests {
     fn mesh_popup_enter_on_session_attaches_remote_session() {
         let mut app = App::new();
         app.popup = Popup::Mesh;
-        app.mesh_focus = crate::mesh::MeshFocus::Sessions;
-        app.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+        app.mesh.mesh_focus = crate::mesh_state::MeshFocus::Sessions;
+        app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
             ..Default::default()
         }];
-        app.remote_sessions_by_node.insert(
+        app.mesh.remote_sessions_by_node.insert(
             "node-1".into(),
             vec![crate::domain::mesh::RemoteSessionInfo {
                 id: "remote-1".into(),
@@ -2929,7 +2895,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.popup = Popup::Mesh;
         app.launch_cwd = Some("/local/launch".into());
-        app.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+        app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
             ..Default::default()
@@ -2958,8 +2924,8 @@ mod model_popup_tests {
         handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(matches!(app.popup, Popup::MeshInvite));
-        assert_eq!(app.mesh_invite_ttl, "24h");
-        assert_eq!(app.mesh_invite_max_uses, "1");
+        assert_eq!(app.mesh.mesh_invite_ttl, "24h");
+        assert_eq!(app.mesh.mesh_invite_max_uses, "1");
     }
 
     #[test]
@@ -2989,33 +2955,38 @@ mod model_popup_tests {
         handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Char('u'))).unwrap();
 
         assert_eq!(
-            app.mesh_clipboard_fallback.as_deref(),
+            app.mesh.mesh_clipboard_fallback.as_deref(),
             Some("qmt://mesh/join/token")
         );
+
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.popup, Popup::MeshInviteQr));
+        assert!(app.mesh.mesh_clipboard_fallback.is_none());
     }
 
     #[test]
     fn mesh_invite_form_rejects_invalid_ttl_and_max_uses() {
         let mut app = App::new();
         app.open_mesh_invite_form();
-        app.mesh_invite_ttl = "lol".into();
+        app.mesh.mesh_invite_ttl = "lol".into();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            app.mesh_error.as_deref(),
+            app.mesh.mesh_error.as_deref(),
             Some("ttl must be like 30m, 1d3h, or 1d3h5m")
         );
 
-        app.mesh_invite_ttl = "24h".into();
-        app.mesh_invite_max_uses = "0".into();
+        app.mesh.mesh_invite_ttl = "24h".into();
+        app.mesh.mesh_invite_max_uses = "0".into();
         handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(rx.try_recv().is_err());
         assert_eq!(
-            app.mesh_error.as_deref(),
+            app.mesh.mesh_error.as_deref(),
             Some("max uses must be at least 1")
         );
     }
@@ -3025,8 +2996,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.popup = Popup::Mesh;
         app.open_mesh_invite_form();
-        app.mesh_invite_name = "Team Mesh".into();
-        app.mesh_invite_ttl = "1d3h5m".into();
+        app.mesh.mesh_invite_name = "Team Mesh".into();
+        app.mesh.mesh_invite_ttl = "1d3h5m".into();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();

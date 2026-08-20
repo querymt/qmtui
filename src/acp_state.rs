@@ -2641,18 +2641,53 @@ mod tests {
     #[test]
     fn native_mesh_nodes_store_state_and_requests_first_node_sessions() {
         let mut app = App::new();
-
-        let replies = app.handle_acp_event(AcpAppEvent::MeshNodes(MeshNodesInfo {
-            nodes: vec![RemoteNodeInfo {
+        app.mesh.mesh_nodes = vec![
+            RemoteNodeInfo {
+                id: "node-0".into(),
+                label: "local".into(),
+                ..Default::default()
+            },
+            RemoteNodeInfo {
                 id: "node-1".into(),
                 label: "framework".into(),
-                active_sessions: 2,
+                ..Default::default()
+            },
+        ];
+        app.mesh.mesh_node_cursor = 1;
+        app.mesh.remote_session_cursor = 4;
+        app.mesh.remote_sessions_by_node.insert(
+            "stale-node".into(),
+            vec![RemoteSessionInfo {
+                id: "stale-session".into(),
+                node_id: "stale-node".into(),
                 ..Default::default()
             }],
+        );
+
+        let replies = app.handle_acp_event(AcpAppEvent::MeshNodes(MeshNodesInfo {
+            nodes: vec![
+                RemoteNodeInfo {
+                    id: "node-0".into(),
+                    label: "local".into(),
+                    ..Default::default()
+                },
+                RemoteNodeInfo {
+                    id: "node-1".into(),
+                    label: "framework".into(),
+                    active_sessions: 2,
+                    ..Default::default()
+                },
+            ],
         }));
 
-        assert_eq!(app.mesh_node_count, Some(1));
-        assert_eq!(app.selected_mesh_node_id(), Some("node-1"));
+        assert_eq!(app.mesh.mesh_node_count, Some(2));
+        assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
+        assert_eq!(app.mesh.mesh_node_cursor, 1);
+        assert_eq!(app.mesh.remote_session_cursor, 4);
+        assert_eq!(
+            app.mesh.remote_sessions_by_node["stale-node"][0].id,
+            "stale-session"
+        );
         assert!(matches!(
             replies.as_slice(),
             [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
@@ -2661,14 +2696,36 @@ mod tests {
     }
 
     #[test]
+    fn mesh_status_stores_before_appending_diagnostic_log() {
+        let mut app = App::new();
+        let before = app.diagnostics.logs.len();
+
+        app.handle_acp_event(AcpAppEvent::MeshStatus(MeshStatusInfo {
+            enabled: true,
+            known_peer_count: 2,
+            ..Default::default()
+        }));
+
+        assert!(
+            app.mesh
+                .mesh_status
+                .as_ref()
+                .is_some_and(|status| { status.enabled && status.known_peer_count == 2 })
+        );
+        let log = &app.diagnostics.logs[before];
+        assert_eq!(log.target, "mesh");
+        assert_eq!(log.message, "mesh status: enabled=true, peers=2");
+    }
+
+    #[test]
     fn native_remote_sessions_store_values_and_clamp_cursor() {
         let mut app = App::new();
-        app.mesh_nodes = vec![RemoteNodeInfo {
+        app.mesh.mesh_nodes = vec![RemoteNodeInfo {
             id: "node-1".into(),
             label: "Framework".into(),
             ..Default::default()
         }];
-        app.remote_session_cursor = 4;
+        app.mesh.remote_session_cursor = 4;
 
         let replies = app.handle_acp_event(AcpAppEvent::RemoteSessions(RemoteSessionListInfo {
             node_id: "node-1".into(),
@@ -2684,10 +2741,10 @@ mod tests {
         }));
 
         assert!(replies.is_empty());
-        assert_eq!(app.remote_session_cursor, 0);
-        assert_eq!(app.selected_remote_sessions()[0].id, "session-1");
+        assert_eq!(app.mesh.remote_session_cursor, 0);
+        assert_eq!(app.mesh.selected_remote_sessions()[0].id, "session-1");
         assert_eq!(
-            app.selected_remote_sessions()[0].title.as_deref(),
+            app.mesh.selected_remote_sessions()[0].title.as_deref(),
             Some("Boundary")
         );
         assert_eq!(app.session_remote_node_id("session-1"), Some("node-1"));
@@ -2711,7 +2768,7 @@ mod tests {
         }));
 
         assert!(matches!(app.popup, Popup::MeshInviteQr));
-        assert_eq!(app.mesh_invite_url(), Some("qmt://mesh/join/token"));
+        assert_eq!(app.mesh.invite_url(), Some("qmt://mesh/join/token"));
     }
 
     #[test]
@@ -2984,6 +3041,13 @@ mod tests {
         app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
         app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
         app.session_stats.total_tool_calls = 1;
+        app.mesh.mesh_nodes = vec![RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "framework".into(),
+            ..Default::default()
+        }];
+        app.mesh.mesh_node_count = Some(1);
+        app.mesh.mesh_invite_name = "preserved".into();
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionCreated {
             agent_id: "agent-1".into(),
@@ -3000,6 +3064,9 @@ mod tests {
         assert!(app.undo_state.is_none());
         assert!(app.elicitation.is_none());
         assert_eq!(app.session_stats.total_tool_calls, 0);
+        assert_eq!(app.mesh.mesh_node_count, Some(1));
+        assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
+        assert_eq!(app.mesh.mesh_invite_name, "preserved");
         assert!(matches!(
             replies.as_slice(),
             [
@@ -3112,6 +3179,8 @@ mod tests {
                 target_agent_id: None,
                 objective: "clear".into(),
             });
+        app.mesh.mesh_node_count = Some(2);
+        app.mesh.mesh_invite_ttl = "48h".into();
 
         app.handle_acp_event(AcpAppEvent::SessionLoaded {
             agent_id: "agent-1".into(),
@@ -3124,6 +3193,8 @@ mod tests {
         assert!(app.delegate_entries.is_empty());
         assert!(app.pending_delegate_child_states.is_empty());
         assert!(app.pending_delegate_tool_calls.is_empty());
+        assert_eq!(app.mesh.mesh_node_count, Some(2));
+        assert_eq!(app.mesh.mesh_invite_ttl, "48h");
     }
 
     #[test]

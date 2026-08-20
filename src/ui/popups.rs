@@ -1487,6 +1487,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
         ])
         .split(inner);
     let title = app
+        .mesh
         .mesh_status
         .as_ref()
         .map(|status| {
@@ -1502,6 +1503,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
         })
         .unwrap_or_else(|| "mesh".to_string());
     let subtitle = app
+        .mesh
         .selected_mesh_node_label()
         .map(|label| format!("selected node: {label}"))
         .unwrap_or_else(|| "no mesh nodes loaded".to_string());
@@ -1519,17 +1521,18 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(chunks[1]);
 
-    let node_items: Vec<ListItem> = if app.mesh_nodes.is_empty() {
+    let node_items: Vec<ListItem> = if app.mesh.mesh_nodes.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  no nodes",
             Theme::status(),
         )))]
     } else {
-        app.mesh_nodes
+        app.mesh
+            .mesh_nodes
             .iter()
             .enumerate()
             .map(|(i, node)| {
-                let selected = i == app.mesh_node_cursor;
+                let selected = i == app.mesh.mesh_node_cursor;
                 let style = if selected {
                     Theme::selected()
                 } else {
@@ -1548,14 +1551,17 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
     };
     let node_block = Block::bordered()
         .title(" nodes ")
-        .border_style(if matches!(app.mesh_focus, crate::mesh::MeshFocus::Nodes) {
-            Theme::status_accent()
-        } else {
-            Theme::status()
-        })
+        .border_style(
+            if matches!(app.mesh.mesh_focus, crate::mesh_state::MeshFocus::Nodes) {
+                Theme::status_accent()
+            } else {
+                Theme::status()
+            },
+        )
         .style(Theme::popup_bg());
     let mut node_state = ListState::default().with_selected(
-        (!app.mesh_nodes.is_empty()).then(|| app.mesh_node_cursor.min(app.mesh_nodes.len() - 1)),
+        (!app.mesh.mesh_nodes.is_empty())
+            .then(|| app.mesh.mesh_node_cursor.min(app.mesh.mesh_nodes.len() - 1)),
     );
     f.render_stateful_widget(
         List::new(node_items).block(node_block),
@@ -1563,7 +1569,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
         &mut node_state,
     );
 
-    let sessions = app.selected_remote_sessions();
+    let sessions = app.mesh.selected_remote_sessions();
     let session_items: Vec<ListItem> = if sessions.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  no remote sessions",
@@ -1574,7 +1580,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
             .iter()
             .enumerate()
             .map(|(i, session)| {
-                let selected = i == app.remote_session_cursor;
+                let selected = i == app.mesh.remote_session_cursor;
                 let style = if selected {
                     Theme::selected()
                 } else {
@@ -1595,7 +1601,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
     let session_block = Block::bordered()
         .title(" remote sessions ")
         .border_style(
-            if matches!(app.mesh_focus, crate::mesh::MeshFocus::Sessions) {
+            if matches!(app.mesh.mesh_focus, crate::mesh_state::MeshFocus::Sessions) {
                 Theme::status_accent()
             } else {
                 Theme::status()
@@ -1603,7 +1609,7 @@ pub(super) fn draw_mesh_popup(f: &mut Frame, app: &App) {
         )
         .style(Theme::popup_bg());
     let mut session_state = ListState::default().with_selected(
-        (!sessions.is_empty()).then(|| app.remote_session_cursor.min(sessions.len() - 1)),
+        (!sessions.is_empty()).then(|| app.mesh.remote_session_cursor.min(sessions.len() - 1)),
     );
     f.render_stateful_widget(
         List::new(session_items).block(session_block),
@@ -1671,6 +1677,7 @@ pub(super) fn draw_mesh_invite_popup(f: &mut Frame, app: &App) {
 pub(super) fn draw_mesh_invite_qr_popup(f: &mut Frame, app: &App) {
     let area = f.area();
     let (qr_width, qr_height) = app
+        .mesh
         .mesh_invite
         .as_ref()
         .and_then(|invite| invite.qr_code.as_deref())
@@ -1717,7 +1724,7 @@ pub(super) fn draw_mesh_invite_qr_popup(f: &mut Frame, app: &App) {
     );
     draw_mesh_invite_details(f, app, chunks[2]);
 
-    if let Some(ref url) = app.mesh_clipboard_fallback {
+    if let Some(ref url) = app.mesh.mesh_clipboard_fallback {
         draw_mesh_clipboard_fallback(f, inner, url);
     }
 
@@ -1763,7 +1770,7 @@ fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    let field = app.mesh_invite_form_field;
+    let field = app.mesh.mesh_invite_form_field;
     let line = |label: &'static str, value: &str, selected: bool| {
         let label_style = Theme::status();
         let value_style = if selected {
@@ -1781,12 +1788,12 @@ fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(line(
             "mesh name",
-            if app.mesh_invite_name.is_empty() {
+            if app.mesh.mesh_invite_name.is_empty() {
                 "(none)"
             } else {
-                &app.mesh_invite_name
+                &app.mesh.mesh_invite_name
             },
-            matches!(field, crate::mesh::MeshInviteFormField::MeshName),
+            matches!(field, crate::mesh_state::MeshInviteFormField::MeshName),
         ))
         .style(Theme::popup_bg()),
         rows[0],
@@ -1794,8 +1801,8 @@ fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(line(
             "ttl",
-            &app.mesh_invite_ttl,
-            matches!(field, crate::mesh::MeshInviteFormField::Ttl),
+            &app.mesh.mesh_invite_ttl,
+            matches!(field, crate::mesh_state::MeshInviteFormField::Ttl),
         ))
         .style(Theme::popup_bg()),
         rows[1],
@@ -1803,13 +1810,13 @@ fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(line(
             "max uses",
-            &app.mesh_invite_max_uses,
-            matches!(field, crate::mesh::MeshInviteFormField::MaxUses),
+            &app.mesh.mesh_invite_max_uses,
+            matches!(field, crate::mesh_state::MeshInviteFormField::MaxUses),
         ))
         .style(Theme::popup_bg()),
         rows[2],
     );
-    if let Some(message) = app.current_mesh_error() {
+    if let Some(message) = app.mesh.current_error() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" ! {message}"),
@@ -1832,7 +1839,7 @@ fn draw_mesh_invite_form(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_mesh_invite_details(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if let Some(invite) = app.mesh_invite.as_ref() {
+    if let Some(invite) = app.mesh.mesh_invite.as_ref() {
         if let Some(qr) = invite.qr_code.as_deref() {
             for row in qr.lines() {
                 lines.push(Line::from(Span::styled(
