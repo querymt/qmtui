@@ -12,6 +12,7 @@ use crate::{
     app::{self, App, Screen},
     command::Command,
     config,
+    diagnostics::LogLevel,
     domain::model::DelegateModelPreference,
     server_manager, theme,
 };
@@ -583,8 +584,8 @@ mod external_editor_tests {
         let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
 
         assert_eq!(action, AppAction::None);
-        assert!(app.status.contains("only available in chat"));
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "editor"));
+        assert!(app.diagnostics.status.contains("only available in chat"));
+        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "editor"));
     }
 
     #[test]
@@ -601,8 +602,8 @@ mod external_editor_tests {
 
         assert_eq!(action, AppAction::None);
         assert_ne!(app.popup, app::Popup::ModelSelect);
-        assert!(app.status.contains("only available in chat"));
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "model"));
+        assert!(app.diagnostics.status.contains("only available in chat"));
+        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "model"));
     }
 
     #[test]
@@ -627,12 +628,22 @@ mod external_editor_tests {
             },
         );
 
-        assert!(app.logs.iter().any(|entry| entry.target == "acp"
-            && entry.level == app::LogLevel::Info
-            && entry.message == "acp.binary_path not set; checking qmtcode on PATH"));
-        assert!(app.logs.iter().any(|entry| entry.target == "acp"
-            && entry.level == app::LogLevel::Info
-            && entry.message == "qmtcode not found on PATH"));
+        assert!(
+            app.diagnostics
+                .logs
+                .iter()
+                .any(|entry| entry.target == "acp"
+                    && entry.level == LogLevel::Info
+                    && entry.message == "acp.binary_path not set; checking qmtcode on PATH")
+        );
+        assert!(
+            app.diagnostics
+                .logs
+                .iter()
+                .any(|entry| entry.target == "acp"
+                    && entry.level == LogLevel::Info
+                    && entry.message == "qmtcode not found on PATH")
+        );
     }
 
     #[test]
@@ -935,7 +946,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.agent_mode, "build");
-        assert!(app.status.contains("already in build"));
+        assert!(app.diagnostics.status.contains("already in build"));
     }
 
     #[test]
@@ -955,7 +966,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert!(app.status.contains("unknown mode"));
+        assert!(app.diagnostics.status.contains("unknown mode"));
     }
 
     #[test]
@@ -1053,7 +1064,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert!(app.status.contains("thinking: high"));
+        assert!(app.diagnostics.status.contains("thinking: high"));
     }
 
     #[test]
@@ -1071,7 +1082,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert!(app.status.contains("unknown level"));
+        assert!(app.diagnostics.status.contains("unknown level"));
     }
 
     #[test]
@@ -1092,7 +1103,7 @@ mod external_editor_tests {
 
         // state must not change when disconnected
         assert_eq!(app.reasoning_effort, Some("high".into()));
-        assert!(app.status.contains("not connected"));
+        assert!(app.diagnostics.status.contains("not connected"));
     }
 
     fn app_with_forkable_messages() -> App {
@@ -1164,8 +1175,8 @@ mod external_editor_tests {
 
         assert_ne!(app.popup, app::Popup::ForkTurnSelect);
         assert!(rx.try_recv().is_err());
-        assert!(app.status.contains("only available in chat"));
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "fork"));
+        assert!(app.diagnostics.status.contains("only available in chat"));
+        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "fork"));
     }
 
     #[test]
@@ -1185,8 +1196,8 @@ mod external_editor_tests {
 
         assert!(rx.try_recv().is_err());
         assert!(app.pending_fork_message_id.is_none());
-        assert!(app.status.contains("only available in chat"));
-        assert!(matches!(app.logs.last(), Some(entry) if entry.target == "fork"));
+        assert!(app.diagnostics.status.contains("only available in chat"));
+        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "fork"));
     }
 
     #[test]
@@ -1246,7 +1257,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert!(rx.try_recv().is_err());
-        assert!(app.status.contains("no forkable turns"));
+        assert!(app.diagnostics.status.contains("no forkable turns"));
     }
 
     #[test]
@@ -1319,9 +1330,9 @@ mod external_editor_tests {
             rx.try_recv().expect("cancel sent"),
             Command::CancelSession
         ));
-        assert_eq!(app.status, "stopping...");
+        assert_eq!(app.diagnostics.status, "stopping...");
         assert!(matches!(
-            app.logs.last(),
+            app.diagnostics.logs.last(),
             Some(entry) if entry.target == "activity" && entry.message == "stopping..."
         ));
     }
@@ -1405,7 +1416,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.status, "press Esc again to stop");
+        assert_eq!(app.diagnostics.status, "press Esc again to stop");
         assert!(rx.try_recv().is_err());
 
         handle_chat_key(
@@ -1414,7 +1425,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.status, "stopping...");
+        assert_eq!(app.diagnostics.status, "stopping...");
         assert!(matches!(
             rx.try_recv().expect("cancel sent"),
             Command::CancelSession
@@ -1435,19 +1446,19 @@ fn log_server_binary_discovery(
     }
     if let Some(path) = discovery.configured_path.as_deref() {
         app.push_log(
-            app::LogLevel::Info,
+            LogLevel::Info,
             "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
     } else if cfg.acp.binary_path.is_none() {
         app.push_log(
-            app::LogLevel::Info,
+            LogLevel::Info,
             "acp",
             "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(app::LogLevel::Info, "acp", "qmtcode not found on PATH");
+        app.push_log(LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1515,7 +1526,7 @@ pub async fn run() -> anyhow::Result<()> {
     } = &selection
     {
         app.push_log(
-            app::LogLevel::Info,
+            LogLevel::Info,
             "acp",
             format!("found ACP WebSocket server at {url}"),
         );
@@ -1544,7 +1555,7 @@ pub async fn run() -> anyhow::Result<()> {
     } = &selection
     {
         app.push_log(
-            app::LogLevel::Warn,
+            LogLevel::Warn,
             "acp",
             format!("qmtcode unavailable; waiting for ACP WebSocket at {url}"),
         );
@@ -2608,16 +2619,16 @@ mod session_popup_key_tests {
         .unwrap();
 
         assert_eq!(app.popup, Popup::Log);
-        assert_eq!(app.log_cursor, 0);
-        assert!(app.log_filter.is_empty());
+        assert_eq!(app.diagnostics.log_cursor, 0);
+        assert!(app.diagnostics.log_filter.is_empty());
     }
 
     #[test]
     fn log_popup_filters_cycles_level_and_closes() {
         let mut app = App::new();
         app.popup = Popup::Log;
-        app.log_cursor = 2;
-        app.log_level_filter = crate::app::LogLevel::Info;
+        app.diagnostics.log_cursor = 2;
+        app.diagnostics.log_level_filter = LogLevel::Info;
 
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_key(
@@ -2626,8 +2637,8 @@ mod session_popup_key_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.log_filter, "x");
-        assert_eq!(app.log_cursor, 0);
+        assert_eq!(app.diagnostics.log_filter, "x");
+        assert_eq!(app.diagnostics.log_cursor, 0);
 
         handle_key(
             &mut app,
@@ -2635,7 +2646,7 @@ mod session_popup_key_tests {
             &tx,
         )
         .unwrap();
-        assert!(app.log_filter.is_empty());
+        assert!(app.diagnostics.log_filter.is_empty());
 
         handle_key(
             &mut app,
@@ -2643,7 +2654,7 @@ mod session_popup_key_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.log_level_filter, crate::app::LogLevel::Warn);
+        assert_eq!(app.diagnostics.log_level_filter, LogLevel::Warn);
 
         handle_key(
             &mut app,
@@ -3087,9 +3098,9 @@ mod chord_reasoning_effort_tests {
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
         // status should reflect the new level
         assert!(
-            app.status.contains("low"),
+            app.diagnostics.status.contains("low"),
             "expected status to mention 'low', got: {}",
-            app.status
+            app.diagnostics.status
         );
     }
 
@@ -3103,7 +3114,7 @@ mod chord_reasoning_effort_tests {
 
         // state must not change when disconnected
         assert_eq!(app.reasoning_effort, Some("high".into()));
-        assert!(app.status.contains("not connected"));
+        assert!(app.diagnostics.status.contains("not connected"));
     }
 }
 

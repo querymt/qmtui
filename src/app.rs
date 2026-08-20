@@ -5,6 +5,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::command::Command;
+use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
     SessionActivity, SessionOp, SessionStatsLite,
@@ -219,45 +220,6 @@ pub const COMMAND_PALETTE_COMMANDS: &[CommandPaletteCommand] = &[
         chat_only: false,
     },
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl LogLevel {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Trace => "TRACE",
-            Self::Debug => "DEBUG",
-            Self::Info => "INFO",
-            Self::Warn => "WARN",
-            Self::Error => "ERROR",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Trace => Self::Debug,
-            Self::Debug => Self::Info,
-            Self::Info => Self::Warn,
-            Self::Warn => Self::Error,
-            Self::Error => Self::Trace,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppLogEntry {
-    pub elapsed: Duration,
-    pub level: LogLevel,
-    pub target: &'static str,
-    pub message: String,
-}
 
 // ── Delegation tracking ───────────────────────────────────────────────────────
 
@@ -684,12 +646,8 @@ pub struct App {
     // help popup
     pub help_scroll: usize,
 
-    // in-memory logs popup
-    pub started_at: Instant,
-    pub logs: Vec<AppLogEntry>,
-    pub log_cursor: usize,
-    pub log_filter: String,
-    pub log_level_filter: LogLevel,
+    // in-memory logs popup and status line
+    pub(crate) diagnostics: DiagnosticsState,
 
     // Undo/redo state mirrors the web UI semantics: a server-authoritative stack
     // of reverted turns plus a frontier that marks the current branch point.
@@ -704,9 +662,6 @@ pub struct App {
     pub context_limit: u64,
     pub session_stats: SessionStatsLite,
     pub pending_cancel_confirm_until: Option<Instant>,
-
-    // status line
-    pub status: String,
 
     // mesh / remote (from ACP extensions)
     /// Count of mesh nodes from the last `querymt/mesh/nodes` fetch.
@@ -931,11 +886,7 @@ impl App {
             theme_cursor: 0,
             theme_filter: String::new(),
             help_scroll: 0,
-            started_at: Instant::now(),
-            logs: Vec::new(),
-            log_cursor: 0,
-            log_filter: String::new(),
-            log_level_filter: LogLevel::Info,
+            diagnostics: DiagnosticsState::new(),
             undo_state: None,
             undoable_turns: Vec::new(),
             recent_prompt_text: None,
@@ -992,7 +943,6 @@ impl App {
             delegation_errors: HashMap::new(),
             pending_delegate_tool_calls: Vec::new(),
             suppress_turn_output: false,
-            status: "connecting...".into(),
             tick: 0,
             should_quit: false,
         }
@@ -1432,48 +1382,29 @@ impl App {
         }
     }
 
+    // phase 11 compatibility forward
     pub fn push_log(&mut self, level: LogLevel, target: &'static str, message: impl Into<String>) {
-        let message = message.into();
-        if self.logs.last().is_some_and(|entry| {
-            entry.level == level && entry.target == target && entry.message == message
-        }) {
-            return;
-        }
-        self.logs.push(AppLogEntry {
-            elapsed: self.started_at.elapsed(),
-            level,
-            target,
-            message,
-        });
+        self.diagnostics.push_log(level, target, message);
     }
 
+    // phase 11 compatibility forward
     pub fn set_status(
         &mut self,
         level: LogLevel,
         target: &'static str,
         message: impl Into<String>,
     ) {
-        let message = message.into();
-        self.status = message.clone();
-        self.push_log(level, target, message);
+        self.diagnostics.set_status(level, target, message);
     }
 
+    // phase 11 compatibility forward
     pub fn filtered_logs(&self) -> Vec<&AppLogEntry> {
-        let query = self.log_filter.to_lowercase();
-        self.logs
-            .iter()
-            .filter(|entry| entry.level >= self.log_level_filter)
-            .filter(|entry| {
-                query.is_empty()
-                    || entry.message.to_lowercase().contains(&query)
-                    || entry.target.to_lowercase().contains(&query)
-                    || entry.level.label().to_lowercase().contains(&query)
-            })
-            .collect()
+        self.diagnostics.filtered_logs()
     }
 
+    // phase 11 compatibility forward
     pub fn cycle_log_level_filter(&mut self) {
-        self.log_level_filter = self.log_level_filter.next();
+        self.diagnostics.cycle_log_level_filter();
     }
 
     pub fn cancel_confirm_active(&self) -> bool {
@@ -3138,68 +3069,24 @@ mod tests {
     }
 
     #[test]
-    fn push_log_deduplicates_consecutive_entries() {
-        let mut app = App::new();
-
-        app.push_log(LogLevel::Info, "server", "starting local server");
-        app.push_log(LogLevel::Info, "server", "starting local server");
-        app.push_log(LogLevel::Warn, "server", "waiting for lock");
-
-        assert_eq!(app.logs.len(), 2);
-        assert_eq!(app.logs[0].level, LogLevel::Info);
-        assert_eq!(app.logs[0].target, "server");
-        assert_eq!(app.logs[0].message, "starting local server");
-        assert_eq!(app.logs[1].level, LogLevel::Warn);
-    }
-
-    #[test]
-    fn set_status_updates_visible_status_and_appends_log() {
-        let mut app = App::new();
-
-        app.set_status(LogLevel::Info, "connection", "connected");
-
-        assert_eq!(app.status, "connected");
-        let last = app.logs.last().expect("missing log entry");
-        assert_eq!(last.level, LogLevel::Info);
-        assert_eq!(last.target, "connection");
-        assert_eq!(last.message, "connected");
-    }
-
-    #[test]
-    fn filtered_logs_apply_level_threshold_and_text_filter() {
-        let mut app = App::new();
-        app.push_log(LogLevel::Debug, "activity", "ready");
-        app.push_log(LogLevel::Warn, "server", "waiting for lock");
-        app.push_log(LogLevel::Error, "server", "start failed");
-
-        app.log_level_filter = LogLevel::Warn;
-        let filtered = app.filtered_logs();
-        assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|entry| entry.level >= LogLevel::Warn));
-
-        app.log_filter = "failed".into();
-        let filtered = app.filtered_logs();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].message, "start failed");
-    }
-
-    #[test]
     fn cancel_confirm_arms_expires_and_restores_status() {
         let mut app = App::new();
         app.activity = ActivityState::Thinking;
 
         app.arm_cancel_confirm();
         assert!(app.cancel_confirm_active());
-        assert_eq!(app.status, "press Esc again to stop");
+        assert_eq!(app.diagnostics.status, "press Esc again to stop");
         assert!(
-            matches!(app.logs.last(), Some(entry) if entry.message == "press Esc again to stop")
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "press Esc again to stop")
         );
 
         app.pending_cancel_confirm_until = Some(Instant::now() - Duration::from_millis(1));
         app.clear_expired_cancel_confirm();
         assert!(!app.cancel_confirm_active());
-        assert_eq!(app.status, "thinking...");
-        assert!(matches!(app.logs.last(), Some(entry) if entry.message == "thinking..."));
+        assert_eq!(app.diagnostics.status, "thinking...");
+        assert!(
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "thinking...")
+        );
     }
 
     #[test]
@@ -3208,22 +3095,22 @@ mod tests {
         app.conn = ConnState::Disconnected;
         app.set_status(LogLevel::Warn, "connection", "connection lost - retrying");
         app.refresh_transient_status();
-        assert_eq!(app.status, "connection lost - retrying");
+        assert_eq!(app.diagnostics.status, "connection lost - retrying");
 
         app.conn = ConnState::Connected;
         app.activity = ActivityState::Thinking;
         app.refresh_transient_status();
-        assert_eq!(app.status, "thinking...");
+        assert_eq!(app.diagnostics.status, "thinking...");
 
         app.activity = ActivityState::Compacting {
             token_estimate: 2048,
         };
         app.refresh_transient_status();
-        assert_eq!(app.status, "compacting context (~2048 tokens)");
+        assert_eq!(app.diagnostics.status, "compacting context (~2048 tokens)");
 
         app.activity = ActivityState::SessionOp(SessionOp::Redo);
         app.refresh_transient_status();
-        assert_eq!(app.status, "redoing...");
+        assert_eq!(app.diagnostics.status, "redoing...");
     }
 
     #[test]
@@ -3460,9 +3347,12 @@ mod tests {
         assert_eq!(app.conn, ConnState::Connecting);
         assert_eq!(app.reconnect_attempt, 3);
         assert_eq!(app.reconnect_delay_ms, Some(2000));
-        assert_eq!(app.status, "waiting for server - retry 3 in 2.0s");
+        assert_eq!(
+            app.diagnostics.status,
+            "waiting for server - retry 3 in 2.0s"
+        );
         assert!(
-            matches!(app.logs.last(), Some(entry) if entry.target == "connection" && entry.level == LogLevel::Warn)
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "connection" && entry.level == LogLevel::Warn)
         );
 
         app.handle_connection_event(ConnectionEvent::Disconnected {
@@ -3470,9 +3360,9 @@ mod tests {
         });
         assert_eq!(app.conn, ConnState::Disconnected);
         assert_eq!(app.reconnect_delay_ms, None);
-        assert_eq!(app.status, "connection lost - socket closed");
+        assert_eq!(app.diagnostics.status, "connection lost - socket closed");
         assert!(
-            matches!(app.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
         );
 
         app.session_id = Some("session-1".into());
@@ -3480,9 +3370,9 @@ mod tests {
         assert_eq!(app.conn, ConnState::Connected);
         assert_eq!(app.reconnect_attempt, 0);
         assert_eq!(app.reconnect_delay_ms, None);
-        assert_eq!(app.status, "reconnected");
+        assert_eq!(app.diagnostics.status, "reconnected");
         assert!(
-            matches!(app.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected")
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected")
         );
     }
 
