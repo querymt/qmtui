@@ -715,6 +715,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         _ => "no model".into(),
     };
     let sid = app
+        .sessions
         .session_id
         .as_deref()
         .map(|s| if s.len() > 8 { &s[..8] } else { s })
@@ -785,7 +786,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         }
     }
 
-    let other_active_session_count = app.other_active_session_count();
+    let other_active_session_count = app.sessions.other_active_session_count();
     if other_active_session_count > 0 {
         right_spans.push(Span::styled(
             format!(" {ICON_MULTI_SESSION} {other_active_session_count} "),
@@ -817,8 +818,8 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         ));
     }
     left_spans.push(Span::styled(
-        format!(" {} ", app.agent_mode),
-        Theme::mode_badge(&app.agent_mode),
+        format!(" {} ", app.sessions.agent_mode),
+        Theme::mode_badge(&app.sessions.agent_mode),
     ));
     if app.parent_session_id.is_some() {
         left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
@@ -1081,7 +1082,7 @@ fn draw_input_panel(
             Theme::input_border_thinking()
         }
         _ if app.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
-        _ => Theme::mode_border(&app.agent_mode),
+        _ => Theme::mode_border(&app.sessions.agent_mode),
     };
     let border_line =
         Paragraph::new(INPUT_OVERLINE.repeat(border_area.width as usize)).style(border_style);
@@ -1122,7 +1123,7 @@ fn draw_input_panel(
             format!("  answer above {ARROW_UP} "),
             Theme::input_thinking(),
         ),
-        _ => ("> ".into(), Theme::mode_border(&app.agent_mode)),
+        _ => ("> ".into(), Theme::mode_border(&app.sessions.agent_mode)),
     };
     let input_style = Theme::input();
     let hide_input_contents = app.should_hide_input_contents();
@@ -2036,8 +2037,8 @@ mod tests {
     #[test]
     fn chat_header_shows_current_and_distinct_new_profile_labels() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
-        app.agent_id = Some("agent-1".into());
+        app.sessions.session_id = Some("session-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.profiles.profiles = vec![
             crate::domain::profile::ProfileInfo {
                 id: "current".into(),
