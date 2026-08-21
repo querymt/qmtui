@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
-use crate::{acp_client::AcpEndpoint, config, server_manager};
+use crate::{acp_client::AcpEndpoint, config, connection_state::ServerState, server_manager};
 
 pub(super) const DEFAULT_ACP_WS_HOST: &str = "127.0.0.1";
 const DEFAULT_ACP_WS_PORT: &str = "3030";
@@ -34,7 +34,7 @@ pub(super) struct Cli {
 pub(super) enum EndpointSelection {
     Endpoint {
         endpoint: AcpEndpoint,
-        state: server_manager::ServerState,
+        state: ServerState,
         discovered_ws: Option<String>,
         missing_binary_fallback: bool,
     },
@@ -92,7 +92,7 @@ pub(super) fn select_acp_endpoint(
     {
         return EndpointSelection::Endpoint {
             endpoint: AcpEndpoint::WebSocket { url },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: false,
         };
@@ -103,7 +103,7 @@ pub(super) fn select_acp_endpoint(
             endpoint: AcpEndpoint::Stdio {
                 argv: server_manager::build_acp_argv(OsString::from(binary_path), cfg.acp_args()),
             },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: false,
         };
@@ -112,7 +112,7 @@ pub(super) fn select_acp_endpoint(
     if let Some(url) = cfg.acp.websocket_url.as_deref().map(normalize_acp_ws_url) {
         return EndpointSelection::Endpoint {
             endpoint: AcpEndpoint::WebSocket { url },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: false,
         };
@@ -124,7 +124,7 @@ pub(super) fn select_acp_endpoint(
             endpoint: AcpEndpoint::WebSocket {
                 url: default_acp_ws_url(),
             },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: false,
         };
@@ -140,7 +140,7 @@ pub(super) fn select_acp_endpoint(
             endpoint: AcpEndpoint::WebSocket {
                 url: default_ws_url.clone(),
             },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: Some(default_ws_url),
             missing_binary_fallback: false,
         };
@@ -152,7 +152,7 @@ pub(super) fn select_acp_endpoint(
             endpoint: AcpEndpoint::WebSocket {
                 url: default_ws_url,
             },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: true,
         },
@@ -160,7 +160,7 @@ pub(super) fn select_acp_endpoint(
             endpoint: AcpEndpoint::Stdio {
                 argv: server_manager::build_acp_argv(binary, cfg.acp_args()),
             },
-            state: server_manager::ServerState::Starting,
+            state: ServerState::Starting,
             discovered_ws: None,
             missing_binary_fallback: false,
         },
@@ -177,7 +177,7 @@ pub(super) fn detect_launch_cwd() -> Option<String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use crate::{acp_client::AcpEndpoint, config, server_manager::ServerState};
+    use crate::{acp_client::AcpEndpoint, config, connection_state::ServerState};
 
     use super::{
         Cli, DEFAULT_ACP_WS_HOST, EndpointSelection, normalize_acp_ws_url, select_acp_endpoint,

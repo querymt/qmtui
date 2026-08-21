@@ -5,11 +5,12 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    app::{self, App},
+    app::App,
     command::Command,
+    connection_state::ConnState,
     diagnostics::LogLevel,
     handlers::{AppAction, handle_key, handle_mouse},
-    server_manager::{self, ServerEvent, ServerState},
+    server_manager::{self, ServerEvent},
     ui,
 };
 
@@ -57,6 +58,45 @@ fn reconnect_session_commands(app: &mut App) -> Vec<Command> {
     .into()
 }
 
+fn handle_server_event(app: &mut App, event: ServerEvent) {
+    match event {
+        ServerEvent::Starting => {
+            app.connection.apply_server_starting();
+            if app.connection.conn != ConnState::Connected {
+                app.set_status(LogLevel::Info, "acp", "starting qmtcode ACP agent...");
+            }
+        }
+        ServerEvent::Started => {
+            app.connection.apply_server_started();
+            if app.connection.conn != ConnState::Connected {
+                app.set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
+            }
+        }
+        ServerEvent::BinaryNotFound => {
+            app.connection.apply_server_binary_not_found();
+            if app.connection.conn != ConnState::Connected {
+                app.set_status(
+                    LogLevel::Warn,
+                    "acp",
+                    "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
+                );
+            }
+        }
+        ServerEvent::StartFailed { error } => {
+            app.connection.apply_server_start_failed(error.clone());
+            app.set_status(LogLevel::Error, "acp", format!("ACP start failed: {error}"));
+        }
+        ServerEvent::Stopped { reason } => {
+            app.connection.apply_server_stopped(reason.clone());
+            app.set_status(
+                LogLevel::Warn,
+                "acp",
+                format!("ACP agent stopped ({reason})"),
+            );
+        }
+    }
+}
+
 pub(super) async fn run_loop(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -77,16 +117,18 @@ pub(super) async fn run_loop(
             Some(event) = conn_rx.recv() => {
                 match event {
                     ConnectionManagerEvent::State(state) => {
-                        let was_connected = app.conn == app::ConnState::Connected;
+                        let was_connected = app.connection.conn == ConnState::Connected;
                         app.handle_connection_event(state);
-                        if app.conn == app::ConnState::Connected {
+                        if app.connection.conn == ConnState::Connected {
                             cmd_tx.send(Command::Init)?;
                             cmd_tx.send(Command::list_sessions_browse())?;
                             cmd_tx.send(Command::ListAllModels { refresh: false })?;
                             for command in reconnect_session_commands(app) {
                                 cmd_tx.send(command)?;
                             }
-                        } else if was_connected && app.conn == app::ConnState::Disconnected {
+                        } else if was_connected
+                            && app.connection.conn == ConnState::Disconnected
+                        {
                             app.set_status(
                                 LogLevel::Warn,
                                 "connection",
@@ -102,46 +144,7 @@ pub(super) async fn run_loop(
                 }
             }
             Some(sup_event) = sup_rx.recv() => {
-                match sup_event {
-                    ServerEvent::Starting => {
-                        app.server_state = ServerState::Starting;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(LogLevel::Info, "acp", "starting qmtcode ACP agent...");
-                        }
-                    }
-                    ServerEvent::Started => {
-                        app.server_state = ServerState::Running;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
-                        }
-                    }
-                    ServerEvent::BinaryNotFound => {
-                        app.server_state = ServerState::BinaryNotFound;
-                        if app.conn != app::ConnState::Connected {
-                            app.set_status(
-                                LogLevel::Warn,
-                                "acp",
-                                "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
-                            );
-                        }
-                    }
-                    ServerEvent::StartFailed { error } => {
-                        app.server_state = ServerState::StartFailed { error: error.clone() };
-                        app.set_status(
-                            LogLevel::Error,
-                            "acp",
-                            format!("ACP start failed: {error}"),
-                        );
-                    }
-                    ServerEvent::Stopped { reason } => {
-                        app.server_state = ServerState::Restarting { reason: reason.clone() };
-                        app.set_status(
-                            LogLevel::Warn,
-                            "acp",
-                            format!("ACP agent stopped ({reason})"),
-                        );
-                    }
-                }
+                handle_server_event(app, sup_event);
             }
             Some(event_result) = term_events.next() => {
                 match event_result {
@@ -192,9 +195,11 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{reconnect_session_commands, send_command, tick_from_elapsed};
+    use super::{handle_server_event, reconnect_session_commands, send_command, tick_from_elapsed};
     use crate::app::App;
     use crate::command::Command;
+    use crate::connection_state::{ConnState, ServerState};
+    use crate::server_manager::ServerEvent;
 
     #[test]
     fn send_command_sends_each_command_once_without_implicit_subscribe() {
@@ -260,7 +265,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_id = Some("local-1".into());
         app.sessions.agent_id = Some("agent-1".into());
-        app.launch_cwd = Some("/local/repo".into());
+        app.connection.launch_cwd = Some("/local/repo".into());
 
         assert_eq!(
             reconnect_session_commands(&mut app),
@@ -280,6 +285,80 @@ mod tests {
     #[test]
     fn reconnect_without_active_session_does_nothing() {
         assert!(reconnect_session_commands(&mut App::new()).is_empty());
+    }
+
+    #[test]
+    fn server_lifecycle_events_report_exact_statuses_while_disconnected() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Disconnected;
+
+        handle_server_event(&mut app, ServerEvent::Starting);
+        assert_eq!(app.connection.server_state, ServerState::Starting);
+        assert_eq!(app.diagnostics.status, "starting qmtcode ACP agent...");
+
+        handle_server_event(&mut app, ServerEvent::Started);
+        assert_eq!(app.connection.server_state, ServerState::Running);
+        assert_eq!(app.diagnostics.status, "qmtcode ACP agent started");
+
+        handle_server_event(&mut app, ServerEvent::BinaryNotFound);
+        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
+        assert_eq!(
+            app.diagnostics.status,
+            "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml"
+        );
+    }
+
+    #[test]
+    fn server_statuses_are_suppressed_while_connected_but_state_still_updates() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.set_status(crate::diagnostics::LogLevel::Debug, "test", "retained");
+
+        handle_server_event(&mut app, ServerEvent::Starting);
+        assert_eq!(app.connection.server_state, ServerState::Starting);
+        assert_eq!(app.diagnostics.status, "retained");
+
+        handle_server_event(&mut app, ServerEvent::Started);
+        assert_eq!(app.connection.server_state, ServerState::Running);
+        assert_eq!(app.diagnostics.status, "retained");
+
+        handle_server_event(&mut app, ServerEvent::BinaryNotFound);
+        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
+        assert_eq!(app.diagnostics.status, "retained");
+    }
+
+    #[test]
+    fn server_failures_always_report_exact_status_and_payload() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+
+        handle_server_event(
+            &mut app,
+            ServerEvent::StartFailed {
+                error: "invalid command".into(),
+            },
+        );
+        assert_eq!(
+            app.connection.server_state,
+            ServerState::StartFailed {
+                error: "invalid command".into()
+            }
+        );
+        assert_eq!(app.diagnostics.status, "ACP start failed: invalid command");
+
+        handle_server_event(
+            &mut app,
+            ServerEvent::Stopped {
+                reason: "process exited".into(),
+            },
+        );
+        assert_eq!(
+            app.connection.server_state,
+            ServerState::Restarting {
+                reason: "process exited".into()
+            }
+        );
+        assert_eq!(app.diagnostics.status, "ACP agent stopped (process exited)");
     }
 
     #[test]

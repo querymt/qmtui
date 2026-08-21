@@ -36,7 +36,8 @@ use ratatui::{
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, ConnState};
+use crate::app::App;
+use crate::connection_state::ConnState;
 use crate::navigation_state::{Popup, Screen};
 use crate::theme::Theme;
 
@@ -415,7 +416,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn conn_indicator(app: &App) -> Span<'static> {
-    let (sym, color) = match app.conn {
+    let (sym, color) = match app.connection.conn {
         ConnState::Connected => (CONN_ONLINE, Theme::ok()),
         ConnState::Connecting => (CONN_OFFLINE, Theme::warn()),
         ConnState::Disconnected => (CONN_ONLINE, Theme::err()),
@@ -492,6 +493,23 @@ mod tests {
     use ratatui::widgets::ListItem;
     use serial_test::serial;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn connection_indicator_preserves_three_state_symbols_and_colors() {
+        let mut app = App::new();
+
+        for (state, symbol, color) in [
+            (ConnState::Connecting, CONN_OFFLINE, Theme::warn()),
+            (ConnState::Connected, CONN_ONLINE, Theme::ok()),
+            (ConnState::Disconnected, CONN_ONLINE, Theme::err()),
+        ] {
+            app.connection.conn = state;
+            let indicator = conn_indicator(&app);
+            assert_eq!(indicator.content.as_ref(), format!("{symbol} "));
+            assert_eq!(indicator.style.fg, Some(color));
+            assert_eq!(indicator.style.bg, Some(Theme::bg_dim()));
+        }
+    }
 
     fn tool_call(name: &str) -> ChatEntry {
         ChatEntry::ToolCall {
