@@ -2662,7 +2662,7 @@ mod tests {
     fn native_remote_attach_uses_remote_cwd_and_detached_refreshes_sessions() {
         let mut app = App::new();
         app.sessions.agent_id = Some("agent-1".into());
-        app.launch_cwd = Some("/launch".into());
+        app.connection.launch_cwd = Some("/launch".into());
         app.sessions.remember_remote_session_location(
             "remote-1",
             "node-1",

@@ -22,22 +22,6 @@ pub enum ServerEvent {
     Stopped { reason: String },
 }
 
-/// Local ACP process state stored on [`crate::app::App`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ServerState {
-    #[default]
-    Disabled,
-    BinaryNotFound,
-    Starting,
-    Running,
-    StartFailed {
-        error: String,
-    },
-    Restarting {
-        reason: String,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryDiscovery {
     pub binary: Option<OsString>,

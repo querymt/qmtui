@@ -6,6 +6,7 @@ mod app;
 mod auth_state;
 mod command;
 mod config;
+mod connection_state;
 mod diagnostics;
 mod domain;
 mod handlers;
