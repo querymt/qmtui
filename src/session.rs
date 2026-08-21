@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::app::{App, FileIndexEntryLite};
+use crate::app::App;
+use crate::composer_state::FileIndexEntryLite;
 use crate::domain::activity::DelegateEntry;
 use crate::navigation_state::Popup;
 

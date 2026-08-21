@@ -704,11 +704,7 @@ impl crate::app::App {
             self.delegation_errors.clear();
             self.pending_delegate_tool_calls.clear();
         }
-        self.file_index.clear();
-        self.file_index_generated_at = None;
-        self.file_index_loading = false;
-        self.file_index_error = None;
-        self.mention_state = None;
+        self.composer.reset_for_session_switch();
         self.last_compaction_token_estimate = None;
         self.elicitation = None;
         self.elicitation_ui = None;
@@ -1928,6 +1924,7 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::composer_state::{FileIndexEntryLite, MentionState};
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
@@ -2936,6 +2933,25 @@ mod tests {
         app.messages.push(ChatEntry::Error("stale".into()));
         app.streaming_content = "stale stream".into();
         app.scroll_offset = 3;
+        app.composer.input = "/mo".into();
+        app.composer.input_cursor = 3;
+        app.composer.input_scroll = 2;
+        app.composer.input_line_width = 40;
+        app.composer.input_preferred_col = Some(4);
+        app.composer.refresh_slash_state();
+        app.composer.file_index = vec![FileIndexEntryLite {
+            path: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        app.composer.file_index_generated_at = Some(7);
+        app.composer.file_index_loading = true;
+        app.composer.file_index_error = Some("stale".into());
+        app.composer.mention_state = Some(MentionState {
+            trigger_start: 0,
+            query: "src".into(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
         app.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
@@ -2964,6 +2980,17 @@ mod tests {
         assert!(app.messages.is_empty());
         assert!(app.streaming_content.is_empty());
         assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.composer.input, "/mo");
+        assert_eq!(app.composer.input_cursor, 3);
+        assert_eq!(app.composer.input_scroll, 2);
+        assert_eq!(app.composer.input_line_width, 40);
+        assert_eq!(app.composer.input_preferred_col, Some(4));
+        assert!(app.composer.file_index.is_empty());
+        assert_eq!(app.composer.file_index_generated_at, None);
+        assert!(!app.composer.file_index_loading);
+        assert_eq!(app.composer.file_index_error, None);
+        assert!(app.composer.mention_state.is_none());
+        assert!(app.composer.slash_state.is_some());
         assert!(app.undo_state.is_none());
         assert!(app.elicitation.is_none());
         assert_eq!(app.session_stats.total_tool_calls, 0);

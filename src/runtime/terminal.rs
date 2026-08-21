@@ -38,7 +38,7 @@ pub(super) fn open_external_editor_with_terminal(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    let result = open_external_editor(&app.input);
+    let result = open_external_editor(&app.composer.input);
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;

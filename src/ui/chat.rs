@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::composer_state::{InputVisualLayout, build_input_visual_layout};
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
 use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
 use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
@@ -18,7 +19,7 @@ use crate::markdown;
 use crate::theme::Theme;
 
 use super::start::short_cwd;
-use super::{INPUT_OVERLINE, InputVisualLayout, build_input_visual_layout, draw_header};
+use super::{INPUT_OVERLINE, draw_header};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 
@@ -888,10 +889,10 @@ pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
 pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // Both slash-completion and @-mention share one panel slot (mutually exclusive).
-    let completion_panel_height = if app.slash_state.is_some()
-        || app.mention_state.is_some()
-        || app.file_index_loading
-        || app.file_index_error.is_some()
+    let completion_panel_height = if app.composer.slash_state.is_some()
+        || app.composer.mention_state.is_some()
+        || app.composer.file_index_loading
+        || app.composer.file_index_error.is_some()
     {
         6u16
     } else {
@@ -920,7 +921,7 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     draw_messages(f, app, chunks[1]);
 
     if completion_panel_height > 0 {
-        if app.slash_state.is_some() {
+        if app.composer.slash_state.is_some() {
             draw_slash_panel(f, app, chunks[2]);
         } else {
             draw_mention_panel(f, app, chunks[2]);
@@ -939,8 +940,8 @@ fn input_layout_metrics(app: &App, area: Rect) -> (u16, InputVisualLayout) {
     let input_inner_width = area.width.saturating_sub(4) as usize;
     let prefix_width = 2usize; // "> "
     let input_layout = build_input_visual_layout(
-        &app.input,
-        app.input_cursor,
+        &app.composer.input,
+        app.composer.input_cursor,
         input_inner_width.max(1),
         prefix_width,
     );
@@ -1093,7 +1094,7 @@ fn draw_input_panel(
         .padding(Padding::new(2, 2, 0, 1))
         .style(Theme::input());
     let inner = input_bg.inner(input_area);
-    app.input_line_width = (inner.width as usize).max(1);
+    app.composer.input_line_width = (inner.width as usize).max(1);
     f.render_widget(input_bg, input_area);
 
     let (label_text, label_style) = match &app.activity {
@@ -1129,7 +1130,7 @@ fn draw_input_panel(
     let hide_input_contents = app.should_hide_input_contents();
 
     if hide_input_contents {
-        app.input_scroll = 0;
+        app.composer.input_scroll = 0;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(label_text, label_style))),
             inner,
@@ -1153,17 +1154,23 @@ fn draw_input_panel(
 
         let total_lines = lines.len() as u16;
         let visible = inner.height;
-        if (layout.cursor_row as u16) >= app.input_scroll + visible {
-            app.input_scroll = (layout.cursor_row as u16) - visible + 1;
+        if (layout.cursor_row as u16) >= app.composer.input_scroll + visible {
+            app.composer.input_scroll = (layout.cursor_row as u16) - visible + 1;
         }
-        if (layout.cursor_row as u16) < app.input_scroll {
-            app.input_scroll = layout.cursor_row as u16;
+        if (layout.cursor_row as u16) < app.composer.input_scroll {
+            app.composer.input_scroll = layout.cursor_row as u16;
         }
-        app.input_scroll = app.input_scroll.min(total_lines.saturating_sub(visible));
+        app.composer.input_scroll = app
+            .composer
+            .input_scroll
+            .min(total_lines.saturating_sub(visible));
 
-        f.render_widget(Paragraph::new(lines).scroll((app.input_scroll, 0)), inner);
+        f.render_widget(
+            Paragraph::new(lines).scroll((app.composer.input_scroll, 0)),
+            inner,
+        );
 
-        let visual_row = (layout.cursor_row as u16).saturating_sub(app.input_scroll);
+        let visual_row = (layout.cursor_row as u16).saturating_sub(app.composer.input_scroll);
         if visual_row < visible {
             f.set_cursor_position((inner.x + layout.cursor_col as u16, inner.y + visual_row));
         }
@@ -1465,7 +1472,7 @@ fn draw_slash_panel(f: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let Some(state) = &app.slash_state else {
+    let Some(state) = &app.composer.slash_state else {
         return;
     };
 
@@ -1510,17 +1517,17 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut items: Vec<ListItem> = Vec::new();
-    if app.file_index_loading && app.file_index.is_empty() {
+    if app.composer.file_index_loading && app.composer.file_index.is_empty() {
         items.push(ListItem::new(Line::from(vec![Span::styled(
             format!("{} indexing files", spinner(SpinnerKind::Braille, app.tick)),
             Theme::thinking(),
         )])));
-    } else if let Some(error) = &app.file_index_error {
+    } else if let Some(error) = &app.composer.file_index_error {
         items.push(ListItem::new(Line::from(vec![Span::styled(
             format!("file index error: {error}"),
             Theme::error_text(),
         )])));
-    } else if let Some(mention) = &app.mention_state {
+    } else if let Some(mention) = &app.composer.mention_state {
         if mention.results.is_empty() {
             items.push(ListItem::new(Line::from(vec![Span::styled(
                 format!("no matches for @{}", mention.query),
@@ -1541,7 +1548,7 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let title = if let Some(mention) = &app.mention_state {
+    let title = if let Some(mention) = &app.composer.mention_state {
         format!(" @ files - {} ", mention.query)
     } else {
         " @ files ".into()
@@ -1551,10 +1558,11 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Theme::selected())
         .highlight_symbol("");
     let selected = app
+        .composer
         .mention_state
         .as_ref()
         .map(|mention| mention.selected_index)
-        .filter(|_| !app.file_index_loading);
+        .filter(|_| !app.composer.file_index_loading);
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, area, &mut state);
 }
