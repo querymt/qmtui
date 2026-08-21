@@ -35,99 +35,9 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::composer_state::build_input_visual_layout;
 use crate::connection_state::ConnState;
 use crate::navigation_state::{Popup, Screen};
 use crate::theme::Theme;
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ElicitationUiState {
-    pub(crate) field_cursor: usize,
-    pub(crate) option_cursor: usize,
-    pub(crate) text_cursor: usize,
-    pub(crate) custom_active: bool,
-    pub(crate) custom_cursor: usize,
-    pub(crate) custom_line_width: usize,
-    pub(crate) custom_scroll: u16,
-}
-
-impl ElicitationUiState {
-    pub(crate) fn current_field_index(&self, field_count: usize) -> Option<usize> {
-        (field_count > 0).then(|| self.field_cursor.min(field_count - 1))
-    }
-
-    pub(crate) fn custom_insert(&mut self, input: &mut String, character: char) {
-        input.insert(self.custom_cursor, character);
-        self.custom_cursor += character.len_utf8();
-    }
-
-    pub(crate) fn custom_backspace(&mut self, input: &mut String) {
-        if self.custom_cursor == 0 {
-            return;
-        }
-        let previous = input[..self.custom_cursor]
-            .char_indices()
-            .last()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        input.drain(previous..self.custom_cursor);
-        self.custom_cursor = previous;
-    }
-
-    pub(crate) fn custom_delete(&mut self, input: &mut String) {
-        if self.custom_cursor >= input.len() {
-            return;
-        }
-        let next = input[self.custom_cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| self.custom_cursor + index)
-            .unwrap_or(input.len());
-        input.drain(self.custom_cursor..next);
-    }
-
-    pub(crate) fn custom_left(&mut self, input: &str) {
-        if self.custom_cursor > 0 {
-            self.custom_cursor = input[..self.custom_cursor]
-                .char_indices()
-                .last()
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-        }
-    }
-
-    pub(crate) fn custom_right(&mut self, input: &str) {
-        if self.custom_cursor < input.len() {
-            self.custom_cursor = input[self.custom_cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(index, _)| self.custom_cursor + index)
-                .unwrap_or(input.len());
-        }
-    }
-
-    pub(crate) fn custom_home(&mut self, input: &str) {
-        self.custom_cursor = input[..self.custom_cursor]
-            .rfind('\n')
-            .map(|index| index + 1)
-            .unwrap_or(0);
-    }
-
-    pub(crate) fn custom_end(&mut self, input: &str) {
-        self.custom_cursor = input[self.custom_cursor..]
-            .find('\n')
-            .map(|index| self.custom_cursor + index)
-            .unwrap_or(input.len());
-    }
-
-    pub(crate) fn custom_move_visual(&mut self, input: &str, delta: i32) {
-        let layout =
-            build_input_visual_layout(input, self.custom_cursor, self.custom_line_width.max(1), 2);
-        let row = (layout.cursor_row as i32 + delta)
-            .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
-        self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
-    }
-}
 
 // ── Symbols shared across sub-modules ──────────────────────────────────────────
 pub(super) const COLOR_SWATCH: &str = "\u{25A0}"; // ■ black square  – theme palette colour preview
@@ -321,6 +231,7 @@ mod tests {
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
     use crate::app::App;
     use crate::auth_state::{AuthPanel, AuthUiNotice};
+    use crate::chat_state::ElicitationUiState;
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
@@ -550,7 +461,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::ForkTurnSelect;
-        app.messages = vec![
+        app.chat.messages = vec![
             ChatEntry::User {
                 text: "alpha prompt".into(),
                 message_id: Some("user-1".into()),
@@ -1233,7 +1144,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "build".into();
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
@@ -1273,7 +1184,7 @@ mod tests {
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "index".into(),
             is_error: false,
@@ -1301,7 +1212,7 @@ mod tests {
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "search_text".into(),
             is_error: false,
@@ -1331,7 +1242,7 @@ mod tests {
         use crate::theme::Theme;
 
         let mut app = App::new();
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "read_tool".into(),
             is_error: false,
@@ -1368,7 +1279,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "build".into();
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
@@ -1480,8 +1391,8 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "build".into();
-        app.elicitation = Some(ElicitationState::new_for_test(vec![]));
-        app.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.elicitation = Some(ElicitationState::new_for_test(vec![]));
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
 
         let _buffer = render_chat_buffer(&mut app, 80, 12);
     }
@@ -1511,8 +1422,8 @@ mod tests {
             custom_cursor: state.custom_input.len(),
             ..Default::default()
         };
-        app.elicitation = Some(state);
-        app.elicitation_ui = Some(ui);
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(ui);
 
         let buffer = render_chat_buffer(&mut app, 40, 21);
         let rendered = buffer
@@ -1545,8 +1456,8 @@ mod tests {
             },
         }]);
         state.message = "When designing a new system-level tool, which approach best describes how you balance rapid prototyping and maintainability?".into();
-        app.elicitation = Some(state);
-        app.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_chat_buffer(&mut app, 50, 21);
         let first =
@@ -1563,7 +1474,7 @@ mod tests {
     fn draw_chat_wraps_long_elicitation_answers() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+        app.chat.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
             title: "Choice".into(),
             description: None,
@@ -1576,7 +1487,7 @@ mod tests {
                 }],
             },
         }]));
-        app.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_chat_buffer(&mut app, 50, 21);
         let first = find_buffer_text(&buffer, "Keep the validated").expect("missing answer row");
@@ -1593,12 +1504,12 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Delegate;
         app.sessions.agent_mode = "build".into();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "Delegate context".into(),
             thinking: None,
             message_id: None,
         });
-        app.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+        app.chat.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
             title: "Choice".into(),
             description: None,
@@ -1618,7 +1529,7 @@ mod tests {
                 ],
             },
         }]));
-        app.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
 
         let buffer = render_delegate_buffer(&mut app, 100, 17);
         let rendered = buffer_text(&buffer);
@@ -1647,7 +1558,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Delegate;
         app.sessions.agent_mode = "build".into();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "Read-only child output".into(),
             thinking: None,
             message_id: None,
@@ -2356,7 +2267,7 @@ mod tests {
     #[test]
     fn delegate_row_fixture_marks_parent_awaiting_input() {
         let mut app = App::new();
-        app.messages.push(delegate_tool_call(
+        app.chat.messages.push(delegate_tool_call(
             "tool-delegate-1",
             "coder",
             "Fix live bug",
@@ -2428,7 +2339,7 @@ mod tests {
     #[test]
     fn message_cards_single_user() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
@@ -2441,7 +2352,7 @@ mod tests {
     #[test]
     fn message_cards_user_supports_markdown_rendering() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "- item\n\n`code`".into(),
             message_id: None,
         });
@@ -2468,7 +2379,7 @@ mod tests {
     #[test]
     fn message_cards_incremental_append() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
@@ -2477,7 +2388,7 @@ mod tests {
             assert_eq!(cards.len(), 1);
         }
 
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "world".into(),
             thinking: None,
             message_id: None,
@@ -2493,7 +2404,7 @@ mod tests {
     #[test]
     fn message_cards_cache_hit_no_change() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
@@ -2509,7 +2420,8 @@ mod tests {
     #[test]
     fn delegate_row_updates_after_child_state_change_without_message_append() {
         let mut app = App::new();
-        app.messages
+        app.chat
+            .messages
             .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -2526,7 +2438,7 @@ mod tests {
 
         let lines = rendered_card_lines(&mut app);
         assert!(!lines.iter().any(|line| line.contains("awaiting input")));
-        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
 
         app.delegates.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
             elicitation_id: "elic-1".into(),
@@ -2538,7 +2450,7 @@ mod tests {
         let lines = rendered_card_lines(&mut app);
 
         assert_eq!(
-            app.messages.len(),
+            app.chat.messages.len(),
             1,
             "delegate state changed without appending messages"
         );
@@ -2551,15 +2463,17 @@ mod tests {
     #[test]
     fn delegate_row_awaiting_marker_uses_tool_call_identity_not_sequence() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "first".into(),
             message_id: None,
         });
         build_message_cards(&mut app);
-        app.messages
+        app.chat
+            .messages
             .push(delegate_tool_call("tool-a", "coder", "First task"));
         build_message_cards(&mut app);
-        app.messages
+        app.chat
+            .messages
             .push(delegate_tool_call("tool-b", "coder", "Second task"));
         app.delegates.delegate_entries = vec![
             DelegateEntry {
@@ -2617,8 +2531,8 @@ mod tests {
     #[test]
     fn message_cards_tool_batch() {
         let mut app = App::new();
-        app.messages.push(tool_call("read"));
-        app.messages.push(tool_call("write"));
+        app.chat.messages.push(tool_call("read"));
+        app.chat.messages.push(tool_call("write"));
 
         let cards = build_message_cards(&mut app);
         // Two consecutive tools → one tool card
@@ -2630,7 +2544,7 @@ mod tests {
     #[test]
     fn message_cards_tool_batch_grows_incrementally() {
         let mut app = App::new();
-        app.messages.push(tool_call("read"));
+        app.chat.messages.push(tool_call("read"));
         {
             let cards = build_message_cards(&mut app);
             assert_eq!(cards.len(), 1);
@@ -2638,7 +2552,7 @@ mod tests {
         }
 
         // Add another tool — should merge into same batch
-        app.messages.push(tool_call("write"));
+        app.chat.messages.push(tool_call("write"));
         {
             let cards = build_message_cards(&mut app);
             assert_eq!(cards.len(), 1); // still 1 card
@@ -2649,10 +2563,10 @@ mod tests {
     #[test]
     fn message_cards_tool_then_user_finalizes_batch() {
         let mut app = App::new();
-        app.messages.push(tool_call("read"));
+        app.chat.messages.push(tool_call("read"));
         build_message_cards(&mut app);
 
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "next".into(),
             message_id: None,
         });
@@ -2665,14 +2579,14 @@ mod tests {
     #[test]
     fn message_cards_invalidated_on_clear() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
         build_message_cards(&mut app);
         assert_eq!(app.card_cache.processed_messages, 1);
 
-        app.messages.clear();
+        app.chat.messages.clear();
         app.card_cache.invalidate();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
@@ -2682,11 +2596,11 @@ mod tests {
     #[test]
     fn message_cards_auto_invalidates_on_shrink() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "world".into(),
             thinking: None,
             message_id: None,
@@ -2695,7 +2609,9 @@ mod tests {
         assert_eq!(app.card_cache.processed_messages, 2);
 
         // Simulate retain() shrinking messages (like compaction does)
-        app.messages.retain(|e| matches!(e, ChatEntry::User { .. }));
+        app.chat
+            .messages
+            .retain(|e| matches!(e, ChatEntry::User { .. }));
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
@@ -2723,9 +2639,9 @@ mod tests {
 
         live_update(&mut app, "test-session", failed_tool_end("tool-1", "shell"));
 
-        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.chat.messages.len(), 2);
         assert!(matches!(
-            app.messages[0],
+            app.chat.messages[0],
             ChatEntry::ToolCall { is_error: true, .. }
         ));
         assert_eq!(
@@ -2735,7 +2651,7 @@ mod tests {
         let lines = rendered_card_lines(&mut app);
         assert!(lines.iter().any(|line| line.contains("x shell")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
-        assert!(matches!(app.messages[1], ChatEntry::Assistant { .. }));
+        assert!(matches!(app.chat.messages[1], ChatEntry::Assistant { .. }));
     }
 
     #[test]
@@ -2755,7 +2671,7 @@ mod tests {
         let warm_lines = rendered_card_lines(&mut app);
         assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
         assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
-        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
 
         live_update(
             &mut app,
@@ -2769,7 +2685,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.messages.len(),
+            app.chat.messages.len(),
             1,
             "tool detail update should be in place"
         );
@@ -2815,7 +2731,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("  1 ") && line.contains("- before"))
         );
-        assert_eq!(app.card_cache.processed_messages, app.messages.len());
+        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
 
         live_update(
             &mut app,
@@ -2829,7 +2745,7 @@ mod tests {
         );
 
         assert_eq!(
-            app.messages.len(),
+            app.chat.messages.len(),
             1,
             "tool detail update should be in place"
         );
@@ -2886,23 +2802,23 @@ mod tests {
         let mut app = App::new();
 
         // Build incrementally
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "q1".into(),
             message_id: None,
         });
         build_message_cards(&mut app);
 
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "a1".into(),
             thinking: None,
             message_id: None,
         });
         build_message_cards(&mut app);
 
-        app.messages.push(tool_call("edit"));
+        app.chat.messages.push(tool_call("edit"));
         build_message_cards(&mut app);
 
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "q2".into(),
             message_id: None,
         });
@@ -2924,11 +2840,11 @@ mod tests {
     #[test]
     fn session_load_invalidates_card_cache_before_native_replay() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "parent prompt".into(),
             message_id: None,
         });
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "parent reply".into(),
             thinking: None,
             message_id: None,
@@ -2937,7 +2853,7 @@ mod tests {
         assert_eq!(app.card_cache.processed_messages, 2);
 
         load_session(&mut app, "delegate-session", "agent-2");
-        assert!(app.messages.is_empty());
+        assert!(app.chat.messages.is_empty());
         assert_eq!(app.card_cache.processed_messages, 0);
         assert!(app.card_cache.cards.is_empty());
 
@@ -2949,7 +2865,7 @@ mod tests {
                 assistant_update("delegate reply", "delegate-assistant"),
             ],
         );
-        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.chat.messages.len(), 2);
     }
 
     #[test]
@@ -2969,9 +2885,9 @@ mod tests {
         );
 
         // Native replay creates a durable card but intentionally does not restore active state.
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }] if elicitation_id == "elic-1")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }] if elicitation_id == "elic-1")
         );
         let rendered = buffer_text(&render_delegate_buffer(&mut app, 100, 16));
         assert!(rendered.contains("Need approval"));
@@ -2981,7 +2897,7 @@ mod tests {
     fn replayed_elicitation_preserves_existing_response_card() {
         let mut app = App::new();
         load_session(&mut app, "child-1", "coder");
-        app.messages.push(ChatEntry::Elicitation {
+        app.chat.messages.push(ChatEntry::Elicitation {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             source: "builtin:question".into(),
@@ -2998,9 +2914,9 @@ mod tests {
                 allow_custom: true,
             }],
         );
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.messages.as_slice(), [ChatEntry::Elicitation { outcome: Some(outcome), .. }] if outcome == "responded")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { outcome: Some(outcome), .. }] if outcome == "responded")
         );
     }
 
@@ -3030,9 +2946,9 @@ mod tests {
             }],
         );
         assert_eq!(app.delegates.parent_session_id.as_deref(), Some("parent"));
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }] if elicitation_id == "elic-1")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }] if elicitation_id == "elic-1")
         );
     }
 
@@ -3049,8 +2965,8 @@ mod tests {
             kind: ElicitationFieldKind::TextInput,
         }]);
         state.message = "Need approval".into();
-        app.elicitation = Some(state);
-        app.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
         let rendered = buffer_text(&render_delegate_buffer(&mut app, 100, 16));
         assert!(rendered.contains("Question"));
         assert!(rendered.contains("Need approval"));
@@ -3072,9 +2988,9 @@ mod tests {
                 allow_custom: false,
             }],
         );
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }] if elicitation_id == "elic-1" && outcome == "unsupported schema - cannot answer in TUI")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }] if elicitation_id == "elic-1" && outcome == "unsupported schema - cannot answer in TUI")
         );
     }
 
@@ -3137,12 +3053,12 @@ mod tests {
     #[test]
     fn message_cards_compact_tool_after_assistant() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "thinking...".into(),
             thinking: None,
             message_id: None,
         });
-        app.messages.push(tool_call("read"));
+        app.chat.messages.push(tool_call("read"));
 
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 2);
@@ -3154,11 +3070,11 @@ mod tests {
     #[test]
     fn message_cards_non_compact_tool_after_user() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "do it".into(),
             message_id: None,
         });
-        app.messages.push(tool_call("read"));
+        app.chat.messages.push(tool_call("read"));
 
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 2);
@@ -3172,7 +3088,7 @@ mod tests {
         let mut app = App::new();
         let old = "aaa\nbbb\n";
         let new = "aaa\nccc\n";
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "edit".into(),
             is_error: false,
@@ -3198,7 +3114,7 @@ mod tests {
     fn message_cards_write_tool_includes_content_lines() {
         let mut app = App::new();
         let content = "fn main() {}\n";
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "write_file".into(),
             is_error: false,
@@ -3231,7 +3147,7 @@ mod tests {
                 start_line: Some(20),
             },
         ];
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "multiedit".into(),
             is_error: false,
@@ -3291,7 +3207,7 @@ mod tests {
             new: "fn build_message_cards() {\n    new();\n}\n".into(),
             start_line: Some(211),
         }];
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "replace_symbol".into(),
             is_error: false,
@@ -3357,7 +3273,7 @@ mod tests {
             ],
             hidden_line_count: 12,
         };
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "shell".into(),
             is_error: false,
@@ -4050,7 +3966,7 @@ mod tests {
     #[test]
     fn message_card_with_thinking_includes_bullet_header() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: Some("reasoning".into()),
             message_id: None,
@@ -4070,7 +3986,7 @@ mod tests {
     #[test]
     fn message_card_without_thinking_has_no_bullet() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: None,
             message_id: None,
@@ -4093,8 +4009,8 @@ mod tests {
     #[test]
     fn message_card_thinking_hidden_when_show_thinking_false() {
         let mut app = App::new();
-        app.show_thinking = false;
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.show_thinking = false;
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "answer".into(),
             thinking: Some("reasoning".into()),
             message_id: None,
@@ -4114,16 +4030,16 @@ mod tests {
     #[test]
     fn hidden_thinking_entry_between_tools_keeps_incremental_tool_batching() {
         let mut app = App::new();
-        app.show_thinking = false;
+        app.chat.show_thinking = false;
 
-        app.messages.push(tool_call("glob"));
+        app.chat.messages.push(tool_call("glob"));
         build_message_cards(&mut app);
-        app.messages.push(ChatEntry::Thinking {
+        app.chat.messages.push(ChatEntry::Thinking {
             content: "hidden reasoning".into(),
             message_id: Some("think-1".into()),
         });
         build_message_cards(&mut app);
-        app.messages.push(tool_call("read_tool"));
+        app.chat.messages.push(tool_call("read_tool"));
 
         let incremental_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);

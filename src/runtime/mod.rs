@@ -87,14 +87,14 @@ mod tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("sess-1".into());
-        app.messages.push(ChatEntry::Elicitation {
+        app.chat.messages.push(ChatEntry::Elicitation {
             elicitation_id: state.elicitation_id.clone(),
             message: state.message.clone(),
             source: state.source.clone(),
             outcome: None,
         });
-        app.elicitation = Some(state);
-        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(crate::chat_state::ElicitationUiState::default());
         app
     }
 
@@ -115,7 +115,7 @@ mod tests {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        assert_eq!(app.elicitation_ui.as_ref().unwrap().option_cursor, 1);
+        assert_eq!(app.chat.elicitation_ui.as_ref().unwrap().option_cursor, 1);
     }
 
     #[test]
@@ -123,7 +123,7 @@ mod tests {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Up), &tx).unwrap();
-        assert_eq!(app.elicitation_ui.as_ref().unwrap().option_cursor, 0);
+        assert_eq!(app.chat.elicitation_ui.as_ref().unwrap().option_cursor, 0);
     }
 
     #[test]
@@ -135,7 +135,7 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         // Elicitation should be cleared
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
 
         // Accept response sent
         let msg = rx.try_recv().expect("message sent");
@@ -145,7 +145,7 @@ mod tests {
         ));
 
         // Chat card updated with the selected label
-        assert!(app.messages.iter().any(|m| matches!(m,
+        assert!(app.chat.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
         )));
     }
@@ -159,7 +159,8 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert!(
-            app.elicitation_ui
+            app.chat
+                .elicitation_ui
                 .as_ref()
                 .is_some_and(|ui| ui.custom_active)
         );
@@ -178,7 +179,7 @@ mod tests {
         }
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(matches!(rx.try_recv().expect("message sent"),
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["choice"] == "custom\nanswer"
@@ -196,14 +197,15 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
 
         assert!(
-            app.elicitation_ui
+            app.chat
+                .elicitation_ui
                 .as_ref()
                 .is_some_and(|ui| !ui.custom_active)
         );
         assert!(rx.try_recv().is_err());
 
         handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(matches!(rx.try_recv().expect("decline sent"),
             Command::ElicitationResponse { action, .. } if action == "decline"
         ));
@@ -220,7 +222,7 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_some());
+        assert!(app.chat.elicitation.is_some());
         assert!(rx.try_recv().is_err());
     }
 
@@ -230,12 +232,12 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, .. } if action == "decline"
         ));
-        assert!(app.messages.iter().any(|m| matches!(m,
+        assert!(app.chat.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if o == "declined"
         )));
     }
@@ -250,17 +252,17 @@ mod tests {
                 required: true,
                 kind: ElicitationFieldKind::TextInput,
             }]));
-        app.elicitation.as_mut().unwrap().text_input = "Alice".into();
+        app.chat.elicitation.as_mut().unwrap().text_input = "Alice".into();
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["name"] == "Alice"
         ));
-        assert!(app.messages.iter().any(|m| matches!(m,
+        assert!(app.chat.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if o == "Alice"
         )));
     }
@@ -278,7 +280,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Char('H')), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Char('i')), &tx).unwrap();
-        assert_eq!(app.elicitation.as_ref().unwrap().text_input, "Hi");
+        assert_eq!(app.chat.elicitation.as_ref().unwrap().text_input, "Hi");
     }
 
     #[test]
@@ -291,11 +293,11 @@ mod tests {
                 required: false,
                 kind: ElicitationFieldKind::TextInput,
             }]));
-        app.elicitation.as_mut().unwrap().text_input = "Hi".into();
-        app.elicitation_ui.as_mut().unwrap().text_cursor = 2;
+        app.chat.elicitation.as_mut().unwrap().text_input = "Hi".into();
+        app.chat.elicitation_ui.as_mut().unwrap().text_cursor = 2;
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        assert_eq!(app.elicitation.as_ref().unwrap().text_input, "H");
+        assert_eq!(app.chat.elicitation.as_ref().unwrap().text_input, "H");
     }
 
     #[test]
@@ -305,10 +307,11 @@ mod tests {
 
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_some(), "popup should remain open");
+        assert!(app.chat.elicitation.is_some(), "popup should remain open");
         assert!(rx.try_recv().is_err(), "no response should be sent");
         assert!(
-            app.messages
+            app.chat
+                .messages
                 .iter()
                 .any(|m| matches!(m, ChatEntry::Elicitation { outcome: None, .. }))
         );
@@ -321,7 +324,8 @@ mod tests {
 
         handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
         assert_eq!(
-            app.elicitation
+            app.chat
+                .elicitation
                 .as_ref()
                 .and_then(|state| state.selected.get("confirm")),
             Some(&serde_json::json!(true))
@@ -329,13 +333,13 @@ mod tests {
 
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == true
         ));
-        assert!(app.messages.iter().any(|m| matches!(m,
+        assert!(app.chat.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if o == "Yes"
         )));
     }
@@ -348,7 +352,8 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
         assert_eq!(
-            app.elicitation
+            app.chat
+                .elicitation
                 .as_ref()
                 .and_then(|state| state.selected.get("confirm")),
             Some(&serde_json::json!(false))
@@ -356,13 +361,13 @@ mod tests {
 
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         let msg = rx.try_recv().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == false
         ));
-        assert!(app.messages.iter().any(|m| matches!(m,
+        assert!(app.chat.messages.iter().any(|m| matches!(m,
             ChatEntry::Elicitation { outcome: Some(o), .. } if o == "No"
         )));
     }
@@ -378,7 +383,7 @@ mod tests {
         handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
         handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
-        assert!(app.elicitation.is_some());
+        assert!(app.chat.elicitation.is_some());
         assert!(rx.try_recv().is_err(), "no response should be sent");
     }
 
@@ -390,11 +395,11 @@ mod tests {
         Theme::begin_frame();
 
         let mut app = App::new();
-        app.messages.push(ChatEntry::User {
+        app.chat.messages.push(ChatEntry::User {
             text: "hello".into(),
             message_id: None,
         });
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "edit".into(),
             is_error: false,
@@ -435,7 +440,7 @@ mod tests {
         assert!(app.streaming_thinking_cache.get(3).is_some());
         assert_eq!(
             app.card_cache.processed_messages,
-            app.messages.len(),
+            app.chat.messages.len(),
             "card_cache should be populated"
         );
 
@@ -459,7 +464,7 @@ mod tests {
             "streaming_thinking_cache should be invalidated"
         );
         assert!(matches!(
-            &app.messages[1],
+            &app.chat.messages[1],
             ChatEntry::ToolCall {
                 detail: ToolDetail::Edit { old, new, .. },
                 ..
@@ -513,7 +518,7 @@ mod external_editor_tests {
         app.composer.input = "abcdef".into();
         app.composer.input_cursor = 4;
         app.composer.input_line_width = 4;
-        app.scroll_offset = 7;
+        app.chat.scroll_offset = 7;
 
         handle_chat_key(
             &mut app,
@@ -522,7 +527,7 @@ mod external_editor_tests {
         )
         .unwrap();
         assert_eq!(app.composer.input_cursor, 2);
-        assert_eq!(app.scroll_offset, 7);
+        assert_eq!(app.chat.scroll_offset, 7);
 
         handle_chat_key(
             &mut app,
@@ -531,7 +536,7 @@ mod external_editor_tests {
         )
         .unwrap();
         assert_eq!(app.composer.input_cursor, 4);
-        assert_eq!(app.scroll_offset, 7);
+        assert_eq!(app.chat.scroll_offset, 7);
     }
 
     #[test]
@@ -539,7 +544,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.scroll_offset = 3;
+        app.chat.scroll_offset = 3;
 
         handle_chat_key(
             &mut app,
@@ -547,7 +552,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.scroll_offset, 13);
+        assert_eq!(app.chat.scroll_offset, 13);
 
         handle_chat_key(
             &mut app,
@@ -555,7 +560,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.scroll_offset, 3);
+        assert_eq!(app.chat.scroll_offset, 3);
     }
 
     #[test]
@@ -657,7 +662,7 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.activity = ActivityState::RunningTool {
+        app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
 
@@ -682,7 +687,7 @@ mod external_editor_tests {
         ));
         assert!(app.composer.input.is_empty());
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::User { text, message_id: Some(message_id) }]
                 if text == "n" && message_id.starts_with("local:pending:")
         ));
@@ -711,7 +716,7 @@ mod external_editor_tests {
                     if text == "first line\nsecond line")
         ));
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::User { text, .. }] if text == "first line\nsecond line"
         ));
     }
@@ -733,7 +738,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert!(rx.try_recv().is_err());
-        assert!(app.messages.is_empty());
+        assert!(app.chat.messages.is_empty());
         assert!(app.composer.input.is_empty());
     }
 
@@ -1118,7 +1123,7 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.messages = vec![
+        app.chat.messages = vec![
             ChatEntry::User {
                 text: "alpha prompt".into(),
                 message_id: Some("user-1".into()),
@@ -1154,7 +1159,7 @@ mod external_editor_tests {
             rx.try_recv().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "user-2"
         ));
-        assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
+        assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("user-2"));
     }
 
     #[test]
@@ -1167,9 +1172,9 @@ mod external_editor_tests {
         handle_key(&mut app, plain_key('b'), &tx).unwrap();
 
         assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
-        assert_eq!(app.fork_filter, "b");
+        assert_eq!(app.chat.fork_filter, "b");
         assert!(app.composer.input.is_empty());
-        assert_eq!(app.filtered_fork_turns().len(), 1);
+        assert_eq!(app.chat.filtered_fork_turns().len(), 1);
     }
 
     #[test]
@@ -1203,7 +1208,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert!(rx.try_recv().is_err());
-        assert!(app.pending_fork_message_id.is_none());
+        assert!(app.chat.pending_fork_message_id.is_none());
         assert!(app.diagnostics.status.contains("only available in chat"));
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "fork"));
     }
@@ -1213,7 +1218,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.open_fork_turn_popup();
-        app.fork_filter = "alpha".into();
+        app.chat.fork_filter = "alpha".into();
 
         handle_fork_turn_popup_key(
             &mut app,
@@ -1226,7 +1231,7 @@ mod external_editor_tests {
             rx.try_recv().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "asst-1"
         ));
-        assert_eq!(app.pending_fork_message_id.as_deref(), Some("asst-1"));
+        assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("asst-1"));
     }
 
     #[test]
@@ -1246,7 +1251,7 @@ mod external_editor_tests {
             rx.try_recv().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "user-2"
         ));
-        assert_eq!(app.pending_fork_message_id.as_deref(), Some("user-2"));
+        assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("user-2"));
     }
 
     #[test]
@@ -1316,7 +1321,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.activity = ActivityState::RunningTool {
+        app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
 
@@ -1326,7 +1331,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert!(app.cancel_confirm_active());
+        assert!(app.chat.cancel_confirm_active());
 
         handle_chat_key(
             &mut app,
@@ -1351,7 +1356,7 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.composer.input = "draft".into();
         app.composer.input_cursor = app.composer.input.len();
 
@@ -1395,7 +1400,7 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.activity = ActivityState::RunningTool {
+        app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
         app.composer.input = "draft".into();
@@ -1407,8 +1412,8 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert!(app.cancel_confirm_active());
-        assert!(app.input_blocked_by_activity());
+        assert!(app.chat.cancel_confirm_active());
+        assert!(app.chat.input_blocked_by_activity());
 
         handle_chat_key(
             &mut app,
@@ -1488,7 +1493,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut app = App::new();
     app.connection.launch_cwd = detect_launch_cwd();
     app.profiles.active_profile_id = cfg.profile.id.clone();
-    app.show_thinking = cfg.show_thinking.unwrap_or(true);
+    app.chat.show_thinking = cfg.show_thinking.unwrap_or(true);
     app.models.delegate_model_preferences = cfg.profile_delegate_models.clone();
     if let Some(profile_id) = cfg.profile.id.as_deref() {
         let legacy_preferences = app

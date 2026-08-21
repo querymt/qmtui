@@ -1399,7 +1399,8 @@ pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
     );
 
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (filter_display, filter_cur) = scroll_input(&app.fork_filter, app.fork_filter.len(), avail);
+    let (filter_display, filter_cur) =
+        scroll_input(&app.chat.fork_filter, app.chat.fork_filter.len(), avail);
     let input_line = Line::from(vec![
         Span::styled("/ ", Theme::popup_title()),
         Span::styled(filter_display, Theme::popup_bg()),
@@ -1410,7 +1411,7 @@ pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
 
-    let turns = app.visible_fork_turns();
+    let turns = app.chat.visible_fork_turns();
     if turns.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled("No forkable turns", Theme::status()))
@@ -1420,7 +1421,7 @@ pub(super) fn draw_fork_turn_popup(f: &mut Frame, app: &App) {
     } else {
         let row_width = chunks[2].width as usize;
         let preview_budget = row_width.saturating_sub(8) / 2;
-        let selected_idx = app.fork_cursor.min(turns.len().saturating_sub(1));
+        let selected_idx = app.chat.fork_cursor.min(turns.len().saturating_sub(1));
         let selected = Some(selected_idx);
         let dim_style = Theme::status().add_modifier(Modifier::DIM);
         let selected_style = Theme::selected();

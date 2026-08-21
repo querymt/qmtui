@@ -1,21 +1,13 @@
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
 use crate::auth_state::AuthState;
+use crate::chat_state::ChatState;
 use crate::command::Command;
 use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
 use crate::delegates_state::DelegatesState;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
-use crate::domain::activity::{
-    ActivityState, DelegateChildState, DelegateStats, SessionOp, SessionStatsLite,
-};
-use crate::domain::chat::{ChatEntry, format_outcome_labels};
-use crate::domain::elicitation::ElicitationState;
-use crate::domain::session::{
-    ForkBoundaryKind, ForkTurnItem, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState,
-    UndoableTurn,
-};
+use crate::domain::activity::{DelegateChildState, DelegateStats};
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
 use crate::mesh_state::MeshState;
@@ -24,7 +16,7 @@ use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
 use crate::session_state::SessionsState;
-use crate::ui::{CardCache, ElicitationUiState};
+use crate::ui::CardCache;
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
 /// Invalidated when `streaming_content` grows or is cleared.
@@ -168,43 +160,12 @@ pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: 
     }
 }
 
-pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_str: &str) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(result_str) else {
-        return;
-    };
-    let Some(answers) = val.get("answers").and_then(|a| a.as_array()) else {
-        return;
-    };
-
-    let mut answer_iter = answers.iter();
-    for entry in messages.iter_mut() {
-        let ChatEntry::Elicitation { outcome, .. } = entry else {
-            continue;
-        };
-        if outcome.as_deref() != Some("responded") {
-            continue;
-        }
-        let Some(answer_entry) = answer_iter.next() else {
-            break;
-        };
-        let labels = answer_entry
-            .get("answers")
-            .and_then(|a| a.as_array())
-            .map(|answers| answers.iter().filter_map(|answer| answer.as_str()))
-            .into_iter()
-            .flatten();
-        *outcome = Some(format_outcome_labels(labels));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connecting { attempt: u32, delay_ms: u64 },
     Connected,
     Disconnected { reason: String },
 }
-
-const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub struct App {
     pub(crate) navigation: NavigationState,
@@ -214,33 +175,14 @@ pub struct App {
     pub(crate) delegates: DelegatesState,
 
     // chat
-    pub messages: Vec<ChatEntry>,
-    /// Monotonic identifier source for locally rendered prompts awaiting ACP echo.
-    pub pending_prompt_seq: u64,
+    pub(crate) chat: ChatState,
     pub(crate) composer: ComposerState,
-    pub fork_filter: String,
-    pub fork_cursor: usize,
-    pub pending_fork_message_id: Option<String>,
-    pub scroll_offset: u16,
     /// Total content height (in rows) from the last render frame.
-    /// Used to compensate `scroll_offset` when content grows while the user
+    /// Used to compensate chat scroll when content grows while the user
     /// is scrolled up, so the viewport stays at the same absolute position.
     pub prev_total_height: u16,
-    pub activity: ActivityState,
-    pub streaming_content: String,
-    pub streaming_content_message_id: Option<String>,
     pub streaming_cache: StreamingCache,
-    pub streaming_thinking: String,
-    pub streaming_thinking_message_id: Option<String>,
     pub streaming_thinking_cache: StreamingCache,
-    pub last_compaction_token_estimate: Option<u32>,
-    /// Active elicitation request waiting for user response.
-    pub elicitation: Option<ElicitationState>,
-    /// Editor, cursor, and layout state for the active elicitation panel.
-    pub elicitation_ui: Option<ElicitationUiState>,
-
-    // thinking display
-    pub show_thinking: bool,
 
     // profile info
     pub(crate) profiles: ProfilesState,
@@ -250,20 +192,6 @@ pub struct App {
 
     // in-memory logs popup and status line
     pub(crate) diagnostics: DiagnosticsState,
-
-    // Undo/redo state mirrors the web UI semantics: a server-authoritative stack
-    // of reverted turns plus a frontier that marks the current branch point.
-    pub undo_state: Option<UndoState>,
-    pub undoable_turns: Vec<UndoableTurn>,
-    /// Tracks the latest prompt text so the follow-up `user_message_stored`
-    /// event can behave like a backfill instead of a duplicate row.
-    pub recent_prompt_text: Option<String>,
-
-    // session stats
-    pub cumulative_cost: Option<f64>,
-    pub context_limit: u64,
-    pub session_stats: SessionStatsLite,
-    pub pending_cancel_confirm_until: Option<Instant>,
 
     // mesh / remote (from ACP extensions)
     pub(crate) mesh: MeshState,
@@ -280,20 +208,8 @@ pub struct App {
     // auth popup state
     pub(crate) auth: AuthState,
 
-    /// While a reverted frontier turn is being suppressed, ignore any
-    /// follow-up assistant/tool/cancelled events until a new prompt arrives.
-    pub suppress_turn_output: bool,
-
     pub tick: u64,
     pub should_quit: bool,
-}
-
-fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        (cursor as isize + delta).rem_euclid(len as isize) as usize
-    }
 }
 
 impl App {
@@ -328,41 +244,19 @@ impl App {
             navigation: NavigationState::new(),
             sessions: SessionsState::new(),
             delegates: DelegatesState::new(),
-            messages: Vec::new(),
-            pending_prompt_seq: 0,
+            chat: ChatState::new(),
             composer: ComposerState::new(),
-            fork_filter: String::new(),
-            fork_cursor: 0,
-            pending_fork_message_id: None,
-            scroll_offset: 0,
             prev_total_height: 0,
-            activity: ActivityState::Idle,
-            streaming_content: String::new(),
-            streaming_content_message_id: None,
             streaming_cache: StreamingCache::new(),
-            streaming_thinking: String::new(),
-            streaming_thinking_message_id: None,
             streaming_thinking_cache: StreamingCache::new(),
-            last_compaction_token_estimate: None,
-            elicitation: None,
-            elicitation_ui: None,
-            show_thinking: true,
             profiles: ProfilesState::new(),
             models: ModelsState::new(),
             diagnostics: DiagnosticsState::new(),
-            undo_state: None,
-            undoable_turns: Vec::new(),
-            recent_prompt_text: None,
-            cumulative_cost: None,
-            context_limit: 0,
-            session_stats: SessionStatsLite::default(),
-            pending_cancel_confirm_until: None,
             mesh: MeshState::new(),
             connection: ConnectionState::new(),
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
             auth: AuthState::new(),
-            suppress_turn_output: false,
             tick: 0,
             should_quit: false,
         }
@@ -372,7 +266,7 @@ impl App {
         self.composer.input_cursor = 0;
         self.composer.input_scroll = 0;
         self.composer.input_preferred_col = None;
-        self.scroll_offset = 0;
+        self.chat.scroll_offset = 0;
         self.composer.mention_state = None;
         self.composer.slash_state = None;
         std::mem::take(&mut self.composer.input)
@@ -385,8 +279,7 @@ impl App {
     /// are discarded.
     pub fn invalidate_streaming_caches(&mut self) {
         self.streaming_cache.invalidate();
-        self.streaming_thinking.clear();
-        self.streaming_thinking_message_id = None;
+        self.chat.clear_streaming_thinking();
         self.streaming_thinking_cache.invalidate();
     }
 
@@ -471,29 +364,9 @@ impl App {
         self.diagnostics.cycle_log_level_filter();
     }
 
-    pub fn cancel_confirm_active(&self) -> bool {
-        self.pending_cancel_confirm_until
-            .map(|deadline| Instant::now() <= deadline)
-            .unwrap_or(false)
-    }
-
     pub fn arm_cancel_confirm(&mut self) {
-        self.pending_cancel_confirm_until = Some(Instant::now() + CANCEL_CONFIRM_TIMEOUT);
+        self.chat.arm_cancel_confirm();
         self.set_status(LogLevel::Warn, "input", "press Esc again to stop");
-    }
-
-    pub fn clear_cancel_confirm(&mut self) {
-        self.pending_cancel_confirm_until = None;
-    }
-
-    pub fn is_turn_active(&self) -> bool {
-        matches!(
-            self.activity,
-            ActivityState::Thinking
-                | ActivityState::Streaming
-                | ActivityState::RunningTool { .. }
-                | ActivityState::Compacting { .. }
-        )
     }
 
     /// Adjust `scroll_offset` to compensate for content growth so the
@@ -503,190 +376,34 @@ impl App {
     /// Call from the renderer after computing the new `total_height`.
     pub fn compensate_scroll_for_growth(&mut self, total_height: u16) {
         let growth = total_height.saturating_sub(self.prev_total_height);
-        if self.scroll_offset > 0 && growth > 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add(growth);
+        if self.chat.scroll_offset > 0 && growth > 0 {
+            self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(growth);
         }
         self.prev_total_height = total_height;
     }
 
-    pub fn has_cancellable_activity(&self) -> bool {
-        self.is_turn_active()
-    }
-
-    pub fn has_pending_session_op(&self) -> bool {
-        matches!(self.activity, ActivityState::SessionOp(_))
-    }
-
-    pub fn forkable_turns(&self) -> Vec<ForkTurnItem> {
-        let mut turns = Vec::new();
-        let mut current_user: Option<(Option<String>, String)> = None;
-        let mut current_assistant: Option<(String, String)> = None;
-
-        for entry in &self.messages {
-            match entry {
-                ChatEntry::User { text, message_id } => {
-                    if let Some((user_id, user_text)) = current_user.take()
-                        && let Some(item) = Self::fork_turn_item(
-                            turns.len() + 1,
-                            user_id,
-                            user_text,
-                            current_assistant.take(),
-                        )
-                    {
-                        turns.push(item);
-                    }
-                    current_user = Some((message_id.clone(), text.clone()));
-                    current_assistant = None;
-                }
-                ChatEntry::Assistant {
-                    content,
-                    message_id,
-                    ..
-                } => {
-                    if let Some(id) = message_id.clone() {
-                        current_assistant = Some((id, content.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if let Some((user_id, user_text)) = current_user.take()
-            && let Some(item) = Self::fork_turn_item(
-                turns.len() + 1,
-                user_id,
-                user_text,
-                current_assistant.take(),
-            )
-        {
-            turns.push(item);
-        }
-
-        turns
-    }
-
-    fn fork_turn_item(
-        turn_index: usize,
-        user_id: Option<String>,
-        user_text: String,
-        assistant: Option<(String, String)>,
-    ) -> Option<ForkTurnItem> {
-        let (message_id, boundary_kind, assistant_preview) = match assistant {
-            Some((assistant_id, assistant_text)) => (
-                Some(assistant_id),
-                ForkBoundaryKind::Assistant,
-                assistant_text,
-            ),
-            None => (user_id, ForkBoundaryKind::User, String::new()),
-        };
-
-        let message_id = message_id.filter(|message_id| !message_id.is_empty())?;
-
-        Some(ForkTurnItem {
-            turn_index,
-            message_id,
-            boundary_kind,
-            user_preview: user_text,
-            assistant_preview,
-        })
-    }
-
-    pub fn filtered_fork_turns(&self) -> Vec<ForkTurnItem> {
-        let query = self.fork_filter.trim().to_lowercase();
-        self.forkable_turns()
-            .into_iter()
-            .filter(|turn| {
-                query.is_empty()
-                    || turn.user_preview.to_lowercase().contains(&query)
-                    || turn.assistant_preview.to_lowercase().contains(&query)
-            })
-            .collect()
-    }
-
-    pub fn visible_fork_turns(&self) -> Vec<ForkTurnItem> {
-        self.filtered_fork_turns().into_iter().rev().collect()
-    }
-
-    pub fn latest_fork_boundary(&self) -> Option<ForkTurnItem> {
-        if self.is_turn_active() {
-            None
-        } else {
-            self.forkable_turns().into_iter().last()
-        }
-    }
-
     pub fn open_fork_turn_popup(&mut self) {
         self.navigation.popup = Popup::ForkTurnSelect;
-        self.fork_filter.clear();
-        self.fork_cursor = 0;
-    }
-
-    pub fn move_fork_cursor(&mut self, delta: isize) {
-        self.fork_cursor =
-            move_wrapping_cursor(self.fork_cursor, self.visible_fork_turns().len(), delta);
-    }
-
-    pub fn fork_filter_insert(&mut self, c: char) {
-        self.fork_filter.push(c);
-        self.fork_cursor = 0;
-    }
-
-    pub fn fork_filter_backspace(&mut self) {
-        self.fork_filter.pop();
-        self.fork_cursor = 0;
-    }
-
-    pub fn selected_fork_turn(&self) -> Option<ForkTurnItem> {
-        self.visible_fork_turns().get(self.fork_cursor).cloned()
+        self.chat.reset_fork_selector();
     }
 
     pub fn push_pending_prompt(&mut self, text: String) -> String {
-        self.pending_prompt_seq = self.pending_prompt_seq.saturating_add(1);
-        let local_id = format!("local:pending:{}", self.pending_prompt_seq);
-        self.messages.push(ChatEntry::User {
-            text,
-            message_id: Some(local_id.clone()),
-        });
+        let local_id = self.chat.push_pending_prompt(text);
         self.card_cache.invalidate();
-        self.scroll_offset = 0;
         local_id
     }
 
-    pub fn input_blocked_by_activity(&self) -> bool {
-        self.elicitation.is_some()
-            || self.has_pending_session_op()
-            || self.pending_cancel_confirm_until.is_some()
-    }
-
-    pub fn should_hide_input_contents(&self) -> bool {
-        self.input_blocked_by_activity()
-    }
-
-    pub fn activity_status_text(&self) -> Option<String> {
-        match &self.activity {
-            ActivityState::Idle => None,
-            ActivityState::Thinking => Some("thinking...".into()),
-            ActivityState::Streaming => Some("streaming...".into()),
-            ActivityState::RunningTool { name } => Some(format!("tool: {name}")),
-            ActivityState::Compacting { token_estimate } => {
-                Some(format!("compacting context (~{token_estimate} tokens)"))
-            }
-            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing...".into()),
-            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing...".into()),
-        }
-    }
-
     pub fn refresh_transient_status(&mut self) {
-        if self.pending_cancel_confirm_until.is_some() {
+        if self.chat.pending_cancel_confirm_until.is_some() {
             return;
         }
-        if self.elicitation.is_some() {
+        if self.chat.elicitation.is_some() {
             self.set_status(
                 LogLevel::Debug,
                 "elicitation",
                 "question - answer in the panel above input",
             );
-        } else if let Some(activity_status) = self.activity_status_text() {
+        } else if let Some(activity_status) = self.chat.activity_status_text() {
             self.set_status(LogLevel::Debug, "activity", activity_status);
         } else if self.connection.conn == ConnState::Connected {
             self.set_status(LogLevel::Debug, "activity", "ready");
@@ -694,72 +411,30 @@ impl App {
     }
 
     pub fn clear_expired_cancel_confirm(&mut self) {
-        if self.pending_cancel_confirm_until.is_some() && !self.cancel_confirm_active() {
-            self.clear_cancel_confirm();
+        if self.chat.clear_expired_cancel_confirm() {
             self.refresh_transient_status();
         }
     }
 
-    pub fn begin_llm_request_span(&mut self, timestamp: Option<i64>) {
-        if self.session_stats.open_llm_request_ts.is_none() {
-            self.session_stats.open_llm_request_ts = timestamp;
-            self.session_stats.open_llm_request_instant = Some(Instant::now());
-        }
-    }
-
-    pub fn end_llm_request_span(&mut self, timestamp: Option<i64>) {
-        let duration = match (self.session_stats.open_llm_request_ts, timestamp) {
-            (Some(started), Some(ended)) if ended >= started => {
-                Some(Duration::from_secs((ended - started) as u64))
-            }
-            _ => self
-                .session_stats
-                .open_llm_request_instant
-                .map(|started| started.elapsed()),
-        };
-        if let Some(duration) = duration {
-            self.session_stats.active_llm_duration += duration;
-        }
-        self.session_stats.open_llm_request_ts = None;
-        self.session_stats.open_llm_request_instant = None;
-    }
-
     pub fn apply_event_stats(&mut self, kind: &EventKind, timestamp: Option<i64>) {
         match kind {
-            EventKind::ToolCallStart { .. } => {
-                self.session_stats.total_tool_calls =
-                    self.session_stats.total_tool_calls.saturating_add(1);
-            }
-            EventKind::LlmRequestStart { .. } => {
-                self.begin_llm_request_span(timestamp);
-            }
+            EventKind::ToolCallStart { .. } => self.chat.record_tool_call(),
+            EventKind::LlmRequestStart { .. } => self.chat.begin_llm_request_span(timestamp),
             EventKind::LlmRequestEnd { context_tokens, .. } => {
-                self.end_llm_request_span(timestamp);
-                if let Some(ctx) = context_tokens {
-                    self.session_stats.latest_context_tokens = Some(*ctx);
+                self.chat.end_llm_request_span(timestamp);
+                if let Some(context_tokens) = context_tokens {
+                    self.chat.record_context_tokens(*context_tokens);
                 }
             }
             EventKind::Cancelled | EventKind::Error { .. } => {
-                self.end_llm_request_span(timestamp);
+                self.chat.end_llm_request_span(timestamp);
             }
             _ => {}
         }
     }
 
-    pub fn llm_request_elapsed(&self) -> Option<Duration> {
-        let mut elapsed = self.session_stats.active_llm_duration;
-        if let Some(started) = self.session_stats.open_llm_request_instant {
-            elapsed += started.elapsed();
-        }
-        if elapsed.is_zero() {
-            None
-        } else {
-            Some(elapsed)
-        }
-    }
-
     pub fn handle_connection_event(&mut self, event: ConnectionEvent) {
-        self.clear_cancel_confirm();
+        self.chat.clear_cancel_confirm();
         match event {
             ConnectionEvent::Connecting { attempt, delay_ms } => {
                 self.connection.apply_connecting(attempt, delay_ms);
@@ -795,161 +470,9 @@ impl App {
         }
     }
 
-    pub fn has_pending_undo(&self) -> bool {
-        self.undo_state
-            .as_ref()
-            .map(|state| {
-                state
-                    .stack
-                    .iter()
-                    .any(|frame| frame.status == UndoFrameStatus::Pending)
-            })
-            .unwrap_or(false)
-    }
-
-    pub fn pending_session_label(&self) -> Option<&'static str> {
-        match self.activity {
-            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing"),
-            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing"),
-            _ => None,
-        }
-    }
-
-    pub fn current_undo_target(&self) -> Option<&UndoableTurn> {
-        let frontier_message_id = self
-            .undo_state
-            .as_ref()
-            .and_then(|state| state.frontier_message_id.as_deref());
-
-        let mut start_index = self.undoable_turns.len();
-        if let Some(frontier_message_id) = frontier_message_id
-            && let Some(frontier_index) = self
-                .undoable_turns
-                .iter()
-                .position(|turn| turn.message_id == frontier_message_id)
-        {
-            start_index = frontier_index;
-        }
-
-        self.undoable_turns[..start_index]
-            .iter()
-            .rev()
-            .find(|turn| !turn.message_id.is_empty())
-    }
-
-    pub fn can_redo(&self) -> bool {
-        self.undo_state
-            .as_ref()
-            .map(|state| !state.stack.is_empty())
-            .unwrap_or(false)
-    }
-
-    pub fn push_pending_undo(&mut self, turn: &UndoableTurn) {
-        let mut stack = self
-            .undo_state
-            .as_ref()
-            .map(|state| state.stack.clone())
-            .unwrap_or_default();
-        stack.push(UndoFrame {
-            turn_id: turn.turn_id.clone(),
-            message_id: turn.message_id.clone(),
-            status: UndoFrameStatus::Pending,
-            reverted_files: Vec::new(),
-        });
-        self.undo_state = Some(UndoState {
-            stack,
-            frontier_message_id: Some(turn.message_id.clone()),
-        });
-    }
-
-    pub fn build_undo_state_from_server_stack(
-        &self,
-        undo_stack: &UndoStackSnapshot,
-        preferred_frontier_message_id: Option<&str>,
-        reverted_files: Option<&[String]>,
-    ) -> Option<UndoState> {
-        if undo_stack.message_ids.is_empty() {
-            return None;
-        }
-
-        let previous_state = self.undo_state.as_ref();
-        let mut previous_by_message_id = std::collections::HashMap::new();
-        if let Some(previous_state) = previous_state {
-            for frame in &previous_state.stack {
-                previous_by_message_id.insert(frame.message_id.clone(), frame.clone());
-            }
-        }
-
-        let stack: Vec<UndoFrame> = undo_stack
-            .message_ids
-            .iter()
-            .map(|message_id| {
-                let previous = previous_by_message_id.get(message_id);
-                let reverted_files = if preferred_frontier_message_id == Some(message_id.as_str()) {
-                    reverted_files
-                        .map(|files| files.to_vec())
-                        .or_else(|| previous.map(|frame| frame.reverted_files.clone()))
-                        .unwrap_or_default()
-                } else {
-                    previous
-                        .map(|frame| frame.reverted_files.clone())
-                        .unwrap_or_default()
-                };
-                let turn_id = previous
-                    .map(|frame| frame.turn_id.clone())
-                    .or_else(|| {
-                        self.undoable_turns
-                            .iter()
-                            .find(|turn| turn.message_id == *message_id)
-                            .map(|turn| turn.turn_id.clone())
-                    })
-                    .unwrap_or_else(|| message_id.clone());
-                UndoFrame {
-                    turn_id,
-                    message_id: message_id.clone(),
-                    status: UndoFrameStatus::Confirmed,
-                    reverted_files,
-                }
-            })
-            .collect();
-
-        let has_message = |message_id: Option<&str>| {
-            message_id
-                .map(|message_id| stack.iter().any(|frame| frame.message_id == message_id))
-                .unwrap_or(false)
-        };
-
-        let frontier_message_id = if has_message(preferred_frontier_message_id) {
-            preferred_frontier_message_id.map(ToOwned::to_owned)
-        } else if has_message(previous_state.and_then(|state| state.frontier_message_id.as_deref()))
-        {
-            previous_state.and_then(|state| state.frontier_message_id.clone())
-        } else {
-            stack.last().map(|frame| frame.message_id.clone())
-        };
-
-        Some(UndoState {
-            stack,
-            frontier_message_id,
-        })
-    }
-
     /// Mark the pending elicitation chat card with an outcome and clear the active state.
     pub fn resolve_elicitation(&mut self, elicitation_id: &str, outcome: &str) {
-        for entry in &mut self.messages {
-            if let ChatEntry::Elicitation {
-                elicitation_id: eid,
-                outcome: out,
-                ..
-            } = entry
-                && eid == elicitation_id
-            {
-                *out = Some(outcome.to_string());
-                break;
-            }
-        }
-        self.elicitation = None;
-        self.elicitation_ui = None;
+        self.chat.resolve_elicitation(elicitation_id, outcome);
         self.card_cache.invalidate();
         self.refresh_transient_status();
     }
@@ -1003,6 +526,8 @@ impl App {
 
 #[cfg(test)]
 mod reasoning_effort_tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::domain::activity::SessionActivity;
     use crate::domain::session::{SessionGroup, SessionSummary};
@@ -1663,9 +1188,15 @@ mod session_mode_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::connection_state::ServerState;
-    use crate::domain::chat::OUTCOME_BULLET;
+    use crate::domain::activity::{ActivityState, SessionOp};
+    use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+    use crate::domain::session::{
+        ForkBoundaryKind, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState, UndoableTurn,
+    };
 
     fn make_turn(message_id: &str) -> UndoableTurn {
         UndoableTurn {
@@ -1684,7 +1215,7 @@ mod tests {
     #[test]
     fn fork_boundary_derivation_uses_last_assistant_then_user_fallback() {
         let mut app = App::new();
-        app.messages = vec![
+        app.chat.messages = vec![
             ChatEntry::User {
                 text: "first prompt".into(),
                 message_id: Some("user-1".into()),
@@ -1705,7 +1236,7 @@ mod tests {
             },
         ];
 
-        let turns = app.forkable_turns();
+        let turns = app.chat.forkable_turns();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].message_id, "asst-1b");
         assert_eq!(turns[0].boundary_kind, ForkBoundaryKind::Assistant);
@@ -1716,7 +1247,7 @@ mod tests {
     #[test]
     fn fork_boundary_derivation_includes_turn_when_only_assistant_has_message_id() {
         let mut app = App::new();
-        app.messages = vec![
+        app.chat.messages = vec![
             ChatEntry::User {
                 text: "first prompt".into(),
                 message_id: None,
@@ -1746,7 +1277,7 @@ mod tests {
             },
         ];
 
-        let turns = app.forkable_turns();
+        let turns = app.chat.forkable_turns();
         assert_eq!(turns.len(), 2);
 
         assert_eq!(turns[0].turn_index, 1);
@@ -1765,7 +1296,7 @@ mod tests {
     #[test]
     fn latest_fork_boundary_selects_latest_eligible_turn() {
         let mut app = App::new();
-        app.messages = vec![
+        app.chat.messages = vec![
             ChatEntry::User {
                 text: "old".into(),
                 message_id: Some("user-old".into()),
@@ -1786,26 +1317,30 @@ mod tests {
             },
         ];
 
-        let latest = app.latest_fork_boundary().expect("latest fork boundary");
+        let latest = app
+            .chat
+            .latest_fork_boundary()
+            .expect("latest fork boundary");
         assert_eq!(latest.message_id, "asst-new");
         assert_eq!(latest.boundary_kind, ForkBoundaryKind::Assistant);
 
-        app.activity = ActivityState::Streaming;
-        assert!(app.latest_fork_boundary().is_none());
+        app.chat.activity = ActivityState::Streaming;
+        assert!(app.chat.latest_fork_boundary().is_none());
     }
 
     #[test]
     fn current_undo_target_moves_left_of_frontier() {
         let mut app = App::new();
-        app.undoable_turns = vec![make_turn("msg-1"), make_turn("msg-2"), make_turn("msg-3")];
+        app.chat.undoable_turns = vec![make_turn("msg-1"), make_turn("msg-2"), make_turn("msg-3")];
 
         assert_eq!(
-            app.current_undo_target()
+            app.chat
+                .current_undo_target()
                 .map(|turn| turn.message_id.as_str()),
             Some("msg-3")
         );
 
-        app.undo_state = Some(UndoState {
+        app.chat.undo_state = Some(UndoState {
             stack: vec![UndoFrame {
                 turn_id: "turn-msg-3".into(),
                 message_id: "msg-3".into(),
@@ -1816,7 +1351,8 @@ mod tests {
         });
 
         assert_eq!(
-            app.current_undo_target()
+            app.chat
+                .current_undo_target()
                 .map(|turn| turn.message_id.as_str()),
             Some("msg-2")
         );
@@ -1825,8 +1361,8 @@ mod tests {
     #[test]
     fn build_undo_state_confirms_frames_and_preserves_frontier() {
         let mut app = App::new();
-        app.undoable_turns = vec![make_turn("msg-1"), make_turn("msg-2")];
-        app.undo_state = Some(UndoState {
+        app.chat.undoable_turns = vec![make_turn("msg-1"), make_turn("msg-2")];
+        app.chat.undo_state = Some(UndoState {
             stack: vec![UndoFrame {
                 turn_id: "turn-msg-1".into(),
                 message_id: "msg-1".into(),
@@ -1837,6 +1373,7 @@ mod tests {
         });
 
         let next = app
+            .chat
             .build_undo_state_from_server_stack(
                 &make_stack(&["msg-1", "msg-2"]),
                 Some("msg-2"),
@@ -1858,7 +1395,7 @@ mod tests {
     #[test]
     fn build_undo_state_preserves_order_previous_turn_and_unknown_fallback() {
         let mut app = App::new();
-        app.undo_state = Some(UndoState {
+        app.chat.undo_state = Some(UndoState {
             stack: vec![UndoFrame {
                 turn_id: "previous-turn".into(),
                 message_id: "msg-1".into(),
@@ -1869,6 +1406,7 @@ mod tests {
         });
 
         let state = app
+            .chat
             .build_undo_state_from_server_stack(&make_stack(&["msg-1", "unknown"]), None, None)
             .expect("undo state");
 
@@ -1884,7 +1422,8 @@ mod tests {
     fn build_undo_state_returns_none_for_empty_stack() {
         let app = App::new();
         assert_eq!(
-            app.build_undo_state_from_server_stack(&UndoStackSnapshot::default(), None, None),
+            app.chat
+                .build_undo_state_from_server_stack(&UndoStackSnapshot::default(), None, None),
             None
         );
     }
@@ -1893,21 +1432,23 @@ mod tests {
     fn pending_guard_tracks_pending_frames() {
         let mut app = App::new();
         let turn = make_turn("msg-1");
-        app.push_pending_undo(&turn);
+        app.chat.push_pending_undo(&turn);
 
-        assert!(app.has_pending_undo());
+        assert!(app.chat.has_pending_undo());
         assert_eq!(
-            app.undo_state
+            app.chat
+                .undo_state
                 .as_ref()
                 .and_then(|state| state.frontier_message_id.as_deref()),
             Some("msg-1")
         );
         assert_eq!(
-            app.undo_state.as_ref().map(|state| state.stack.len()),
+            app.chat.undo_state.as_ref().map(|state| state.stack.len()),
             Some(1)
         );
         assert_eq!(
-            app.undo_state
+            app.chat
+                .undo_state
                 .as_ref()
                 .map(|state| state.stack[0].status.clone()),
             Some(UndoFrameStatus::Pending)
@@ -1917,30 +1458,30 @@ mod tests {
     #[test]
     fn pending_session_label_stays_reserved_for_undo_and_redo() {
         let mut app = App::new();
-        app.activity = ActivityState::Compacting {
+        app.chat.activity = ActivityState::Compacting {
             token_estimate: 9_000,
         };
-        assert_eq!(app.pending_session_label(), None);
+        assert_eq!(app.chat.pending_session_label(), None);
 
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        assert_eq!(app.pending_session_label(), Some("undoing"));
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        assert_eq!(app.chat.pending_session_label(), Some("undoing"));
     }
 
     #[test]
     fn cancel_confirm_arms_expires_and_restores_status() {
         let mut app = App::new();
-        app.activity = ActivityState::Thinking;
+        app.chat.activity = ActivityState::Thinking;
 
         app.arm_cancel_confirm();
-        assert!(app.cancel_confirm_active());
+        assert!(app.chat.cancel_confirm_active());
         assert_eq!(app.diagnostics.status, "press Esc again to stop");
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "press Esc again to stop")
         );
 
-        app.pending_cancel_confirm_until = Some(Instant::now() - Duration::from_millis(1));
+        app.chat.pending_cancel_confirm_until = Some(Instant::now() - Duration::from_millis(1));
         app.clear_expired_cancel_confirm();
-        assert!(!app.cancel_confirm_active());
+        assert!(!app.chat.cancel_confirm_active());
         assert_eq!(app.diagnostics.status, "thinking...");
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "thinking...")
@@ -1956,17 +1497,17 @@ mod tests {
         assert_eq!(app.diagnostics.status, "connection lost - retrying");
 
         app.connection.conn = ConnState::Connected;
-        app.activity = ActivityState::Thinking;
+        app.chat.activity = ActivityState::Thinking;
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "thinking...");
 
-        app.activity = ActivityState::Compacting {
+        app.chat.activity = ActivityState::Compacting {
             token_estimate: 2048,
         };
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "compacting context (~2048 tokens)");
 
-        app.activity = ActivityState::SessionOp(SessionOp::Redo);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "redoing...");
     }
@@ -2007,9 +1548,12 @@ mod tests {
             Some(160),
         );
 
-        assert_eq!(app.session_stats.latest_context_tokens, Some(2048));
-        assert_eq!(app.session_stats.total_tool_calls, 1);
-        assert_eq!(app.llm_request_elapsed(), Some(Duration::from_secs(40)));
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(2048));
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
+        assert_eq!(
+            app.chat.llm_request_elapsed(),
+            Some(Duration::from_secs(40))
+        );
     }
 
     #[test]
@@ -2022,47 +1566,50 @@ mod tests {
             Some(200),
         );
         app.apply_event_stats(&EventKind::Cancelled, Some(215));
-        assert_eq!(app.llm_request_elapsed(), Some(Duration::from_secs(15)));
-        assert_eq!(app.session_stats.open_llm_request_ts, None);
-        assert_eq!(app.session_stats.open_llm_request_instant, None);
+        assert_eq!(
+            app.chat.llm_request_elapsed(),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(app.chat.session_stats.open_llm_request_ts, None);
+        assert_eq!(app.chat.session_stats.open_llm_request_instant, None);
     }
 
     #[test]
     fn activity_helpers_report_turn_and_session_state() {
         let mut app = App::new();
-        assert!(!app.is_turn_active());
-        assert!(!app.has_pending_session_op());
-        assert!(!app.input_blocked_by_activity());
-        assert!(!app.should_hide_input_contents());
-        assert_eq!(app.pending_session_label(), None);
+        assert!(!app.chat.is_turn_active());
+        assert!(!app.chat.has_pending_session_op());
+        assert!(!app.chat.input_blocked_by_activity());
+        assert!(!app.chat.should_hide_input_contents());
+        assert_eq!(app.chat.pending_session_label(), None);
 
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        assert!(!app.is_turn_active());
-        assert!(app.has_pending_session_op());
-        assert!(app.input_blocked_by_activity());
-        assert!(app.should_hide_input_contents());
-        assert_eq!(app.pending_session_label(), Some("undoing"));
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        assert!(!app.chat.is_turn_active());
+        assert!(app.chat.has_pending_session_op());
+        assert!(app.chat.input_blocked_by_activity());
+        assert!(app.chat.should_hide_input_contents());
+        assert_eq!(app.chat.pending_session_label(), Some("undoing"));
 
-        app.activity = ActivityState::SessionOp(SessionOp::Redo);
-        assert!(!app.is_turn_active());
-        assert!(app.has_pending_session_op());
-        assert!(app.input_blocked_by_activity());
-        assert!(app.should_hide_input_contents());
-        assert_eq!(app.pending_session_label(), Some("redoing"));
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        assert!(!app.chat.is_turn_active());
+        assert!(app.chat.has_pending_session_op());
+        assert!(app.chat.input_blocked_by_activity());
+        assert!(app.chat.should_hide_input_contents());
+        assert_eq!(app.chat.pending_session_label(), Some("redoing"));
 
-        app.activity = ActivityState::RunningTool {
+        app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
-        assert!(app.is_turn_active());
-        assert!(app.has_cancellable_activity());
-        assert!(!app.has_pending_session_op());
-        assert!(!app.input_blocked_by_activity());
-        assert!(!app.should_hide_input_contents());
-        assert_eq!(app.pending_session_label(), None);
+        assert!(app.chat.is_turn_active());
+        assert!(app.chat.has_cancellable_activity());
+        assert!(!app.chat.has_pending_session_op());
+        assert!(!app.chat.input_blocked_by_activity());
+        assert!(!app.chat.should_hide_input_contents());
+        assert_eq!(app.chat.pending_session_label(), None);
 
         app.arm_cancel_confirm();
-        assert!(app.input_blocked_by_activity());
-        assert!(app.should_hide_input_contents());
+        assert!(app.chat.input_blocked_by_activity());
+        assert!(app.chat.should_hide_input_contents());
     }
 
     #[test]
@@ -2078,7 +1625,7 @@ mod tests {
         assert_eq!(app.connection.conn, ConnState::Connecting);
         assert_eq!(app.connection.reconnect_attempt, 3);
         assert_eq!(app.connection.reconnect_delay_ms, Some(2000));
-        assert!(app.pending_cancel_confirm_until.is_none());
+        assert!(app.chat.pending_cancel_confirm_until.is_none());
         assert_eq!(
             app.diagnostics.status,
             "waiting for server - retry 3 in 2.0s"
@@ -2149,7 +1696,7 @@ mod tests {
                 .contains("session-1")
         );
         assert_eq!(app.composer.input, "retained prompt");
-        assert!(app.pending_cancel_confirm_until.is_none());
+        assert!(app.chat.pending_cancel_confirm_until.is_none());
         assert_eq!(app.diagnostics.status, "connection lost - socket closed");
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
@@ -2169,7 +1716,10 @@ mod tests {
             outcome: Some("responded".into()),
         }];
         let result = r#"{"answers":[{"question":"Pick one","answers":["Beta"]}]}"#;
-        backfill_elicitation_outcomes(&mut messages, result);
+        let mut chat = ChatState::new();
+        chat.messages = messages;
+        chat.backfill_elicitation_outcomes(result);
+        messages = chat.messages;
         assert!(matches!(&messages[0],
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
         ));
@@ -2184,7 +1734,10 @@ mod tests {
             outcome: Some("responded".into()),
         }];
         let result = r#"{"answers":[{"question":"Pick many","answers":["X","Z"]}]}"#;
-        backfill_elicitation_outcomes(&mut messages, result);
+        let mut chat = ChatState::new();
+        chat.messages = messages;
+        chat.backfill_elicitation_outcomes(result);
+        messages = chat.messages;
         assert!(matches!(&messages[0],
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}X\n{OUTCOME_BULLET}Z")
         ));
@@ -2207,7 +1760,10 @@ mod tests {
             },
         ];
         let result = r#"{"answers":[{"question":"Q1","answers":["Alpha"]},{"question":"Q2","answers":["Yes"]}]}"#;
-        backfill_elicitation_outcomes(&mut messages, result);
+        let mut chat = ChatState::new();
+        chat.messages = messages;
+        chat.backfill_elicitation_outcomes(result);
+        messages = chat.messages;
         assert!(matches!(&messages[0],
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Alpha")
         ));
@@ -2233,7 +1789,10 @@ mod tests {
             },
         ];
         let result = r#"{"answers":[{"question":"Q2","answers":["Beta"]}]}"#;
-        backfill_elicitation_outcomes(&mut messages, result);
+        let mut chat = ChatState::new();
+        chat.messages = messages;
+        chat.backfill_elicitation_outcomes(result);
+        messages = chat.messages;
         // First card unchanged
         assert!(matches!(&messages[0],
             ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}AlreadySet")
