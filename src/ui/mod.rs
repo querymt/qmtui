@@ -774,11 +774,11 @@ mod tests {
     fn draw_chat_shows_multi_session_badge_for_other_recent_sessions() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.session_id = Some("session-a".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("session-a".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
-        app.session_activity.insert(
+        app.sessions.session_activity.insert(
             "session-a".into(),
             SessionActivity {
                 last_event_at: Instant::now(),
@@ -793,7 +793,7 @@ mod tests {
             .collect::<String>();
         assert!(!rendered.contains(ICON_MULTI_SESSION));
 
-        app.session_activity.insert(
+        app.sessions.session_activity.insert(
             "session-b".into(),
             SessionActivity {
                 last_event_at: Instant::now(),
@@ -808,7 +808,7 @@ mod tests {
         assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 1")));
         assert!(!rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
 
-        app.session_activity.insert(
+        app.sessions.session_activity.insert(
             "session-c".into(),
             SessionActivity {
                 last_event_at: Instant::now(),
@@ -822,7 +822,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains(&format!("{ICON_MULTI_SESSION} 2")));
 
-        app.session_activity.insert(
+        app.sessions.session_activity.insert(
             "session-c".into(),
             SessionActivity {
                 last_event_at: Instant::now() - Duration::from_secs(6),
@@ -842,8 +842,8 @@ mod tests {
     fn draw_chat_shows_delegate_badge_when_entries_exist() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("s1".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
 
@@ -903,8 +903,8 @@ mod tests {
     fn draw_chat_shows_delegate_awaiting_input_badge() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("s1".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
         app.delegate_entries = vec![DelegateEntry {
@@ -946,8 +946,8 @@ mod tests {
 
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("s1".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
         app.delegate_entries = vec![DelegateEntry {
@@ -977,8 +977,8 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
-        app.session_id = Some("parent".into());
+        app.sessions.session_popup_tab = 1;
+        app.sessions.session_id = Some("parent".into());
         app.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -1040,7 +1040,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
+        app.sessions.session_popup_tab = 1;
         app.delegate_cursor = 1;
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
@@ -1088,7 +1088,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
+        app.sessions.session_popup_tab = 1;
         app.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -1155,7 +1155,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
+        app.sessions.session_popup_tab = 1;
         app.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
@@ -1197,7 +1197,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
+        app.sessions.session_popup_tab = 1;
         app.delegate_cursor = 0; // keep first row selected; failed row remains unselected
         app.delegate_entries = vec![
             DelegateEntry {
@@ -1245,7 +1245,7 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
+        app.sessions.session_popup_tab = 1;
         app.delegate_cursor = 1;
         app.delegate_entries = vec![
             DelegateEntry {
@@ -1331,8 +1331,8 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
-        app.session_popup_tab = 1;
-        app.session_id = Some("parent".into());
+        app.sessions.session_popup_tab = 1;
+        app.sessions.session_id = Some("parent".into());
         app.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
@@ -1387,7 +1387,7 @@ mod tests {
 
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "delegate".into(),
@@ -1522,7 +1522,7 @@ mod tests {
     fn delegate_tool_call_shows_awaiting_input_marker() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "delegate".into(),
@@ -1566,7 +1566,7 @@ mod tests {
     fn draw_chat_preserves_hard_line_breaks_in_input() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.input = "alpha\nbeta".into();
         app.input_cursor = app.input.len();
 
@@ -1588,7 +1588,7 @@ mod tests {
     fn draw_chat_places_cursor_on_next_row_after_newline() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.input = "alpha\nbeta".into();
         app.input_cursor = "alpha\n".len();
 
@@ -1634,7 +1634,7 @@ mod tests {
     fn draw_chat_does_not_panic_with_empty_elicitation_fields() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.elicitation = Some(ElicitationState::new_for_test(vec![]));
         app.elicitation_ui = Some(ElicitationUiState::default());
 
@@ -1645,7 +1645,7 @@ mod tests {
     fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         let mut state = ElicitationState::new_for_test(vec![ElicitationField {
             name: "choice".into(),
             title: "Choice".into(),
@@ -1747,7 +1747,7 @@ mod tests {
     fn draw_delegate_view_shows_elicitation_popup_and_input_hint() {
         let mut app = App::new();
         app.navigation.screen = Screen::Delegate;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.messages.push(ChatEntry::Assistant {
             content: "Delegate context".into(),
             thinking: None,
@@ -1801,7 +1801,7 @@ mod tests {
     fn draw_delegate_view_without_elicitation_remains_read_only() {
         let mut app = App::new();
         app.navigation.screen = Screen::Delegate;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.messages.push(ChatEntry::Assistant {
             content: "Read-only child output".into(),
             thinking: None,
@@ -1829,8 +1829,8 @@ mod tests {
     fn draw_session_popup_shows_active_marker_for_current_session() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.session_id = Some("s2".into());
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.session_id = Some("s2".into());
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1850,8 +1850,8 @@ mod tests {
     fn draw_session_popup_highlights_active_session_id() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.session_id = Some("s2".into());
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.session_id = Some("s2".into());
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1870,9 +1870,9 @@ mod tests {
     fn draw_session_popup_shows_fork_count_marker() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.session_groups[0].sessions[0].fork_count = 3;
-        app.session_cursor = 1;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.sessions.session_groups[0].sessions[0].fork_count = 3;
+        app.sessions.session_cursor = 1;
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1898,11 +1898,11 @@ mod tests {
     fn draw_session_popup_truncates_long_titles_with_unicode_ellipsis() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.session_groups = vec![make_group(Some("/a"), &["session-12345678"])];
-        app.session_groups[0].sessions[0].title =
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["session-12345678"])];
+        app.sessions.session_groups[0].sessions[0].title =
             Some("This is a very long session title that should truncate in the popup".into());
-        app.session_groups[0].sessions[0].updated_at = Some("2026-03-20T14:30:00Z".into());
-        app.session_cursor = 1;
+        app.sessions.session_groups[0].sessions[0].updated_at = Some("2026-03-20T14:30:00Z".into());
+        app.sessions.session_cursor = 1;
 
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2032,7 +2032,7 @@ mod tests {
     fn draw_model_popup_groups_models_by_provider() {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.models.model_popup_agent_tab = 0;
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
@@ -2110,7 +2110,7 @@ mod tests {
     fn draw_model_popup_live_marker_uses_status_accent_on_session_tab() {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.models.model_popup_agent_tab = 0;
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
@@ -2159,7 +2159,7 @@ mod tests {
     fn draw_model_popup_marks_only_remote_live_row_when_duplicates() {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.models.model_popup_agent_tab = 0;
         app.models.current_provider = Some("codex".into());
         app.models.current_model = Some("gpt-5".into());
@@ -2343,7 +2343,7 @@ mod tests {
     fn draw_model_popup_shows_current_mode_model_on_short_terminal() {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.agent_mode = "build".into();
+        app.sessions.agent_mode = "build".into();
         app.models.models = (0..12)
             .map(|i| ModelEntry {
                 id: format!("anthropic/model-{i}"),
@@ -2477,9 +2477,9 @@ mod tests {
     fn draw_new_session_popup_shows_compact_default_cwd_hint() {
         let mut app = App::new();
         app.navigation.popup = Popup::NewSession;
-        app.new_session_path = "/launch".into();
-        app.new_session_cursor = app.new_session_path.len();
-        app.new_session_completion = Some(crate::app::PathCompletionState {
+        app.sessions.new_session_path = "/launch".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
+        app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
             query: "/launch".into(),
             selected_index: 0,
             results: vec![crate::app::FileIndexEntryLite {
@@ -2859,7 +2859,7 @@ mod tests {
     #[test]
     fn late_failed_tool_end_updates_cached_tool_card_without_appending_badge() {
         let mut app = App::new();
-        app.session_id = Some("test-session".into());
+        app.sessions.session_id = Some("test-session".into());
         live_update(
             &mut app,
             "test-session",
@@ -2896,7 +2896,7 @@ mod tests {
     #[test]
     fn warm_shell_tool_card_rebuilds_with_output_tail_after_native_end_update() {
         let mut app = App::new();
-        app.session_id = Some("test-session".into());
+        app.sessions.session_id = Some("test-session".into());
         live_update(
             &mut app,
             "test-session",
@@ -2949,7 +2949,7 @@ mod tests {
     #[test]
     fn warm_edit_tool_card_rebuilds_with_start_line_after_native_end_update() {
         let mut app = App::new();
-        app.session_id = Some("test-session".into());
+        app.sessions.session_id = Some("test-session".into());
         live_update(
             &mut app,
             "test-session",
@@ -3004,7 +3004,7 @@ mod tests {
     #[test]
     fn failed_tool_end_before_start_reconciles_badge_without_stale_bottom_entry() {
         let mut app = App::new();
-        app.session_id = Some("test-session".into());
+        app.sessions.session_id = Some("test-session".into());
         for update in [
             assistant_update("older assistant", "assistant-old"),
             failed_tool_end("tool-out-of-order", "shell"),
@@ -3162,7 +3162,7 @@ mod tests {
     #[test]
     fn child_session_group_replays_elicitation_as_durable_card() {
         let mut app = App::new();
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_groups = vec![SessionGroup {
             cwd: None,
             sessions: vec![SessionSummary {
                 session_id: "child-1".into(),
@@ -3953,7 +3953,7 @@ mod tests {
 
     // ── start-page session list row builder ───────────────────────────────────
 
-    use crate::app::StartPageItem;
+    use crate::session_state::StartPageItem;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -3997,7 +3997,7 @@ mod tests {
     #[test]
     fn start_page_rows_single_expanded_group() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         let rows = build_start_page_rows(&app, 80);
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0].item, StartPageItem::GroupHeader { .. }));
@@ -4009,8 +4009,8 @@ mod tests {
     #[test]
     fn start_page_rows_collapsed_group_shows_only_header() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.collapsed_groups.insert("/a".to_string());
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.collapsed_groups.insert("/a".to_string());
         let rows = build_start_page_rows(&app, 80);
         assert_eq!(rows.len(), 1);
         assert!(matches!(
@@ -4026,8 +4026,8 @@ mod tests {
     #[test]
     fn start_page_rows_selected_flag_matches_cursor() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.session_cursor = 1; // points at first session row (index 1)
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.session_cursor = 1; // points at first session row (index 1)
         let rows = build_start_page_rows(&app, 80);
         assert!(!rows[0].selected); // header not selected
         assert!(rows[1].selected); // first session selected
@@ -4038,7 +4038,7 @@ mod tests {
     #[test]
     fn start_page_rows_header_contains_cwd() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1"])];
+        app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1"])];
         let rows = build_start_page_rows(&app, 80);
         // The header line should contain the cwd somewhere in its text
         let header_text = rows[0]
@@ -4056,8 +4056,8 @@ mod tests {
     #[test]
     fn start_page_rows_header_uses_loaded_total_count() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
-        app.session_groups[0].total_count = Some(5);
+        app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
+        app.sessions.session_groups[0].total_count = Some(5);
         let rows = build_start_page_rows(&app, 80);
         let header_text = row_text(&rows[0]);
 
@@ -4067,8 +4067,8 @@ mod tests {
     #[test]
     fn start_page_rows_header_uses_loaded_count_when_total_unknown() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
-        app.session_groups[0].total_count = None;
+        app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
+        app.sessions.session_groups[0].total_count = None;
         let rows = build_start_page_rows(&app, 80);
         let header_text = row_text(&rows[0]);
 
@@ -4080,7 +4080,7 @@ mod tests {
     #[test]
     fn start_page_rows_session_contains_id() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
         let rows = build_start_page_rows(&app, 80);
         let session_text = rows[1]
             .line
@@ -4097,8 +4097,8 @@ mod tests {
     #[test]
     fn start_page_rows_session_shows_fork_count_marker() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
-        app.session_groups[0].sessions[0].fork_count = 3;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
+        app.sessions.session_groups[0].sessions[0].fork_count = 3;
 
         let rows = build_start_page_rows(&app, 80);
         let session_text = row_text(&rows[1]);
@@ -4128,7 +4128,7 @@ mod tests {
     #[test]
     fn start_page_rows_session_hides_zero_fork_count_marker() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
 
         let rows = build_start_page_rows(&app, 80);
         let session_text = row_text(&rows[1]);
@@ -4143,8 +4143,8 @@ mod tests {
     #[test]
     fn start_page_rows_collapsed_indicator_present() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.collapsed_groups.insert("/a".to_string());
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.sessions.collapsed_groups.insert("/a".to_string());
         let rows = build_start_page_rows(&app, 80);
         let text = rows[0]
             .line
@@ -4162,7 +4162,7 @@ mod tests {
     #[test]
     fn start_page_rows_expanded_indicator_present() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         // not collapsed
         let rows = build_start_page_rows(&app, 80);
         let text = rows[0]
@@ -4180,7 +4180,7 @@ mod tests {
     #[test]
     fn start_page_show_more_row_uses_show_all_label_not_load_more() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
         let rows = build_start_page_rows(&app, 80);
         let text = row_text(rows.last().expect("missing show more row"));
 

@@ -7,7 +7,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, session_group_count_text};
+use crate::app::App;
 use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::DelegateStats;
@@ -15,6 +15,7 @@ use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::ProfileInfo;
 use crate::models_state::ModelPopupItem;
+use crate::session_state::session_group_count_text;
 use crate::theme::Theme;
 
 use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
@@ -403,7 +404,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
     let tab_labels = ["sessions", "delegates"];
     let mut tab_spans = Vec::new();
     for (i, label) in tab_labels.iter().enumerate() {
-        let is_active = i == app.session_popup_tab;
+        let is_active = i == app.sessions.session_popup_tab;
         let style = if is_active {
             Theme::popup_title().add_modifier(Modifier::UNDERLINED)
         } else {
@@ -419,7 +420,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
         chunks[0],
     );
 
-    if app.session_popup_tab == 0 {
+    if app.sessions.session_popup_tab == 0 {
         draw_session_tab_content(f, app, &chunks);
     } else {
         draw_delegate_tab_content(f, app, &chunks);
@@ -427,12 +428,15 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
-    use crate::app::PopupItem;
+    use crate::session_state::PopupItem;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (session_filter_display, session_filter_cur) =
-        scroll_input(&app.session_filter, app.session_filter.len(), avail);
+    let (session_filter_display, session_filter_cur) = scroll_input(
+        &app.sessions.session_filter,
+        app.sessions.session_filter.len(),
+        avail,
+    );
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(session_filter_display, Theme::popup_bg()),
@@ -444,16 +448,16 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
     f.set_cursor_position((chunks[1].x + 2 + session_filter_cur as u16, chunks[1].y));
 
     // grouped session list
-    let popup_items = app.visible_popup_items();
+    let popup_items = app.sessions.visible_popup_items();
     let list_w = chunks[3].width as usize;
     let visible_rows = chunks[3].height as usize;
-    app.session_popup_visible_rows = visible_rows;
+    app.sessions.session_popup_visible_rows = visible_rows;
 
     let items: Vec<ListItem> = popup_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let selected = i == app.session_cursor;
+            let selected = i == app.sessions.session_cursor;
             match item {
                 PopupItem::GroupHeader {
                     cwd,
@@ -485,7 +489,7 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     path,
                     depth,
                 } => {
-                    let Some(s) = app.session_by_path(*group_idx, path) else {
+                    let Some(s) = app.sessions.session_by_path(*group_idx, path) else {
                         return ListItem::new(Line::from(""));
                     };
                     let id_short: String = s.session_id.chars().take(8).collect();
@@ -496,7 +500,8 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                         .unwrap_or_default();
                     let title = s.title.as_deref().unwrap_or("(untitled)");
 
-                    let is_active = app.session_id.as_deref() == Some(s.session_id.as_str());
+                    let is_active =
+                        app.sessions.session_id.as_deref() == Some(s.session_id.as_str());
                     let is_parent = app.parent_session_id.as_deref() == Some(s.session_id.as_str());
                     let marker_part = if is_active {
                         " ● "
@@ -507,8 +512,12 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     };
                     let indent = "  ".repeat(*depth);
                     let id_part = format!(" {indent}{id_short} ");
-                    let fork_marker = if app.expandable_root_session(*group_idx, path) {
-                        let indicator = if app.expanded_session_children.contains(&s.session_id) {
+                    let fork_marker = if app.sessions.expandable_root_session(*group_idx, path) {
+                        let indicator = if app
+                            .sessions
+                            .expanded_session_children
+                            .contains(&s.session_id)
+                        {
                             COLLAPSE_OPEN
                         } else {
                             COLLAPSE_CLOSED
@@ -585,11 +594,12 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
     let offset = app
+        .sessions
         .session_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
-        .with_selected(Some(app.session_cursor));
+        .with_selected(Some(app.sessions.session_cursor));
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
@@ -727,7 +737,8 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
                     entry.objective.clone()
                 };
 
-                let is_current = entry.child_session_id.as_deref() == app.session_id.as_deref();
+                let is_current =
+                    entry.child_session_id.as_deref() == app.sessions.session_id.as_deref();
                 let duration = entry
                     .started_at
                     .map(|start| {
@@ -1239,6 +1250,7 @@ pub(super) fn draw_profile_popup(f: &mut Frame, app: &App) {
 pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
     let area = f.area();
     let show_completion = app
+        .sessions
         .new_session_completion
         .as_ref()
         .map(|completion| !completion.results.is_empty())
@@ -1289,8 +1301,11 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
         chunks[1],
     );
     let avail = chunks[2].width.saturating_sub(2) as usize;
-    let (path_display, path_cur) =
-        scroll_input(&app.new_session_path, app.new_session_cursor, avail);
+    let (path_display, path_cur) = scroll_input(
+        &app.sessions.new_session_path,
+        app.sessions.new_session_cursor,
+        avail,
+    );
     let input_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(path_display, Theme::popup_bg()),
@@ -1301,7 +1316,7 @@ pub(super) fn draw_new_session_popup(f: &mut Frame, app: &App) {
     );
     f.set_cursor_position((chunks[2].x + 2 + path_cur as u16, chunks[2].y));
 
-    if let Some(completion) = &app.new_session_completion
+    if let Some(completion) = &app.sessions.new_session_completion
         && !completion.results.is_empty()
     {
         let items: Vec<ListItem> = completion
@@ -3063,7 +3078,7 @@ mod tests {
             profile("other", "Other"),
         ];
         app.profiles.active_profile_id = Some("active".into());
-        app.session_id = Some("session".into());
+        app.sessions.session_id = Some("session".into());
         app.profiles
             .bind_session_profile("session".into(), "active".into());
         app.profiles.profile_filter = "selected".into();
@@ -3088,7 +3103,7 @@ mod tests {
         let mut app = App::new();
         app.profiles.profiles = vec![profile("active", "Active"), profile("current", "Current")];
         app.profiles.active_profile_id = Some("active".into());
-        app.session_id = Some("session".into());
+        app.sessions.session_id = Some("session".into());
         app.profiles
             .bind_session_profile("session".into(), "current".into());
 

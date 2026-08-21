@@ -21,6 +21,7 @@ mod protocol;
 pub mod runtime;
 mod server_manager;
 mod session;
+mod session_state;
 mod slash;
 mod theme;
 mod themes_gen;

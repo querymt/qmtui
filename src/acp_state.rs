@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::acp_client::DelegateModelOverrideInfo;
-use crate::app::POPUP_SESSION_PAGE_TARGET;
 use crate::command::{Command, SessionListRequest};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{
@@ -20,8 +19,7 @@ use crate::domain::mesh::{
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
-    ForkResult, RedoResult, SessionGroup, SessionListPage, SessionSummary, UndoResult,
-    UndoStackSnapshot, UndoableTurn,
+    ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot, UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
 use crate::navigation_state::{Popup, Screen};
@@ -199,7 +197,7 @@ impl crate::app::App {
                 if !profiles.is_empty() {
                     self.apply_profile_catalog(profiles, active_profile_id);
                 }
-                self.agent_id = Some(agent_id.clone());
+                self.sessions.agent_id = Some(agent_id.clone());
                 self.models.initialize_primary_agent(AgentInfo {
                     id: agent_id,
                     name: agent_name,
@@ -207,10 +205,7 @@ impl crate::app::App {
                     capabilities: Vec::new(),
                 });
                 if let Some(mode) = agent_mode {
-                    self.agent_mode = mode;
-                    if self.agent_mode != "review" {
-                        self.mode_before_review = None;
-                    }
+                    self.sessions.replace_agent_mode(mode);
                 }
                 if let Some(effort) = reasoning_effort {
                     self.models.reasoning_effort = effort;
@@ -220,10 +215,7 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::AgentMode { mode } => {
-                self.agent_mode = mode;
-                if self.agent_mode != "review" {
-                    self.mode_before_review = None;
-                }
+                self.sessions.replace_agent_mode(mode);
                 vec![]
             }
             AcpAppEvent::ReasoningEffort { reasoning_effort } => {
@@ -243,7 +235,7 @@ impl crate::app::App {
                     self.models.replace_profile_agents(profile_id, agents);
                     if self.parent_session_id.is_none()
                         && let (Some(session_id), Some(profile_id)) = (
-                            self.session_id.as_deref(),
+                            self.sessions.session_id.as_deref(),
                             self.models.agents_profile_id.as_deref(),
                         )
                     {
@@ -378,11 +370,11 @@ impl crate::app::App {
                         self.streaming_content_message_id = None;
                         self.streaming_cache.invalidate();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
-                        if let Some(ref sid) = self.session_id {
+                        if let Some(ref sid) = self.sessions.session_id {
                             return Command::load_session_commands(
                                 sid.clone(),
                                 self.current_session_cwd(),
-                                self.agent_id.clone(),
+                                self.sessions.agent_id.clone(),
                             )
                             .into();
                         }
@@ -415,11 +407,11 @@ impl crate::app::App {
                         self.undo_state =
                             self.build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(LogLevel::Info, "session", "redone - reloading session");
-                        if let Some(ref sid) = self.session_id {
+                        if let Some(ref sid) = self.sessions.session_id {
                             return Command::load_session_commands(
                                 sid.clone(),
                                 self.current_session_cwd(),
-                                self.agent_id.clone(),
+                                self.sessions.agent_id.clone(),
                             )
                             .into();
                         }
@@ -449,7 +441,7 @@ impl crate::app::App {
                         return Command::load_session_commands(
                             forked_session_id,
                             self.current_session_cwd(),
-                            self.agent_id.clone(),
+                            self.sessions.agent_id.clone(),
                         )
                         .into();
                     }
@@ -481,7 +473,7 @@ impl crate::app::App {
                 session_id,
                 updates,
             } => {
-                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                if self.sessions.session_id.as_deref() == Some(session_id.as_str()) {
                     for update in updates {
                         self.apply_acp_delegation_update(update);
                     }
@@ -587,163 +579,40 @@ impl crate::app::App {
         page: SessionListPage,
     ) -> Vec<Command> {
         let SessionListPage {
-            mut groups,
+            groups,
             next_cursor,
             total_count: _,
         } = page;
-        for group in &mut groups {
-            group.total_count = None;
-            for session in &group.sessions {
-                if let Some(node_id) = session
-                    .node_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                {
-                    self.remember_remote_session_location(
-                        &session.session_id,
-                        node_id,
-                        session.cwd.clone(),
-                    );
-                }
-            }
-            group.sessions.sort_by(|a, b| {
-                b.updated_at
-                    .cmp(&a.updated_at)
-                    .then_with(|| b.session_id.cmp(&a.session_id))
-            });
-            group.latest_activity = group
-                .sessions
-                .first()
-                .and_then(|session| session.updated_at.clone());
-        }
-
-        let mut commands = Vec::new();
         match request {
             SessionListRequest::Discovery => {
-                self.session_discovery_in_progress = false;
-                for mut group in groups {
-                    group.next_cursor = None;
-                    match group.cwd.clone() {
-                        Some(cwd) => {
-                            let hydrated = self.hydrated_session_groups.contains(&cwd);
-                            if let Some(existing) = self
-                                .session_groups
-                                .iter_mut()
-                                .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
-                            {
-                                if !hydrated {
-                                    merge_session_page(
-                                        existing,
-                                        group.sessions,
-                                        Some(POPUP_SESSION_PAGE_TARGET),
-                                    );
-                                }
-                            } else {
-                                group.sessions.truncate(POPUP_SESSION_PAGE_TARGET);
-                                self.session_groups.push(group);
-                            }
-
-                            if !hydrated
-                                && self.pending_session_group_loads.insert(Some(cwd.clone()))
-                            {
-                                commands.push(Command::list_sessions_workspace(cwd));
-                            }
-                        }
-                        None => {
-                            if let Some(existing) = self
-                                .session_groups
-                                .iter_mut()
-                                .find(|existing| existing.cwd.is_none())
-                            {
-                                merge_session_page(
-                                    existing,
-                                    group.sessions,
-                                    Some(POPUP_SESSION_PAGE_TARGET),
-                                );
-                            } else {
-                                group.sessions.truncate(POPUP_SESSION_PAGE_TARGET);
-                                self.session_groups.push(group);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(cursor) = next_cursor
-                    && self.session_discovery_cursors.insert(cursor.clone())
-                {
-                    self.session_discovery_in_progress = true;
+                let (workspaces, next_discovery_cursor) =
+                    self.sessions.apply_discovery_page(groups, next_cursor);
+                let mut commands = workspaces
+                    .into_iter()
+                    .map(Command::list_sessions_workspace)
+                    .collect::<Vec<_>>();
+                if let Some(cursor) = next_discovery_cursor {
                     commands.push(Command::list_sessions_discovery(Some(cursor)));
                 }
+                commands
             }
             SessionListRequest::WorkspaceFirstPage { cwd } => {
-                self.pending_session_group_loads.remove(&Some(cwd.clone()));
-                self.hydrated_session_groups.insert(cwd.clone());
-                let mut group = groups
-                    .into_iter()
-                    .find(|group| group.cwd.as_deref() == Some(cwd.as_str()))
-                    .unwrap_or_else(|| SessionGroup {
-                        cwd: Some(cwd.clone()),
-                        ..SessionGroup::default()
-                    });
-                group.cwd = Some(cwd.clone());
-                group.total_count = None;
-
-                if group.sessions.is_empty() {
-                    self.session_groups
-                        .retain(|existing| existing.cwd.as_deref() != Some(cwd.as_str()));
-                } else if let Some(existing) = self
-                    .session_groups
-                    .iter_mut()
-                    .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
-                {
-                    *existing = group;
-                } else {
-                    self.session_groups.push(group);
-                }
+                self.sessions.apply_workspace_first_page(cwd, groups);
+                Vec::new()
             }
             SessionListRequest::WorkspaceContinuation { cwd } => {
-                self.pending_session_group_loads.remove(&Some(cwd.clone()));
-                let page = groups
-                    .into_iter()
-                    .find(|group| group.cwd.as_deref() == Some(cwd.as_str()))
-                    .unwrap_or_else(|| SessionGroup {
-                        cwd: Some(cwd.clone()),
-                        ..SessionGroup::default()
-                    });
-                if let Some(existing) = self
-                    .session_groups
-                    .iter_mut()
-                    .find(|existing| existing.cwd.as_deref() == Some(cwd.as_str()))
-                {
-                    existing.next_cursor = page.next_cursor.clone();
-                    merge_session_page(existing, page.sessions, None);
-                } else if !page.sessions.is_empty() {
-                    self.session_groups.push(page);
-                }
+                self.sessions.apply_workspace_continuation(cwd, groups);
+                Vec::new()
             }
         }
-
-        self.session_groups
-            .retain(|group| !group.sessions.is_empty());
-        self.session_groups.sort_by(|a, b| {
-            b.latest_activity
-                .cmp(&a.latest_activity)
-                .then_with(|| a.cwd.cmp(&b.cwd))
-        });
-
-        let visible_len = self.visible_start_items().len();
-        if self.session_cursor >= visible_len && visible_len > 0 {
-            self.session_cursor = visible_len - 1;
-        }
-        commands
     }
 
     fn apply_acp_session_list_failure(&mut self, request: &SessionListRequest) {
         match request {
-            SessionListRequest::Discovery => self.session_discovery_in_progress = false,
+            SessionListRequest::Discovery => self.sessions.fail_discovery(),
             SessionListRequest::WorkspaceFirstPage { cwd }
             | SessionListRequest::WorkspaceContinuation { cwd } => {
-                self.pending_session_group_loads.remove(&Some(cwd.clone()));
+                self.sessions.fail_workspace_request(cwd);
             }
         }
     }
@@ -754,15 +623,15 @@ impl crate::app::App {
         session_id: String,
         profile_id: Option<String>,
     ) -> Vec<Command> {
-        self.session_id = Some(session_id.clone());
+        self.sessions.session_id = Some(session_id.clone());
         self.apply_session_profile_binding(&session_id, profile_id);
-        self.agent_id = Some(agent_id);
+        self.sessions.agent_id = Some(agent_id);
         self.reset_active_session_view();
         self.navigation.screen = Screen::Chat;
         self.set_status(LogLevel::Info, "session", "session created");
         let mut commands = vec![Command::SubscribeSession {
             session_id: session_id.clone(),
-            agent_id: self.agent_id.clone(),
+            agent_id: self.sessions.agent_id.clone(),
         }];
         if let Some(profile_id) = self.current_session_profile_id().map(str::to_string) {
             if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
@@ -781,13 +650,14 @@ impl crate::app::App {
         profile_id: Option<String>,
     ) -> Vec<Command> {
         self.activity = ActivityState::Idle;
-        self.parent_session_id = self
-            .pending_parent_session_id
-            .take()
-            .or_else(|| self.session_parent_id(&session_id).map(str::to_owned));
+        self.parent_session_id = self.pending_parent_session_id.take().or_else(|| {
+            self.sessions
+                .session_parent_id(&session_id)
+                .map(str::to_owned)
+        });
         self.apply_session_profile_binding(&session_id, profile_id);
-        self.session_id = Some(session_id.clone());
-        self.agent_id = Some(agent_id);
+        self.sessions.session_id = Some(session_id.clone());
+        self.sessions.agent_id = Some(agent_id);
         self.reset_active_session_view();
         self.navigation.screen = if self.parent_session_id.is_some() {
             Screen::Delegate
@@ -796,7 +666,7 @@ impl crate::app::App {
         };
         self.set_status(LogLevel::Debug, "activity", "ready");
         let mut commands = vec![Command::SetAgentMode {
-            mode: self.agent_mode.clone(),
+            mode: self.sessions.agent_mode.clone(),
         }];
         if self.parent_session_id.is_none()
             && let Some(profile_id) = self.current_session_profile_id().map(str::to_string)
@@ -843,7 +713,7 @@ impl crate::app::App {
         self.elicitation = None;
         self.elicitation_ui = None;
         self.clear_cancel_confirm();
-        self.mode_before_review = None;
+        self.sessions.mode_before_review = None;
         self.cumulative_cost = None;
         self.session_stats = crate::domain::activity::SessionStatsLite::default();
     }
@@ -888,7 +758,7 @@ impl crate::app::App {
     }
 
     fn apply_acp_delegation_update(&mut self, update: DelegationUpdate) {
-        if self.session_id.as_deref() != Some(update.session_id.as_str()) {
+        if self.sessions.session_id.as_deref() != Some(update.session_id.as_str()) {
             return;
         }
         let existing_index = self
@@ -1087,12 +957,12 @@ impl crate::app::App {
         update: AcpSessionUpdate,
         is_replay: bool,
     ) {
-        if self.session_id.as_deref() != Some(session_id) {
-            self.note_session_activity(session_id);
+        if self.sessions.session_id.as_deref() != Some(session_id) {
+            self.sessions.note_session_activity(session_id);
             self.apply_acp_delegate_child_update(session_id, &update);
             return;
         }
-        self.note_session_activity(session_id);
+        self.sessions.note_session_activity(session_id);
 
         match update {
             AcpSessionUpdate::TurnStarted => {
@@ -1716,32 +1586,6 @@ impl crate::app::App {
     }
 }
 
-fn merge_session_page(group: &mut SessionGroup, sessions: Vec<SessionSummary>, cap: Option<usize>) {
-    let mut seen = group
-        .sessions
-        .iter()
-        .map(|session| session.session_id.clone())
-        .collect::<HashSet<_>>();
-    group.sessions.extend(
-        sessions
-            .into_iter()
-            .filter(|session| seen.insert(session.session_id.clone())),
-    );
-    group.sessions.sort_by(|a, b| {
-        b.updated_at
-            .cmp(&a.updated_at)
-            .then_with(|| b.session_id.cmp(&a.session_id))
-    });
-    if let Some(cap) = cap {
-        group.sessions.truncate(cap);
-    }
-    group.latest_activity = group
-        .sessions
-        .first()
-        .and_then(|session| session.updated_at.clone());
-    group.total_count = None;
-}
-
 fn normalize_replay_updates(updates: Vec<AcpSessionUpdate>) -> Vec<AcpSessionUpdate> {
     let finalized_messages = finalized_assistant_messages(&updates);
     let mut normalized = Vec::with_capacity(updates.len());
@@ -2087,7 +1931,9 @@ mod tests {
     use crate::domain::activity::{PendingDelegateToolCall, SessionOp};
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
-    use crate::domain::session::{SessionListPage, UndoFrame, UndoFrameStatus, UndoState};
+    use crate::domain::session::{
+        SessionGroup, SessionListPage, SessionSummary, UndoFrame, UndoFrameStatus, UndoState,
+    };
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";
@@ -2116,7 +1962,7 @@ mod tests {
 
     fn app_with_active_session() -> App {
         let mut app = App::new();
-        app.session_id = Some(TEST_SESSION_ID.into());
+        app.sessions.session_id = Some(TEST_SESSION_ID.into());
         app
     }
 
@@ -2360,7 +2206,8 @@ mod tests {
     #[test]
     fn loading_missing_remote_profile_removes_stale_binding() {
         let mut app = App::new();
-        app.remember_remote_session_node("remote-1", "node-1");
+        app.sessions
+            .remember_remote_session_node("remote-1", "node-1");
         app.profiles
             .bind_session_profile("remote-1".into(), "fast".into());
 
@@ -2591,7 +2438,7 @@ mod tests {
     #[test]
     fn profile_agents_reapply_profile_scoped_preferences_to_parent_session() {
         let mut app = App::new();
-        app.session_id = Some("parent".into());
+        app.sessions.session_id = Some("parent".into());
         app.profiles
             .bind_session_profile("parent".into(), "quorum".into());
         app.models.delegate_model_preferences.insert(
@@ -2750,9 +2597,12 @@ mod tests {
             app.mesh.selected_remote_sessions()[0].title.as_deref(),
             Some("Boundary")
         );
-        assert_eq!(app.session_remote_node_id("session-1"), Some("node-1"));
         assert_eq!(
-            app.session_remote_cwd("session-1"),
+            app.sessions.session_remote_node_id("session-1"),
+            Some("node-1")
+        );
+        assert_eq!(
+            app.sessions.session_remote_cwd("session-1"),
             Some("/remote/repo".into())
         );
     }
@@ -2777,7 +2627,7 @@ mod tests {
     #[test]
     fn native_remote_attach_loads_and_subscribes_once() {
         let mut app = App::new();
-        app.agent_id = Some("agent-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
             RemoteSessionAttachInfo {
@@ -2793,7 +2643,10 @@ mod tests {
             },
         ));
 
-        assert_eq!(app.session_remote_node_id("remote-1"), Some("node-1"));
+        assert_eq!(
+            app.sessions.session_remote_node_id("remote-1"),
+            Some("node-1")
+        );
         assert!(matches!(
             replies.as_slice(),
             [
@@ -2808,9 +2661,13 @@ mod tests {
     #[test]
     fn native_remote_attach_uses_remote_cwd_and_detached_refreshes_sessions() {
         let mut app = App::new();
-        app.agent_id = Some("agent-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.launch_cwd = Some("/launch".into());
-        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        app.sessions.remember_remote_session_location(
+            "remote-1",
+            "node-1",
+            Some("/remote/repo".into()),
+        );
 
         let attached = app.handle_acp_event(AcpAppEvent::RemoteSessionAttached(
             RemoteSessionAttachInfo {
@@ -2841,8 +2698,11 @@ mod tests {
                 snapshot: None,
             },
         ));
-        assert_eq!(app.session_remote_node_id("remote-2"), Some("node-2"));
-        assert_eq!(app.session_remote_cwd("remote-2"), None);
+        assert_eq!(
+            app.sessions.session_remote_node_id("remote-2"),
+            Some("node-2")
+        );
+        assert_eq!(app.sessions.session_remote_cwd("remote-2"), None);
         assert_eq!(
             detached,
             vec![Command::ListRemoteSessions {
@@ -2856,7 +2716,11 @@ mod tests {
     #[test]
     fn acp_node_less_session_page_does_not_overwrite_remote_location() {
         let mut app = App::new();
-        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        app.sessions.remember_remote_session_location(
+            "remote-1",
+            "node-1",
+            Some("/remote/repo".into()),
+        );
 
         app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
@@ -2874,7 +2738,7 @@ mod tests {
             ),
         });
 
-        let location = &app.remote_session_locations["remote-1"];
+        let location = &app.sessions.remote_session_locations["remote-1"];
         assert_eq!(location.node_id, "node-1");
         assert_eq!(location.cwd.as_deref(), Some("/remote/repo"));
     }
@@ -2882,7 +2746,7 @@ mod tests {
     #[test]
     fn acp_discovery_hydrates_workspaces_and_replays_root_cursor() {
         let mut app = App::new();
-        app.session_discovery_in_progress = true;
+        app.sessions.session_discovery_in_progress = true;
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
@@ -2892,12 +2756,13 @@ mod tests {
             ),
         });
 
-        assert!(app.session_discovery_in_progress);
+        assert!(app.sessions.session_discovery_in_progress);
         assert!(
-            app.pending_session_group_loads
+            app.sessions
+                .pending_session_group_loads
                 .contains(&Some("/repo".into()))
         );
-        assert_eq!(app.session_groups[0].next_cursor, None);
+        assert_eq!(app.sessions.session_groups[0].next_cursor, None);
         assert!(replies.iter().any(|reply| matches!(
             reply,
             Command::ListSessions {
@@ -2918,8 +2783,10 @@ mod tests {
     #[test]
     fn acp_workspace_first_page_replaces_discovery_preview() {
         let mut app = App::new();
-        app.session_groups = vec![session_group("/repo", &["preview"])];
-        app.pending_session_group_loads.insert(Some("/repo".into()));
+        app.sessions.session_groups = vec![session_group("/repo", &["preview"])];
+        app.sessions
+            .pending_session_group_loads
+            .insert(Some("/repo".into()));
         let mut page = session_group("/repo", &["new-1", "new-2"]);
         page.next_cursor = Some("opaque-workspace-2".into());
 
@@ -2930,11 +2797,11 @@ mod tests {
             page: session_list_page(vec![page], Some("opaque-workspace-2")),
         });
 
-        assert!(app.hydrated_session_groups.contains("/repo"));
-        assert!(app.pending_session_group_loads.is_empty());
-        assert_eq!(app.session_groups[0].total_count, None);
+        assert!(app.sessions.hydrated_session_groups.contains("/repo"));
+        assert!(app.sessions.pending_session_group_loads.is_empty());
+        assert_eq!(app.sessions.session_groups[0].total_count, None);
         assert_eq!(
-            app.session_groups[0]
+            app.sessions.session_groups[0]
                 .sessions
                 .iter()
                 .map(|session| session.session_id.as_str())
@@ -2942,7 +2809,7 @@ mod tests {
             vec!["new-2", "new-1"]
         );
         assert_eq!(
-            app.session_groups[0].next_cursor.as_deref(),
+            app.sessions.session_groups[0].next_cursor.as_deref(),
             Some("opaque-workspace-2")
         );
     }
@@ -2950,9 +2817,9 @@ mod tests {
     #[test]
     fn acp_discovery_merges_later_workspaces_without_overwriting_hydrated_groups() {
         let mut app = App::new();
-        app.session_discovery_in_progress = true;
-        app.hydrated_session_groups.insert("/repo".into());
-        app.session_groups = vec![session_group("/repo", &["authoritative"])];
+        app.sessions.session_discovery_in_progress = true;
+        app.sessions.hydrated_session_groups.insert("/repo".into());
+        app.sessions.session_groups = vec![session_group("/repo", &["authoritative"])];
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionList {
             request: SessionListRequest::Discovery,
@@ -2966,13 +2833,15 @@ mod tests {
         });
 
         let repo = app
+            .sessions
             .session_groups
             .iter()
             .find(|group| group.cwd.as_deref() == Some("/repo"))
             .unwrap();
         assert_eq!(repo.sessions[0].session_id, "authoritative");
         assert!(
-            app.session_groups
+            app.sessions
+                .session_groups
                 .iter()
                 .any(|group| group.cwd.as_deref() == Some("/later"))
         );
@@ -2988,8 +2857,10 @@ mod tests {
     #[test]
     fn acp_group_session_page_merges_group_and_dedupes() {
         let mut app = App::new();
-        app.session_groups = vec![session_group("/repo", &["s1"])];
-        app.pending_session_group_loads.insert(Some("/repo".into()));
+        app.sessions.session_groups = vec![session_group("/repo", &["s1"])];
+        app.sessions
+            .pending_session_group_loads
+            .insert(Some("/repo".into()));
 
         let mut group = session_group("/repo", &["s1", "s2"]);
         group.next_cursor = Some("cursor-2".into());
@@ -3000,14 +2871,14 @@ mod tests {
             page: session_list_page(vec![group], Some("cursor-2")),
         });
 
-        assert!(app.pending_session_group_loads.is_empty());
-        assert_eq!(app.session_groups.len(), 1);
+        assert!(app.sessions.pending_session_group_loads.is_empty());
+        assert_eq!(app.sessions.session_groups.len(), 1);
         assert_eq!(
-            app.session_groups[0].next_cursor.as_deref(),
+            app.sessions.session_groups[0].next_cursor.as_deref(),
             Some("cursor-2")
         );
         assert_eq!(
-            app.session_groups[0]
+            app.sessions.session_groups[0]
                 .sessions
                 .iter()
                 .map(|session| session.session_id.as_str())
@@ -3019,7 +2890,9 @@ mod tests {
     #[test]
     fn acp_session_list_failure_clears_scoped_pending_state() {
         let mut app = App::new();
-        app.pending_session_group_loads.insert(Some("/repo".into()));
+        app.sessions
+            .pending_session_group_loads
+            .insert(Some("/repo".into()));
 
         app.handle_acp_event(AcpAppEvent::SessionListFailed {
             request: SessionListRequest::WorkspaceContinuation {
@@ -3028,7 +2901,7 @@ mod tests {
             message: "failed".into(),
         });
 
-        assert!(app.pending_session_group_loads.is_empty());
+        assert!(app.sessions.pending_session_group_loads.is_empty());
     }
 
     fn seed_model_state(app: &mut App) {
@@ -3085,8 +2958,8 @@ mod tests {
             profile_id: Some("code".into()),
         });
 
-        assert_eq!(app.session_id.as_deref(), Some("session-1"));
-        assert_eq!(app.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(app.sessions.session_id.as_deref(), Some("session-1"));
+        assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(app.navigation.screen, Screen::Chat);
         assert!(app.messages.is_empty());
         assert!(app.streaming_content.is_empty());
@@ -3112,7 +2985,7 @@ mod tests {
     #[test]
     fn native_session_loaded_discovers_parent_preserves_delegate_state_and_resets_view() {
         let mut app = App::new();
-        app.agent_mode = "plan".into();
+        app.sessions.agent_mode = "plan".into();
         let mut child = SessionSummary {
             session_id: "child".into(),
             parent_session_id: Some("parent".into()),
@@ -3128,7 +3001,7 @@ mod tests {
             ..Default::default()
         };
         parent.children = vec![child];
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_groups = vec![SessionGroup {
             cwd: Some("/repo".into()),
             sessions: vec![parent],
             ..Default::default()
@@ -3332,21 +3205,21 @@ mod tests {
     #[test]
     fn native_agent_mode_updates_mode_and_clears_review_return_state() {
         let mut app = App::new();
-        app.agent_mode = "review".into();
-        app.mode_before_review = Some("plan".into());
+        app.sessions.agent_mode = "review".into();
+        app.sessions.mode_before_review = Some("plan".into());
 
         app.handle_acp_event(AcpAppEvent::AgentMode {
             mode: "build".into(),
         });
-        assert_eq!(app.agent_mode, "build");
-        assert_eq!(app.mode_before_review, None);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.mode_before_review, None);
 
-        app.mode_before_review = Some("plan".into());
+        app.sessions.mode_before_review = Some("plan".into());
         app.handle_acp_event(AcpAppEvent::AgentMode {
             mode: "review".into(),
         });
-        assert_eq!(app.agent_mode, "review");
-        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
+        assert_eq!(app.sessions.agent_mode, "review");
+        assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
     }
 
     #[test]
@@ -3760,7 +3633,7 @@ mod tests {
     #[test]
     fn native_tool_call_start_keeps_shell_details() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3788,7 +3661,7 @@ mod tests {
     #[test]
     fn native_usage_update_updates_status_metrics() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3815,7 +3688,7 @@ mod tests {
     #[test]
     fn native_timing_update_adds_active_time() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3839,7 +3712,7 @@ mod tests {
     #[test]
     fn native_live_turn_updates_realtime_elapsed() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3875,7 +3748,7 @@ mod tests {
     #[test]
     fn native_replay_turn_does_not_start_realtime_elapsed() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3915,7 +3788,7 @@ mod tests {
     #[test]
     fn native_acp_error_closes_realtime_elapsed() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -3940,7 +3813,7 @@ mod tests {
     #[test]
     fn native_tool_call_end_updates_shell_output_tail() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
             is_replay: false,
@@ -3977,7 +3850,7 @@ mod tests {
     #[test]
     fn native_tool_call_start_keeps_read_tool_range() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "session-1".into(),
@@ -4005,8 +3878,8 @@ mod tests {
     #[test]
     fn native_undo_result_success_updates_state_and_reloads_session() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
-        app.agent_id = Some("agent-1".into());
+        app.sessions.session_id = Some("session-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.undoable_turns.push(UndoableTurn {
             turn_id: "u1".into(),
@@ -4045,7 +3918,7 @@ mod tests {
     #[test]
     fn native_undo_rejection_without_target_uses_stack_tail_without_reload() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.streaming_content = "keep streaming content".into();
         app.undoable_turns = vec![
@@ -4133,8 +4006,8 @@ mod tests {
     #[test]
     fn native_redo_result_success_rebuilds_state_and_reloads_session() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
-        app.agent_id = Some("agent-1".into());
+        app.sessions.session_id = Some("session-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.activity = ActivityState::SessionOp(SessionOp::Redo);
 
         let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResult::Applied {
@@ -4184,7 +4057,7 @@ mod tests {
     #[test]
     fn native_fork_result_success_loads_forked_session() {
         let mut app = App::new();
-        app.agent_id = Some("agent-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.navigation.popup = Popup::ForkTurnSelect;
         app.pending_fork_message_id = Some("msg-1".into());
 
@@ -4256,7 +4129,7 @@ mod tests {
     #[test]
     fn native_session_update_for_other_session_marks_activity_only() {
         let mut app = App::new();
-        app.session_id = Some("active".into());
+        app.sessions.session_id = Some("active".into());
 
         app.handle_acp_event(AcpAppEvent::SessionUpdate {
             session_id: "other".into(),
@@ -4269,13 +4142,13 @@ mod tests {
         });
 
         assert!(app.messages.is_empty());
-        assert!(app.session_activity.contains_key("other"));
+        assert!(app.sessions.session_activity.contains_key("other"));
     }
 
     #[test]
     fn native_session_replay_applies_history_as_one_event() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: "session-1".into(),
@@ -4305,7 +4178,7 @@ mod tests {
     #[test]
     fn native_session_replay_coalesces_deltas_without_crossing_tool_order() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: "session-1".into(),
@@ -4354,7 +4227,7 @@ mod tests {
     #[test]
     fn native_session_replay_prefers_final_assistant_message() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: "session-1".into(),
@@ -4385,7 +4258,7 @@ mod tests {
     #[test]
     fn native_session_replay_merges_adjacent_assistant_chunks_from_loading_notifications() {
         let mut app = App::new();
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
 
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: "session-1".into(),
