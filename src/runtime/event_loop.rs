@@ -30,17 +30,17 @@ fn send_command(cmd_tx: &mpsc::UnboundedSender<Command>, command: Command) -> an
 }
 
 fn reconnect_session_commands(app: &mut App) -> Vec<Command> {
-    let Some(session_id) = app.session_id.clone() else {
+    let Some(session_id) = app.sessions.session_id.clone() else {
         return Vec::new();
     };
 
-    if let Some(node_id) = app.session_remote_node_id(&session_id) {
+    if let Some(node_id) = app.sessions.session_remote_node_id(&session_id) {
         return vec![Command::AttachRemoteSession {
             node_id: node_id.to_string(),
             session_id,
         }];
     }
-    if app.is_remote_session_id(&session_id) {
+    if app.sessions.is_remote_session_id(&session_id) {
         app.set_status(
             LogLevel::Warn,
             "session",
@@ -49,8 +49,12 @@ fn reconnect_session_commands(app: &mut App) -> Vec<Command> {
         return Vec::new();
     }
 
-    Command::load_session_commands(session_id, app.current_session_cwd(), app.agent_id.clone())
-        .into()
+    Command::load_session_commands(
+        session_id,
+        app.current_session_cwd(),
+        app.sessions.agent_id.clone(),
+    )
+    .into()
 }
 
 pub(super) async fn run_loop(
@@ -218,8 +222,12 @@ mod tests {
     #[test]
     fn reconnect_attaches_remembered_remote_session_without_loading() {
         let mut app = App::new();
-        app.session_id = Some("remote-1".into());
-        app.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        app.sessions.session_id = Some("remote-1".into());
+        app.sessions.remember_remote_session_location(
+            "remote-1",
+            "node-1",
+            Some("/remote/repo".into()),
+        );
 
         assert_eq!(
             reconnect_session_commands(&mut app),
@@ -233,8 +241,8 @@ mod tests {
     #[test]
     fn reconnect_warns_for_remote_session_missing_node() {
         let mut app = App::new();
-        app.session_id = Some("remote-1".into());
-        app.session_groups = vec![crate::domain::session::SessionGroup {
+        app.sessions.session_id = Some("remote-1".into());
+        app.sessions.session_groups = vec![crate::domain::session::SessionGroup {
             sessions: vec![crate::domain::session::SessionSummary {
                 session_id: "remote-1".into(),
                 node: Some("remote".into()),
@@ -250,8 +258,8 @@ mod tests {
     #[test]
     fn reconnect_loads_and_subscribes_local_session() {
         let mut app = App::new();
-        app.session_id = Some("local-1".into());
-        app.agent_id = Some("agent-1".into());
+        app.sessions.session_id = Some("local-1".into());
+        app.sessions.agent_id = Some("agent-1".into());
         app.launch_cwd = Some("/local/repo".into());
 
         assert_eq!(

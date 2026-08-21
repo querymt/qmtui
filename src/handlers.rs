@@ -263,9 +263,7 @@ fn open_session_popup(
         return Ok(());
     }
     app.navigation.popup = Popup::SessionSelect;
-    app.session_popup_tab = 0;
-    app.session_cursor = 0;
-    app.session_filter.clear();
+    app.sessions.reset_browser_for_open();
     if let Some(request) = app.begin_session_discovery() {
         cmd_tx.send(request)?;
     }
@@ -655,7 +653,7 @@ pub(crate) fn handle_key(
         if !can_send_server_commands(app) {
             return Ok(AppAction::None);
         }
-        switch_mode(app, cmd_tx, &app.next_mode())?;
+        switch_mode(app, cmd_tx, &app.sessions.next_mode())?;
         return Ok(AppAction::None);
     }
 
@@ -747,7 +745,7 @@ pub(crate) fn handle_chord(
                     cmd_tx,
                     parent_sid,
                     app.current_session_cwd(),
-                    app.agent_id.clone(),
+                    app.sessions.agent_id.clone(),
                 )?;
             } else {
                 app.set_status(LogLevel::Info, "session", "no parent session");
@@ -866,7 +864,7 @@ pub(crate) fn handle_sessions_key(
                 cmd_tx,
                 session_id,
                 cwd,
-                agent_id.or_else(|| app.agent_id.clone()),
+                agent_id.or_else(|| app.sessions.agent_id.clone()),
             )?;
         }
         SessionKeyAction::AttachRemoteSession {
@@ -912,11 +910,11 @@ pub(crate) fn handle_session_popup_key(
 ) -> anyhow::Result<()> {
     // Tab / BackTab: switch between sessions and delegates tabs
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        app.session_popup_tab = 1 - app.session_popup_tab;
+        app.sessions.switch_session_popup_tab();
         return Ok(());
     }
 
-    if app.session_popup_tab == 1 {
+    if app.sessions.session_popup_tab == 1 {
         // Delegates tab
         return handle_delegate_popup_key(app, key, cmd_tx);
     }
@@ -963,7 +961,7 @@ pub(crate) fn handle_session_popup_key(
                 cmd_tx,
                 session_id,
                 cwd,
-                agent_id.or_else(|| app.agent_id.clone()),
+                agent_id.or_else(|| app.sessions.agent_id.clone()),
             )?;
         }
         SessionKeyAction::AttachRemoteSession {
@@ -1009,57 +1007,50 @@ pub(crate) fn apply_popup_session_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::app::PopupItem;
+    use crate::session_state::PopupItem;
 
     match key {
         KeyCode::Esc => {
             app.navigation.popup = Popup::None;
         }
-        KeyCode::Up => {
-            app.session_cursor = app.session_cursor.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            let max = app.visible_popup_items().len().saturating_sub(1);
-            app.session_cursor = (app.session_cursor + 1).min(max);
-        }
+        KeyCode::Up => app.sessions.move_popup_cursor_up(),
+        KeyCode::Down => app.sessions.move_popup_cursor_down(),
         KeyCode::PageUp => {
-            let step = popup_page_step(app.session_popup_visible_rows);
-            app.session_cursor = app.session_cursor.saturating_sub(step);
+            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            app.sessions.move_popup_cursor_page(step, false);
         }
         KeyCode::PageDown => {
-            let max = app.visible_popup_items().len().saturating_sub(1);
-            let step = popup_page_step(app.session_popup_visible_rows);
-            app.session_cursor = app.session_cursor.saturating_add(step).min(max);
+            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            app.sessions.move_popup_cursor_page(step, true);
         }
         KeyCode::Enter => {
-            let items = app.visible_popup_items();
-            if let Some(item) = items.get(app.session_cursor).cloned() {
+            let items = app.sessions.visible_popup_items();
+            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
                 match item {
                     PopupItem::GroupHeader { cwd, .. } => {
-                        app.toggle_popup_group_collapse(cwd.as_deref());
-                        // Clamp cursor: collapsing may hide rows the cursor pointed at.
-                        let new_len = app.visible_popup_items().len();
-                        if new_len > 0 && app.session_cursor >= new_len {
-                            app.session_cursor = new_len - 1;
-                        }
+                        app.sessions.toggle_popup_group_collapse(cwd.as_deref());
+                        app.sessions.clamp_popup_cursor();
                     }
                     PopupItem::Session {
                         group_idx, path, ..
                     } => {
-                        let session = app.session_by_path(group_idx, &path).cloned();
+                        let session = app.sessions.session_by_path(group_idx, &path).cloned();
                         if let Some(session) = session {
                             app.navigation.popup = Popup::None;
                             let session_id = session.session_id;
-                            if let Some(node_id) =
-                                app.session_remote_node_id(&session_id).map(str::to_string)
+                            if let Some(node_id) = app
+                                .sessions
+                                .session_remote_node_id(&session_id)
+                                .map(str::to_string)
                             {
-                                app.remember_remote_session_node(&session_id, &node_id);
+                                app.sessions
+                                    .remember_remote_session_node(&session_id, &node_id);
                                 return SessionKeyAction::AttachRemoteSession {
                                     node_id,
                                     session_id,
                                 };
                             }
-                            if app.is_remote_session_id(&session_id) {
+                            if app.sessions.is_remote_session_id(&session_id) {
                                 app.set_status(
                                     LogLevel::Warn,
                                     "session",
@@ -1072,7 +1063,7 @@ pub(crate) fn apply_popup_session_key(
                                 agent_id: None,
                                 cwd: session
                                     .cwd
-                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
+                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
@@ -1089,31 +1080,17 @@ pub(crate) fn apply_popup_session_key(
             }
         }
         KeyCode::Delete => {
-            let items = app.visible_popup_items();
+            let items = app.sessions.visible_popup_items();
             if let Some(PopupItem::Session {
                 group_idx, path, ..
-            }) = items.get(app.session_cursor).cloned()
+            }) = items.get(app.sessions.session_cursor).cloned()
             {
-                let Some(session) = app.session_by_path(group_idx, &path).cloned() else {
+                let Some((session, is_remote)) =
+                    app.sessions.remove_session_at(group_idx, &path, true)
+                else {
                     return SessionKeyAction::None;
                 };
                 let sid = session.session_id;
-                let is_remote = app.is_remote_session_id(&sid);
-                // Optimistic remove
-                if path.len() == 1 {
-                    app.session_groups[group_idx].sessions.remove(path[0]);
-                } else if let Some(parent_path) = path.get(..path.len() - 1).map(Vec::from)
-                    && let Some(parent) = app.session_by_path_mut(group_idx, &parent_path)
-                    && let Some(child_idx) = path.last()
-                    && *child_idx < parent.children.len()
-                {
-                    parent.children.remove(*child_idx);
-                }
-                app.session_groups.retain(|g| !g.sessions.is_empty());
-                let new_len = app.visible_popup_items().len();
-                if new_len > 0 && app.session_cursor >= new_len {
-                    app.session_cursor = new_len - 1;
-                }
                 return if is_remote {
                     SessionKeyAction::DismissRemoteSession { session_id: sid }
                 } else {
@@ -1122,25 +1099,20 @@ pub(crate) fn apply_popup_session_key(
             }
             // Delete on a GroupHeader: no-op
         }
-        KeyCode::Backspace => {
-            app.session_filter.pop();
-            app.session_cursor = 0;
-        }
-        KeyCode::Char(c) => {
-            app.session_filter.push(c);
-            app.session_cursor = 0;
-        }
+        KeyCode::Backspace => app.sessions.popup_filter_backspace(),
+        KeyCode::Char(c) => app.sessions.popup_filter_insert(c),
         _ => {}
     }
     SessionKeyAction::None
 }
 
 pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
-    use crate::app::{PopupItem, StartPageItem};
+    use crate::session_state::{PopupItem, StartPageItem};
 
     let selected = if popup_items {
-        app.visible_popup_items()
-            .get(app.session_cursor)
+        app.sessions
+            .visible_popup_items()
+            .get(app.sessions.session_cursor)
             .cloned()
             .and_then(|item| match item {
                 PopupItem::Session {
@@ -1149,8 +1121,9 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
                 _ => None,
             })
     } else {
-        app.visible_start_items()
-            .get(app.session_cursor)
+        app.sessions
+            .visible_start_items()
+            .get(app.sessions.session_cursor)
             .cloned()
             .and_then(|item| match item {
                 StartPageItem::Session {
@@ -1164,7 +1137,7 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
         return SessionKeyAction::None;
     };
 
-    let should_load = app.toggle_session_children(group_idx, &path);
+    let should_load = app.sessions.toggle_session_children(group_idx, &path);
     if should_load {
         SessionKeyAction::LoadMoreSessions {
             group_idx,
@@ -1209,7 +1182,7 @@ fn handle_delegate_view_key(
                     cmd_tx,
                     parent_sid,
                     app.current_session_cwd(),
-                    app.agent_id.clone(),
+                    app.sessions.agent_id.clone(),
                 )?;
             }
         }
@@ -1242,7 +1215,7 @@ pub(crate) fn handle_delegate_popup_key(
                 cmd_tx,
                 session_id,
                 cwd,
-                agent_id.or_else(|| app.agent_id.clone()),
+                agent_id.or_else(|| app.sessions.agent_id.clone()),
             )?;
         }
         SessionKeyAction::NewSession
@@ -1300,7 +1273,7 @@ pub(crate) fn apply_delegate_popup_key(
                     app.pending_parent_session_id = app
                         .parent_session_id
                         .clone()
-                        .or_else(|| app.session_id.clone());
+                        .or_else(|| app.sessions.session_id.clone());
                     app.navigation.popup = Popup::None;
                     return SessionKeyAction::LoadSession {
                         session_id: sid,
@@ -1485,48 +1458,43 @@ pub(crate) fn handle_new_session_popup_key(
             app.navigation.popup = Popup::None;
         }
         KeyCode::Up => {
-            app.move_new_session_completion_selection(-1);
+            app.sessions.move_new_session_completion_selection(-1);
         }
         KeyCode::Down => {
-            app.move_new_session_completion_selection(1);
+            app.sessions.move_new_session_completion_selection(1);
         }
         KeyCode::Tab => {
             app.accept_selected_new_session_completion();
         }
         KeyCode::Left => {
-            app.new_session_cursor = app.new_session_cursor.saturating_sub(1);
+            app.sessions.move_new_session_cursor_left();
             app.refresh_new_session_completion();
         }
         KeyCode::Right => {
-            app.new_session_cursor = (app.new_session_cursor + 1).min(app.new_session_path.len());
+            app.sessions.move_new_session_cursor_right();
             app.refresh_new_session_completion();
         }
         KeyCode::Home => {
-            app.new_session_cursor = 0;
+            app.sessions.move_new_session_cursor_home();
             app.refresh_new_session_completion();
         }
         KeyCode::End => {
-            app.new_session_cursor = app.new_session_path.len();
+            app.sessions.move_new_session_cursor_end();
             app.refresh_new_session_completion();
         }
         KeyCode::Backspace => {
-            if app.new_session_cursor > 0 && !app.new_session_path.is_empty() {
-                let idx = app.new_session_cursor - 1;
-                app.new_session_path.remove(idx);
-                app.new_session_cursor = idx;
-            }
+            app.sessions.new_session_backspace();
             app.refresh_new_session_completion();
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.new_session_path.insert(app.new_session_cursor, c);
-            app.new_session_cursor += 1;
+            app.sessions.new_session_insert(c);
             app.refresh_new_session_completion();
         }
         KeyCode::Enter => {
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            let cwd = app.normalize_new_session_path(&app.new_session_path);
+            let cwd = app.normalize_new_session_path(&app.sessions.new_session_path);
             app.navigation.popup = Popup::None;
             cmd_tx.send(Command::NewSession {
                 cwd,
@@ -1754,15 +1722,7 @@ fn switch_mode(
         mode: target.to_string(),
     })?;
 
-    if target == "review" {
-        if app.agent_mode != "review" {
-            app.mode_before_review = Some(app.agent_mode.clone());
-        }
-    } else {
-        app.mode_before_review = None;
-    }
-
-    app.agent_mode = target.to_string();
+    app.sessions.apply_mode_transition(target);
 
     save_config(app);
     Ok(())
@@ -1836,11 +1796,11 @@ fn try_execute_slash_command(
             }
             if arg.is_empty() {
                 // No arg: cycle to next mode (same as Tab).
-                switch_mode(app, cmd_tx, &app.next_mode())?;
+                switch_mode(app, cmd_tx, &app.sessions.next_mode())?;
             } else {
                 match arg.as_str() {
                     "build" | "plan" => {
-                        if app.agent_mode == arg {
+                        if app.sessions.agent_mode == arg {
                             app.set_status(
                                 LogLevel::Info,
                                 "mode",
@@ -1865,7 +1825,7 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            if app.agent_mode == "review" {
+            if app.sessions.agent_mode == "review" {
                 app.set_status(LogLevel::Info, "mode", "already in review mode");
             } else {
                 switch_mode(app, cmd_tx, "review")?;
@@ -1945,9 +1905,7 @@ fn try_execute_slash_command(
                 return Ok(SlashResult::Handled);
             }
             app.navigation.popup = Popup::SessionSelect;
-            app.session_popup_tab = 0;
-            app.session_cursor = 0;
-            app.session_filter.clear();
+            app.sessions.reset_browser_for_open();
             if let Some(request) = app.begin_session_discovery() {
                 cmd_tx.send(request)?;
             }
@@ -2421,8 +2379,8 @@ pub(crate) fn handle_model_popup_key(
                     .models
                     .model_popup_is_session_tab(app.models.model_popup_agent_tab)
                 {
-                    if !app.current_session_is_remote() {
-                        if let Some(session_id) = app.session_id.clone() {
+                    if !app.sessions.current_session_is_remote() {
+                        if let Some(session_id) = app.sessions.session_id.clone() {
                             cmd_tx.send(Command::SetSessionModel {
                                 session_id,
                                 model_id: model.id.clone(),
@@ -2448,7 +2406,7 @@ pub(crate) fn handle_model_popup_key(
                     app.models
                         .set_delegate_model_preference(&profile_id, &agent_id, &model);
                     if app.parent_session_id.is_none()
-                        && let Some(session_id) = app.session_id.clone()
+                        && let Some(session_id) = app.sessions.session_id.clone()
                     {
                         cmd_tx.send(Command::SetDelegateModel {
                             session_id,
@@ -2480,7 +2438,7 @@ pub(crate) fn handle_model_popup_key(
                 app.models
                     .clear_delegate_model_preference(&profile_id, &agent_id);
                 if app.parent_session_id.is_none()
-                    && let Some(session_id) = app.session_id.clone()
+                    && let Some(session_id) = app.sessions.session_id.clone()
                 {
                     cmd_tx.send(Command::SetDelegateModel {
                         session_id,
@@ -2544,55 +2502,43 @@ pub(crate) fn apply_sessions_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::app::StartPageItem;
+    use crate::session_state::StartPageItem;
 
     match key {
-        KeyCode::Up => {
-            app.session_cursor = app.session_cursor.saturating_sub(1);
-            // Adjust scroll if needed (draw_start also does this, but keeping
-            // state consistent here means tests don't need a frame).
-            if app.session_cursor < app.start_page_scroll {
-                app.start_page_scroll = app.session_cursor;
-            }
-        }
-        KeyCode::Down => {
-            // Button slot is one past the last item (items.len()).
-            let max = app.visible_start_items().len(); // inclusive: button slot
-            if app.session_cursor < max {
-                app.session_cursor += 1;
-            }
-        }
+        KeyCode::Up => app.sessions.move_start_cursor_up(),
+        KeyCode::Down => app.sessions.move_start_cursor_down(),
         KeyCode::Enter => {
-            let items = app.visible_start_items();
+            let items = app.sessions.visible_start_items();
             // Cursor on the button slot (one past the last item)?
-            if app.session_cursor == items.len() {
+            if app.sessions.session_cursor == items.len() {
                 return SessionKeyAction::NewSession;
             }
-            if let Some(item) = items.get(app.session_cursor).cloned() {
+            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
                 match item {
                     StartPageItem::GroupHeader { cwd, .. } => {
-                        app.toggle_group_collapse(cwd.as_deref());
-                        // Clamp cursor after collapse may hide rows.
-                        let new_len = app.visible_start_items().len();
-                        if new_len > 0 && app.session_cursor >= new_len {
-                            app.session_cursor = new_len - 1;
-                        }
+                        app.sessions.toggle_group_collapse(cwd.as_deref());
+                        app.sessions.clamp_start_cursor();
                     }
                     StartPageItem::Session {
                         group_idx, path, ..
                     } => {
-                        if let Some(session) = app.session_by_path(group_idx, &path).cloned() {
+                        if let Some(session) =
+                            app.sessions.session_by_path(group_idx, &path).cloned()
+                        {
                             let session_id = session.session_id;
-                            if let Some(node_id) =
-                                app.session_remote_node_id(&session_id).map(str::to_string)
+                            if let Some(node_id) = app
+                                .sessions
+                                .session_remote_node_id(&session_id)
+                                .map(str::to_string)
                             {
-                                app.remember_remote_session_node(&session_id, &node_id);
+                                app.sessions
+                                    .remember_remote_session_node(&session_id, &node_id);
                                 return SessionKeyAction::AttachRemoteSession {
                                     node_id,
                                     session_id,
                                 };
                             }
-                            if app.is_remote_session_id(&session_id) {
+                            if app.sessions.is_remote_session_id(&session_id) {
                                 app.set_status(
                                     LogLevel::Warn,
                                     "session",
@@ -2605,45 +2551,29 @@ pub(crate) fn apply_sessions_key(
                                 agent_id: None,
                                 cwd: session
                                     .cwd
-                                    .or_else(|| app.session_groups[group_idx].cwd.clone()),
+                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
                             };
                         }
                     }
                     StartPageItem::ShowMore { .. } => {
                         app.navigation.popup = Popup::SessionSelect;
-                        app.session_popup_tab = 0;
-                        app.session_cursor = 0;
-                        app.session_filter.clear();
+                        app.sessions.reset_browser_for_open();
                     }
                 }
             }
         }
         KeyCode::Delete => {
-            let items = app.visible_start_items();
+            let items = app.sessions.visible_start_items();
             if let Some(StartPageItem::Session {
                 group_idx, path, ..
-            }) = items.get(app.session_cursor).cloned()
+            }) = items.get(app.sessions.session_cursor).cloned()
             {
-                let Some(session) = app.session_by_path(group_idx, &path).cloned() else {
+                let Some((session, is_remote)) =
+                    app.sessions.remove_session_at(group_idx, &path, false)
+                else {
                     return SessionKeyAction::None;
                 };
                 let sid = session.session_id;
-                let is_remote = app.is_remote_session_id(&sid);
-                // Optimistic remove
-                if path.len() == 1 {
-                    app.session_groups[group_idx].sessions.remove(path[0]);
-                } else if let Some(parent_path) = path.get(..path.len() - 1).map(Vec::from)
-                    && let Some(parent) = app.session_by_path_mut(group_idx, &parent_path)
-                    && let Some(child_idx) = path.last()
-                    && *child_idx < parent.children.len()
-                {
-                    parent.children.remove(*child_idx);
-                }
-                app.session_groups.retain(|g| !g.sessions.is_empty());
-                let new_len = app.visible_start_items().len();
-                if new_len > 0 && app.session_cursor >= new_len {
-                    app.session_cursor = new_len - 1;
-                }
                 return if is_remote {
                     SessionKeyAction::DismissRemoteSession { session_id: sid }
                 } else {
@@ -2652,16 +2582,8 @@ pub(crate) fn apply_sessions_key(
             }
             // Delete on a GroupHeader: no-op
         }
-        KeyCode::Backspace => {
-            app.session_filter.pop();
-            app.session_cursor = 0;
-            app.start_page_scroll = 0;
-        }
-        KeyCode::Char(c) => {
-            app.session_filter.push(c);
-            app.session_cursor = 0;
-            app.start_page_scroll = 0;
-        }
+        KeyCode::Backspace => app.sessions.start_filter_backspace(),
+        KeyCode::Char(c) => app.sessions.start_filter_insert(c),
         _ => {}
     }
     SessionKeyAction::None
@@ -2717,7 +2639,7 @@ mod model_popup_tests {
     #[test]
     fn start_page_enter_on_remote_session_attaches_instead_of_loading() {
         let mut app = App::new();
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_groups = vec![SessionGroup {
             sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
@@ -2726,7 +2648,7 @@ mod model_popup_tests {
             }],
             ..Default::default()
         }];
-        app.session_cursor = 1;
+        app.sessions.session_cursor = 1;
 
         let action = apply_sessions_key(&mut app, KeyCode::Enter);
 
@@ -2743,7 +2665,7 @@ mod model_popup_tests {
     fn popup_enter_on_remote_session_attaches_instead_of_loading() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_groups = vec![SessionGroup {
             sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
@@ -2752,7 +2674,7 @@ mod model_popup_tests {
             }],
             ..Default::default()
         }];
-        app.session_cursor = 1;
+        app.sessions.session_cursor = 1;
 
         let action = apply_popup_session_key(&mut app, KeyCode::Enter);
 
@@ -2796,11 +2718,11 @@ mod model_popup_tests {
     fn help_popup_routes_scroll_and_escape_before_screen_keys() {
         let mut app = App::new();
         app.navigation.open_help();
-        app.session_filter = "keep".into();
+        app.sessions.session_filter = "keep".into();
         let (tx, _rx) = mpsc::unbounded_channel();
 
         handle_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
-        assert_eq!(app.session_filter, "keep");
+        assert_eq!(app.sessions.session_filter, "keep");
         assert_eq!(app.navigation.popup, Popup::Help);
 
         handle_key(&mut app, key(KeyCode::Down), &tx).unwrap();
@@ -3122,7 +3044,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.popup = Popup::ProfileSelect;
-        app.session_id = Some("session".into());
+        app.sessions.session_id = Some("session".into());
         app.profiles
             .bind_session_profile("session".into(), "current".into());
         app.profiles.profiles = vec![make_profile("fast", "Fast")];
@@ -3140,8 +3062,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
-        app.new_session_path = "/repo".into();
-        app.new_session_cursor = app.new_session_path.len();
+        app.sessions.new_session_path = "/repo".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
         app.profiles.active_profile_id = Some("coder-delegate".into());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3159,11 +3081,11 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("delegate-tab");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
+        app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
             .bind_session_profile("s1".into(), "profile".into());
-        app.agent_mode = "plan".into();
+        app.sessions.agent_mode = "plan".into();
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.agents = vec![make_agent("main", "Main"), make_agent("coder", "Coder")];
@@ -3212,7 +3134,7 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("delegate-reset");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
+        app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
             .bind_session_profile("s1".into(), "profile".into());
@@ -3249,7 +3171,7 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("delegate-child-model");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("child".into());
+        app.sessions.session_id = Some("child".into());
         app.parent_session_id = Some("parent".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
@@ -3278,8 +3200,8 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("active-mode");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("s1".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.reasoning_effort = Some("high".into());
@@ -3321,8 +3243,8 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("remote-mesh-model");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("s1".into());
-        app.agent_mode = "build".into();
+        app.sessions.session_id = Some("s1".into());
+        app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.models = vec![
@@ -3373,9 +3295,9 @@ mod model_popup_tests {
         let _guard = TestPersistenceGuard::new("active-remote-mode");
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
-        app.session_id = Some("remote-1".into());
-        app.agent_mode = "build".into();
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_id = Some("remote-1".into());
+        app.sessions.agent_mode = "build".into();
+        app.sessions.session_groups = vec![SessionGroup {
             sessions: vec![SessionSummary {
                 session_id: "remote-1".into(),
                 node_id: Some("node-1".into()),
@@ -3402,7 +3324,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "review".into();
+        app.sessions.agent_mode = "review".into();
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.models = vec![make_model("openai", "gpt-4o")];
@@ -3423,7 +3345,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "review".into();
+        app.sessions.agent_mode = "review".into();
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.models = vec![make_model("openai", "gpt-4o")];
@@ -3448,15 +3370,15 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "plan".into();
+        app.sessions.agent_mode = "plan".into();
         app.input = "/review".into();
         app.input_cursor = app.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert!(matches!(action, AppAction::None));
-        assert_eq!(app.agent_mode, "review");
-        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
+        assert_eq!(app.sessions.agent_mode, "review");
+        assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
         assert!(matches!(
             rx.try_recv().expect("expected SetAgentMode(review)"),
             Command::SetAgentMode { mode } if mode == "review"
@@ -3464,8 +3386,8 @@ mod model_popup_tests {
         assert!(rx.try_recv().is_err());
 
         handle_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
-        assert_eq!(app.agent_mode, "plan");
-        assert_eq!(app.mode_before_review, None);
+        assert_eq!(app.sessions.agent_mode, "plan");
+        assert_eq!(app.sessions.mode_before_review, None);
         assert!(matches!(
             rx.try_recv().expect("expected SetAgentMode(plan)"),
             Command::SetAgentMode { mode } if mode == "plan"
@@ -3480,7 +3402,7 @@ mod model_popup_tests {
         };
 
         let mut app = App::new();
-        app.agent_id = Some("planner".into());
+        app.sessions.agent_id = Some("planner".into());
         app.navigation.popup = Popup::SessionSelect;
         app.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -3515,16 +3437,16 @@ mod model_popup_tests {
         let mut app = App::new();
         app.conn = app::ConnState::Connected;
         app.navigation.screen = Screen::Chat;
-        app.agent_mode = "review".into();
-        app.mode_before_review = Some("plan".into());
+        app.sessions.agent_mode = "review".into();
+        app.sessions.mode_before_review = Some("plan".into());
         app.input = "/review".into();
         app.input_cursor = app.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
         assert!(matches!(action, AppAction::None));
-        assert_eq!(app.agent_mode, "review");
-        assert_eq!(app.mode_before_review.as_deref(), Some("plan"));
+        assert_eq!(app.sessions.agent_mode, "review");
+        assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
         assert!(rx.try_recv().is_err());
         assert_eq!(app.diagnostics.status, "already in review mode");
     }

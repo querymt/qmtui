@@ -5,7 +5,8 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use crate::app::{App, session_group_count_text};
+use crate::app::App;
+use crate::session_state::{StartPageItem, session_group_count_text};
 use crate::theme::Theme;
 
 use super::{ELLIPSIS, draw_header, mesh_header_span, relative_time};
@@ -20,7 +21,7 @@ pub(super) const COLLAPSE_CLOSED: &str = "\u{25B8}"; // ▸ collapsed group
 /// Returned by [`build_start_page_rows`] and consumed by [`draw_start`].
 pub(crate) struct StartPageRow {
     /// The logical item this row represents.
-    pub(crate) item: crate::app::StartPageItem,
+    pub(crate) item: StartPageItem,
     /// Pre-rendered line (spans already styled).
     pub(crate) line: Line<'static>,
     /// True when `session_cursor` points at this row.
@@ -32,11 +33,11 @@ pub(crate) struct StartPageRow {
 /// Pure function — does not touch the frame. Accepts `area_width` for
 /// truncating long paths/titles.
 pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPageRow> {
-    let items = app.visible_start_items();
+    let items = app.sessions.visible_start_items();
     let mut rows = Vec::with_capacity(items.len());
 
     for (idx, item) in items.iter().enumerate() {
-        let selected = idx == app.session_cursor;
+        let selected = idx == app.sessions.session_cursor;
 
         let (header_style, dim_style) = if selected {
             (Theme::selected(), Theme::selected())
@@ -50,7 +51,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
         };
 
         let line: Line<'static> = match &item {
-            crate::app::StartPageItem::GroupHeader {
+            StartPageItem::GroupHeader {
                 cwd,
                 session_count,
                 session_total,
@@ -72,12 +73,12 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 ])
             }
 
-            crate::app::StartPageItem::Session {
+            StartPageItem::Session {
                 group_idx,
                 path,
                 depth,
             } => {
-                let Some(session) = app.session_by_path(*group_idx, path) else {
+                let Some(session) = app.sessions.session_by_path(*group_idx, path) else {
                     continue;
                 };
                 let id_short: String = session.session_id.chars().take(8).collect();
@@ -88,8 +89,12 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                     .map(relative_time)
                     .unwrap_or_default();
 
-                let fork_marker = if app.expandable_root_session(*group_idx, path) {
-                    let indicator = if app.expanded_session_children.contains(&session.session_id) {
+                let fork_marker = if app.sessions.expandable_root_session(*group_idx, path) {
+                    let indicator = if app
+                        .sessions
+                        .expanded_session_children
+                        .contains(&session.session_id)
+                    {
                         COLLAPSE_OPEN
                     } else {
                         COLLAPSE_CLOSED
@@ -130,7 +135,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
 
             // Per-group overflow row. The start page always opens the popup;
             // only the popup performs paginated load-more requests.
-            crate::app::StartPageItem::ShowMore { .. } => {
+            StartPageItem::ShowMore { .. } => {
                 let label = format!("   {ELLIPSIS} show all");
                 Line::from(vec![Span::styled(label, dim_style)])
             }
@@ -366,7 +371,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
     };
     let filter_line = Line::from(vec![
         Span::styled(" > ", Theme::start_header()),
-        Span::styled(app.session_filter.clone(), Theme::fg()),
+        Span::styled(app.sessions.session_filter.clone(), Theme::fg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::base()),
@@ -374,7 +379,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
     );
     // Show cursor at the end of the typed filter text
     f.set_cursor_position((
-        filter_area.x + 3 + app.session_filter.chars().count() as u16,
+        filter_area.x + 3 + app.sessions.session_filter.chars().count() as u16,
         filter_area.y,
     ));
 
@@ -383,7 +388,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 
     if rows.is_empty() {
         // Empty state
-        let msg = if app.session_filter.is_empty() {
+        let msg = if app.sessions.session_filter.is_empty() {
             "No sessions yet.  C-x n to start a new one."
         } else {
             "No sessions match the filter."
@@ -406,19 +411,20 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         let total_rows = rows.len();
 
         // Clamp scroll so cursor is in view.
-        if app.session_cursor >= app.start_page_scroll + visible_rows {
-            app.start_page_scroll = app.session_cursor + 1 - visible_rows;
+        if app.sessions.session_cursor >= app.sessions.start_page_scroll + visible_rows {
+            app.sessions.start_page_scroll = app.sessions.session_cursor + 1 - visible_rows;
         }
-        if app.session_cursor < app.start_page_scroll {
-            app.start_page_scroll = app.session_cursor;
+        if app.sessions.session_cursor < app.sessions.start_page_scroll {
+            app.sessions.start_page_scroll = app.sessions.session_cursor;
         }
-        app.start_page_scroll = app
+        app.sessions.start_page_scroll = app
+            .sessions
             .start_page_scroll
             .min(total_rows.saturating_sub(visible_rows));
 
         for (display_row, row) in rows
             .iter()
-            .skip(app.start_page_scroll)
+            .skip(app.sessions.start_page_scroll)
             .take(visible_rows)
             .enumerate()
         {
@@ -455,7 +461,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         height: 1,
     };
 
-    let button_focused = app.session_cursor == rows.len();
+    let button_focused = app.sessions.session_cursor == rows.len();
 
     // Build text spans: glitch only when focused, always bold
     let text_spans: Vec<Span<'static>> = if button_focused {

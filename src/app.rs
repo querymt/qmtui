@@ -6,14 +6,13 @@ use crate::command::Command;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
-    SessionActivity, SessionOp, SessionStatsLite,
+    SessionOp, SessionStatsLite,
 };
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
-use crate::domain::mesh::RemoteSessionLocation;
 use crate::domain::session::{
-    ForkBoundaryKind, ForkTurnItem, SessionGroup, UndoFrame, UndoFrameStatus, UndoStackSnapshot,
-    UndoState, UndoableTurn,
+    ForkBoundaryKind, ForkTurnItem, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState,
+    UndoableTurn,
 };
 use crate::highlight::Highlighter;
 use crate::markdown::CardBlock;
@@ -22,6 +21,7 @@ use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
+use crate::session_state::SessionsState;
 use crate::ui::{CardCache, ElicitationUiState};
 
 /// Cache for rendered streaming markdown to avoid re-parsing every frame.
@@ -217,13 +217,6 @@ pub struct SlashCompletionState {
     pub results: Vec<&'static crate::slash::SlashCommandDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathCompletionState {
-    pub query: String,
-    pub selected_index: usize,
-    pub results: Vec<FileIndexEntryLite>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Connecting,
@@ -240,142 +233,16 @@ pub enum ConnectionEvent {
 
 const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// A single visible row on the start-page session list.
-///
-/// Built by [`App::visible_start_items`] each render frame, respecting the
-/// current filter and per-group collapse state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartPageItem {
-    /// A group header row (cwd label + count + collapsed state).
-    GroupHeader {
-        /// The cwd key used to look up collapse state (mirrors `SessionGroup::cwd`).
-        cwd: Option<String>,
-        /// Loaded sessions in this group (unfiltered).
-        session_count: usize,
-        /// Total sessions in this group from the backend, when known.
-        session_total: Option<u64>,
-        /// Whether the group is currently collapsed.
-        collapsed: bool,
-    },
-    /// A session row inside an expanded group.
-    Session {
-        /// Index into `App::session_groups`.
-        group_idx: usize,
-        /// Index path from root session to this visible session.
-        path: Vec<usize>,
-        /// Visual nesting depth: 0 for roots, 1+ for fork children.
-        depth: usize,
-    },
-    /// A "... show all" row shown when a group has more sessions than are
-    /// currently visible on the start page.
-    ShowMore {
-        /// Index into `App::session_groups`.
-        group_idx: usize,
-        /// Number of loaded sessions hidden beyond the first `MAX_RECENT_SESSIONS`.
-        remaining: usize,
-        /// Whether the backend has another page for this group.
-        has_more: bool,
-    },
-}
-
-/// Maximum number of recent sessions shown per group on the start page.
-pub const MAX_RECENT_SESSIONS: usize = 3;
-/// Maximum discovery-preview sessions retained before the workspace page arrives.
-pub const POPUP_SESSION_PAGE_TARGET: usize = 10;
-pub const SESSION_CHILD_PAGE_LIMIT: u32 = 10;
-
-/// Maximum number of workspace groups shown on the start page.
-/// Groups beyond this cap are hidden from the start page but remain accessible
-/// through the session popup.
-pub const MAX_VISIBLE_GROUPS: usize = 3;
-
-/// A single visible row in the sessions popup.
-///
-/// Built by [`App::visible_popup_items`]. Unlike [`StartPageItem`] there is no
-/// `ShowMore` variant — the popup always shows all sessions and all groups.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PopupItem {
-    /// A group header row (cwd label + count + collapsed state).
-    GroupHeader {
-        /// The cwd key used to look up collapse state (mirrors `SessionGroup::cwd`).
-        cwd: Option<String>,
-        /// Loaded sessions in this group (unfiltered).
-        session_count: usize,
-        /// Total sessions in this group from the backend, when known.
-        session_total: Option<u64>,
-        /// Whether the group is currently collapsed in the popup.
-        collapsed: bool,
-    },
-    /// A session row inside an expanded group.
-    Session {
-        /// Index into `App::session_groups`.
-        group_idx: usize,
-        /// Index path from root session to this visible session.
-        path: Vec<usize>,
-        /// Visual nesting depth: 0 for roots, 1+ for fork children.
-        depth: usize,
-    },
-    /// A "... load more..." row that fetches the next page for one group or parent fork.
-    LoadMore {
-        /// Index into `App::session_groups`.
-        group_idx: usize,
-        /// Parent session path when loading more fork children; empty for a cwd group page.
-        parent_path: Vec<usize>,
-    },
-}
-
-pub fn session_group_count_text(session_count: usize, session_total: Option<u64>) -> String {
-    session_total
-        .map(|total| format!("{session_count}/{total}"))
-        .unwrap_or_else(|| session_count.to_string())
-}
-
 pub struct App {
     pub(crate) navigation: NavigationState,
 
     // sessions
-    /// Session groups as received from the server (preserve group structure for start page).
-    pub session_groups: Vec<SessionGroup>,
-    pub session_cursor: usize,
-    pub session_filter: String,
-    /// Active tab in the session popup: 0 = sessions, 1 = delegates.
-    pub session_popup_tab: usize,
-    /// Groups whose header has been collapsed by the user on the start page.
-    pub collapsed_groups: HashSet<String>,
-    /// Groups whose header has been collapsed by the user in the session popup.
-    /// Separate from `collapsed_groups` so start-page and popup states are independent.
-    pub popup_collapsed_groups: HashSet<String>,
-    /// Whether global ACP session discovery has another request in flight.
-    pub session_discovery_in_progress: bool,
-    /// Opaque global cursors already queued during the current discovery pass.
-    pub session_discovery_cursors: HashSet<String>,
-    /// CWDs with an outstanding first-page or continuation request.
-    pub pending_session_group_loads: HashSet<Option<String>>,
-    /// CWDs whose authoritative first workspace page has been loaded.
-    pub hydrated_session_groups: HashSet<String>,
-    /// Root session IDs expanded to show fork children.
-    pub expanded_session_children: HashSet<String>,
-    /// Parent session IDs with an outstanding child-page request.
-    pub pending_session_child_loads: HashSet<String>,
-    /// Scroll offset for the start-page session list (in visible rows).
-    pub start_page_scroll: usize,
-    /// Last rendered visible row count for the sessions tab in the popup.
-    pub session_popup_visible_rows: usize,
+    pub(crate) sessions: SessionsState,
     /// Last rendered visible row count for the delegates tab in the popup.
     pub delegate_popup_visible_rows: usize,
 
-    // active session
-    pub session_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub agent_mode: String,
-    pub mode_before_review: Option<String>,
+    // active session startup context
     pub launch_cwd: Option<String>,
-    pub new_session_path: String,
-    pub new_session_cursor: usize,
-    pub new_session_completion: Option<PathCompletionState>,
-    pub session_activity: HashMap<String, SessionActivity>,
-    /// Remote locations retained from ACP and mesh session metadata.
-    pub remote_session_locations: HashMap<String, RemoteSessionLocation>,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -498,24 +365,13 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 
 impl App {
     pub fn begin_session_discovery(&mut self) -> Option<Command> {
-        if self.session_discovery_in_progress || !self.pending_session_group_loads.is_empty() {
-            return None;
-        }
-        self.session_groups.clear();
-        self.session_discovery_cursors.clear();
-        self.pending_session_group_loads.clear();
-        self.hydrated_session_groups.clear();
-        self.session_discovery_in_progress = true;
-        Some(Command::list_sessions_browse())
+        self.sessions
+            .prepare_session_discovery()
+            .then(Command::list_sessions_browse)
     }
 
     pub fn session_group_page_request(&mut self, group_idx: usize) -> Option<Command> {
-        let group = self.session_groups.get(group_idx)?;
-        let cursor = group.next_cursor.clone()?;
-        let cwd = group.cwd.clone()?;
-        if !self.pending_session_group_loads.insert(Some(cwd.clone())) {
-            return None;
-        }
+        let (cwd, cursor) = self.sessions.prepare_session_group_page(group_idx)?;
         Some(Command::list_sessions_group(cwd, cursor))
     }
 
@@ -524,46 +380,22 @@ impl App {
         group_idx: usize,
         parent_path: &[usize],
     ) -> Option<Command> {
-        let parent = self.session_by_path(group_idx, parent_path)?;
-        let parent_session_id = parent.session_id.clone();
-        let cursor = parent.children_next_cursor.clone();
-        self.pending_session_child_loads
-            .insert(parent_session_id.clone());
+        let (parent_session_id, cursor) = self
+            .sessions
+            .prepare_session_child_page(group_idx, parent_path)?;
         Some(Command::list_session_children(
             parent_session_id,
             cursor,
-            SESSION_CHILD_PAGE_LIMIT,
+            crate::session_state::SESSION_CHILD_PAGE_LIMIT,
         ))
     }
 
     pub fn new() -> Self {
         Self {
             navigation: NavigationState::new(),
-            session_groups: Vec::new(),
-            session_cursor: 0,
-            session_filter: String::new(),
-            session_popup_tab: 0,
-            collapsed_groups: HashSet::new(),
-            popup_collapsed_groups: HashSet::new(),
-            session_discovery_in_progress: false,
-            session_discovery_cursors: HashSet::new(),
-            pending_session_group_loads: HashSet::new(),
-            hydrated_session_groups: HashSet::new(),
-            expanded_session_children: HashSet::new(),
-            pending_session_child_loads: HashSet::new(),
-            start_page_scroll: 0,
-            session_popup_visible_rows: 0,
+            sessions: SessionsState::new(),
             delegate_popup_visible_rows: 0,
-            session_id: None,
-            agent_id: None,
-            agent_mode: "build".into(),
-            mode_before_review: None,
             launch_cwd: None,
-            new_session_path: String::new(),
-            new_session_cursor: 0,
-            new_session_completion: None,
-            session_activity: HashMap::new(),
-            remote_session_locations: HashMap::new(),
             messages: Vec::new(),
             pending_prompt_seq: 0,
             input: String::new(),
@@ -675,7 +507,8 @@ impl App {
     }
 
     pub fn current_session_profile_id(&self) -> Option<&str> {
-        self.session_id
+        self.sessions
+            .session_id
             .as_deref()
             .and_then(|session_id| self.profiles.session_profile_id(session_id))
     }
@@ -684,7 +517,7 @@ impl App {
         self.current_session_profile_id()
             .map(|profile_id| self.profiles.profile_display_name(profile_id))
             .unwrap_or_else(|| {
-                if self.current_session_is_remote() {
+                if self.sessions.current_session_is_remote() {
                     "remote".to_string()
                 } else {
                     self.profiles.active_profile_label()
@@ -1030,7 +863,7 @@ impl App {
                 self.set_status(
                     LogLevel::Info,
                     "connection",
-                    if self.session_id.is_some() {
+                    if self.sessions.session_id.is_some() {
                         "reconnected".to_string()
                     } else {
                         "connected".to_string()
@@ -1040,8 +873,8 @@ impl App {
             ConnectionEvent::Disconnected { reason } => {
                 self.conn = ConnState::Disconnected;
                 self.reconnect_delay_ms = None;
-                self.session_discovery_in_progress = false;
-                self.pending_session_group_loads.clear();
+                self.sessions.session_discovery_in_progress = false;
+                self.sessions.pending_session_group_loads.clear();
                 self.set_status(
                     LogLevel::Warn,
                     "connection",
@@ -1210,18 +1043,6 @@ impl App {
         self.refresh_transient_status();
     }
 
-    pub fn next_mode(&self) -> String {
-        match self.agent_mode.as_str() {
-            "build" => "plan".into(),
-            "plan" => "build".into(),
-            "review" => self
-                .mode_before_review
-                .clone()
-                .unwrap_or_else(|| "build".into()),
-            _ => "build".into(),
-        }
-    }
-
     // ── delegate model preference coordination ───────────────────────────────
 
     pub fn delegate_preference_profile_id(&self) -> Option<&str> {
@@ -1272,7 +1093,9 @@ impl App {
 #[cfg(test)]
 mod reasoning_effort_tests {
     use super::*;
-    use crate::domain::session::SessionSummary;
+    use crate::domain::activity::SessionActivity;
+    use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::session_state::PathCompletionState;
 
     // ── cycle_reasoning_effort ────────────────────────────────────────────────
 
@@ -1429,54 +1252,54 @@ mod reasoning_effort_tests {
     #[test]
     fn active_session_count_requires_multiple_recent_sessions() {
         let mut app = App::new();
-        app.note_session_activity("session-a");
-        assert_eq!(app.active_session_count(), 1);
+        app.sessions.note_session_activity("session-a");
+        assert_eq!(app.sessions.active_session_count(), 1);
 
-        app.note_session_activity("session-b");
-        assert_eq!(app.active_session_count(), 2);
+        app.sessions.note_session_activity("session-b");
+        assert_eq!(app.sessions.active_session_count(), 2);
     }
 
     #[test]
     fn other_active_session_count_excludes_current_session() {
         let mut app = App::new();
-        app.session_id = Some("session-a".into());
-        app.note_session_activity("session-a");
-        app.note_session_activity("session-b");
-        app.note_session_activity("session-c");
+        app.sessions.session_id = Some("session-a".into());
+        app.sessions.note_session_activity("session-a");
+        app.sessions.note_session_activity("session-b");
+        app.sessions.note_session_activity("session-c");
 
-        assert_eq!(app.other_active_session_count(), 2);
+        assert_eq!(app.sessions.other_active_session_count(), 2);
     }
 
     #[test]
     fn other_active_session_count_shows_other_session_when_current_is_idle() {
         let mut app = App::new();
-        app.session_id = Some("session-a".into());
-        app.note_session_activity("session-b");
+        app.sessions.session_id = Some("session-a".into());
+        app.sessions.note_session_activity("session-b");
 
-        assert_eq!(app.other_active_session_count(), 1);
+        assert_eq!(app.sessions.other_active_session_count(), 1);
     }
 
     #[test]
     fn active_session_count_excludes_stale_sessions() {
         let mut app = App::new();
-        app.note_session_activity("session-a");
-        app.session_activity.insert(
+        app.sessions.note_session_activity("session-a");
+        app.sessions.session_activity.insert(
             "session-b".into(),
             SessionActivity {
                 last_event_at: Instant::now() - Duration::from_secs(6),
             },
         );
 
-        assert_eq!(app.active_session_count(), 1);
-        assert_eq!(app.other_active_session_count(), 1);
+        assert_eq!(app.sessions.active_session_count(), 1);
+        assert_eq!(app.sessions.other_active_session_count(), 1);
     }
 
     #[test]
     fn resolve_new_session_default_cwd_prefers_active_session_cwd_then_group_then_launch() {
         let mut app = App::new();
         app.launch_cwd = Some("/launch".into());
-        app.session_id = Some("session-a".into());
-        app.session_groups = vec![SessionGroup {
+        app.sessions.session_id = Some("session-a".into());
+        app.sessions.session_groups = vec![SessionGroup {
             cwd: Some("/group".into()),
             latest_activity: None,
             sessions: vec![SessionSummary {
@@ -1496,13 +1319,13 @@ mod reasoning_effort_tests {
             Some("/session")
         );
 
-        app.session_groups[0].sessions[0].cwd = None;
+        app.sessions.session_groups[0].sessions[0].cwd = None;
         assert_eq!(
             app.resolve_new_session_default_cwd().as_deref(),
             Some("/group")
         );
 
-        app.session_groups.clear();
+        app.sessions.session_groups.clear();
         assert_eq!(
             app.resolve_new_session_default_cwd().as_deref(),
             Some("/launch")
@@ -1517,8 +1340,8 @@ mod reasoning_effort_tests {
         app.open_new_session_popup();
 
         assert_eq!(app.navigation.popup, Popup::NewSession);
-        assert_eq!(app.new_session_path, "/launch");
-        assert_eq!(app.new_session_cursor, "/launch".len());
+        assert_eq!(app.sessions.new_session_path, "/launch");
+        assert_eq!(app.sessions.new_session_cursor, "/launch".len());
     }
 
     #[test]
@@ -1557,7 +1380,7 @@ mod reasoning_effort_tests {
     #[test]
     fn accept_selected_new_session_completion_replaces_input() {
         let mut app = App::new();
-        app.new_session_completion = Some(PathCompletionState {
+        app.sessions.new_session_completion = Some(PathCompletionState {
             query: "pro".into(),
             selected_index: 0,
             results: vec![FileIndexEntryLite {
@@ -1567,8 +1390,8 @@ mod reasoning_effort_tests {
         });
 
         assert!(app.accept_selected_new_session_completion());
-        assert_eq!(app.new_session_path, "/launch/project-two/");
-        assert!(app.new_session_completion.is_none());
+        assert_eq!(app.sessions.new_session_path, "/launch/project-two/");
+        assert!(app.sessions.new_session_completion.is_none());
     }
 
     #[test]
@@ -1907,17 +1730,17 @@ mod session_mode_tests {
     #[test]
     fn next_mode_exits_review_to_previous_mode() {
         let mut app = App::new();
-        app.agent_mode = "review".into();
-        app.mode_before_review = Some("plan".into());
-        assert_eq!(app.next_mode(), "plan");
+        app.sessions.agent_mode = "review".into();
+        app.sessions.mode_before_review = Some("plan".into());
+        assert_eq!(app.sessions.next_mode(), "plan");
     }
 
     #[test]
     fn next_mode_from_review_defaults_to_build_without_previous_mode() {
         let mut app = App::new();
-        app.agent_mode = "review".into();
-        app.mode_before_review = None;
-        assert_eq!(app.next_mode(), "build");
+        app.sessions.agent_mode = "review".into();
+        app.sessions.mode_before_review = None;
+        assert_eq!(app.sessions.next_mode(), "build");
     }
 
     // ── SessionModeChanged in audit replay ────────────────────────────────────
@@ -2488,7 +2311,7 @@ mod tests {
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
         );
 
-        app.session_id = Some("session-1".into());
+        app.sessions.session_id = Some("session-1".into());
         app.handle_connection_event(ConnectionEvent::Connected);
         assert_eq!(app.conn, ConnState::Connected);
         assert_eq!(app.reconnect_attempt, 0);
@@ -2593,7 +2416,8 @@ mod tests {
 #[cfg(test)]
 mod start_page_tests {
     use super::*;
-    use crate::domain::session::SessionSummary;
+    use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::session_state::{PopupItem, StartPageItem};
 
     fn make_group(cwd: Option<&str>, ids: &[(&str, Option<&str>)]) -> SessionGroup {
         SessionGroup {
@@ -2621,7 +2445,7 @@ mod start_page_tests {
     #[test]
     fn visible_items_empty_when_no_sessions() {
         let app = App::new();
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         assert!(items.is_empty());
     }
 
@@ -2630,9 +2454,9 @@ mod start_page_tests {
     #[test]
     fn visible_items_header_then_sessions_expanded() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // 1 header + 2 sessions
         assert_eq!(items.len(), 3);
         assert!(matches!(&items[0], StartPageItem::GroupHeader { .. }));
@@ -2645,10 +2469,10 @@ mod start_page_tests {
     #[test]
     fn visible_items_collapsed_group_hides_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
-        app.collapsed_groups.insert("/a".to_string());
+        app.sessions.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
+        app.sessions.collapsed_groups.insert("/a".to_string());
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // only the header
         assert_eq!(items.len(), 1);
         assert!(matches!(
@@ -2665,12 +2489,12 @@ mod start_page_tests {
     #[test]
     fn visible_items_multiple_groups() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
             make_group(Some("/b"), &[("s2", None), ("s3", None)]),
         ];
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // group /a: 1 header + 1 session = 2
         // group /b: 1 header + 2 sessions = 3
         assert_eq!(items.len(), 5);
@@ -2681,13 +2505,13 @@ mod start_page_tests {
     #[test]
     fn visible_items_one_group_collapsed_other_expanded() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
             make_group(Some("/b"), &[("s2", None), ("s3", None)]),
         ];
-        app.collapsed_groups.insert("/a".to_string());
+        app.sessions.collapsed_groups.insert("/a".to_string());
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // /a collapsed: 1 header
         // /b expanded:  1 header + 2 sessions
         assert_eq!(items.len(), 4);
@@ -2712,13 +2536,13 @@ mod start_page_tests {
     #[test]
     fn visible_items_filter_hides_non_matching_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[("aaa", None), ("bbb", None), ("aab", None)],
         )];
-        app.session_filter = "aa".to_string();
+        app.sessions.session_filter = "aa".to_string();
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // header + "aaa" + "aab" (bbb filtered out by session_id)
         assert_eq!(items.len(), 3);
     }
@@ -2728,13 +2552,13 @@ mod start_page_tests {
     #[test]
     fn visible_items_filter_hides_groups_with_no_matches() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("aaa", None)]),
             make_group(Some("/b"), &[("bbb", None)]),
         ];
-        app.session_filter = "bbb".to_string();
+        app.sessions.session_filter = "bbb".to_string();
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // group /a has no matches → hidden entirely
         // group /b: header + "bbb"
         assert_eq!(items.len(), 2);
@@ -2750,12 +2574,12 @@ mod start_page_tests {
     #[test]
     fn visible_items_session_indices_correct() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s0", None), ("s1", None)]),
             make_group(Some("/b"), &[("s2", None)]),
         ];
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // items[0]: GroupHeader /a
         // items[1]: Session group_idx=0, session_idx=0
         // items[2]: Session group_idx=0, session_idx=1
@@ -2792,8 +2616,8 @@ mod start_page_tests {
         let mut app = App::new();
         let mut group = make_group(Some("/a"), &[("root", Some("2024-01-04T00:00:00Z"))]);
         group.sessions[0].fork_count = 1;
-        app.session_groups = vec![group];
-        app.session_cursor = 1;
+        app.sessions.session_groups = vec![group];
+        app.sessions.session_cursor = 1;
 
         let action = crate::handlers::apply_session_fork_toggle_key(&mut app, false);
         assert_eq!(
@@ -2803,12 +2627,12 @@ mod start_page_tests {
                 parent_path: vec![0],
             }
         );
-        assert!(app.expanded_session_children.contains("root"));
-        assert!(app.pending_session_child_loads.is_empty());
+        assert!(app.sessions.expanded_session_children.contains("root"));
+        assert!(app.sessions.pending_session_child_loads.is_empty());
 
         let action = crate::handlers::apply_session_fork_toggle_key(&mut app, false);
         assert_eq!(action, crate::handlers::SessionKeyAction::None);
-        assert!(app.pending_session_child_loads.is_empty());
+        assert!(app.sessions.pending_session_child_loads.is_empty());
     }
 
     #[test]
@@ -2817,12 +2641,12 @@ mod start_page_tests {
         let mut group = make_group(Some("/a"), &[("remote", Some("2024-01-04T00:00:00Z"))]);
         group.sessions[0].fork_count = 1;
         group.sessions[0].node = Some("remote-host".to_string());
-        app.session_groups = vec![group];
+        app.sessions.session_groups = vec![group];
 
-        assert!(!app.expandable_root_session(0, &[0]));
-        assert!(!app.toggle_session_children(0, &[0]));
-        assert!(app.expanded_session_children.is_empty());
-        assert!(app.pending_session_child_loads.is_empty());
+        assert!(!app.sessions.expandable_root_session(0, &[0]));
+        assert!(!app.sessions.toggle_session_children(0, &[0]));
+        assert!(app.sessions.expanded_session_children.is_empty());
+        assert!(app.sessions.pending_session_child_loads.is_empty());
     }
 
     #[test]
@@ -2837,10 +2661,12 @@ mod start_page_tests {
             parent_session_id: Some("root".to_string()),
             ..Default::default()
         }];
-        app.expanded_session_children.insert("root".to_string());
-        app.session_groups = vec![group];
+        app.sessions
+            .expanded_session_children
+            .insert("root".to_string());
+        app.sessions.session_groups = vec![group];
 
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
 
         assert!(matches!(
             &items[2],
@@ -2864,13 +2690,13 @@ mod start_page_tests {
     #[test]
     fn group_header_session_count_reflects_total_not_filtered() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[("s1", None), ("s2", None), ("s3", None)],
         )];
-        app.session_groups[0].total_count = Some(8);
+        app.sessions.session_groups[0].total_count = Some(8);
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         assert!(matches!(
             &items[0],
             StartPageItem::GroupHeader {
@@ -2884,9 +2710,9 @@ mod start_page_tests {
     #[test]
     fn group_header_session_total_falls_back_to_unknown() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &[("s1", None)])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &[("s1", None)])];
 
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         assert!(matches!(
             &items[0],
             StartPageItem::GroupHeader {
@@ -2903,23 +2729,23 @@ mod start_page_tests {
     fn toggle_group_collapse_collapses_then_expands() {
         let mut app = App::new();
         let key = "/a".to_string();
-        assert!(!app.collapsed_groups.contains(&key));
+        assert!(!app.sessions.collapsed_groups.contains(&key));
 
-        app.toggle_group_collapse(Some("/a"));
-        assert!(app.collapsed_groups.contains(&key));
+        app.sessions.toggle_group_collapse(Some("/a"));
+        assert!(app.sessions.collapsed_groups.contains(&key));
 
-        app.toggle_group_collapse(Some("/a"));
-        assert!(!app.collapsed_groups.contains(&key));
+        app.sessions.toggle_group_collapse(Some("/a"));
+        assert!(!app.sessions.collapsed_groups.contains(&key));
     }
 
     #[test]
     fn toggle_group_collapse_none_cwd_uses_empty_string_key() {
         let mut app = App::new();
-        app.toggle_group_collapse(None);
-        assert!(app.collapsed_groups.contains(""));
+        app.sessions.toggle_group_collapse(None);
+        assert!(app.sessions.collapsed_groups.contains(""));
 
-        app.toggle_group_collapse(None);
-        assert!(!app.collapsed_groups.contains(""));
+        app.sessions.toggle_group_collapse(None);
+        assert!(!app.sessions.collapsed_groups.contains(""));
     }
 
     // ── MAX_RECENT_SESSIONS cap ───────────────────────────────────────────────
@@ -2927,11 +2753,11 @@ mod start_page_tests {
     #[test]
     fn visible_items_group_with_three_sessions_shows_no_show_more() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[("s1", None), ("s2", None), ("s3", None)],
         )];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // header + 3 sessions, no ShowMore
         assert_eq!(items.len(), 4);
         assert!(
@@ -2944,11 +2770,11 @@ mod start_page_tests {
     #[test]
     fn visible_items_group_with_four_sessions_shows_show_more() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[("s1", None), ("s2", None), ("s3", None), ("s4", None)],
         )];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // header + 3 sessions + ShowMore
         assert_eq!(items.len(), 5);
         assert!(matches!(
@@ -2960,7 +2786,7 @@ mod start_page_tests {
     #[test]
     fn visible_items_show_more_remaining_is_total_minus_three() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[
                 ("s1", None),
@@ -2976,7 +2802,7 @@ mod start_page_tests {
                 ("s11", None),
             ],
         )];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         assert!(matches!(
             items.last(),
             Some(StartPageItem::ShowMore {
@@ -2990,7 +2816,7 @@ mod start_page_tests {
     #[test]
     fn visible_items_filter_active_still_caps_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(
+        app.sessions.session_groups = vec![make_group(
             Some("/a"),
             &[
                 ("aaa1", None),
@@ -3006,8 +2832,8 @@ mod start_page_tests {
                 ("aaa11", None),
             ],
         )];
-        app.session_filter = "aaa".to_string();
-        let items = app.visible_start_items();
+        app.sessions.session_filter = "aaa".to_string();
+        let items = app.sessions.visible_start_items();
         assert_eq!(items.len(), 5);
         assert!(matches!(
             items.last(),
@@ -3020,12 +2846,12 @@ mod start_page_tests {
     #[test]
     fn visible_items_three_groups_shows_no_trailing_show_more() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
             make_group(Some("/b"), &[("s2", None)]),
             make_group(Some("/c"), &[("s3", None)]),
         ];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // 3 headers + 3 sessions = 6, no trailing ShowMore
         assert_eq!(items.len(), 6);
         assert!(
@@ -3038,13 +2864,13 @@ mod start_page_tests {
     #[test]
     fn visible_items_four_groups_caps_at_three_no_trailing_show_more() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
             make_group(Some("/b"), &[("s2", None)]),
             make_group(Some("/c"), &[("s3", None)]),
             make_group(Some("/d"), &[("s4", None)]),
         ];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // 3 groups (3 headers + 3 sessions) = 6, no trailing ShowMore
         assert_eq!(items.len(), 6);
         assert!(
@@ -3057,7 +2883,7 @@ mod start_page_tests {
     #[test]
     fn visible_items_six_groups_caps_at_three_no_trailing_show_more() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("s1", None)]),
             make_group(Some("/b"), &[("s2", None)]),
             make_group(Some("/c"), &[("s3", None)]),
@@ -3065,7 +2891,7 @@ mod start_page_tests {
             make_group(Some("/e"), &[("s5", None)]),
             make_group(Some("/f"), &[("s6", None)]),
         ];
-        let items = app.visible_start_items();
+        let items = app.sessions.visible_start_items();
         // 3 shown groups (3 headers + 3 sessions) = 6, no trailing ShowMore
         assert_eq!(items.len(), 6);
         assert!(
@@ -3078,14 +2904,14 @@ mod start_page_tests {
     #[test]
     fn visible_items_group_cap_applied_with_filter_active() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &[("aaa1", None)]),
             make_group(Some("/b"), &[("aaa2", None)]),
             make_group(Some("/c"), &[("aaa3", None)]),
             make_group(Some("/d"), &[("aaa4", None)]),
         ];
-        app.session_filter = "aaa".to_string();
-        let items = app.visible_start_items();
+        app.sessions.session_filter = "aaa".to_string();
+        let items = app.sessions.visible_start_items();
         // Filter active but group cap still applies → 3 groups, no trailing ShowMore
         let headers = items
             .iter()
@@ -3105,7 +2931,8 @@ mod start_page_tests {
 #[cfg(test)]
 mod popup_item_tests {
     use super::*;
-    use crate::domain::session::SessionSummary;
+    use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::session_state::PopupItem;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -3133,7 +2960,7 @@ mod popup_item_tests {
     #[test]
     fn popup_items_empty_when_no_sessions() {
         let app = App::new();
-        assert!(app.visible_popup_items().is_empty());
+        assert!(app.sessions.visible_popup_items().is_empty());
     }
 
     // ── basic structure: header then sessions ─────────────────────────────────
@@ -3141,8 +2968,8 @@ mod popup_item_tests {
     #[test]
     fn popup_items_header_then_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        let items = app.visible_popup_items();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        let items = app.sessions.visible_popup_items();
         // 1 header + 2 sessions
         assert_eq!(items.len(), 3);
         assert!(matches!(&items[0], PopupItem::GroupHeader { .. }));
@@ -3157,8 +2984,8 @@ mod popup_item_tests {
         let mut app = App::new();
         // 10 sessions - all should appear, no cap like start page
         let ids: Vec<&str> = vec!["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"];
-        app.session_groups = vec![make_group(Some("/a"), &ids)];
-        let items = app.visible_popup_items();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &ids)];
+        let items = app.sessions.visible_popup_items();
         // 1 header + 10 sessions = 11
         assert_eq!(items.len(), 11);
         assert!(
@@ -3173,9 +3000,9 @@ mod popup_item_tests {
         let mut app = App::new();
         let mut group = make_group(Some("/workspace/project"), &["s1"]);
         group.next_cursor = Some("cursor-1".to_string());
-        app.session_groups = vec![group];
+        app.sessions.session_groups = vec![group];
 
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
 
         assert!(matches!(
             items.last(),
@@ -3193,11 +3020,13 @@ mod popup_item_tests {
         let mut app = App::new();
         let mut group = make_group(Some("/workspace/project"), &["s1"]);
         group.next_cursor = Some("opaque-workspace-2".to_string());
-        app.session_groups = vec![group];
-        app.pending_session_group_loads
+        app.sessions.session_groups = vec![group];
+        app.sessions
+            .pending_session_group_loads
             .insert(Some("/workspace/project".to_string()));
 
-        assert!(!app.visible_popup_items().iter().any(
+        assert!(app.session_group_page_request(0).is_none());
+        assert!(!app.sessions.visible_popup_items().iter().any(
             |item| matches!(item, PopupItem::LoadMore { parent_path, .. } if parent_path.is_empty())
         ));
     }
@@ -3205,14 +3034,14 @@ mod popup_item_tests {
     #[test]
     fn popup_items_shows_all_groups_beyond_cap() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &["s1"]),
             make_group(Some("/b"), &["s2"]),
             make_group(Some("/c"), &["s3"]),
             make_group(Some("/d"), &["s4"]),
             make_group(Some("/e"), &["s5"]),
         ];
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
         let headers = items
             .iter()
             .filter(|i| matches!(i, PopupItem::GroupHeader { .. }))
@@ -3226,10 +3055,10 @@ mod popup_item_tests {
     #[test]
     fn popup_collapsed_is_independent_of_start_page_collapsed() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         // Collapse on the start page should NOT affect the popup
-        app.collapsed_groups.insert("/a".to_string());
-        let items = app.visible_popup_items();
+        app.sessions.collapsed_groups.insert("/a".to_string());
+        let items = app.sessions.visible_popup_items();
         // Popup uses popup_collapsed_groups, not collapsed_groups
         // /a is expanded in popup → header + 2 sessions = 3
         assert_eq!(items.len(), 3);
@@ -3238,9 +3067,9 @@ mod popup_item_tests {
     #[test]
     fn popup_collapsed_hides_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.popup_collapsed_groups.insert("/a".to_string());
-        let items = app.visible_popup_items();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+        app.sessions.popup_collapsed_groups.insert("/a".to_string());
+        let items = app.sessions.visible_popup_items();
         // Only the header visible
         assert_eq!(items.len(), 1);
         assert!(matches!(
@@ -3255,9 +3084,9 @@ mod popup_item_tests {
     #[test]
     fn popup_expanded_shows_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         // Not in popup_collapsed_groups → expanded
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
         assert_eq!(items.len(), 2);
         assert!(matches!(
             &items[0],
@@ -3273,11 +3102,11 @@ mod popup_item_tests {
     #[test]
     fn popup_items_multiple_groups() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &["s1"]),
             make_group(Some("/b"), &["s2", "s3"]),
         ];
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
         // /a: 1 header + 1 session; /b: 1 header + 2 sessions = 5
         assert_eq!(items.len(), 5);
     }
@@ -3285,12 +3114,12 @@ mod popup_item_tests {
     #[test]
     fn popup_one_group_collapsed_other_expanded() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &["s1"]),
             make_group(Some("/b"), &["s2", "s3"]),
         ];
-        app.popup_collapsed_groups.insert("/a".to_string());
-        let items = app.visible_popup_items();
+        app.sessions.popup_collapsed_groups.insert("/a".to_string());
+        let items = app.sessions.visible_popup_items();
         // /a collapsed: 1 header; /b expanded: 1 header + 2 sessions = 4
         assert_eq!(items.len(), 4);
         assert!(matches!(
@@ -3314,9 +3143,9 @@ mod popup_item_tests {
     #[test]
     fn popup_filter_hides_non_matching_sessions() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["aaa", "bbb", "aab"])];
-        app.session_filter = "aa".to_string();
-        let items = app.visible_popup_items();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["aaa", "bbb", "aab"])];
+        app.sessions.session_filter = "aa".to_string();
+        let items = app.sessions.visible_popup_items();
         // header + "aaa" + "aab" (bbb filtered out by session_id)
         assert_eq!(items.len(), 3);
     }
@@ -3324,12 +3153,12 @@ mod popup_item_tests {
     #[test]
     fn popup_filter_hides_groups_with_no_matches() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &["aaa"]),
             make_group(Some("/b"), &["bbb"]),
         ];
-        app.session_filter = "bbb".to_string();
-        let items = app.visible_popup_items();
+        app.sessions.session_filter = "bbb".to_string();
+        let items = app.sessions.visible_popup_items();
         // /a has no matches → hidden; /b: header + "bbb" = 2
         assert_eq!(items.len(), 2);
         if let PopupItem::GroupHeader { cwd, .. } = &items[0] {
@@ -3344,11 +3173,11 @@ mod popup_item_tests {
     #[test]
     fn popup_items_session_indices_correct() {
         let mut app = App::new();
-        app.session_groups = vec![
+        app.sessions.session_groups = vec![
             make_group(Some("/a"), &["s0", "s1"]),
             make_group(Some("/b"), &["s2"]),
         ];
-        let items = app.visible_popup_items();
+        let items = app.sessions.visible_popup_items();
         // items[0]: GroupHeader /a
         // items[1]: Session group_idx=0, session_idx=0
         // items[2]: Session group_idx=0, session_idx=1
@@ -3385,9 +3214,9 @@ mod popup_item_tests {
     #[test]
     fn popup_group_header_session_count_reflects_total() {
         let mut app = App::new();
-        app.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
-        app.session_groups[0].total_count = Some(8);
-        let items = app.visible_popup_items();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
+        app.sessions.session_groups[0].total_count = Some(8);
+        let items = app.sessions.visible_popup_items();
         assert!(matches!(
             &items[0],
             PopupItem::GroupHeader {
@@ -3403,29 +3232,29 @@ mod popup_item_tests {
     #[test]
     fn toggle_popup_collapse_collapses_then_expands() {
         let mut app = App::new();
-        assert!(!app.popup_collapsed_groups.contains("/a"));
-        app.toggle_popup_group_collapse(Some("/a"));
-        assert!(app.popup_collapsed_groups.contains("/a"));
-        app.toggle_popup_group_collapse(Some("/a"));
-        assert!(!app.popup_collapsed_groups.contains("/a"));
+        assert!(!app.sessions.popup_collapsed_groups.contains("/a"));
+        app.sessions.toggle_popup_group_collapse(Some("/a"));
+        assert!(app.sessions.popup_collapsed_groups.contains("/a"));
+        app.sessions.toggle_popup_group_collapse(Some("/a"));
+        assert!(!app.sessions.popup_collapsed_groups.contains("/a"));
     }
 
     #[test]
     fn toggle_popup_collapse_none_cwd_uses_empty_string_key() {
         let mut app = App::new();
-        app.toggle_popup_group_collapse(None);
-        assert!(app.popup_collapsed_groups.contains(""));
-        app.toggle_popup_group_collapse(None);
-        assert!(!app.popup_collapsed_groups.contains(""));
+        app.sessions.toggle_popup_group_collapse(None);
+        assert!(app.sessions.popup_collapsed_groups.contains(""));
+        app.sessions.toggle_popup_group_collapse(None);
+        assert!(!app.sessions.popup_collapsed_groups.contains(""));
     }
 
     #[test]
     fn toggle_popup_collapse_does_not_affect_start_page_state() {
         let mut app = App::new();
-        app.toggle_popup_group_collapse(Some("/a"));
-        assert!(app.popup_collapsed_groups.contains("/a"));
+        app.sessions.toggle_popup_group_collapse(Some("/a"));
+        assert!(app.sessions.popup_collapsed_groups.contains("/a"));
         // start page collapsed_groups should be untouched
-        assert!(!app.collapsed_groups.contains("/a"));
+        assert!(!app.sessions.collapsed_groups.contains("/a"));
     }
 
     // ── slash completion state ─────────────────────────────────────────────────
