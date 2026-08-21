@@ -739,7 +739,7 @@ pub(crate) fn handle_chord(
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if let Some(parent_sid) = app.parent_session_id.clone() {
+            if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
                 send_load_session_commands(
                     cmd_tx,
                     parent_sid,
@@ -1174,7 +1174,7 @@ fn handle_delegate_view_key(
         }
         KeyCode::Esc => {
             // Go back to parent session.
-            if let Some(parent_sid) = app.parent_session_id.clone() {
+            if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
                 send_load_session_commands(
                     cmd_tx,
                     parent_sid,
@@ -1238,39 +1238,24 @@ pub(crate) fn apply_delegate_popup_key(
         KeyCode::Esc => {
             app.navigation.popup = Popup::None;
         }
-        KeyCode::Up => {
-            app.delegate_cursor = app.delegate_cursor.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            let max = app.visible_delegate_entries().len().saturating_sub(1);
-            app.delegate_cursor = (app.delegate_cursor + 1).min(max);
-        }
-        KeyCode::PageUp => {
-            let step = popup_page_step(app.delegate_popup_visible_rows);
-            app.delegate_cursor = app.delegate_cursor.saturating_sub(step);
-        }
-        KeyCode::PageDown => {
-            let max = app.visible_delegate_entries().len().saturating_sub(1);
-            let step = popup_page_step(app.delegate_popup_visible_rows);
-            app.delegate_cursor = app.delegate_cursor.saturating_add(step).min(max);
-        }
+        KeyCode::Up => app.delegates.move_cursor_up(),
+        KeyCode::Down => app.delegates.move_cursor_down(),
+        KeyCode::PageUp => app.delegates.move_cursor_page(false),
+        KeyCode::PageDown => app.delegates.move_cursor_page(true),
         KeyCode::Enter => {
-            let selected = app
-                .visible_delegate_entries()
-                .get(app.delegate_cursor)
-                .map(|entry| {
-                    (
-                        entry.child_session_id.clone(),
-                        entry.target_agent_id.clone(),
-                    )
-                });
+            let selected = app.delegates.selected_entry().map(|entry| {
+                (
+                    entry.child_session_id.clone(),
+                    entry.target_agent_id.clone(),
+                )
+            });
             if let Some((child_session_id, target_agent_id)) = selected {
                 if let Some(sid) = child_session_id {
                     // Use the real parent when navigating between siblings.
-                    app.pending_parent_session_id = app
-                        .parent_session_id
-                        .clone()
-                        .or_else(|| app.sessions.session_id.clone());
+                    app.delegates.stage_parent_for_child_navigation(
+                        app.delegates.parent_session_id.clone(),
+                        app.sessions.session_id.clone(),
+                    );
                     app.navigation.popup = Popup::None;
                     return SessionKeyAction::LoadSession {
                         session_id: sid,
@@ -1286,14 +1271,8 @@ pub(crate) fn apply_delegate_popup_key(
                 }
             }
         }
-        KeyCode::Backspace => {
-            app.delegate_filter.pop();
-            app.delegate_cursor = 0;
-        }
-        KeyCode::Char(c) => {
-            app.delegate_filter.push(c);
-            app.delegate_cursor = 0;
-        }
+        KeyCode::Backspace => app.delegates.filter_backspace(),
+        KeyCode::Char(c) => app.delegates.filter_insert(c),
         _ => {}
     }
     SessionKeyAction::None
@@ -2402,7 +2381,7 @@ pub(crate) fn handle_model_popup_key(
                 {
                     app.models
                         .set_delegate_model_preference(&profile_id, &agent_id, &model);
-                    if app.parent_session_id.is_none()
+                    if app.delegates.parent_session_id.is_none()
                         && let Some(session_id) = app.sessions.session_id.clone()
                     {
                         cmd_tx.send(Command::SetDelegateModel {
@@ -2434,7 +2413,7 @@ pub(crate) fn handle_model_popup_key(
             {
                 app.models
                     .clear_delegate_model_preference(&profile_id, &agent_id);
-                if app.parent_session_id.is_none()
+                if app.delegates.parent_session_id.is_none()
                     && let Some(session_id) = app.sessions.session_id.clone()
                 {
                     cmd_tx.send(Command::SetDelegateModel {
@@ -3279,7 +3258,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("child".into());
-        app.parent_session_id = Some("parent".into());
+        app.delegates.parent_session_id = Some("parent".into());
         app.profiles.active_profile_id = Some("profile".into());
         app.profiles
             .bind_session_profile("child".into(), "profile".into());
@@ -3511,7 +3490,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.sessions.agent_id = Some("planner".into());
         app.navigation.popup = Popup::SessionSelect;
-        app.delegate_entries.push(DelegateEntry {
+        app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
             delegate_tool_call_id: None,

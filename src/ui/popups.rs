@@ -502,7 +502,8 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
 
                     let is_active =
                         app.sessions.session_id.as_deref() == Some(s.session_id.as_str());
-                    let is_parent = app.parent_session_id.as_deref() == Some(s.session_id.as_str());
+                    let is_parent =
+                        app.delegates.parent_session_id.as_deref() == Some(s.session_id.as_str());
                     let marker_part = if is_active {
                         " ● "
                     } else if is_parent {
@@ -688,8 +689,11 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
-    let (filter_display, filter_cur) =
-        scroll_input(&app.delegate_filter, app.delegate_filter.len(), avail);
+    let (filter_display, filter_cur) = scroll_input(
+        &app.delegates.delegate_filter,
+        app.delegates.delegate_filter.len(),
+        avail,
+    );
     let filter_line = Line::from(vec![
         Span::styled("> ", Theme::popup_title()),
         Span::styled(filter_display, Theme::popup_bg()),
@@ -702,8 +706,8 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
 
     // delegate entry list (built from event stream)
     let visible_rows = chunks[3].height as usize;
-    app.delegate_popup_visible_rows = visible_rows;
-    let entries = app.visible_delegate_entries();
+    app.delegates.delegate_popup_visible_rows = visible_rows;
+    let entries = app.delegates.visible_entries();
 
     if entries.is_empty() {
         let list = List::new(vec![ListItem::new(Line::from(Span::styled(
@@ -922,7 +926,10 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
             .style(Theme::popup_bg())
             .row_highlight_style(Theme::selected());
 
-        let selected_idx = app.delegate_cursor.min(entries.len().saturating_sub(1));
+        let selected_idx = app
+            .delegates
+            .delegate_cursor
+            .min(entries.len().saturating_sub(1));
         let offset = selected_idx.saturating_sub(visible_rows.saturating_sub(1));
         let selected = Some(selected_idx);
         let mut state = TableState::default()
@@ -932,7 +939,11 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
     }
 
     // hint
-    let selected_entry = entries.get(app.delegate_cursor.min(entries.len().saturating_sub(1)));
+    let selected_entry = entries.get(
+        app.delegates
+            .delegate_cursor
+            .min(entries.len().saturating_sub(1)),
+    );
     let awaiting_selected = selected_entry.is_some_and(|entry| entry.awaiting_input());
     let enter_help = if awaiting_selected {
         "open child to answer"
