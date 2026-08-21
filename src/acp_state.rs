@@ -10,7 +10,6 @@ use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateStatus, DelegationState, DelegationUpdate,
 };
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
-use crate::domain::chat::ChatEntry;
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
@@ -19,7 +18,7 @@ use crate::domain::mesh::{
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
-    ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot, UndoableTurn,
+    ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot,
 };
 use crate::domain::tool::ToolDetail;
 use crate::navigation_state::{Popup, Screen};
@@ -271,7 +270,7 @@ impl crate::app::App {
                 self.models
                     .replace_live_selection(provider, model, provider_node_id);
                 if let Some(limit) = context_limit {
-                    self.context_limit = limit;
+                    self.chat.context_limit = limit;
                 }
                 vec![]
             }
@@ -346,11 +345,13 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::UndoStack(undo_stack) => {
-                self.undo_state = self.build_undo_state_from_server_stack(&undo_stack, None, None);
+                self.chat.undo_state =
+                    self.chat
+                        .build_undo_state_from_server_stack(&undo_stack, None, None);
                 vec![]
             }
             AcpAppEvent::UndoResult(result) => {
-                self.activity = ActivityState::Idle;
+                self.chat.activity = ActivityState::Idle;
                 match result {
                     UndoResult::Applied {
                         target_message_id,
@@ -360,14 +361,14 @@ impl crate::app::App {
                     } => {
                         let message_id_for_files =
                             target_message_id.or_else(|| stack.message_ids.last().cloned());
-                        self.undo_state = self.build_undo_state_from_server_stack(
+                        self.chat.undo_state = self.chat.build_undo_state_from_server_stack(
                             &stack,
                             message_id_for_files.as_deref(),
                             Some(&reverted_files),
                         );
-                        self.recent_prompt_text = None;
-                        self.streaming_content.clear();
-                        self.streaming_content_message_id = None;
+                        self.chat.recent_prompt_text = None;
+                        self.chat.streaming_content.clear();
+                        self.chat.streaming_content_message_id = None;
                         self.streaming_cache.invalidate();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.sessions.session_id {
@@ -386,7 +387,7 @@ impl crate::app::App {
                     } => {
                         let preferred =
                             target_message_id.or_else(|| stack.message_ids.last().cloned());
-                        self.undo_state = self.build_undo_state_from_server_stack(
+                        self.chat.undo_state = self.chat.build_undo_state_from_server_stack(
                             &stack,
                             preferred.as_deref(),
                             None,
@@ -401,11 +402,12 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::RedoResult(result) => {
-                self.activity = ActivityState::Idle;
+                self.chat.activity = ActivityState::Idle;
                 match result {
                     RedoResult::Applied { message: _, stack } => {
-                        self.undo_state =
-                            self.build_undo_state_from_server_stack(&stack, None, None);
+                        self.chat.undo_state = self
+                            .chat
+                            .build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(LogLevel::Info, "session", "redone - reloading session");
                         if let Some(ref sid) = self.sessions.session_id {
                             return Command::load_session_commands(
@@ -417,8 +419,9 @@ impl crate::app::App {
                         }
                     }
                     RedoResult::Rejected { message, stack } => {
-                        self.undo_state =
-                            self.build_undo_state_from_server_stack(&stack, None, None);
+                        self.chat.undo_state = self
+                            .chat
+                            .build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(
                             LogLevel::Warn,
                             "session",
@@ -429,7 +432,7 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::ForkResult(result) => {
-                self.pending_fork_message_id = None;
+                self.chat.pending_fork_message_id = None;
                 match result {
                     ForkResult::Succeeded {
                         source_session_id: _,
@@ -528,22 +531,14 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::Error { message } => {
-                self.end_llm_request_span(None);
+                self.chat.end_llm_request_span(None);
                 self.push_acp_error(&message);
                 self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
                 vec![]
             }
             AcpAppEvent::PromptFailed { local_id, message } => {
-                self.end_llm_request_span(None);
-                self.messages.retain(|entry| {
-                    !matches!(
-                        entry,
-                        ChatEntry::User {
-                            message_id: Some(message_id),
-                            ..
-                        } if message_id == &local_id
-                    )
-                });
+                self.chat.end_llm_request_span(None);
+                self.chat.rollback_pending_prompt(&local_id);
                 self.card_cache.invalidate();
                 self.push_acp_error(&message);
                 self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
@@ -651,7 +646,7 @@ impl crate::app::App {
         session_id: String,
         profile_id: Option<String>,
     ) -> Vec<Command> {
-        self.activity = ActivityState::Idle;
+        self.chat.activity = ActivityState::Idle;
         let discovered_parent = self
             .sessions
             .session_parent_id(&session_id)
@@ -683,30 +678,14 @@ impl crate::app::App {
     }
 
     fn reset_active_session_view(&mut self) {
-        self.messages.clear();
-        self.pending_prompt_seq = 0;
-        self.streaming_content.clear();
-        self.streaming_content_message_id = None;
-        self.streaming_thinking.clear();
-        self.streaming_thinking_message_id = None;
+        self.chat.reset_for_session_switch();
         self.invalidate_streaming_caches();
         self.card_cache.invalidate();
-        self.scroll_offset = 0;
-        self.undo_state = None;
-        self.undoable_turns.clear();
-        self.recent_prompt_text = None;
-        self.suppress_turn_output = false;
         if self.delegates.parent_session_id.is_none() {
             self.delegates.clear_for_root_session();
         }
         self.composer.reset_for_session_switch();
-        self.last_compaction_token_estimate = None;
-        self.elicitation = None;
-        self.elicitation_ui = None;
-        self.clear_cancel_confirm();
         self.sessions.mode_before_review = None;
-        self.cumulative_cost = None;
-        self.session_stats = crate::domain::activity::SessionStatsLite::default();
     }
 
     fn upsert_provisional_delegate(
@@ -855,14 +834,9 @@ impl crate::app::App {
 
         match update {
             AcpSessionUpdate::TurnStarted => {
-                self.clear_cancel_confirm();
-                if !is_replay {
-                    self.begin_llm_request_span(None);
-                }
-                self.activity = ActivityState::Thinking;
-                self.streaming_content.clear();
-                self.streaming_content_message_id = None;
-                self.invalidate_streaming_caches();
+                self.chat.begin_turn(is_replay);
+                self.streaming_cache.invalidate();
+                self.streaming_thinking_cache.invalidate();
                 self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
             AcpSessionUpdate::UserMessage {
@@ -873,56 +847,28 @@ impl crate::app::App {
                 content,
                 message_id,
             } => {
-                if self.is_turn_active() {
-                    self.activity = ActivityState::Streaming;
+                let transition = self.chat.append_streaming_content(&content, message_id);
+                if transition.finalized_previous {
+                    self.streaming_cache.invalidate();
+                    self.streaming_thinking_cache.invalidate();
+                    self.card_cache.invalidate();
                 }
-                let active_message_id = self
-                    .streaming_content_message_id
-                    .as_deref()
-                    .or(self.streaming_thinking_message_id.as_deref());
-                if message_id.as_deref().is_some_and(|incoming| {
-                    active_message_id.is_some_and(|active| active != incoming)
-                }) {
-                    self.finalize_streaming_segment();
-                }
-                if self.streaming_content.is_empty()
-                    || (self.streaming_content_message_id.is_none() && message_id.is_some())
-                {
-                    self.streaming_content_message_id = message_id;
-                }
-                self.streaming_content.push_str(&content);
             }
             AcpSessionUpdate::AssistantThinkingDelta {
                 content,
                 message_id,
             } => {
-                // `Finished` clears non-durable streaming thinking, so only an unterminated
-                // replay can be present here for a second identical application.
-                if is_replay
-                    && message_id.as_deref().is_some_and(|incoming| {
-                        self.messages.iter().any(|entry| {
-                            matches!(entry, ChatEntry::Thinking { message_id: Some(existing), .. } if existing == incoming)
-                        }) || (self.streaming_thinking_message_id.as_deref() == Some(incoming)
-                            && self.streaming_thinking == content)
-                    })
-                {
+                let transition = self
+                    .chat
+                    .append_streaming_thinking(&content, message_id, is_replay);
+                if transition.ignored_duplicate {
                     return;
                 }
-                let active_message_id = self
-                    .streaming_content_message_id
-                    .as_deref()
-                    .or(self.streaming_thinking_message_id.as_deref());
-                if message_id.as_deref().is_some_and(|incoming| {
-                    active_message_id.is_some_and(|active| active != incoming)
-                }) {
-                    self.finalize_streaming_segment();
+                if transition.finalized_previous {
+                    self.streaming_cache.invalidate();
+                    self.streaming_thinking_cache.invalidate();
+                    self.card_cache.invalidate();
                 }
-                if self.streaming_thinking.is_empty()
-                    || (self.streaming_thinking_message_id.is_none() && message_id.is_some())
-                {
-                    self.streaming_thinking_message_id = message_id;
-                }
-                self.streaming_thinking.push_str(&content);
             }
             AcpSessionUpdate::AssistantMessage {
                 content,
@@ -934,10 +880,10 @@ impl crate::app::App {
                 name,
                 arguments,
             } => {
-                if self.suppress_turn_output {
+                if self.chat.suppress_turn_output {
                     return;
                 }
-                self.activity = ActivityState::RunningTool { name: name.clone() };
+                self.chat.activity = ActivityState::RunningTool { name: name.clone() };
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
                 self.finalize_streaming_segment();
                 if name == "delegate" {
@@ -947,35 +893,21 @@ impl crate::app::App {
                     let cwd = self.current_session_cwd();
                     let detail =
                         tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
-                    if tool_detail::reconcile_tool_call_start(
-                        &mut self.messages,
+                    if self.chat.reconcile_tool_call_start(
                         tool_call_id.as_deref(),
                         &name,
                         detail.clone(),
                     ) {
-                        self.streaming_thinking.clear();
-                        self.streaming_thinking_message_id = None;
+                        self.chat.clear_streaming_thinking();
                         self.streaming_thinking_cache.invalidate();
                         self.card_cache.invalidate();
                         return;
                     }
-                    self.session_stats.total_tool_calls =
-                        self.session_stats.total_tool_calls.saturating_add(1);
-                    if !self.streaming_thinking.is_empty() {
-                        let thinking = std::mem::take(&mut self.streaming_thinking);
-                        let thinking_message_id = self.streaming_thinking_message_id.take();
-                        self.messages.push(ChatEntry::Thinking {
-                            content: thinking,
-                            message_id: thinking_message_id,
-                        });
+                    self.chat.record_tool_call();
+                    if self.chat.push_streaming_thinking_entry() {
                         self.streaming_thinking_cache.invalidate();
                     }
-                    self.messages.push(ChatEntry::ToolCall {
-                        tool_call_id,
-                        name,
-                        is_error: false,
-                        detail,
-                    });
+                    self.chat.push_tool_call(tool_call_id, name, false, detail);
                 }
             }
             AcpSessionUpdate::ToolCallEnd {
@@ -987,25 +919,24 @@ impl crate::app::App {
                 let mut updated = false;
                 if let Some(result) = result.as_deref() {
                     updated = tool_detail::update_tool_detail(
-                        &mut self.messages,
+                        &mut self.chat.messages,
                         tool_call_id.as_deref(),
                         result,
                     );
                 }
                 if is_error {
-                    if tool_detail::mark_tool_call_failed(
-                        &mut self.messages,
-                        tool_call_id.as_deref(),
-                        &name,
-                    ) {
+                    if self
+                        .chat
+                        .mark_tool_call_failed(tool_call_id.as_deref(), &name)
+                    {
                         updated = true;
                     } else {
-                        self.messages.push(ChatEntry::ToolCall {
+                        self.chat.push_tool_call(
                             tool_call_id,
-                            name: format!("{name} (failed)"),
-                            is_error: true,
-                            detail: result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
-                        });
+                            format!("{name} (failed)"),
+                            true,
+                            result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
+                        );
                         updated = true;
                     }
                 }
@@ -1018,15 +949,7 @@ impl crate::app::App {
                 size,
                 cost_usd,
             } => {
-                if used > 0 {
-                    self.session_stats.latest_context_tokens = Some(used);
-                }
-                if size > 0 {
-                    self.context_limit = size;
-                }
-                if let Some(cost_usd) = cost_usd {
-                    self.cumulative_cost = Some(cost_usd);
-                }
+                self.chat.apply_usage(used, size, cost_usd);
                 let pct = if used > 0 && size > 0 {
                     format!(" ({}%)", (used as f64 / size as f64 * 100.0) as u32)
                 } else {
@@ -1043,8 +966,8 @@ impl crate::app::App {
             }
             AcpSessionUpdate::TimingUpdate { duration_secs } => {
                 if duration_secs > 0 {
-                    self.session_stats.active_llm_duration +=
-                        std::time::Duration::from_secs(duration_secs);
+                    self.chat
+                        .add_active_llm_duration(std::time::Duration::from_secs(duration_secs));
                     self.push_log(
                         LogLevel::Info,
                         "usage",
@@ -1069,25 +992,15 @@ impl crate::app::App {
                 );
             }
             AcpSessionUpdate::Cancelled => {
-                if !is_replay {
-                    self.end_llm_request_span(None);
-                }
-                self.activity = ActivityState::Idle;
-                self.streaming_content.clear();
-                self.streaming_content_message_id = None;
-                self.invalidate_streaming_caches();
+                self.chat.cancel_turn(is_replay);
+                self.streaming_cache.invalidate();
+                self.streaming_thinking_cache.invalidate();
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
             AcpSessionUpdate::Finished { finish_reason } => {
-                if !is_replay {
-                    self.end_llm_request_span(None);
-                }
-                self.activity = ActivityState::Idle;
-                self.streaming_content.clear();
-                self.streaming_content_message_id = None;
-                self.streaming_thinking.clear();
-                self.streaming_thinking_message_id = None;
-                self.invalidate_streaming_caches();
+                self.chat.finish_turn(is_replay);
+                self.streaming_cache.invalidate();
+                self.streaming_thinking_cache.invalidate();
                 self.set_status(
                     LogLevel::Debug,
                     "activity",
@@ -1104,103 +1017,24 @@ impl crate::app::App {
         is_replay: bool,
     ) {
         let text = acp_content_to_string(&content);
-        if text.is_empty() {
-            return;
-        }
-        if let Some(message_id) = message_id.as_deref()
-            && self.messages.iter().any(|entry| {
-                matches!(entry, ChatEntry::User { message_id: Some(mid), .. } if mid == message_id)
-            })
-        {
-            self.recent_prompt_text = Some(text);
-            self.suppress_turn_output = false;
-            return;
-        }
-        // QueryMT currently echoes prompts without the client's local ID. Correlating
-        // PromptRequest._meta with UserMessageChunk._meta would make this identity-based;
-        // until then, normalized text is the interoperable fallback for generic ACP agents.
-        if !is_replay
-            && let Some(entry) = self.messages.iter_mut().find(|entry| {
-                matches!(
-                    entry,
-                    ChatEntry::User {
-                        text: pending_text,
-                        message_id: Some(pending_id),
-                    } if pending_id.starts_with("local:pending:")
-                        && pending_text.trim() == text.trim()
-                )
-            })
-        {
-            if let ChatEntry::User {
-                text: pending_text,
-                message_id: pending_id,
-            } = entry
-            {
-                *pending_text = text.clone();
-                *pending_id = message_id.clone();
-            }
-            self.recent_prompt_text = Some(text.clone());
-            self.suppress_turn_output = false;
-            if let Some(message_id) = message_id {
-                self.push_undoable_user_turn(message_id, text);
-            }
+        let transition = self.chat.push_user_message(text, message_id, is_replay);
+        if matches!(
+            transition,
+            crate::chat_state::UserMessageTransition::Reconciled
+        ) {
             self.card_cache.invalidate();
-            return;
-        }
-        if !is_replay && (self.undo_state.is_some() || self.suppress_turn_output) {
-            return;
-        }
-        self.suppress_turn_output = false;
-        self.messages.push(ChatEntry::User {
-            text: text.clone(),
-            message_id: message_id.clone(),
-        });
-        self.recent_prompt_text = Some(text.clone());
-        if let Some(message_id) = message_id {
-            self.push_undoable_user_turn(message_id, text);
         }
     }
 
     fn finalize_streaming_segment(&mut self) {
-        if self.streaming_content.is_empty() && self.streaming_thinking.is_empty() {
-            return;
+        if self.chat.finalize_streaming_segment() {
+            self.invalidate_streaming_caches();
+            self.card_cache.invalidate();
         }
-        let content = std::mem::take(&mut self.streaming_content);
-        let content_message_id = self.streaming_content_message_id.take();
-        let thinking = (!self.streaming_thinking.is_empty())
-            .then(|| std::mem::take(&mut self.streaming_thinking));
-        let thinking_message_id = self.streaming_thinking_message_id.take();
-        self.invalidate_streaming_caches();
-
-        if content.is_empty() {
-            if let Some(thinking) = thinking {
-                self.messages.push(ChatEntry::Thinking {
-                    content: thinking,
-                    message_id: thinking_message_id,
-                });
-            }
-        } else {
-            self.messages.push(ChatEntry::Assistant {
-                content,
-                thinking,
-                message_id: content_message_id.or(thinking_message_id),
-            });
-        }
-        self.card_cache.invalidate();
     }
 
     fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
-        if !self
-            .undoable_turns
-            .iter()
-            .any(|turn| turn.message_id == message_id)
-        {
-            self.undoable_turns.push(UndoableTurn {
-                turn_id: message_id.clone(),
-                message_id,
-                text,
-            });
-        }
+        self.chat.push_undoable_user_turn(message_id, text);
     }
 
     fn push_acp_assistant_message(
@@ -1209,97 +1043,18 @@ impl crate::app::App {
         thinking: Option<String>,
         message_id: Option<String>,
     ) {
-        let explicit_thinking = thinking.filter(|text| !text.is_empty());
-        let streaming_thinking_message_id = self.streaming_thinking_message_id.clone();
-        let thinking_message_id = message_id.clone().or(streaming_thinking_message_id);
-        self.streaming_content.clear();
-        self.streaming_content_message_id = None;
         self.streaming_cache.invalidate();
-        if self.is_turn_active() {
-            self.activity = ActivityState::Thinking;
-        }
-        if content.is_empty() && explicit_thinking.is_none() && self.streaming_thinking.is_empty() {
-            self.streaming_thinking_message_id = None;
-            self.streaming_thinking_cache.invalidate();
-            return;
-        }
-        self.recent_prompt_text = None;
-        if self.suppress_turn_output {
-            self.streaming_thinking.clear();
-            self.streaming_thinking_message_id = None;
-            self.streaming_thinking_cache.invalidate();
-            return;
-        }
-
-        if let Some(message_id) = message_id.as_deref() {
-            if self.messages.iter().any(|entry| {
-                matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } if mid == message_id)
-            }) {
-                self.streaming_thinking.clear();
-                self.streaming_thinking_message_id = None;
-                self.streaming_thinking_cache.invalidate();
-                return;
-            }
-
-            if let Some(idx) = self.messages.iter().position(|entry| {
-                matches!(entry, ChatEntry::Thinking { message_id: Some(mid), .. } if mid == message_id)
-            }) {
-                if content.is_empty() {
-                    self.streaming_thinking.clear();
-                    self.streaming_thinking_message_id = None;
-                    self.streaming_thinking_cache.invalidate();
-                    return;
-                }
-                let existing_thinking = match &self.messages[idx] {
-                    ChatEntry::Thinking { content, .. } => content.clone(),
-                    _ => String::new(),
-                };
-                let streaming_thinking = (!self.streaming_thinking.is_empty())
-                    .then(|| std::mem::take(&mut self.streaming_thinking));
-                let thinking_text = explicit_thinking
-                    .or_else(|| (!existing_thinking.is_empty()).then_some(existing_thinking))
-                    .or(streaming_thinking);
-                self.streaming_thinking_message_id = None;
-                self.streaming_thinking_cache.invalidate();
-                self.messages[idx] = ChatEntry::Assistant {
-                    content,
-                    thinking: thinking_text,
-                    message_id: Some(message_id.to_string()),
-                };
-                self.card_cache.invalidate();
-                return;
-            }
-        }
-
-        let streaming_thinking = (!self.streaming_thinking.is_empty())
-            .then(|| std::mem::take(&mut self.streaming_thinking));
-        let thinking_text = explicit_thinking.or(streaming_thinking);
-        self.streaming_thinking_message_id = None;
+        let replaced = self
+            .chat
+            .push_assistant_message(content, thinking, message_id);
         self.streaming_thinking_cache.invalidate();
-        if content.is_empty() {
-            if let Some(thinking) = thinking_text {
-                self.messages.push(ChatEntry::Thinking {
-                    content: thinking,
-                    message_id: thinking_message_id,
-                });
-            }
-        } else {
-            self.messages.push(ChatEntry::Assistant {
-                content,
-                thinking: thinking_text,
-                message_id,
-            });
+        if replaced {
+            self.card_cache.invalidate();
         }
     }
 
     fn push_acp_error(&mut self, message: &str) {
-        if !self
-            .messages
-            .iter()
-            .any(|entry| matches!(entry, ChatEntry::Error(existing) if existing == message))
-        {
-            self.messages.push(ChatEntry::Error(message.to_string()));
-        }
+        self.chat.push_error(message);
     }
 
     fn handle_acp_elicitation_requested(
@@ -1311,61 +1066,45 @@ impl crate::app::App {
         allow_custom: bool,
         is_replay: bool,
     ) {
-        // An elicitation ID is the durable identity across live delivery and replay.
-        // Keep an existing card (and any recorded outcome) rather than reopening it.
-        if self.messages.iter().any(|entry| {
-            matches!(
-                entry,
-                ChatEntry::Elicitation {
-                    elicitation_id: existing_id,
-                    ..
-                } if existing_id == elicitation_id
-            )
-        }) {
+        let fields = ElicitationState::parse_schema(requested_schema);
+        let supported = !fields.is_empty();
+        let active = (supported && !is_replay).then(|| ElicitationState {
+            elicitation_id: elicitation_id.to_string(),
+            message: message.to_string(),
+            source: source.to_string(),
+            fields,
+            selected: std::collections::HashMap::new(),
+            text_input: String::new(),
+            custom_input: String::new(),
+            allow_custom,
+        });
+        let outcome = (!supported).then(|| "unsupported schema - cannot answer in TUI".into());
+        let transition = self.chat.push_elicitation(
+            active,
+            elicitation_id.to_string(),
+            message.to_string(),
+            source.to_string(),
+            outcome,
+        );
+        if !transition.inserted {
             return;
         }
-
-        self.finalize_streaming_segment();
-        let fields = ElicitationState::parse_schema(requested_schema);
-        if fields.is_empty() {
-            let outcome = "unsupported schema - cannot answer in TUI";
-            self.messages.push(ChatEntry::Elicitation {
-                elicitation_id: elicitation_id.to_string(),
-                message: message.to_string(),
-                source: source.to_string(),
-                outcome: Some(outcome.into()),
-            });
-            self.scroll_offset = 0;
-            self.set_status(
-                LogLevel::Warn,
-                "elicitation",
-                "question skipped - unsupported schema",
-            );
-        } else {
-            if !is_replay {
-                self.elicitation = Some(ElicitationState {
-                    elicitation_id: elicitation_id.to_string(),
-                    message: message.to_string(),
-                    source: source.to_string(),
-                    fields,
-                    selected: std::collections::HashMap::new(),
-                    text_input: String::new(),
-                    custom_input: String::new(),
-                    allow_custom,
-                });
-                self.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
-            }
-            self.messages.push(ChatEntry::Elicitation {
-                elicitation_id: elicitation_id.to_string(),
-                message: message.to_string(),
-                source: source.to_string(),
-                outcome: None,
-            });
-            self.scroll_offset = 0;
+        if transition.finalized_streaming {
+            self.streaming_cache.invalidate();
+            self.streaming_thinking_cache.invalidate();
+            self.card_cache.invalidate();
+        }
+        if supported {
             self.set_status(
                 LogLevel::Info,
                 "elicitation",
                 "question - answer in the panel above input",
+            );
+        } else {
+            self.set_status(
+                LogLevel::Warn,
+                "elicitation",
+                "question skipped - unsupported schema",
             );
         }
     }
@@ -1809,14 +1548,17 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::chat_state::ElicitationUiState;
     use crate::composer_state::{FileIndexEntryLite, MentionState};
     use crate::domain::activity::{
         DelegateEntry, DelegateStats, PendingDelegateToolCall, SessionOp,
     };
+    use crate::domain::chat::ChatEntry;
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
     use crate::domain::session::{
         SessionGroup, SessionListPage, SessionSummary, UndoFrame, UndoFrameStatus, UndoState,
+        UndoableTurn,
     };
 
     const TEST_SESSION_ID: &str = "session-1";
@@ -1900,7 +1642,7 @@ mod tests {
         expected_message_id: &str,
     ) {
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Assistant { content, thinking, message_id: Some(message_id) }]
                 if content == expected_content
                     && thinking.as_deref() == expected_thinking
@@ -1909,7 +1651,7 @@ mod tests {
     }
 
     fn push_thinking_entry(app: &mut App, content: &str) {
-        app.messages.push(ChatEntry::Thinking {
+        app.chat.messages.push(ChatEntry::Thinking {
             content: content.into(),
             message_id: Some(TEST_ASSISTANT_ID.into()),
         });
@@ -2300,16 +2042,16 @@ mod tests {
     #[test]
     fn delegation_completion_does_not_interrupt_parent_streaming() {
         let mut app = app_with_active_session();
-        app.streaming_content = "partial".into();
-        app.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "partial".into();
+        app.chat.activity = ActivityState::Streaming;
 
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
             DelegationState::Completed,
             120,
         )));
 
-        assert_eq!(app.streaming_content, "partial");
-        assert_eq!(app.activity, ActivityState::Streaming);
+        assert_eq!(app.chat.streaming_content, "partial");
+        assert_eq!(app.chat.activity, ActivityState::Streaming);
     }
 
     #[test]
@@ -2848,8 +2590,8 @@ mod tests {
     #[test]
     fn native_session_created_resets_view_and_subscribes() {
         let mut app = App::new();
-        app.messages.push(ChatEntry::Error("stale".into()));
-        app.streaming_content = "stale stream".into();
+        app.chat.messages.push(ChatEntry::Error("stale".into()));
+        app.chat.streaming_content = "stale stream".into();
         app.delegates.parent_session_id = Some("old-parent".into());
         app.delegates.pending_parent_session_id = Some("staged-parent".into());
         app.delegates.delegate_entries.push(DelegateEntry {
@@ -2864,7 +2606,7 @@ mod tests {
             ended_at: None,
             child_state: DelegateChildState::None,
         });
-        app.scroll_offset = 3;
+        app.chat.scroll_offset = 3;
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
         app.composer.input_scroll = 2;
@@ -2884,13 +2626,13 @@ mod tests {
             selected_index: 0,
             results: Vec::new(),
         });
-        app.undo_state = Some(UndoState {
+        app.chat.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
         });
-        app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
-        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
-        app.session_stats.total_tool_calls = 1;
+        app.chat.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.session_stats.total_tool_calls = 1;
         app.mesh.mesh_nodes = vec![RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
@@ -2912,9 +2654,9 @@ mod tests {
         assert_eq!(app.delegates.parent_session_id, None);
         assert_eq!(app.delegates.pending_parent_session_id, None);
         assert!(app.delegates.delegate_entries.is_empty());
-        assert!(app.messages.is_empty());
-        assert!(app.streaming_content.is_empty());
-        assert_eq!(app.scroll_offset, 0);
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.streaming_content.is_empty());
+        assert_eq!(app.chat.scroll_offset, 0);
         assert_eq!(app.composer.input, "/mo");
         assert_eq!(app.composer.input_cursor, 3);
         assert_eq!(app.composer.input_scroll, 2);
@@ -2926,9 +2668,9 @@ mod tests {
         assert_eq!(app.composer.file_index_error, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_some());
-        assert!(app.undo_state.is_none());
-        assert!(app.elicitation.is_none());
-        assert_eq!(app.session_stats.total_tool_calls, 0);
+        assert!(app.chat.undo_state.is_none());
+        assert!(app.chat.elicitation.is_none());
+        assert_eq!(app.chat.session_stats.total_tool_calls, 0);
         assert_eq!(app.mesh.mesh_node_count, Some(1));
         assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
         assert_eq!(app.mesh.mesh_invite_name, "preserved");
@@ -2968,20 +2710,20 @@ mod tests {
             sessions: vec![parent],
             ..Default::default()
         }];
-        app.messages.push(ChatEntry::Error("stale".into()));
-        app.streaming_content = "stale stream".into();
-        app.streaming_content_message_id = Some("stream-1".into());
-        app.streaming_thinking = "stale thinking".into();
-        app.streaming_thinking_message_id = Some("thinking-1".into());
-        app.scroll_offset = 4;
-        app.undo_state = Some(UndoState {
+        app.chat.messages.push(ChatEntry::Error("stale".into()));
+        app.chat.streaming_content = "stale stream".into();
+        app.chat.streaming_content_message_id = Some("stream-1".into());
+        app.chat.streaming_thinking = "stale thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-1".into());
+        app.chat.scroll_offset = 4;
+        app.chat.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
         });
-        app.recent_prompt_text = Some("stale prompt".into());
-        app.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
-        app.elicitation_ui = Some(crate::ui::ElicitationUiState::default());
-        app.session_stats.total_tool_calls = 2;
+        app.chat.recent_prompt_text = Some("stale prompt".into());
+        app.chat.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.session_stats.total_tool_calls = 2;
         seed_model_state(&mut app);
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "delegate-1".into(),
@@ -3004,17 +2746,17 @@ mod tests {
 
         assert_eq!(app.delegates.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(app.navigation.screen, Screen::Delegate);
-        assert!(app.messages.is_empty());
-        assert!(app.streaming_content.is_empty());
-        assert_eq!(app.streaming_content_message_id, None);
-        assert!(app.streaming_thinking.is_empty());
-        assert_eq!(app.streaming_thinking_message_id, None);
-        assert_eq!(app.scroll_offset, 0);
-        assert!(app.undo_state.is_none());
-        assert!(app.undoable_turns.is_empty());
-        assert!(app.recent_prompt_text.is_none());
-        assert!(app.elicitation.is_none());
-        assert_eq!(app.session_stats.total_tool_calls, 0);
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.streaming_content.is_empty());
+        assert_eq!(app.chat.streaming_content_message_id, None);
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert_eq!(app.chat.streaming_thinking_message_id, None);
+        assert_eq!(app.chat.scroll_offset, 0);
+        assert!(app.chat.undo_state.is_none());
+        assert!(app.chat.undoable_turns.is_empty());
+        assert!(app.chat.recent_prompt_text.is_none());
+        assert!(app.chat.elicitation.is_none());
+        assert_eq!(app.chat.session_stats.total_tool_calls, 0);
         assert_eq!(app.delegates.delegate_entries.len(), 1);
         assert_seeded_model_state(&app);
         assert!(matches!(
@@ -3135,7 +2877,7 @@ mod tests {
     #[test]
     fn native_provider_changed_updates_selection_and_preserves_limit_when_absent() {
         let mut app = App::new();
-        app.context_limit = 4_096;
+        app.chat.context_limit = 4_096;
 
         app.handle_acp_event(AcpAppEvent::ProviderChanged {
             provider: "remote-provider".into(),
@@ -3148,7 +2890,7 @@ mod tests {
             Some("remote-provider")
         );
         assert_eq!(app.models.current_model.as_deref(), Some("model-1"));
-        assert_eq!(app.context_limit, 128_000);
+        assert_eq!(app.chat.context_limit, 128_000);
         assert_eq!(app.models.current_model_node_id.as_deref(), Some("node-1"));
 
         app.handle_acp_event(AcpAppEvent::ProviderChanged {
@@ -3162,7 +2904,7 @@ mod tests {
             Some("local-provider")
         );
         assert_eq!(app.models.current_model.as_deref(), Some("model-2"));
-        assert_eq!(app.context_limit, 128_000);
+        assert_eq!(app.chat.context_limit, 128_000);
         assert_eq!(app.models.current_model_node_id, None);
     }
 
@@ -3200,7 +2942,7 @@ mod tests {
         apply_live_update(&mut app, final_assistant_update("world", None));
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { text, message_id: Some(user_id) },
                 ChatEntry::Assistant { content, message_id: Some(assistant_id), .. }
@@ -3237,7 +2979,7 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { message_id: Some(message_id), .. },
                 ChatEntry::Elicitation { elicitation_id, .. }
@@ -3259,7 +3001,7 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::User { text, message_id: Some(message_id) }]
                 if text == "first line\nsecond line" && message_id == "user-1"
         ));
@@ -3282,7 +3024,7 @@ mod tests {
         }
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { text: first_text, message_id: Some(first), .. },
                 ChatEntry::User { text: second_text, message_id: Some(second), .. }
@@ -3308,7 +3050,7 @@ mod tests {
         }
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { message_id: Some(first), .. },
                 ChatEntry::User { message_id: Some(second), .. }
@@ -3335,13 +3077,13 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Assistant { content, message_id: Some(message_id), .. }]
                 if content == "first" && message_id == "assistant-1"
         ));
-        assert_eq!(app.streaming_content, "second");
+        assert_eq!(app.chat.streaming_content, "second");
         assert_eq!(
-            app.streaming_content_message_id.as_deref(),
+            app.chat.streaming_content_message_id.as_deref(),
             Some("assistant-2")
         );
     }
@@ -3366,13 +3108,13 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::Assistant { content, message_id: Some(message_id), .. },
                 ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. }
             ] if content == "Let me check." && message_id == "assistant-1" && tool_call_id == "tool-1"
         ));
-        assert!(app.streaming_content.is_empty());
+        assert!(app.chat.streaming_content.is_empty());
     }
 
     #[test]
@@ -3390,12 +3132,12 @@ mod tests {
             });
         }
 
-        assert_eq!(app.streaming_thinking, "inspect files");
+        assert_eq!(app.chat.streaming_thinking, "inspect files");
         assert_eq!(
-            app.streaming_thinking_message_id.as_deref(),
+            app.chat.streaming_thinking_message_id.as_deref(),
             Some("assistant-1")
         );
-        assert!(app.messages.is_empty());
+        assert!(app.chat.messages.is_empty());
     }
 
     #[test]
@@ -3412,9 +3154,9 @@ mod tests {
             });
         }
 
-        assert_eq!(app.streaming_thinking, "hello");
+        assert_eq!(app.chat.streaming_thinking, "hello");
         assert_eq!(
-            app.streaming_thinking_message_id.as_deref(),
+            app.chat.streaming_thinking_message_id.as_deref(),
             Some("assistant-1")
         );
     }
@@ -3446,7 +3188,7 @@ mod tests {
         }
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::Thinking { content, message_id: Some(message_id) },
                 ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. },
@@ -3457,11 +3199,11 @@ mod tests {
     #[test]
     fn final_assistant_replaces_matching_thinking_without_crossing_tool() {
         let mut app = app_with_active_session();
-        app.messages.push(ChatEntry::Thinking {
+        app.chat.messages.push(ChatEntry::Thinking {
             content: "Need to inspect".into(),
             message_id: Some("assistant-1".into()),
         });
-        app.messages.push(ChatEntry::ToolCall {
+        app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: Some("tool-1".into()),
             name: "read_tool".into(),
             is_error: false,
@@ -3478,7 +3220,7 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::Assistant { content, thinking: Some(thinking), .. },
                 ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), .. }
@@ -3498,8 +3240,11 @@ mod tests {
             },
         );
 
-        assert_eq!(app.streaming_thinking, "thinking");
-        assert_eq!(app.streaming_thinking_message_id.as_deref(), Some("a1"));
+        assert_eq!(app.chat.streaming_thinking, "thinking");
+        assert_eq!(
+            app.chat.streaming_thinking_message_id.as_deref(),
+            Some("a1")
+        );
     }
 
     #[test]
@@ -3529,8 +3274,8 @@ mod tests {
             },
         );
 
-        assert!(app.streaming_content.is_empty());
-        assert!(app.streaming_thinking.is_empty());
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
         assert_single_assistant(
             &app,
             "final answer",
@@ -3575,7 +3320,7 @@ mod tests {
     #[test]
     fn native_duplicate_final_assistant_message_is_not_appended() {
         let mut app = app_with_active_session();
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "first answer".into(),
             thinking: Some("first thinking".into()),
             message_id: Some(TEST_ASSISTANT_ID.into()),
@@ -3613,13 +3358,13 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::ToolCall {
                 detail: ToolDetail::Shell { command, workdir, .. },
                 ..
             }] if command == "cargo check --examples" && workdir.as_deref() == Some("/repo")
         ));
-        assert_eq!(app.session_stats.total_tool_calls, 1);
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
     }
 
     #[test]
@@ -3637,9 +3382,9 @@ mod tests {
             },
         });
 
-        assert_eq!(app.session_stats.latest_context_tokens, Some(2048));
-        assert_eq!(app.context_limit, 8192);
-        assert_eq!(app.cumulative_cost, Some(0.0123));
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(2048));
+        assert_eq!(app.chat.context_limit, 8192);
+        assert_eq!(app.chat.cumulative_cost, Some(0.0123));
         assert!(matches!(
             app.diagnostics.logs.last(),
             Some(entry)
@@ -3661,7 +3406,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.llm_request_elapsed(),
+            app.chat.llm_request_elapsed(),
             Some(std::time::Duration::from_secs(42))
         );
         assert!(matches!(
@@ -3684,12 +3429,13 @@ mod tests {
             update: AcpSessionUpdate::TurnStarted,
         });
 
-        assert!(app.session_stats.open_llm_request_instant.is_some());
-        app.session_stats.open_llm_request_instant = app
+        assert!(app.chat.session_stats.open_llm_request_instant.is_some());
+        app.chat.session_stats.open_llm_request_instant = app
+            .chat
             .session_stats
             .open_llm_request_instant
             .map(|started| started - std::time::Duration::from_secs(2));
-        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+        assert!(app.chat.llm_request_elapsed().is_some_and(|elapsed| {
             elapsed >= std::time::Duration::from_secs(2)
                 && elapsed < std::time::Duration::from_secs(3)
         }));
@@ -3702,8 +3448,8 @@ mod tests {
             },
         });
 
-        assert!(app.session_stats.open_llm_request_instant.is_none());
-        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.llm_request_elapsed().is_some_and(|elapsed| {
             elapsed >= std::time::Duration::from_secs(2)
                 && elapsed < std::time::Duration::from_secs(3)
         }));
@@ -3720,8 +3466,8 @@ mod tests {
             update: AcpSessionUpdate::TurnStarted,
         });
 
-        assert!(app.session_stats.open_llm_request_instant.is_none());
-        assert_eq!(app.llm_request_elapsed(), None);
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert_eq!(app.chat.llm_request_elapsed(), None);
     }
 
     #[test]
@@ -3736,12 +3482,13 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.first(),
+            app.chat.messages.first(),
             Some(ChatEntry::User { text, message_id: Some(message_id) })
                 if text == "second" && message_id == &second
         ));
         assert_eq!(
-            app.messages
+            app.chat
+                .messages
                 .iter()
                 .filter(|entry| matches!(entry, ChatEntry::User { .. }))
                 .count(),
@@ -3759,7 +3506,8 @@ mod tests {
             is_replay: false,
             update: AcpSessionUpdate::TurnStarted,
         });
-        app.session_stats.open_llm_request_instant = app
+        app.chat.session_stats.open_llm_request_instant = app
+            .chat
             .session_stats
             .open_llm_request_instant
             .map(|started| started - std::time::Duration::from_secs(3));
@@ -3767,8 +3515,8 @@ mod tests {
             message: "prompt failed".into(),
         });
 
-        assert!(app.session_stats.open_llm_request_instant.is_none());
-        assert!(app.llm_request_elapsed().is_some_and(|elapsed| {
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.llm_request_elapsed().is_some_and(|elapsed| {
             elapsed >= std::time::Duration::from_secs(3)
                 && elapsed < std::time::Duration::from_secs(4)
         }));
@@ -3803,7 +3551,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::ToolCall {
                 detail: ToolDetail::Shell { output_tail: Some(tail), .. },
                 ..
@@ -3831,7 +3579,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::ToolCall {
                 detail: ToolDetail::ReadTool { path, start_line: Some(10), end_line: Some(14) },
                 ..
@@ -3844,8 +3592,8 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_id = Some("session-1".into());
         app.sessions.agent_id = Some("agent-1".into());
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        app.undoable_turns.push(UndoableTurn {
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.undoable_turns.push(UndoableTurn {
             turn_id: "u1".into(),
             message_id: "u1".into(),
             text: "change".into(),
@@ -3860,11 +3608,11 @@ mod tests {
             },
         }));
 
-        assert!(matches!(app.activity, ActivityState::Idle));
+        assert!(matches!(app.chat.activity, ActivityState::Idle));
         assert_eq!(app.diagnostics.status, "undone - reloading session");
-        assert!(app.can_redo());
+        assert!(app.chat.can_redo());
         assert_eq!(
-            app.undo_state.as_ref().unwrap().stack[0].reverted_files,
+            app.chat.undo_state.as_ref().unwrap().stack[0].reverted_files,
             ["src/main.rs"]
         );
         assert!(matches!(
@@ -3883,9 +3631,9 @@ mod tests {
     fn native_undo_rejection_without_target_uses_stack_tail_without_reload() {
         let mut app = App::new();
         app.sessions.session_id = Some("session-1".into());
-        app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        app.streaming_content = "keep streaming content".into();
-        app.undoable_turns = vec![
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.streaming_content = "keep streaming content".into();
+        app.chat.undoable_turns = vec![
             UndoableTurn {
                 turn_id: "turn-1".into(),
                 message_id: "msg-1".into(),
@@ -3897,7 +3645,7 @@ mod tests {
                 text: "second".into(),
             },
         ];
-        app.undo_state = Some(UndoState {
+        app.chat.undo_state = Some(UndoState {
             stack: vec![UndoFrame {
                 turn_id: "turn-1".into(),
                 message_id: "msg-1".into(),
@@ -3915,11 +3663,11 @@ mod tests {
             },
         }));
 
-        assert!(matches!(app.activity, ActivityState::Idle));
+        assert!(matches!(app.chat.activity, ActivityState::Idle));
         assert_eq!(app.diagnostics.status, "Undo rejected");
-        assert_eq!(app.streaming_content, "keep streaming content");
+        assert_eq!(app.chat.streaming_content, "keep streaming content");
         assert!(replies.is_empty());
-        let undo_state = app.undo_state.as_ref().expect("undo state");
+        let undo_state = app.chat.undo_state.as_ref().expect("undo state");
         assert_eq!(undo_state.frontier_message_id.as_deref(), Some("msg-2"));
         assert!(
             undo_state
@@ -3928,7 +3676,8 @@ mod tests {
                 .all(|frame| frame.reverted_files.is_empty())
         );
         assert_eq!(
-            app.current_undo_target()
+            app.chat
+                .current_undo_target()
                 .map(|turn| turn.message_id.as_str()),
             Some("msg-1")
         );
@@ -3937,7 +3686,7 @@ mod tests {
     #[test]
     fn native_undo_rejection_prefers_explicit_target() {
         let mut app = App::new();
-        app.undoable_turns = vec![
+        app.chat.undoable_turns = vec![
             UndoableTurn {
                 turn_id: "turn-1".into(),
                 message_id: "msg-1".into(),
@@ -3960,7 +3709,8 @@ mod tests {
 
         assert!(replies.is_empty());
         assert_eq!(
-            app.undo_state
+            app.chat
+                .undo_state
                 .as_ref()
                 .and_then(|state| state.frontier_message_id.as_deref()),
             Some("msg-1")
@@ -3972,7 +3722,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_id = Some("session-1".into());
         app.sessions.agent_id = Some("agent-1".into());
-        app.activity = ActivityState::SessionOp(SessionOp::Redo);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
 
         let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResult::Applied {
             message: Some("redone".into()),
@@ -3981,9 +3731,9 @@ mod tests {
             },
         }));
 
-        assert!(matches!(app.activity, ActivityState::Idle));
+        assert!(matches!(app.chat.activity, ActivityState::Idle));
         assert_eq!(app.diagnostics.status, "redone - reloading session");
-        assert!(app.can_redo());
+        assert!(app.chat.can_redo());
         assert!(matches!(
             replies.as_slice(),
             [
@@ -3999,7 +3749,7 @@ mod tests {
     #[test]
     fn native_redo_result_failure_clears_pending_state_and_logs_warning() {
         let mut app = App::new();
-        app.activity = ActivityState::SessionOp(SessionOp::Redo);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
 
         let replies = app.handle_acp_event(AcpAppEvent::RedoResult(RedoResult::Rejected {
             message: Some("Nothing to redo".into()),
@@ -4008,9 +3758,9 @@ mod tests {
             },
         }));
 
-        assert!(matches!(app.activity, ActivityState::Idle));
+        assert!(matches!(app.chat.activity, ActivityState::Idle));
         assert_eq!(app.diagnostics.status, "Nothing to redo");
-        assert!(app.can_redo());
+        assert!(app.chat.can_redo());
         assert!(replies.is_empty());
         assert!(matches!(
             app.diagnostics.logs.last(),
@@ -4023,7 +3773,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.agent_id = Some("agent-1".into());
         app.navigation.popup = Popup::ForkTurnSelect;
-        app.pending_fork_message_id = Some("msg-1".into());
+        app.chat.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Succeeded {
             source_session_id: Some("source-1".into()),
@@ -4031,7 +3781,7 @@ mod tests {
             message: None,
         }));
 
-        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.chat.pending_fork_message_id, None);
         assert_eq!(app.navigation.popup, Popup::None);
         assert_eq!(app.diagnostics.status, "forked - loading session");
         assert_eq!(replies.len(), 2);
@@ -4048,7 +3798,7 @@ mod tests {
     fn native_fork_result_success_without_id_warns_and_keeps_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::ForkTurnSelect;
-        app.pending_fork_message_id = Some("msg-1".into());
+        app.chat.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Succeeded {
             source_session_id: Some("source-1".into()),
@@ -4057,7 +3807,7 @@ mod tests {
         }));
 
         assert!(replies.is_empty());
-        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.chat.pending_fork_message_id, None);
         assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.diagnostics.status, "fork succeeded without session id");
     }
@@ -4066,7 +3816,7 @@ mod tests {
     fn native_fork_result_failure_clears_pending_and_keeps_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::ForkTurnSelect;
-        app.pending_fork_message_id = Some("msg-1".into());
+        app.chat.pending_fork_message_id = Some("msg-1".into());
 
         let replies = app.handle_acp_event(AcpAppEvent::ForkResult(ForkResult::Failed {
             source_session_id: Some("source-1".into()),
@@ -4074,7 +3824,7 @@ mod tests {
         }));
 
         assert!(replies.is_empty());
-        assert_eq!(app.pending_fork_message_id, None);
+        assert_eq!(app.chat.pending_fork_message_id, None);
         assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.diagnostics.status, "fork failed");
     }
@@ -4087,7 +3837,7 @@ mod tests {
             message_ids: vec!["u1".into()],
         }));
 
-        assert!(app.can_redo());
+        assert!(app.chat.can_redo());
     }
 
     #[test]
@@ -4105,7 +3855,7 @@ mod tests {
             },
         });
 
-        assert!(app.messages.is_empty());
+        assert!(app.chat.messages.is_empty());
         assert!(app.sessions.session_activity.contains_key("other"));
     }
 
@@ -4131,7 +3881,7 @@ mod tests {
 
         assert!(replies.is_empty());
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { text, message_id: Some(user_id) },
                 ChatEntry::Assistant { content, message_id: Some(assistant_id), .. }
@@ -4178,7 +3928,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { .. },
                 ChatEntry::Assistant { content: before, .. },
@@ -4213,7 +3963,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) }]
                 if content == "final" && thinking == "final thinking" && message_id == "a1"
         ));
@@ -4251,7 +4001,7 @@ mod tests {
         });
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::Assistant { content: first, message_id: Some(first_id), .. },
                 ChatEntry::ToolCall { .. },
@@ -4272,7 +4022,7 @@ mod tests {
         apply_live_update(&mut app, update);
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::User { text, message_id: Some(message_id) }]
                 if text == "hello" && message_id == "u1"
         ));
@@ -4291,7 +4041,7 @@ mod tests {
         apply_live_update(&mut app, update);
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Thinking { content, message_id: Some(message_id) }]
                 if content == "checking" && message_id == "a1"
         ));
@@ -4308,7 +4058,7 @@ mod tests {
         app.handle_acp_event(event);
 
         assert!(
-            matches!(app.messages.as_slice(), [ChatEntry::Error(message)] if message == "connection lost")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Error(message)] if message == "connection lost")
         );
     }
 
@@ -4327,7 +4077,7 @@ mod tests {
         );
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), name, is_error: true, detail: ToolDetail::Shell { command, .. } }]
                 if tool_call_id == "tool-1" && name == "shell" && command == "echo late"
         ));
@@ -4342,7 +4092,7 @@ mod tests {
         apply_live_update(&mut app, failed_tool_end("tool-2", "shell"));
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::ToolCall { tool_call_id: Some(first), name: first_name, is_error: true, .. },
                 ChatEntry::ToolCall { tool_call_id: Some(second), name: second_name, is_error: true, .. },
@@ -4371,13 +4121,14 @@ mod tests {
         );
 
         assert_eq!(
-            app.elicitation
+            app.chat
+                .elicitation
                 .as_ref()
                 .map(|state| state.elicitation_id.as_str()),
             Some("elic-1")
         );
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, message, outcome: None, .. }]
                 if elicitation_id == "elic-1" && message == "Choose a target"
         ));
@@ -4402,9 +4153,9 @@ mod tests {
             }],
         });
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, message, outcome: None, .. }]
                 if elicitation_id == "elic-1" && message == "Choose a target"
         ));
@@ -4437,9 +4188,9 @@ mod tests {
             updates,
         });
 
-        assert!(app.elicitation.is_none());
+        assert!(app.chat.elicitation.is_none());
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
                 if elicitation_id == "elic-1" && outcome == "staging"
         ));
@@ -4467,13 +4218,14 @@ mod tests {
         });
 
         assert_eq!(
-            app.elicitation
+            app.chat
+                .elicitation
                 .as_ref()
                 .map(|state| state.elicitation_id.as_str()),
             Some("elic-live")
         );
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::Elicitation { elicitation_id: first, .. },
                 ChatEntry::Elicitation { elicitation_id: second, .. },
@@ -4500,7 +4252,7 @@ mod tests {
         }
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
                 if elicitation_id == "elic-unsupported"
                     && outcome == "unsupported schema - cannot answer in TUI"
@@ -4530,7 +4282,7 @@ mod tests {
         }
 
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [
                 ChatEntry::User { message_id: Some(user_id), .. },
                 ChatEntry::Assistant { message_id: Some(assistant_id), .. },
