@@ -1485,14 +1485,6 @@ pub(crate) fn handle_new_session_popup_key(
     Ok(())
 }
 
-/// Invalidate every theme-dependent cache in `app` so that the next render
-/// frame rebuilds styled lines with the current palette.
-pub(crate) fn invalidate_theme_caches(app: &mut App) {
-    app.card_cache.invalidate();
-    app.streaming_cache.invalidate();
-    app.streaming_thinking_cache.invalidate();
-}
-
 pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => {
@@ -1513,7 +1505,7 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Re
             {
                 theme::Theme::set_by_index(idx);
                 theme::Theme::begin_frame();
-                invalidate_theme_caches(app);
+                app.render.invalidate_theme_caches();
                 app.navigation.popup = Popup::None;
                 save_config(app);
             }
@@ -1601,7 +1593,7 @@ pub(crate) fn handle_chat_key(
                     local_id: local_id.clone(),
                 }) {
                     app.chat.rollback_pending_prompt(&local_id);
-                    app.card_cache.invalidate();
+                    app.render.invalidate_card_cache();
                     return Err(error.into());
                 }
             }

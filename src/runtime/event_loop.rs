@@ -108,7 +108,8 @@ pub(super) async fn run_loop(
     let mut term_events = EventStream::new();
 
     loop {
-        app.tick = tick_from_elapsed(app.diagnostics.started_at.elapsed());
+        app.render
+            .replace_tick(tick_from_elapsed(app.diagnostics.started_at.elapsed()));
         app.clear_expired_cancel_confirm();
         terminal.draw(|frame| ui::draw(frame, app))?;
 

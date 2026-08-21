@@ -225,7 +225,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 
     // ── glitch / wave variables (shared by art and button) ───────────────────
     const GLITCH_CHARS: &str = "░▒▓█▌▐▄▀┃╋╳";
-    let tick = app.tick as usize;
+    let tick = app.render.tick as usize;
     let prng = |seed: usize| -> usize {
         let mut h = seed.wrapping_mul(2654435761);
         h ^= h >> 16;

@@ -369,7 +369,7 @@ impl crate::app::App {
                         self.chat.recent_prompt_text = None;
                         self.chat.streaming_content.clear();
                         self.chat.streaming_content_message_id = None;
-                        self.streaming_cache.invalidate();
+                        self.render.invalidate_content_cache();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.sessions.session_id {
                             return Command::load_session_commands(
@@ -539,7 +539,7 @@ impl crate::app::App {
             AcpAppEvent::PromptFailed { local_id, message } => {
                 self.chat.end_llm_request_span(None);
                 self.chat.rollback_pending_prompt(&local_id);
-                self.card_cache.invalidate();
+                self.render.invalidate_card_cache();
                 self.push_acp_error(&message);
                 self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
                 vec![]
@@ -679,8 +679,10 @@ impl crate::app::App {
 
     fn reset_active_session_view(&mut self) {
         self.chat.reset_for_session_switch();
-        self.invalidate_streaming_caches();
-        self.card_cache.invalidate();
+        self.render.invalidate_content_cache();
+        self.chat.clear_streaming_thinking();
+        self.render.invalidate_thinking_cache();
+        self.render.invalidate_card_cache();
         if self.delegates.parent_session_id.is_none() {
             self.delegates.clear_for_root_session();
         }
@@ -709,7 +711,7 @@ impl crate::app::App {
             .delegates
             .upsert_provisional_delegate(tool_call_id, target_agent_id, objective)
         {
-            self.invalidate_delegate_render_cache();
+            self.render.invalidate_card_cache();
         }
     }
 
@@ -741,7 +743,7 @@ impl crate::app::App {
                 error: update.error,
             })
         {
-            self.invalidate_delegate_render_cache();
+            self.render.invalidate_card_cache();
         }
     }
 
@@ -815,7 +817,7 @@ impl crate::app::App {
             .delegates
             .apply_child_snapshot(session_id, state, stats)
         {
-            self.invalidate_delegate_render_cache();
+            self.render.invalidate_card_cache();
         }
     }
 
@@ -835,8 +837,8 @@ impl crate::app::App {
         match update {
             AcpSessionUpdate::TurnStarted => {
                 self.chat.begin_turn(is_replay);
-                self.streaming_cache.invalidate();
-                self.streaming_thinking_cache.invalidate();
+                self.render.invalidate_content_cache();
+                self.render.invalidate_thinking_cache();
                 self.set_status(LogLevel::Debug, "activity", "thinking...");
             }
             AcpSessionUpdate::UserMessage {
@@ -849,9 +851,9 @@ impl crate::app::App {
             } => {
                 let transition = self.chat.append_streaming_content(&content, message_id);
                 if transition.finalized_previous {
-                    self.streaming_cache.invalidate();
-                    self.streaming_thinking_cache.invalidate();
-                    self.card_cache.invalidate();
+                    self.render.invalidate_content_cache();
+                    self.render.invalidate_thinking_cache();
+                    self.render.invalidate_card_cache();
                 }
             }
             AcpSessionUpdate::AssistantThinkingDelta {
@@ -865,9 +867,9 @@ impl crate::app::App {
                     return;
                 }
                 if transition.finalized_previous {
-                    self.streaming_cache.invalidate();
-                    self.streaming_thinking_cache.invalidate();
-                    self.card_cache.invalidate();
+                    self.render.invalidate_content_cache();
+                    self.render.invalidate_thinking_cache();
+                    self.render.invalidate_card_cache();
                 }
             }
             AcpSessionUpdate::AssistantMessage {
@@ -899,13 +901,13 @@ impl crate::app::App {
                         detail.clone(),
                     ) {
                         self.chat.clear_streaming_thinking();
-                        self.streaming_thinking_cache.invalidate();
-                        self.card_cache.invalidate();
+                        self.render.invalidate_thinking_cache();
+                        self.render.invalidate_card_cache();
                         return;
                     }
                     self.chat.record_tool_call();
                     if self.chat.push_streaming_thinking_entry() {
-                        self.streaming_thinking_cache.invalidate();
+                        self.render.invalidate_thinking_cache();
                     }
                     self.chat.push_tool_call(tool_call_id, name, false, detail);
                 }
@@ -941,7 +943,7 @@ impl crate::app::App {
                     }
                 }
                 if updated {
-                    self.card_cache.invalidate();
+                    self.render.invalidate_card_cache();
                 }
             }
             AcpSessionUpdate::UsageUpdate {
@@ -993,14 +995,14 @@ impl crate::app::App {
             }
             AcpSessionUpdate::Cancelled => {
                 self.chat.cancel_turn(is_replay);
-                self.streaming_cache.invalidate();
-                self.streaming_thinking_cache.invalidate();
+                self.render.invalidate_content_cache();
+                self.render.invalidate_thinking_cache();
                 self.set_status(LogLevel::Warn, "activity", "cancelled");
             }
             AcpSessionUpdate::Finished { finish_reason } => {
                 self.chat.finish_turn(is_replay);
-                self.streaming_cache.invalidate();
-                self.streaming_thinking_cache.invalidate();
+                self.render.invalidate_content_cache();
+                self.render.invalidate_thinking_cache();
                 self.set_status(
                     LogLevel::Debug,
                     "activity",
@@ -1022,14 +1024,16 @@ impl crate::app::App {
             transition,
             crate::chat_state::UserMessageTransition::Reconciled
         ) {
-            self.card_cache.invalidate();
+            self.render.invalidate_card_cache();
         }
     }
 
     fn finalize_streaming_segment(&mut self) {
         if self.chat.finalize_streaming_segment() {
-            self.invalidate_streaming_caches();
-            self.card_cache.invalidate();
+            self.render.invalidate_content_cache();
+            self.chat.clear_streaming_thinking();
+            self.render.invalidate_thinking_cache();
+            self.render.invalidate_card_cache();
         }
     }
 
@@ -1043,13 +1047,13 @@ impl crate::app::App {
         thinking: Option<String>,
         message_id: Option<String>,
     ) {
-        self.streaming_cache.invalidate();
+        self.render.invalidate_content_cache();
         let replaced = self
             .chat
             .push_assistant_message(content, thinking, message_id);
-        self.streaming_thinking_cache.invalidate();
+        self.render.invalidate_thinking_cache();
         if replaced {
-            self.card_cache.invalidate();
+            self.render.invalidate_card_cache();
         }
     }
 
@@ -1090,9 +1094,9 @@ impl crate::app::App {
             return;
         }
         if transition.finalized_streaming {
-            self.streaming_cache.invalidate();
-            self.streaming_thinking_cache.invalidate();
-            self.card_cache.invalidate();
+            self.render.invalidate_content_cache();
+            self.render.invalidate_thinking_cache();
+            self.render.invalidate_card_cache();
         }
         if supported {
             self.set_status(

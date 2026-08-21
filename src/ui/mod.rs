@@ -2333,7 +2333,7 @@ mod tests {
         let mut app = App::new();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.card_cache.processed_messages, 0);
+        assert_eq!(app.render.card_cache.processed_messages, 0);
     }
 
     #[test]
@@ -2346,7 +2346,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
-        assert_eq!(app.card_cache.processed_messages, 1);
+        assert_eq!(app.render.card_cache.processed_messages, 1);
     }
 
     #[test]
@@ -2409,12 +2409,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.card_cache.processed_messages, 1);
+        assert_eq!(app.render.card_cache.processed_messages, 1);
 
         // Second call with no new messages — cache hit
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
-        assert_eq!(app.card_cache.processed_messages, 1);
+        assert_eq!(app.render.card_cache.processed_messages, 1);
     }
 
     #[test]
@@ -2438,7 +2438,10 @@ mod tests {
 
         let lines = rendered_card_lines(&mut app);
         assert!(!lines.iter().any(|line| line.contains("awaiting input")));
-        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
+        assert_eq!(
+            app.render.card_cache.processed_messages,
+            app.chat.messages.len()
+        );
 
         app.delegates.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
             elicitation_id: "elic-1".into(),
@@ -2446,7 +2449,7 @@ mod tests {
             requested_schema: serde_json::json!({ "properties": {} }),
             source: "builtin:question".into(),
         };
-        app.invalidate_delegate_render_cache();
+        app.render.invalidate_card_cache();
         let lines = rendered_card_lines(&mut app);
 
         assert_eq!(
@@ -2506,7 +2509,7 @@ mod tests {
                 child_state: DelegateChildState::None,
             },
         ];
-        app.invalidate_delegate_render_cache();
+        app.render.invalidate_card_cache();
 
         let lines = rendered_card_lines(&mut app);
         let first = lines
@@ -2584,13 +2587,13 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.card_cache.processed_messages, 1);
+        assert_eq!(app.render.card_cache.processed_messages, 1);
 
         app.chat.messages.clear();
-        app.card_cache.invalidate();
+        app.render.card_cache.invalidate();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.card_cache.processed_messages, 0);
+        assert_eq!(app.render.card_cache.processed_messages, 0);
     }
 
     #[test]
@@ -2606,7 +2609,7 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.card_cache.processed_messages, 2);
+        assert_eq!(app.render.card_cache.processed_messages, 2);
 
         // Simulate retain() shrinking messages (like compaction does)
         app.chat
@@ -2645,7 +2648,7 @@ mod tests {
             ChatEntry::ToolCall { is_error: true, .. }
         ));
         assert_eq!(
-            app.card_cache.processed_messages, 0,
+            app.render.card_cache.processed_messages, 0,
             "cache must invalidate"
         );
         let lines = rendered_card_lines(&mut app);
@@ -2671,7 +2674,10 @@ mod tests {
         let warm_lines = rendered_card_lines(&mut app);
         assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
         assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
-        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
+        assert_eq!(
+            app.render.card_cache.processed_messages,
+            app.chat.messages.len()
+        );
 
         live_update(
             &mut app,
@@ -2690,7 +2696,7 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.card_cache.processed_messages, 0,
+            app.render.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
         );
         let rebuilt_lines = rendered_card_lines(&mut app);
@@ -2731,7 +2737,10 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("  1 ") && line.contains("- before"))
         );
-        assert_eq!(app.card_cache.processed_messages, app.chat.messages.len());
+        assert_eq!(
+            app.render.card_cache.processed_messages,
+            app.chat.messages.len()
+        );
 
         live_update(
             &mut app,
@@ -2750,7 +2759,7 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.card_cache.processed_messages, 0,
+            app.render.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
         );
         let rebuilt_lines = rendered_card_lines(&mut app);
@@ -2828,7 +2837,7 @@ mod tests {
         };
 
         // Full rebuild from scratch
-        app.card_cache.invalidate();
+        app.render.card_cache.invalidate();
         let full_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|c| c.kind.clone()).collect()
@@ -2850,12 +2859,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.card_cache.processed_messages, 2);
+        assert_eq!(app.render.card_cache.processed_messages, 2);
 
         load_session(&mut app, "delegate-session", "agent-2");
         assert!(app.chat.messages.is_empty());
-        assert_eq!(app.card_cache.processed_messages, 0);
-        assert!(app.card_cache.cards.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(app.render.card_cache.cards.is_empty());
 
         replay_session(
             &mut app,
@@ -4045,14 +4054,14 @@ mod tests {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let incremental_tool_lines = app.card_cache.cards[0].lines_for(80).len();
+        let incremental_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
 
-        app.card_cache.invalidate();
+        app.render.card_cache.invalidate();
         let full_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let full_tool_lines = app.card_cache.cards[0].lines_for(80).len();
+        let full_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
 
         assert_eq!(incremental_kinds, full_kinds);
         assert_eq!(incremental_kinds, vec![CardKind::Tool { compact: false }]);

@@ -723,7 +723,7 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
             .map(|entry| {
                 let status_badge = match entry.status {
                     DelegateStatus::InProgress => {
-                        spinner(SpinnerKind::Braille, app.tick).to_string()
+                        spinner(SpinnerKind::Braille, app.render.tick).to_string()
                     }
                     DelegateStatus::Completed => CHECK_CHECKED.to_string(),
                     DelegateStatus::Failed => CHECK_FAILED.to_string(),
