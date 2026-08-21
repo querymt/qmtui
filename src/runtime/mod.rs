@@ -510,9 +510,9 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "abcdef".into();
-        app.input_cursor = 4;
-        app.input_line_width = 4;
+        app.composer.input = "abcdef".into();
+        app.composer.input_cursor = 4;
+        app.composer.input_line_width = 4;
         app.scroll_offset = 7;
 
         handle_chat_key(
@@ -521,7 +521,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input_cursor, 2);
+        assert_eq!(app.composer.input_cursor, 2);
         assert_eq!(app.scroll_offset, 7);
 
         handle_chat_key(
@@ -530,7 +530,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input_cursor, 4);
+        assert_eq!(app.composer.input_cursor, 4);
         assert_eq!(app.scroll_offset, 7);
     }
 
@@ -563,7 +563,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "draft".into();
+        app.composer.input = "draft".into();
         assert_eq!(
             handle_key(&mut app, ctrl_x(), &tx).unwrap(),
             AppAction::None
@@ -573,7 +573,7 @@ mod external_editor_tests {
 
         assert_eq!(action, AppAction::OpenExternalEditor);
         assert!(!app.navigation.chord);
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
     }
 
     #[test]
@@ -680,7 +680,7 @@ mod external_editor_tests {
                 if local_id.starts_with("local:pending:")
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
         ));
-        assert!(app.input.is_empty());
+        assert!(app.composer.input.is_empty());
         assert!(matches!(
             app.messages.as_slice(),
             [ChatEntry::User { text, message_id: Some(message_id) }]
@@ -694,8 +694,8 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.input = "  first line\nsecond line\n  ".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "  first line\nsecond line\n  ".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         handle_chat_key(
             &mut app,
@@ -722,8 +722,8 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
-        app.input = " \n  ".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = " \n  ".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         handle_chat_key(
             &mut app,
@@ -734,7 +734,7 @@ mod external_editor_tests {
 
         assert!(rx.try_recv().is_err());
         assert!(app.messages.is_empty());
-        assert!(app.input.is_empty());
+        assert!(app.composer.input.is_empty());
     }
 
     // ── slash command handler tests ────────────────────────────────────────────
@@ -744,13 +744,13 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/model".into();
-        app.input_cursor = "/model".len();
-        app.refresh_slash_state();
-        assert!(app.slash_state.is_some());
+        app.composer.input = "/model".into();
+        app.composer.input_cursor = "/model".len();
+        app.composer.refresh_slash_state();
+        assert!(app.composer.slash_state.is_some());
 
         // hold left until cursor reaches 0 — must not panic at any step
-        for _ in 0..=app.input.len() {
+        for _ in 0..=app.composer.input.len() {
             handle_chat_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
@@ -758,8 +758,8 @@ mod external_editor_tests {
             )
             .unwrap();
         }
-        assert_eq!(app.input_cursor, 0);
-        assert!(app.slash_state.is_none());
+        assert_eq!(app.composer.input_cursor, 0);
+        assert!(app.composer.slash_state.is_none());
     }
 
     #[test]
@@ -767,10 +767,10 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/mo".into();
-        app.input_cursor = 3;
-        app.refresh_slash_state();
-        assert!(app.slash_state.is_some());
+        app.composer.input = "/mo".into();
+        app.composer.input_cursor = 3;
+        app.composer.refresh_slash_state();
+        assert!(app.composer.slash_state.is_some());
 
         handle_chat_key(
             &mut app,
@@ -779,7 +779,7 @@ mod external_editor_tests {
         )
         .unwrap();
 
-        assert!(app.slash_state.is_none());
+        assert!(app.composer.slash_state.is_none());
     }
 
     #[test]
@@ -787,9 +787,9 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/help".into();
-        app.input_cursor = "/help".len();
-        app.refresh_slash_state();
+        app.composer.input = "/help".into();
+        app.composer.input_cursor = "/help".len();
+        app.composer.refresh_slash_state();
 
         handle_chat_key(
             &mut app,
@@ -799,7 +799,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.navigation.popup, Popup::Help);
-        assert!(app.input.is_empty());
+        assert!(app.composer.input.is_empty());
     }
 
     #[test]
@@ -807,10 +807,10 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/hel".into();
-        app.input_cursor = "/hel".len();
-        app.refresh_slash_state();
-        assert!(app.slash_state.is_some());
+        app.composer.input = "/hel".into();
+        app.composer.input_cursor = "/hel".len();
+        app.composer.refresh_slash_state();
+        assert!(app.composer.slash_state.is_some());
 
         handle_chat_key(
             &mut app,
@@ -820,8 +820,8 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.navigation.popup, Popup::Help);
-        assert!(app.input.is_empty());
-        assert!(app.slash_state.is_none());
+        assert!(app.composer.input.is_empty());
+        assert!(app.composer.slash_state.is_none());
     }
 
     #[test]
@@ -829,9 +829,9 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/hel".into();
-        app.input_cursor = "/hel".len();
-        app.refresh_slash_state();
+        app.composer.input = "/hel".into();
+        app.composer.input_cursor = "/hel".len();
+        app.composer.refresh_slash_state();
 
         handle_chat_key(
             &mut app,
@@ -841,9 +841,9 @@ mod external_editor_tests {
         .unwrap();
 
         // Completed but not executed — no popup opened
-        assert_eq!(app.input, "/help ");
+        assert_eq!(app.composer.input, "/help ");
         assert_eq!(app.navigation.popup, Popup::None);
-        assert!(app.slash_state.is_none());
+        assert!(app.composer.slash_state.is_none());
     }
 
     #[test]
@@ -851,10 +851,10 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/".into();
-        app.input_cursor = 1;
-        app.refresh_slash_state();
-        let initial = app.slash_state.as_ref().unwrap().selected_index;
+        app.composer.input = "/".into();
+        app.composer.input_cursor = 1;
+        app.composer.refresh_slash_state();
+        let initial = app.composer.slash_state.as_ref().unwrap().selected_index;
 
         handle_chat_key(
             &mut app,
@@ -863,7 +863,7 @@ mod external_editor_tests {
         )
         .unwrap();
         assert_eq!(
-            app.slash_state.as_ref().unwrap().selected_index,
+            app.composer.slash_state.as_ref().unwrap().selected_index,
             initial + 1
         );
 
@@ -873,7 +873,10 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, initial);
+        assert_eq!(
+            app.composer.slash_state.as_ref().unwrap().selected_index,
+            initial
+        );
     }
 
     #[test]
@@ -886,8 +889,8 @@ mod external_editor_tests {
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
-        app.input = "/mode".into();
-        app.input_cursor = "/mode".len();
+        app.composer.input = "/mode".into();
+        app.composer.input_cursor = "/mode".len();
 
         handle_chat_key(
             &mut app,
@@ -897,7 +900,7 @@ mod external_editor_tests {
         .unwrap();
 
         assert_eq!(app.sessions.agent_mode, "plan");
-        assert!(app.input.is_empty());
+        assert!(app.composer.input.is_empty());
         // SetAgentMode should have been sent
         assert!(matches!(
             rx.try_recv().expect("SetAgentMode sent"),
@@ -915,8 +918,8 @@ mod external_editor_tests {
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
-        app.input = "/mode plan".into();
-        app.input_cursor = "/mode plan".len();
+        app.composer.input = "/mode plan".into();
+        app.composer.input_cursor = "/mode plan".len();
 
         handle_chat_key(
             &mut app,
@@ -940,8 +943,8 @@ mod external_editor_tests {
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
-        app.input = "/mode build".into();
-        app.input_cursor = "/mode build".len();
+        app.composer.input = "/mode build".into();
+        app.composer.input_cursor = "/mode build".len();
 
         handle_chat_key(
             &mut app,
@@ -961,8 +964,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
-        app.input = "/mode xyz".into();
-        app.input_cursor = "/mode xyz".len();
+        app.composer.input = "/mode xyz".into();
+        app.composer.input_cursor = "/mode xyz".len();
 
         handle_chat_key(
             &mut app,
@@ -983,8 +986,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
-        app.input = "/thinking high".into();
-        app.input_cursor = "/thinking high".len();
+        app.composer.input = "/thinking high".into();
+        app.composer.input_cursor = "/thinking high".len();
 
         handle_chat_key(
             &mut app,
@@ -1010,8 +1013,8 @@ mod external_editor_tests {
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.models.reasoning_effort = Some("max".into());
-        app.input = "/thinking auto".into();
-        app.input_cursor = "/thinking auto".len();
+        app.composer.input = "/thinking auto".into();
+        app.composer.input_cursor = "/thinking auto".len();
 
         handle_chat_key(
             &mut app,
@@ -1036,8 +1039,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
-        app.input = "/thinking med".into();
-        app.input_cursor = "/thinking med".len();
+        app.composer.input = "/thinking med".into();
+        app.composer.input_cursor = "/thinking med".len();
 
         handle_chat_key(
             &mut app,
@@ -1059,8 +1062,8 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.models.reasoning_effort = Some("high".into());
-        app.input = "/thinking".into();
-        app.input_cursor = "/thinking".len();
+        app.composer.input = "/thinking".into();
+        app.composer.input_cursor = "/thinking".len();
 
         handle_chat_key(
             &mut app,
@@ -1077,8 +1080,8 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.input = "/thinking xyz".into();
-        app.input_cursor = "/thinking xyz".len();
+        app.composer.input = "/thinking xyz".into();
+        app.composer.input_cursor = "/thinking xyz".len();
 
         handle_chat_key(
             &mut app,
@@ -1096,8 +1099,8 @@ mod external_editor_tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.models.reasoning_effort = Some("high".into());
-        app.input = "/thinking max".into();
-        app.input_cursor = "/thinking max".len();
+        app.composer.input = "/thinking max".into();
+        app.composer.input_cursor = "/thinking max".len();
 
         handle_chat_key(
             &mut app,
@@ -1137,8 +1140,8 @@ mod external_editor_tests {
     fn slash_fork_sends_latest_boundary() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
-        app.input = "/fork".into();
-        app.input_cursor = "/fork".len();
+        app.composer.input = "/fork".into();
+        app.composer.input_cursor = "/fork".len();
 
         handle_chat_key(
             &mut app,
@@ -1165,7 +1168,7 @@ mod external_editor_tests {
 
         assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.fork_filter, "b");
-        assert!(app.input.is_empty());
+        assert!(app.composer.input.is_empty());
         assert_eq!(app.filtered_fork_turns().len(), 1);
     }
 
@@ -1189,8 +1192,8 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = app_with_forkable_messages();
         app.navigation.screen = Screen::Delegate;
-        app.input = "/fork".into();
-        app.input_cursor = "/fork".len();
+        app.composer.input = "/fork".into();
+        app.composer.input_cursor = "/fork".len();
 
         handle_chat_key(
             &mut app,
@@ -1272,8 +1275,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
-        app.input = "/model sonnet".into();
-        app.input_cursor = "/model sonnet".len();
+        app.composer.input = "/model sonnet".into();
+        app.composer.input_cursor = "/model sonnet".len();
 
         handle_chat_key(
             &mut app,
@@ -1294,8 +1297,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
-        app.input = "/model".into();
-        app.input_cursor = "/model".len();
+        app.composer.input = "/model".into();
+        app.composer.input_cursor = "/model".len();
 
         handle_chat_key(
             &mut app,
@@ -1349,8 +1352,8 @@ mod external_editor_tests {
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
-        app.input = "draft".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "draft".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         handle_chat_key(
             &mut app,
@@ -1358,7 +1361,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
 
         handle_chat_key(
             &mut app,
@@ -1366,7 +1369,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
 
         handle_chat_key(
             &mut app,
@@ -1374,7 +1377,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input_cursor, "draft".len());
+        assert_eq!(app.composer.input_cursor, "draft".len());
 
         handle_chat_key(
             &mut app,
@@ -1382,7 +1385,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
         assert!(rx.try_recv().is_err());
     }
 
@@ -1395,8 +1398,8 @@ mod external_editor_tests {
         app.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
-        app.input = "draft".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "draft".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         handle_chat_key(
             &mut app,
@@ -1413,7 +1416,7 @@ mod external_editor_tests {
             &tx,
         )
         .unwrap();
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
 
         handle_chat_key(
             &mut app,
@@ -2739,7 +2742,7 @@ mod session_popup_key_tests {
         app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
             query: "pro".into(),
             selected_index: 0,
-            results: vec![crate::app::FileIndexEntryLite {
+            results: vec![crate::composer_state::FileIndexEntryLite {
                 path: "/launch/project".into(),
                 is_dir: true,
             }],
@@ -2766,7 +2769,7 @@ mod session_popup_key_tests {
         app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
             query: "pro".into(),
             selected_index: 0,
-            results: vec![crate::app::FileIndexEntryLite {
+            results: vec![crate::composer_state::FileIndexEntryLite {
                 path: "/launch/project".into(),
                 is_dir: true,
             }],

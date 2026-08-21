@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::app::FileIndexEntryLite;
+use crate::composer_state::FileIndexEntryLite;
 use crate::domain::activity::SessionActivity;
 use crate::domain::mesh::RemoteSessionLocation;
 use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionSummary};
