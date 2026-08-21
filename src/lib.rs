@@ -21,6 +21,7 @@ mod models_state;
 mod navigation_state;
 mod profiles_state;
 mod protocol;
+mod render_state;
 pub mod runtime;
 mod server_manager;
 mod session;

@@ -45,8 +45,8 @@ pub(super) fn open_external_editor_with_terminal(
     terminal.hide_cursor()?;
     terminal.clear()?;
     terminal.autoresize()?;
-    app.card_cache.invalidate();
-    app.streaming_cache.invalidate();
+    app.render.invalidate_card_cache();
+    app.render.invalidate_content_cache();
     apply_external_editor_outcome(app, result);
     terminal.draw(|frame| ui::draw(frame, app))?;
     Ok(())

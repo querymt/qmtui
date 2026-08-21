@@ -423,23 +423,23 @@ mod tests {
             })
             .expect("edit preview should contain a styled file span");
 
-        app.streaming_cache.store(
+        app.render.streaming_cache.store(
             5,
             vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
                 "stream",
             ))],
         );
-        app.streaming_thinking_cache.store(
+        app.render.streaming_thinking_cache.store(
             3,
             vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
                 "think",
             ))],
         );
 
-        assert!(app.streaming_cache.get(5).is_some());
-        assert!(app.streaming_thinking_cache.get(3).is_some());
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(3).is_some());
         assert_eq!(
-            app.card_cache.processed_messages,
+            app.render.card_cache.processed_messages,
             app.chat.messages.len(),
             "card_cache should be populated"
         );
@@ -449,18 +449,18 @@ mod tests {
         Theme::begin_frame();
         let current_preview_fg = Theme::diff_file().fg.expect("diff_file should define fg");
         assert_ne!(old_preview_fg, current_preview_fg);
-        invalidate_theme_caches(&mut app);
+        app.render.invalidate_theme_caches();
 
         assert_eq!(
-            app.card_cache.processed_messages, 0,
+            app.render.card_cache.processed_messages, 0,
             "card_cache should be invalidated"
         );
         assert!(
-            app.streaming_cache.get(5).is_none(),
+            app.render.streaming_cache.get(5).is_none(),
             "streaming_cache should be invalidated"
         );
         assert!(
-            app.streaming_thinking_cache.get(3).is_none(),
+            app.render.streaming_thinking_cache.get(3).is_none(),
             "streaming_thinking_cache should be invalidated"
         );
         assert!(matches!(
