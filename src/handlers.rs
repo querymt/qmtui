@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{self, App};
+use crate::app::App;
 use crate::auth_state::{AuthPanel, AuthUiNotice};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
@@ -15,6 +15,7 @@ fn popup_page_step(visible_rows: usize) -> usize {
 }
 use crate::command::{Command, PromptBlock};
 use crate::config;
+use crate::connection_state::ConnState;
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +25,7 @@ pub(crate) enum AppAction {
 }
 
 pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
-    if app.conn == app::ConnState::Connected {
+    if app.connection.conn == ConnState::Connected {
         true
     } else {
         app.set_status(
@@ -2606,6 +2607,30 @@ mod model_popup_tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
+    #[test]
+    fn can_send_server_commands_accepts_only_connected_and_preserves_exact_warning() {
+        let mut app = App::new();
+
+        assert!(!can_send_server_commands(&mut app));
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+
+        app.connection.conn = ConnState::Disconnected;
+        app.set_status(LogLevel::Debug, "test", "before disconnected guard");
+        assert!(!can_send_server_commands(&mut app));
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+
+        app.connection.conn = ConnState::Connected;
+        app.set_status(LogLevel::Debug, "test", "retained");
+        assert!(can_send_server_commands(&mut app));
+        assert_eq!(app.diagnostics.status, "retained");
+    }
+
     fn make_model(provider: &str, model: &str) -> ModelEntry {
         ModelEntry {
             id: format!("{provider}/{model}"),
@@ -2775,7 +2800,7 @@ mod model_popup_tests {
     #[test]
     fn command_palette_open_mesh_refreshes_remote_nodes() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "open mesh".into();
 
@@ -2820,7 +2845,7 @@ mod model_popup_tests {
     fn mesh_popup_create_remote_session_does_not_forward_local_cwd() {
         let mut app = App::new();
         app.navigation.popup = Popup::Mesh;
-        app.launch_cwd = Some("/local/launch".into());
+        app.connection.launch_cwd = Some("/local/launch".into());
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
             id: "node-1".into(),
             label: "framework".into(),
@@ -2842,7 +2867,7 @@ mod model_popup_tests {
     #[test]
     fn command_palette_create_mesh_invite_opens_prefilled_invite_popup() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "mesh invite".into();
 
@@ -2957,7 +2982,7 @@ mod model_popup_tests {
     #[test]
     fn command_palette_profile_lists_profiles() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "profile".into();
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
@@ -2977,7 +3002,7 @@ mod model_popup_tests {
     #[test]
     fn slash_profile_without_arg_opens_selector_and_lists_profiles() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.input = "/profile".into();
         app.input_cursor = app.input.len();
@@ -2994,7 +3019,7 @@ mod model_popup_tests {
     fn slash_profile_with_arg_updates_local_new_session_profile() {
         let _guard = TestPersistenceGuard::new("slash-profile");
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.profiles.profiles = vec![make_profile("fast", "Fast")];
         app.profiles.active_profile_id = Some("old".into());
@@ -3019,7 +3044,7 @@ mod model_popup_tests {
     fn profile_popup_enter_updates_local_new_session_profile() {
         let _guard = TestPersistenceGuard::new("profile-popup-enter");
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ProfileSelect;
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.profile_cursor = 1;
@@ -3042,7 +3067,7 @@ mod model_popup_tests {
     fn profile_selection_with_bound_session_skips_agent_refresh() {
         let _guard = TestPersistenceGuard::new("profile-bound-session");
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ProfileSelect;
         app.sessions.session_id = Some("session".into());
         app.profiles
@@ -3060,7 +3085,7 @@ mod model_popup_tests {
     #[test]
     fn new_session_uses_locally_selected_profile() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
         app.sessions.new_session_path = "/repo".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
@@ -3322,7 +3347,7 @@ mod model_popup_tests {
     #[test]
     fn opening_model_popup_starts_on_session_tab() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "review".into();
         app.models.current_provider = Some("openai".into());
@@ -3343,7 +3368,7 @@ mod model_popup_tests {
     #[test]
     fn slash_model_starts_on_session_tab() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "review".into();
         app.models.current_provider = Some("openai".into());
@@ -3368,7 +3393,7 @@ mod model_popup_tests {
     fn review_slash_command_enters_review_and_tab_returns_to_previous_mode() {
         let _guard = TestPersistenceGuard::new("review-cycle");
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "plan".into();
         app.input = "/review".into();
@@ -3435,7 +3460,7 @@ mod model_popup_tests {
     #[test]
     fn review_slash_command_is_noop_when_already_in_review() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "review".into();
         app.sessions.mode_before_review = Some("plan".into());

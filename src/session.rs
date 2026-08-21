@@ -64,7 +64,8 @@ impl App {
             }
         }
 
-        self.launch_cwd
+        self.connection
+            .launch_cwd
             .as_ref()
             .filter(|cwd| !cwd.trim().is_empty())
             .cloned()
@@ -90,7 +91,8 @@ impl App {
     }
 
     pub fn new_session_base_dir(&self) -> PathBuf {
-        self.launch_cwd
+        self.connection
+            .launch_cwd
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))

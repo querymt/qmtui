@@ -12,6 +12,7 @@ use crate::{
     app::{self, App},
     command::Command,
     config,
+    connection_state::ServerState,
     diagnostics::LogLevel,
     domain::model::DelegateModelPreference,
     navigation_state::Screen,
@@ -27,7 +28,7 @@ use event_loop::run_loop;
 use tokio::sync::mpsc;
 
 #[cfg(test)]
-use crate::navigation_state::Popup;
+use crate::{connection_state::ConnState, navigation_state::Popup};
 
 #[derive(Debug)]
 pub(crate) enum ConnectionManagerEvent {
@@ -84,7 +85,7 @@ mod tests {
 
     fn make_app_with_elicitation(state: ElicitationState) -> App {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("sess-1".into());
         app.messages.push(ChatEntry::Elicitation {
             elicitation_id: state.elicitation_id.clone(),
@@ -655,7 +656,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
@@ -692,7 +693,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.input = "  first line\nsecond line\n  ".into();
         app.input_cursor = app.input.len();
 
@@ -720,7 +721,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.input = " \n  ".into();
         app.input_cursor = app.input.len();
 
@@ -882,7 +883,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
         app.input = "/mode".into();
@@ -911,7 +912,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
         app.input = "/mode plan".into();
@@ -936,7 +937,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
         app.input = "/mode build".into();
@@ -958,7 +959,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.input = "/mode xyz".into();
         app.input_cursor = "/mode xyz".len();
@@ -980,7 +981,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.input = "/thinking high".into();
         app.input_cursor = "/thinking high".len();
@@ -1006,7 +1007,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.models.reasoning_effort = Some("max".into());
         app.input = "/thinking auto".into();
@@ -1033,7 +1034,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.input = "/thinking med".into();
         app.input_cursor = "/thinking med".len();
@@ -1113,7 +1114,7 @@ mod external_editor_tests {
     fn app_with_forkable_messages() -> App {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.messages = vec![
             ChatEntry::User {
                 text: "alpha prompt".into(),
@@ -1250,7 +1251,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.open_fork_turn_popup();
 
         handle_fork_turn_popup_key(
@@ -1269,7 +1270,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.input = "/model sonnet".into();
         app.input_cursor = "/model sonnet".len();
@@ -1291,7 +1292,7 @@ mod external_editor_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.input = "/model".into();
         app.input_cursor = "/model".len();
@@ -1346,7 +1347,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.input = "draft".into();
         app.input_cursor = app.input.len();
@@ -1390,7 +1391,7 @@ mod external_editor_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
@@ -1482,7 +1483,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnectionManagerEvent>();
 
     let mut app = App::new();
-    app.launch_cwd = detect_launch_cwd();
+    app.connection.launch_cwd = detect_launch_cwd();
     app.profiles.active_profile_id = cfg.profile.id.clone();
     app.show_thinking = cfg.show_thinking.unwrap_or(true);
     app.models.delegate_model_preferences = cfg.profile_delegate_models.clone();
@@ -1575,9 +1576,9 @@ pub async fn run() -> anyhow::Result<()> {
         } => (Some(endpoint), state),
         EndpointSelection::BinaryNotFound => {
             let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            (None, server_manager::ServerState::BinaryNotFound)
+            (None, ServerState::BinaryNotFound)
         }
-        EndpointSelection::Disabled => (None, server_manager::ServerState::Disabled),
+        EndpointSelection::Disabled => (None, ServerState::Disabled),
     };
 
     if let Some(endpoint) = endpoint {
@@ -1587,13 +1588,13 @@ pub async fn run() -> anyhow::Result<()> {
             cmd_rx,
             conn_tx,
             sup_event_tx.clone(),
-            app.launch_cwd.clone(),
+            app.connection.launch_cwd.clone(),
         ));
     }
 
     let mut terminal = terminal::enter()?;
 
-    app.server_state = initial_server_state;
+    app.connection.server_state = initial_server_state;
     let result = run_loop(
         &mut terminal,
         &mut app,
@@ -1735,7 +1736,7 @@ mod sessions_key_tests {
     #[test]
     fn enter_on_session_emits_one_load_and_one_subscribe() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.agent_id = Some("agent-1".into());
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abc12345"])];
         app.sessions.session_cursor = 1;
@@ -2531,8 +2532,8 @@ mod session_popup_key_tests {
     fn popup_ctrl_n_opens_new_session_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.conn = crate::app::ConnState::Connected;
-        app.launch_cwd = Some("/launch".into());
+        app.connection.conn = ConnState::Connected;
+        app.connection.launch_cwd = Some("/launch".into());
 
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         handle_session_popup_key(
@@ -2574,8 +2575,8 @@ mod session_popup_key_tests {
     #[test]
     fn global_ctrl_x_n_opens_new_session_popup() {
         let mut app = App::new();
-        app.conn = crate::app::ConnState::Connected;
-        app.launch_cwd = Some("/launch".into());
+        app.connection.conn = ConnState::Connected;
+        app.connection.launch_cwd = Some("/launch".into());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         handle_key(
@@ -2599,7 +2600,7 @@ mod session_popup_key_tests {
     #[test]
     fn global_ctrl_x_l_opens_session_popup() {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         let (tx, _rx) = mpsc::unbounded_channel();
 
         handle_key(
@@ -2681,9 +2682,9 @@ mod session_popup_key_tests {
     #[test]
     fn new_session_popup_enter_with_empty_path_uses_launch_cwd() {
         let mut app = App::new();
-        app.conn = crate::app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
-        app.launch_cwd = Some("/launch".into());
+        app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path.clear();
         app.sessions.new_session_cursor = 0;
 
@@ -2708,9 +2709,9 @@ mod session_popup_key_tests {
     #[test]
     fn new_session_popup_enter_normalizes_relative_path_to_absolute() {
         let mut app = App::new();
-        app.conn = crate::app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
-        app.launch_cwd = Some("/launch".into());
+        app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path = "proj/subdir".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
 
@@ -2759,7 +2760,7 @@ mod session_popup_key_tests {
     #[test]
     fn handle_key_routes_tab_to_new_session_popup_before_global_mode_switch() {
         let mut app = App::new();
-        app.conn = crate::app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
         app.sessions.agent_mode = "build".into();
         app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
@@ -3064,7 +3065,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         assert_eq!(app.models.reasoning_effort, None);
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
@@ -3085,7 +3086,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.models.reasoning_effort = Some("max".into());
 
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
@@ -3106,7 +3107,7 @@ mod chord_reasoning_effort_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         handle_key(&mut app, ctrl_t(), &tx).unwrap();
         // status should reflect the new level
         assert!(
@@ -3165,7 +3166,7 @@ mod reasoning_effort_integration_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
 
         handle_key(
             &mut app,
@@ -3187,7 +3188,7 @@ mod reasoning_effort_integration_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
@@ -3220,7 +3221,7 @@ mod reasoning_effort_integration_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
@@ -3252,7 +3253,7 @@ mod reasoning_effort_integration_tests {
         let (tx, _rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.agent_mode = "plan".into();
         app.models.model_popup_agent_tab = 0;
         app.models.current_provider = Some("anthropic".into());
@@ -3288,7 +3289,7 @@ mod reasoning_effort_integration_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.agent_mode = "build".into();
@@ -3330,7 +3331,7 @@ mod reasoning_effort_integration_tests {
         let _guard = PersistenceGuard::new("main-test");
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.agent_mode = "build".into();
@@ -3444,7 +3445,7 @@ mod auth_tests {
 
     fn make_app_with_providers(providers: Vec<AuthProviderEntry>) -> App {
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.auth.providers = providers;
         app.navigation.popup = Popup::ProviderAuth;
         app
@@ -4159,7 +4160,7 @@ mod auth_tests {
     fn chord_a_opens_auth_popup_and_sends_list() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new();
-        app.conn = app::ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
 
         // Activate chord mode
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);

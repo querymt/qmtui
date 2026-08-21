@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth_state::AuthState;
 use crate::command::Command;
+use crate::connection_state::{ConnState, ConnectionState};
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
     ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
@@ -217,13 +218,6 @@ pub struct SlashCompletionState {
     pub results: Vec<&'static crate::slash::SlashCommandDef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnState {
-    Connecting,
-    Connected,
-    Disconnected,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connecting { attempt: u32, delay_ms: u64 },
@@ -240,9 +234,6 @@ pub struct App {
     pub(crate) sessions: SessionsState,
     /// Last rendered visible row count for the delegates tab in the popup.
     pub delegate_popup_visible_rows: usize,
-
-    // active session startup context
-    pub launch_cwd: Option<String>,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -309,13 +300,8 @@ pub struct App {
     // mesh / remote (from ACP extensions)
     pub(crate) mesh: MeshState,
 
-    // connection
-    pub conn: ConnState,
-    pub reconnect_attempt: u32,
-    pub reconnect_delay_ms: Option<u64>,
-
-    // server lifecycle (managed by server_manager::supervisor)
-    pub server_state: crate::server_manager::ServerState,
+    // connection and server lifecycle
+    pub(crate) connection: ConnectionState,
 
     // syntax highlighting
     pub hl: Highlighter,
@@ -395,7 +381,6 @@ impl App {
             navigation: NavigationState::new(),
             sessions: SessionsState::new(),
             delegate_popup_visible_rows: 0,
-            launch_cwd: None,
             messages: Vec::new(),
             pending_prompt_seq: 0,
             input: String::new(),
@@ -436,10 +421,7 @@ impl App {
             session_stats: SessionStatsLite::default(),
             pending_cancel_confirm_until: None,
             mesh: MeshState::new(),
-            conn: ConnState::Connecting,
-            reconnect_attempt: 0,
-            reconnect_delay_ms: None,
-            server_state: crate::server_manager::ServerState::default(),
+            connection: ConnectionState::new(),
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
             auth: AuthState::new(),
@@ -772,7 +754,7 @@ impl App {
             );
         } else if let Some(activity_status) = self.activity_status_text() {
             self.set_status(LogLevel::Debug, "activity", activity_status);
-        } else if self.conn == ConnState::Connected {
+        } else if self.connection.conn == ConnState::Connected {
             self.set_status(LogLevel::Debug, "activity", "ready");
         }
     }
@@ -846,9 +828,7 @@ impl App {
         self.clear_cancel_confirm();
         match event {
             ConnectionEvent::Connecting { attempt, delay_ms } => {
-                self.conn = ConnState::Connecting;
-                self.reconnect_attempt = attempt;
-                self.reconnect_delay_ms = Some(delay_ms);
+                self.connection.apply_connecting(attempt, delay_ms);
                 let secs = delay_ms as f64 / 1000.0;
                 self.set_status(
                     LogLevel::Warn,
@@ -857,9 +837,7 @@ impl App {
                 );
             }
             ConnectionEvent::Connected => {
-                self.conn = ConnState::Connected;
-                self.reconnect_attempt = 0;
-                self.reconnect_delay_ms = None;
+                self.connection.apply_connected();
                 self.set_status(
                     LogLevel::Info,
                     "connection",
@@ -871,8 +849,7 @@ impl App {
                 );
             }
             ConnectionEvent::Disconnected { reason } => {
-                self.conn = ConnState::Disconnected;
-                self.reconnect_delay_ms = None;
+                self.connection.apply_disconnected();
                 self.sessions.session_discovery_in_progress = false;
                 self.sessions.pending_session_group_loads.clear();
                 self.set_status(
@@ -1297,7 +1274,7 @@ mod reasoning_effort_tests {
     #[test]
     fn resolve_new_session_default_cwd_prefers_active_session_cwd_then_group_then_launch() {
         let mut app = App::new();
-        app.launch_cwd = Some("/launch".into());
+        app.connection.launch_cwd = Some("/launch".into());
         app.sessions.session_id = Some("session-a".into());
         app.sessions.session_groups = vec![SessionGroup {
             cwd: Some("/group".into()),
@@ -1335,7 +1312,7 @@ mod reasoning_effort_tests {
     #[test]
     fn open_new_session_popup_prefills_path_and_cursor() {
         let mut app = App::new();
-        app.launch_cwd = Some("/launch".into());
+        app.connection.launch_cwd = Some("/launch".into());
 
         app.open_new_session_popup();
 
@@ -1347,7 +1324,7 @@ mod reasoning_effort_tests {
     #[test]
     fn normalize_new_session_path_uses_launch_cwd_for_relative_paths() {
         let mut app = App::new();
-        app.launch_cwd = Some("/launch/base".into());
+        app.connection.launch_cwd = Some("/launch/base".into());
 
         assert_eq!(
             app.normalize_new_session_path("proj/subdir").as_deref(),
@@ -1406,7 +1383,7 @@ mod reasoning_effort_tests {
         std::fs::write(dir.join("project-file.txt"), "x").unwrap();
 
         let mut app = App::new();
-        app.launch_cwd = Some(dir.to_string_lossy().into_owned());
+        app.connection.launch_cwd = Some(dir.to_string_lossy().into_owned());
         let results = app.rank_path_completion_matches("project");
 
         assert!(results.iter().all(|entry| entry.is_dir));
@@ -1752,6 +1729,7 @@ mod session_mode_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_state::ServerState;
     use crate::domain::chat::OUTCOME_BULLET;
 
     fn make_turn(message_id: &str) -> UndoableTurn {
@@ -2037,12 +2015,12 @@ mod tests {
     #[test]
     fn refresh_transient_status_preserves_connection_and_operation_precedence() {
         let mut app = App::new();
-        app.conn = ConnState::Disconnected;
+        app.connection.conn = ConnState::Disconnected;
         app.set_status(LogLevel::Warn, "connection", "connection lost - retrying");
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "connection lost - retrying");
 
-        app.conn = ConnState::Connected;
+        app.connection.conn = ConnState::Connected;
         app.activity = ActivityState::Thinking;
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "thinking...");
@@ -2283,15 +2261,19 @@ mod tests {
     }
 
     #[test]
-    fn connection_events_update_status_and_retry_metadata() {
+    fn connecting_event_updates_status_retry_metadata_and_clears_cancel_confirmation() {
         let mut app = App::new();
+        app.arm_cancel_confirm();
+
         app.handle_connection_event(ConnectionEvent::Connecting {
             attempt: 3,
             delay_ms: 2000,
         });
-        assert_eq!(app.conn, ConnState::Connecting);
-        assert_eq!(app.reconnect_attempt, 3);
-        assert_eq!(app.reconnect_delay_ms, Some(2000));
+
+        assert_eq!(app.connection.conn, ConnState::Connecting);
+        assert_eq!(app.connection.reconnect_attempt, 3);
+        assert_eq!(app.connection.reconnect_delay_ms, Some(2000));
+        assert!(app.pending_cancel_confirm_until.is_none());
         assert_eq!(
             app.diagnostics.status,
             "waiting for server - retry 3 in 2.0s"
@@ -2299,25 +2281,73 @@ mod tests {
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "connection" && entry.level == LogLevel::Warn)
         );
+    }
+
+    #[test]
+    fn connected_event_selects_connected_or_reconnected_and_resets_retry_metadata() {
+        let mut app = App::new();
+        app.connection.reconnect_attempt = 3;
+        app.connection.reconnect_delay_ms = Some(2000);
+
+        app.handle_connection_event(ConnectionEvent::Connected);
+        assert_eq!(app.connection.conn, ConnState::Connected);
+        assert_eq!(app.connection.reconnect_attempt, 0);
+        assert_eq!(app.connection.reconnect_delay_ms, None);
+        assert_eq!(app.diagnostics.status, "connected");
+
+        app.sessions.session_id = Some("session-1".into());
+        app.connection.reconnect_attempt = 2;
+        app.connection.reconnect_delay_ms = Some(1000);
+        app.handle_connection_event(ConnectionEvent::Connected);
+        assert_eq!(app.connection.conn, ConnState::Connected);
+        assert_eq!(app.connection.reconnect_attempt, 0);
+        assert_eq!(app.connection.reconnect_delay_ms, None);
+        assert_eq!(app.diagnostics.status, "reconnected");
+        assert!(
+            matches!(app.diagnostics.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected")
+        );
+    }
+
+    #[test]
+    fn disconnected_event_clears_only_transient_session_discovery_and_delay_state() {
+        let mut app = App::new();
+        app.connection.launch_cwd = Some("/workspace".into());
+        app.connection.reconnect_attempt = 4;
+        app.connection.reconnect_delay_ms = Some(4000);
+        app.connection.server_state = ServerState::Running;
+        app.sessions.session_id = Some("session-1".into());
+        app.sessions.session_discovery_in_progress = true;
+        app.sessions
+            .pending_session_group_loads
+            .insert(Some("/workspace".into()));
+        app.sessions
+            .pending_session_child_loads
+            .insert("session-1".into());
+        app.input = "retained prompt".into();
+        app.arm_cancel_confirm();
 
         app.handle_connection_event(ConnectionEvent::Disconnected {
             reason: "socket closed".into(),
         });
-        assert_eq!(app.conn, ConnState::Disconnected);
-        assert_eq!(app.reconnect_delay_ms, None);
+
+        assert_eq!(app.connection.conn, ConnState::Disconnected);
+        assert_eq!(app.connection.reconnect_attempt, 4);
+        assert_eq!(app.connection.reconnect_delay_ms, None);
+        assert_eq!(app.connection.launch_cwd.as_deref(), Some("/workspace"));
+        assert_eq!(app.connection.server_state, ServerState::Running);
+        assert_eq!(app.sessions.session_id.as_deref(), Some("session-1"));
+        assert!(!app.sessions.session_discovery_in_progress);
+        assert!(app.sessions.pending_session_group_loads.is_empty());
+        assert!(
+            app.sessions
+                .pending_session_child_loads
+                .contains("session-1")
+        );
+        assert_eq!(app.input, "retained prompt");
+        assert!(app.pending_cancel_confirm_until.is_none());
         assert_eq!(app.diagnostics.status, "connection lost - socket closed");
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
-        );
-
-        app.sessions.session_id = Some("session-1".into());
-        app.handle_connection_event(ConnectionEvent::Connected);
-        assert_eq!(app.conn, ConnState::Connected);
-        assert_eq!(app.reconnect_attempt, 0);
-        assert_eq!(app.reconnect_delay_ms, None);
-        assert_eq!(app.diagnostics.status, "reconnected");
-        assert!(
-            matches!(app.diagnostics.logs.last(), Some(entry) if entry.level == LogLevel::Info && entry.message == "reconnected")
         );
     }
 
