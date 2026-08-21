@@ -698,7 +698,7 @@ mod tests {
         assert!(!rendered.contains(ICON_DELEGATES));
 
         // 2 completed + 1 running = "2/3"
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "d1".into(),
                 child_session_id: Some("c1".into()),
@@ -752,7 +752,7 @@ mod tests {
         app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
-        app.delegate_entries = vec![DelegateEntry {
+        app.delegates.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: Some("c1".into()),
             delegate_tool_call_id: None,
@@ -795,7 +795,7 @@ mod tests {
         app.sessions.agent_mode = "build".into();
         app.models.current_provider = Some("anthropic".into());
         app.models.current_model = Some("claude-sonnet".into());
-        app.delegate_entries = vec![DelegateEntry {
+        app.delegates.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: Some("c1".into()),
             delegate_tool_call_id: None,
@@ -824,7 +824,7 @@ mod tests {
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
         app.sessions.session_id = Some("parent".into());
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: Some("child-1".into()),
@@ -886,8 +886,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_cursor = 1;
-        app.delegate_entries = vec![DelegateEntry {
+        app.delegates.delegate_cursor = 1;
+        app.delegates.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
             delegate_tool_call_id: None,
@@ -934,7 +934,7 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
@@ -1001,7 +1001,7 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_entries = vec![DelegateEntry {
+        app.delegates.delegate_entries = vec![DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
             delegate_tool_call_id: None,
@@ -1043,8 +1043,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_cursor = 0; // keep first row selected; failed row remains unselected
-        app.delegate_entries = vec![
+        app.delegates.delegate_cursor = 0; // keep first row selected; failed row remains unselected
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-0".into(),
                 child_session_id: None,
@@ -1091,8 +1091,8 @@ mod tests {
         app.navigation.screen = Screen::Chat;
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_cursor = 1;
-        app.delegate_entries = vec![
+        app.delegates.delegate_cursor = 1;
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
@@ -1178,7 +1178,7 @@ mod tests {
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
         app.sessions.session_id = Some("parent".into());
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-1".into(),
                 child_session_id: None,
@@ -1239,7 +1239,7 @@ mod tests {
             is_error: false,
             detail: ToolDetail::Summary("(coder) Fix the bug".into()),
         });
-        app.delegate_entries.push(DelegateEntry {
+        app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: None,
             delegate_tool_call_id: None,
@@ -1374,7 +1374,7 @@ mod tests {
             is_error: false,
             detail: ToolDetail::Summary("(coder) Fix the bug".into()),
         });
-        app.delegate_entries.push(DelegateEntry {
+        app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
             delegate_tool_call_id: None,
@@ -2362,7 +2362,7 @@ mod tests {
             "Fix live bug",
         ));
         // ACP has no delegation lifecycle updates; this fixture isolates row rendering.
-        app.delegate_entries.push(DelegateEntry {
+        app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
             delegate_tool_call_id: Some("tool-delegate-1".into()),
@@ -2511,7 +2511,7 @@ mod tests {
         let mut app = App::new();
         app.messages
             .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
-        app.delegate_entries.push(DelegateEntry {
+        app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
             child_session_id: Some("child-1".into()),
             delegate_tool_call_id: Some("tool-1".into()),
@@ -2528,7 +2528,7 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("awaiting input")));
         assert_eq!(app.card_cache.processed_messages, app.messages.len());
 
-        app.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
+        app.delegates.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             requested_schema: serde_json::json!({ "properties": {} }),
@@ -2561,7 +2561,7 @@ mod tests {
         build_message_cards(&mut app);
         app.messages
             .push(delegate_tool_call("tool-b", "coder", "Second task"));
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "del-b".into(),
                 child_session_id: Some("child-b".into()),
@@ -3029,7 +3029,7 @@ mod tests {
                 allow_custom: true,
             }],
         );
-        assert_eq!(app.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(app.delegates.parent_session_id.as_deref(), Some("parent"));
         assert!(app.elicitation.is_none());
         assert!(
             matches!(app.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }] if elicitation_id == "elic-1")
@@ -3117,7 +3117,7 @@ mod tests {
             "parent-session",
             vec![user_update("parent prompt 1", "parent-user-1")],
         );
-        app.pending_parent_session_id = Some("parent-session".into());
+        app.delegates.pending_parent_session_id = Some("parent-session".into());
         load_session(&mut app, "delegate-session", "agent-2");
         replay_session(
             &mut app,
