@@ -497,10 +497,8 @@ pub(crate) fn handle_key(
 
     // ctrl-c: clear input first, quit on second press
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if !app.input.is_empty() {
-            app.input.clear();
-            app.input_cursor = 0;
-            app.input_scroll = 0;
+        if !app.composer.input.is_empty() {
+            app.composer.clear_input();
         } else {
             app.should_quit = true;
         }
@@ -777,10 +775,8 @@ pub(crate) fn handle_chord(
             } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.current_undo_target().cloned() {
-                if app.input.trim().is_empty() && !turn.text.is_empty() {
-                    app.input = turn.text.clone();
-                    app.input_cursor = app.input.len();
-                    app.input_scroll = 0;
+                if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
+                    app.composer.replace_input(turn.text.clone());
                 }
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -1554,16 +1550,16 @@ pub(crate) fn handle_chat_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<AppAction> {
-    if app.input_line_width == 0 {
-        app.input_line_width = 1;
+    if app.composer.input_line_width == 0 {
+        app.composer.input_line_width = 1;
     }
     let input_blocked = app.input_blocked_by_activity();
     match key.code {
         KeyCode::Esc => {
             // Dismiss whichever completion popup is open first.
-            if app.mention_state.is_some() || app.slash_state.is_some() {
-                app.mention_state = None;
-                app.slash_state = None;
+            if app.composer.mention_state.is_some() || app.composer.slash_state.is_some() {
+                app.composer.mention_state = None;
+                app.composer.slash_state = None;
                 app.clear_cancel_confirm();
             } else if app.has_cancellable_activity() {
                 if app.cancel_confirm_active() {
@@ -1579,11 +1575,11 @@ pub(crate) fn handle_chat_key(
         }
         KeyCode::Enter => {
             // 1. Complete slash completion, then fall through to execute.
-            if app.slash_state.is_some() {
-                app.accept_selected_slash_completion();
+            if app.composer.slash_state.is_some() {
+                app.composer.accept_selected_slash_completion();
             }
             // 2. Try slash command execution (input starts with '/').
-            if !app.input.is_empty() && app.input.trim_start().starts_with('/') {
+            if !app.composer.input.is_empty() && app.composer.input.trim_start().starts_with('/') {
                 match try_execute_slash_command(app, cmd_tx)? {
                     SlashResult::OpenEditor => return Ok(AppAction::OpenExternalEditor),
                     SlashResult::Handled => return Ok(AppAction::None),
@@ -1591,18 +1587,20 @@ pub(crate) fn handle_chat_key(
                 }
             }
             // 3. Accept mention completion.
-            if app.mention_state.is_some() && app.accept_selected_mention() {
-                if let Some(msg) = app.request_file_index_if_needed() {
-                    cmd_tx.send(msg)?;
+            if app.composer.mention_state.is_some() && app.composer.accept_selected_mention() {
+                if app.composer.prepare_file_index_request() {
+                    cmd_tx.send(Command::GetFileIndex)?;
                 }
                 return Ok(AppAction::None);
             }
             // 4. Normal prompt send.
-            if !app.input.is_empty() {
+            if !app.composer.input.is_empty() {
                 if input_blocked || !can_send_server_commands(app) {
                     return Ok(AppAction::None);
                 }
-                let (text, links) = app.build_prompt_text_and_links(&app.input);
+                let (text, links) = app
+                    .composer
+                    .build_prompt_text_and_links(&app.composer.input);
                 let text = text.trim().to_string();
                 let _ = app.take_input();
                 if text.is_empty() {
@@ -1635,43 +1633,43 @@ pub(crate) fn handle_chat_key(
             }
         }
         KeyCode::Tab if !input_blocked => {
-            if app.slash_state.is_some() {
-                app.accept_selected_slash_completion();
-            } else if app.mention_state.is_some()
-                && app.accept_selected_mention()
-                && let Some(msg) = app.request_file_index_if_needed()
+            if app.composer.slash_state.is_some() {
+                app.composer.accept_selected_slash_completion();
+            } else if app.composer.mention_state.is_some()
+                && app.composer.accept_selected_mention()
+                && app.composer.prepare_file_index_request()
             {
-                cmd_tx.send(msg)?;
+                cmd_tx.send(Command::GetFileIndex)?;
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
-            app.input_insert(c);
-            if let Some(msg) = app.request_file_index_if_needed() {
-                cmd_tx.send(msg)?;
+            app.composer.input_insert(c);
+            if app.composer.prepare_file_index_request() {
+                cmd_tx.send(Command::GetFileIndex)?;
             }
         }
         KeyCode::Up => {
             if input_blocked {
                 return Ok(AppAction::None);
             }
-            if app.slash_state.is_some() {
-                app.move_slash_selection(-1);
-            } else if app.mention_state.is_some() {
-                app.move_mention_selection(-1);
+            if app.composer.slash_state.is_some() {
+                app.composer.move_slash_selection(-1);
+            } else if app.composer.mention_state.is_some() {
+                app.composer.move_mention_selection(-1);
             } else {
-                app.input_up_visual(2);
+                app.composer.input_up_visual(2);
             }
         }
         KeyCode::Down => {
             if input_blocked {
                 return Ok(AppAction::None);
             }
-            if app.slash_state.is_some() {
-                app.move_slash_selection(1);
-            } else if app.mention_state.is_some() {
-                app.move_mention_selection(1);
+            if app.composer.slash_state.is_some() {
+                app.composer.move_slash_selection(1);
+            } else if app.composer.mention_state.is_some() {
+                app.composer.move_mention_selection(1);
             } else {
-                app.input_down_visual(2);
+                app.composer.input_down_visual(2);
             }
         }
         KeyCode::PageUp => {
@@ -1681,27 +1679,27 @@ pub(crate) fn handle_chat_key(
             app.scroll_offset = app.scroll_offset.saturating_sub(10);
         }
         KeyCode::Backspace if !input_blocked => {
-            app.input_backspace();
+            app.composer.input_backspace();
         }
         KeyCode::Delete if !input_blocked => {
-            app.input_delete();
+            app.composer.input_delete();
         }
         KeyCode::Left if !input_blocked => {
-            app.input_left();
+            app.composer.input_left();
         }
         KeyCode::Right if !input_blocked => {
-            app.input_right();
+            app.composer.input_right();
         }
         KeyCode::Home if !input_blocked => {
-            app.input_home();
+            app.composer.input_home();
         }
         KeyCode::End => {
             if input_blocked {
                 app.scroll_offset = 0;
-            } else if app.input.is_empty() {
+            } else if app.composer.input.is_empty() {
                 app.scroll_offset = 0; // snap to bottom
             } else {
-                app.input_end();
+                app.composer.input_end();
             }
         }
         _ => {}
@@ -1742,9 +1740,9 @@ enum SlashResult {
     NotACommand,
 }
 
-/// Parse and execute a slash command from `app.input`.
+/// Parse and execute a slash command from `app.composer.input`.
 ///
-/// Expects `app.input` to begin with `/`.  Always calls `app.take_input()`
+/// Expects `app.composer.input` to begin with `/`.  Always calls `app.take_input()`
 /// before performing any side-effects so the command text is cleared first
 /// (this allows `/undo` to optionally restore the previous turn text).
 fn try_execute_slash_command(
@@ -1752,7 +1750,7 @@ fn try_execute_slash_command(
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<SlashResult> {
     // Extract the command name (first word after '/') and optional argument.
-    let after_slash = app.input.trim_start_matches('/');
+    let after_slash = app.composer.input.trim_start_matches('/');
     let cmd = after_slash
         .split_whitespace()
         .next()
@@ -1988,10 +1986,8 @@ fn try_execute_slash_command(
             } else if app.has_pending_session_op() || app.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.current_undo_target().cloned() {
-                if app.input.trim().is_empty() && !turn.text.is_empty() {
-                    app.input = turn.text.clone();
-                    app.input_cursor = app.input.len();
-                    app.input_scroll = 0;
+                if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
+                    app.composer.replace_input(turn.text.clone());
                 }
                 app.push_pending_undo(&turn);
                 app.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -2596,6 +2592,7 @@ pub(crate) fn apply_sessions_key(
 mod model_popup_tests {
     use super::*;
     use crate::app::App;
+    use crate::command::PromptBlock;
     use crate::config::TestPersistenceGuard;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
@@ -2605,6 +2602,91 @@ mod model_popup_tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn mention_typing_prepares_and_sends_file_index_request_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut app = App::new();
+
+        handle_chat_key(&mut app, key(KeyCode::Char('@')), &tx).unwrap();
+        handle_chat_key(&mut app, key(KeyCode::Char('s')), &tx).unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(Command::GetFileIndex)));
+        assert!(rx.try_recv().is_err());
+        assert!(app.composer.file_index_loading);
+        assert_eq!(app.composer.input, "@s");
+    }
+
+    #[test]
+    fn prompt_send_is_optimistic_and_clears_input_before_dispatch() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.composer.replace_input(" hello ".into());
+
+        handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+
+        assert!(app.composer.input.is_empty());
+        let local_id = match app.messages.as_slice() {
+            [
+                ChatEntry::User {
+                    text,
+                    message_id: Some(local_id),
+                },
+            ] if text == "hello" => local_id.clone(),
+            messages => panic!("unexpected optimistic messages: {messages:?}"),
+        };
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::Prompt { prompt, local_id: sent_id })
+                if sent_id == local_id
+                    && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn failed_prompt_dispatch_rolls_back_only_optimistic_message() {
+        let (tx, rx) = mpsc::unbounded_channel::<Command>();
+        drop(rx);
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.messages.push(ChatEntry::Assistant {
+            content: "keep".into(),
+            thinking: None,
+            message_id: Some("assistant-1".into()),
+        });
+        app.composer.replace_input("send me".into());
+
+        assert!(handle_chat_key(&mut app, key(KeyCode::Enter), &tx).is_err());
+
+        assert!(app.composer.input.is_empty());
+        assert!(matches!(
+            app.messages.as_slice(),
+            [ChatEntry::Assistant { content, .. }] if content == "keep"
+        ));
+    }
+
+    #[test]
+    fn take_input_resets_composer_then_chat_scroll_boundary() {
+        let mut app = App::new();
+        app.composer.input = "draft".into();
+        app.composer.input_cursor = 3;
+        app.composer.input_scroll = 2;
+        app.composer.input_preferred_col = Some(4);
+        app.composer.refresh_mention_state();
+        app.composer.input = "/mo".into();
+        app.composer.input_cursor = 3;
+        app.composer.refresh_slash_state();
+        app.scroll_offset = 7;
+
+        assert_eq!(app.take_input(), "/mo");
+        assert_eq!(app.composer.input_cursor, 0);
+        assert_eq!(app.composer.input_scroll, 0);
+        assert_eq!(app.composer.input_preferred_col, None);
+        assert!(app.composer.mention_state.is_none());
+        assert!(app.composer.slash_state.is_none());
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
@@ -3004,8 +3086,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
-        app.input = "/profile".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "/profile".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3023,8 +3105,8 @@ mod model_popup_tests {
         app.navigation.screen = Screen::Chat;
         app.profiles.profiles = vec![make_profile("fast", "Fast")];
         app.profiles.active_profile_id = Some("old".into());
-        app.input = "/profile Fast".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "/profile Fast".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3374,8 +3456,8 @@ mod model_popup_tests {
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.models = vec![make_model("openai", "gpt-4o")];
-        app.input = "/model".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "/model".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3396,8 +3478,8 @@ mod model_popup_tests {
         app.connection.conn = ConnState::Connected;
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "plan".into();
-        app.input = "/review".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "/review".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
@@ -3464,8 +3546,8 @@ mod model_popup_tests {
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "review".into();
         app.sessions.mode_before_review = Some("plan".into());
-        app.input = "/review".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "/review".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();

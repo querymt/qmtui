@@ -77,11 +77,7 @@ pub(super) fn open_external_editor(initial_text: &str) -> anyhow::Result<Option<
 }
 
 pub(super) fn apply_external_editor_result(app: &mut App, updated_input: String) {
-    app.input = updated_input;
-    app.input_cursor = app.input.len();
-    app.input_scroll = 0;
-    app.refresh_mention_state();
-    app.refresh_slash_state();
+    app.composer.replace_input_from_editor(updated_input);
 }
 
 pub(super) fn apply_external_editor_outcome(app: &mut App, result: anyhow::Result<Option<String>>) {
@@ -142,26 +138,26 @@ mod tests {
     #[test]
     fn apply_external_editor_result_updates_input_and_cursor() {
         let mut app = App::new();
-        app.input = "old".into();
-        app.input_cursor = 1;
-        app.input_scroll = 3;
+        app.composer.input = "old".into();
+        app.composer.input_cursor = 1;
+        app.composer.input_scroll = 3;
 
         apply_external_editor_result(&mut app, "new text".into());
 
-        assert_eq!(app.input, "new text");
-        assert_eq!(app.input_cursor, "new text".len());
-        assert_eq!(app.input_scroll, 0);
+        assert_eq!(app.composer.input, "new text");
+        assert_eq!(app.composer.input_cursor, "new text".len());
+        assert_eq!(app.composer.input_scroll, 0);
     }
 
     #[test]
     fn apply_external_editor_outcome_updates_input_on_success() {
         let mut app = App::new();
-        app.input = "draft".into();
+        app.composer.input = "draft".into();
 
         apply_external_editor_outcome(&mut app, Ok(Some("revised prompt".into())));
 
-        assert_eq!(app.input, "revised prompt");
-        assert_eq!(app.input_cursor, "revised prompt".len());
+        assert_eq!(app.composer.input, "revised prompt");
+        assert_eq!(app.composer.input_cursor, "revised prompt".len());
         assert_eq!(app.diagnostics.status, "loaded prompt from external editor");
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "editor"));
     }
@@ -169,11 +165,11 @@ mod tests {
     #[test]
     fn apply_external_editor_outcome_keeps_input_on_cancel() {
         let mut app = App::new();
-        app.input = "draft".into();
+        app.composer.input = "draft".into();
 
         apply_external_editor_outcome(&mut app, Ok(None));
 
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.composer.input, "draft");
         assert_eq!(app.diagnostics.status, "external editor cancelled");
     }
 }

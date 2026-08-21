@@ -34,9 +34,8 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use unicode_width::UnicodeWidthChar;
-
 use crate::app::App;
+use crate::composer_state::build_input_visual_layout;
 use crate::connection_state::ConnState;
 use crate::navigation_state::{Popup, Screen};
 use crate::theme::Theme;
@@ -127,158 +126,6 @@ impl ElicitationUiState {
         let row = (layout.cursor_row as i32 + delta)
             .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
         self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InputVisualRow {
-    pub(crate) text: String,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) columns: Vec<(usize, usize)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InputVisualLayout {
-    pub(crate) rows: Vec<InputVisualRow>,
-    pub(crate) cursor_row: usize,
-    pub(crate) cursor_col: usize,
-    pub(crate) cursor_text_col: usize,
-}
-
-impl InputVisualLayout {
-    pub(crate) fn total_rows(&self) -> usize {
-        self.rows.len().max(1)
-    }
-
-    pub(crate) fn cursor_offset_for_row_col(&self, row: usize, preferred_col: usize) -> usize {
-        let Some(row) = self.rows.get(row) else {
-            return 0;
-        };
-        let mut best = row.end;
-        for (col, offset) in &row.columns {
-            if *col <= preferred_col {
-                best = *offset;
-            } else {
-                break;
-            }
-        }
-        best
-    }
-}
-
-pub(crate) fn build_input_visual_layout(
-    input: &str,
-    input_cursor: usize,
-    line_width: usize,
-    prefix_width: usize,
-) -> InputVisualLayout {
-    let line_width = line_width.max(1);
-    let mut rows: Vec<InputVisualRow> = Vec::new();
-    let mut row_text = String::new();
-    let mut row_columns = vec![(0usize, 0usize)];
-    let mut row_start = 0usize;
-    let mut row_end = 0usize;
-    let mut col = prefix_width;
-    let mut text_col = 0usize;
-    let mut cursor_row = 0usize;
-    let mut cursor_col = prefix_width;
-    let mut cursor_text_col = 0usize;
-    let mut cursor_found = input_cursor == 0;
-
-    let row_prefix_width = |rows_len: usize| if rows_len == 0 { prefix_width } else { 0 };
-
-    if cursor_found {
-        cursor_row = 0;
-        cursor_col = prefix_width;
-        cursor_text_col = 0;
-    }
-
-    let finish_row = |rows: &mut Vec<InputVisualRow>,
-                      row_text: &mut String,
-                      row_columns: &mut Vec<(usize, usize)>,
-                      row_start: &mut usize,
-                      row_end: &mut usize,
-                      next_start: usize| {
-        rows.push(InputVisualRow {
-            text: std::mem::take(row_text),
-            start: *row_start,
-            end: *row_end,
-            columns: std::mem::take(row_columns),
-        });
-        *row_columns = vec![(0, next_start)];
-        *row_start = next_start;
-        *row_end = next_start;
-    };
-
-    for (byte_idx, ch) in input.char_indices() {
-        if !cursor_found && byte_idx == input_cursor {
-            cursor_row = rows.len();
-            cursor_col = col;
-            cursor_text_col = text_col;
-            cursor_found = true;
-        }
-
-        if ch == '\n' {
-            row_end = byte_idx;
-            finish_row(
-                &mut rows,
-                &mut row_text,
-                &mut row_columns,
-                &mut row_start,
-                &mut row_end,
-                byte_idx + ch.len_utf8(),
-            );
-            col = row_prefix_width(rows.len());
-            text_col = 0;
-            continue;
-        }
-
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width > 0 && col + ch_width > line_width {
-            finish_row(
-                &mut rows,
-                &mut row_text,
-                &mut row_columns,
-                &mut row_start,
-                &mut row_end,
-                byte_idx,
-            );
-            col = row_prefix_width(rows.len());
-            text_col = 0;
-            if !cursor_found && byte_idx == input_cursor {
-                cursor_row = rows.len();
-                cursor_col = col;
-                cursor_text_col = 0;
-                cursor_found = true;
-            }
-        }
-
-        row_text.push(ch);
-        col += ch_width;
-        text_col += ch_width;
-        row_end = byte_idx + ch.len_utf8();
-        row_columns.push((text_col, row_end));
-    }
-
-    if !cursor_found && input_cursor == input.len() {
-        cursor_row = rows.len();
-        cursor_col = col;
-        cursor_text_col = text_col;
-    }
-
-    rows.push(InputVisualRow {
-        text: row_text,
-        start: row_start,
-        end: row_end,
-        columns: row_columns,
-    });
-
-    InputVisualLayout {
-        rows,
-        cursor_row,
-        cursor_col,
-        cursor_text_col,
     }
 }
 
@@ -655,26 +502,6 @@ mod tests {
         assert_eq!(spinner(SpinnerKind::Braille, 0), "⠋");
         assert_eq!(spinner(SpinnerKind::Line, 0), "-");
         assert_eq!(spinner(SpinnerKind::Dots, 0), ".  ");
-    }
-
-    #[test]
-    fn input_visual_layout_wraps_long_lines_and_tracks_cursor() {
-        let layout = build_input_visual_layout("abcdef", 4, 4, 2);
-        assert_eq!(layout.rows.len(), 2);
-        assert_eq!(layout.rows[0].text, "ab");
-        assert_eq!(layout.rows[1].text, "cdef");
-        assert_eq!(layout.cursor_row, 1);
-        assert_eq!(layout.cursor_col, 2);
-    }
-
-    #[test]
-    fn input_visual_layout_preserves_hard_break_rows() {
-        let layout = build_input_visual_layout("ab\ncd", 3, 6, 2);
-        assert_eq!(layout.rows.len(), 2);
-        assert_eq!(layout.rows[0].text, "ab");
-        assert_eq!(layout.rows[1].text, "cd");
-        assert_eq!(layout.cursor_row, 1);
-        assert_eq!(layout.cursor_col, 0);
     }
 
     fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
@@ -1585,8 +1412,8 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "build".into();
-        app.input = "alpha\nbeta".into();
-        app.input_cursor = app.input.len();
+        app.composer.input = "alpha\nbeta".into();
+        app.composer.input_cursor = app.composer.input.len();
 
         let buffer = render_chat_buffer(&mut app, 40, 10);
         let line1 = buffer_line(&buffer, 7);
@@ -1607,8 +1434,8 @@ mod tests {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.sessions.agent_mode = "build".into();
-        app.input = "alpha\nbeta".into();
-        app.input_cursor = "alpha\n".len();
+        app.composer.input = "alpha\nbeta".into();
+        app.composer.input_cursor = "alpha\n".len();
 
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2500,7 +2327,7 @@ mod tests {
         app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
             query: "/launch".into(),
             selected_index: 0,
-            results: vec![crate::app::FileIndexEntryLite {
+            results: vec![crate::composer_state::FileIndexEntryLite {
                 path: "/launch/project".into(),
                 is_dir: true,
             }],

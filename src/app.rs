@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth_state::AuthState;
 use crate::command::Command;
+use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
@@ -197,28 +198,6 @@ pub(crate) fn backfill_elicitation_outcomes(messages: &mut [ChatEntry], result_s
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileIndexEntryLite {
-    pub path: String,
-    pub is_dir: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MentionState {
-    pub trigger_start: usize,
-    pub query: String,
-    pub selected_index: usize,
-    pub results: Vec<FileIndexEntryLite>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlashCompletionState {
-    /// The text typed after the leading `/` (e.g. `"mo"` while typing `/mo`).
-    pub query: String,
-    pub selected_index: usize,
-    pub results: Vec<&'static crate::slash::SlashCommandDef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connecting { attempt: u32, delay_ms: u64 },
     Connected,
@@ -239,11 +218,7 @@ pub struct App {
     pub messages: Vec<ChatEntry>,
     /// Monotonic identifier source for locally rendered prompts awaiting ACP echo.
     pub pending_prompt_seq: u64,
-    pub input: String,
-    pub input_cursor: usize,
-    pub input_scroll: u16,
-    pub input_line_width: usize,
-    pub input_preferred_col: Option<usize>,
+    pub(crate) composer: ComposerState,
     pub fork_filter: String,
     pub fork_cursor: usize,
     pub pending_fork_message_id: Option<String>,
@@ -259,12 +234,6 @@ pub struct App {
     pub streaming_thinking: String,
     pub streaming_thinking_message_id: Option<String>,
     pub streaming_thinking_cache: StreamingCache,
-    pub file_index: Vec<FileIndexEntryLite>,
-    pub file_index_generated_at: Option<u64>,
-    pub file_index_loading: bool,
-    pub file_index_error: Option<String>,
-    pub mention_state: Option<MentionState>,
-    pub slash_state: Option<SlashCompletionState>,
     pub last_compaction_token_estimate: Option<u32>,
     /// Active elicitation request waiting for user response.
     pub elicitation: Option<ElicitationState>,
@@ -383,11 +352,7 @@ impl App {
             delegate_popup_visible_rows: 0,
             messages: Vec::new(),
             pending_prompt_seq: 0,
-            input: String::new(),
-            input_cursor: 0,
-            input_scroll: 0,
-            input_line_width: 1,
-            input_preferred_col: None,
+            composer: ComposerState::new(),
             fork_filter: String::new(),
             fork_cursor: 0,
             pending_fork_message_id: None,
@@ -400,12 +365,6 @@ impl App {
             streaming_thinking: String::new(),
             streaming_thinking_message_id: None,
             streaming_thinking_cache: StreamingCache::new(),
-            file_index: Vec::new(),
-            file_index_generated_at: None,
-            file_index_loading: false,
-            file_index_error: None,
-            mention_state: None,
-            slash_state: None,
             last_compaction_token_estimate: None,
             elicitation: None,
             elicitation_ui: None,
@@ -442,6 +401,16 @@ impl App {
             tick: 0,
             should_quit: false,
         }
+    }
+
+    pub fn take_input(&mut self) -> String {
+        self.composer.input_cursor = 0;
+        self.composer.input_scroll = 0;
+        self.composer.input_preferred_col = None;
+        self.scroll_offset = 0;
+        self.composer.mention_state = None;
+        self.composer.slash_state = None;
+        std::mem::take(&mut self.composer.input)
     }
 
     /// Invalidate both streaming caches and clear the thinking buffer.
@@ -1360,7 +1329,7 @@ mod reasoning_effort_tests {
         app.sessions.new_session_completion = Some(PathCompletionState {
             query: "pro".into(),
             selected_index: 0,
-            results: vec![FileIndexEntryLite {
+            results: vec![crate::composer_state::FileIndexEntryLite {
                 path: "/launch/project/../project-two".into(),
                 is_dir: true,
             }],
@@ -2093,136 +2062,6 @@ mod tests {
     }
 
     #[test]
-    fn active_mention_query_detects_trigger_and_ignores_email() {
-        let app = App::new();
-
-        assert_eq!(
-            app.active_mention_query_from("fix @src/ma", "fix @src/ma".len()),
-            Some((4, "src/ma".into()))
-        );
-        assert_eq!(
-            app.active_mention_query_from("email@test.com", "email@test.com".len()),
-            None
-        );
-        assert_eq!(
-            app.active_mention_query_from("foo @", 5),
-            Some((4, String::new()))
-        );
-        assert_eq!(
-            app.active_mention_query_from("foo @bar baz", 8),
-            Some((4, "bar".into()))
-        );
-        assert_eq!(app.active_mention_query_from("foo @bar baz", 12), None);
-    }
-
-    #[test]
-    fn mention_results_rank_prefix_before_loose_matches() {
-        let mut app = App::new();
-        app.file_index = vec![
-            FileIndexEntryLite {
-                path: "src/main.rs".into(),
-                is_dir: false,
-            },
-            FileIndexEntryLite {
-                path: "tests/main_spec.rs".into(),
-                is_dir: false,
-            },
-            FileIndexEntryLite {
-                path: "src/manifest.toml".into(),
-                is_dir: false,
-            },
-            FileIndexEntryLite {
-                path: "src".into(),
-                is_dir: true,
-            },
-        ];
-
-        let results = app.rank_file_matches("ma");
-        let ranked: Vec<&str> = results.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(ranked[0], "src/main.rs");
-        assert!(ranked.contains(&"src/manifest.toml"));
-        assert!(ranked.contains(&"tests/main_spec.rs"));
-    }
-
-    #[test]
-    fn input_up_visual_moves_to_previous_wrapped_row() {
-        let mut app = App::new();
-        app.input = "abcdef".into();
-        app.input_cursor = 4;
-        app.input_line_width = 4;
-
-        app.input_up_visual(2);
-
-        assert_eq!(app.input_cursor, 2);
-        assert_eq!(app.input_preferred_col, Some(2));
-    }
-
-    #[test]
-    fn input_down_visual_moves_to_next_wrapped_row() {
-        let mut app = App::new();
-        app.input = "abcdef".into();
-        app.input_cursor = 2;
-        app.input_line_width = 4;
-
-        app.input_down_visual(2);
-
-        assert_eq!(app.input_cursor, 4);
-        assert_eq!(app.input_preferred_col, Some(2));
-    }
-
-    #[test]
-    fn input_down_visual_crosses_newline_boundary() {
-        let mut app = App::new();
-        app.input = "ab\ncd".into();
-        app.input_cursor = 1;
-        app.input_line_width = 6;
-
-        app.input_down_visual(2);
-
-        assert_eq!(app.input_cursor, 4);
-    }
-
-    #[test]
-    fn input_horizontal_move_resets_preferred_column() {
-        let mut app = App::new();
-        app.input = "abcdef".into();
-        app.input_cursor = 4;
-        app.input_preferred_col = Some(2);
-
-        app.input_left();
-
-        assert_eq!(app.input_cursor, 3);
-        assert_eq!(app.input_preferred_col, None);
-    }
-
-    #[test]
-    fn accept_selected_mention_replaces_query_with_friendly_token() {
-        let mut app = App::new();
-        app.input = "open @src/ma now".into();
-        app.input_cursor = "open @src/ma".len();
-        app.file_index = vec![FileIndexEntryLite {
-            path: "src/main.rs".into(),
-            is_dir: false,
-        }];
-        app.refresh_mention_state();
-
-        let accepted = app.accept_selected_mention();
-        assert!(accepted);
-        assert_eq!(app.input, "open @src/main.rs  now");
-        assert_eq!(app.input_cursor, "open @src/main.rs ".len());
-        assert!(app.mention_state.is_none());
-    }
-
-    #[test]
-    fn build_prompt_text_converts_friendly_mentions_to_markup_and_links() {
-        let app = App::new();
-        let (text, links) =
-            app.build_prompt_text_and_links("check @src/main.rs and @src/lib.rs then @src/main.rs");
-        assert_eq!(text, "check @src/main.rs and @src/lib.rs then @src/main.rs");
-        assert_eq!(links, vec!["src/main.rs", "src/lib.rs"]);
-    }
-
-    #[test]
     fn activity_helpers_report_turn_and_session_state() {
         let mut app = App::new();
         assert!(!app.is_turn_active());
@@ -2323,7 +2162,7 @@ mod tests {
         app.sessions
             .pending_session_child_loads
             .insert("session-1".into());
-        app.input = "retained prompt".into();
+        app.composer.input = "retained prompt".into();
         app.arm_cancel_confirm();
 
         app.handle_connection_event(ConnectionEvent::Disconnected {
@@ -2343,7 +2182,7 @@ mod tests {
                 .pending_session_child_loads
                 .contains("session-1")
         );
-        assert_eq!(app.input, "retained prompt");
+        assert_eq!(app.composer.input, "retained prompt");
         assert!(app.pending_cancel_confirm_until.is_none());
         assert_eq!(app.diagnostics.status, "connection lost - socket closed");
         assert!(
@@ -3284,144 +3123,5 @@ mod popup_item_tests {
         assert!(app.sessions.popup_collapsed_groups.contains("/a"));
         // start page collapsed_groups should be untouched
         assert!(!app.sessions.collapsed_groups.contains("/a"));
-    }
-
-    // ── slash completion state ─────────────────────────────────────────────────
-
-    #[test]
-    fn slash_query_cursor_at_zero_returns_none() {
-        let mut app = App::new();
-        app.input = "/model".into();
-        app.input_cursor = 0;
-        assert_eq!(app.active_slash_query(), None);
-    }
-
-    #[test]
-    fn slash_query_only_slash_typed() {
-        let mut app = App::new();
-        app.input = "/".into();
-        app.input_cursor = 1;
-        assert_eq!(app.active_slash_query(), Some(String::new()));
-    }
-
-    #[test]
-    fn slash_query_partial_command() {
-        let mut app = App::new();
-        app.input = "/mo".into();
-        app.input_cursor = 3;
-        assert_eq!(app.active_slash_query(), Some("mo".into()));
-    }
-
-    #[test]
-    fn slash_query_full_command_no_space() {
-        let mut app = App::new();
-        app.input = "/model".into();
-        app.input_cursor = 6;
-        assert_eq!(app.active_slash_query(), Some("model".into()));
-    }
-
-    #[test]
-    fn slash_query_after_space_returns_none() {
-        let mut app = App::new();
-        app.input = "/model ".into();
-        app.input_cursor = 7;
-        assert_eq!(app.active_slash_query(), None);
-    }
-
-    #[test]
-    fn slash_query_non_slash_input_returns_none() {
-        let mut app = App::new();
-        app.input = "hello".into();
-        app.input_cursor = 5;
-        assert_eq!(app.active_slash_query(), None);
-    }
-
-    #[test]
-    fn refresh_slash_state_filters_by_prefix() {
-        let mut app = App::new();
-        app.input = "/mo".into();
-        app.input_cursor = 3;
-        app.refresh_slash_state();
-        let state = app
-            .slash_state
-            .as_ref()
-            .expect("slash_state should be Some");
-        assert!(!state.results.is_empty());
-        assert!(state.results.iter().all(|c| c.name.starts_with("mo")));
-        assert!(state.results.iter().any(|c| c.name == "model"));
-    }
-
-    #[test]
-    fn refresh_slash_state_clears_on_no_match() {
-        let mut app = App::new();
-        app.input = "/zzz".into();
-        app.input_cursor = 4;
-        app.refresh_slash_state();
-        assert!(app.slash_state.is_none());
-    }
-
-    #[test]
-    fn refresh_slash_state_clears_on_cursor_at_zero() {
-        let mut app = App::new();
-        app.input = "/model".into();
-        app.input_cursor = 0;
-        app.refresh_slash_state(); // must not panic
-        assert!(app.slash_state.is_none());
-    }
-
-    #[test]
-    fn move_slash_selection_wraps_down_to_first() {
-        let mut app = App::new();
-        app.input = "/".into();
-        app.input_cursor = 1;
-        app.refresh_slash_state();
-        let total = app.slash_state.as_ref().unwrap().results.len();
-        app.slash_state.as_mut().unwrap().selected_index = total - 1;
-        app.move_slash_selection(1);
-        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, 0);
-    }
-
-    #[test]
-    fn move_slash_selection_wraps_up_to_last() {
-        let mut app = App::new();
-        app.input = "/".into();
-        app.input_cursor = 1;
-        app.refresh_slash_state();
-        let total = app.slash_state.as_ref().unwrap().results.len();
-        app.slash_state.as_mut().unwrap().selected_index = 0;
-        app.move_slash_selection(-1);
-        assert_eq!(app.slash_state.as_ref().unwrap().selected_index, total - 1);
-    }
-
-    #[test]
-    fn accept_slash_completion_replaces_partial_token() {
-        let mut app = App::new();
-        app.input = "/mo".into();
-        app.input_cursor = 3;
-        app.refresh_slash_state();
-        let idx = app
-            .slash_state
-            .as_ref()
-            .unwrap()
-            .results
-            .iter()
-            .position(|c| c.name == "model")
-            .expect("model should be in results");
-        app.slash_state.as_mut().unwrap().selected_index = idx;
-
-        let accepted = app.accept_selected_slash_completion();
-        assert!(accepted);
-        assert_eq!(app.input, "/model ");
-        assert_eq!(app.input_cursor, "/model ".len());
-        assert!(app.slash_state.is_none());
-    }
-
-    #[test]
-    fn accept_slash_completion_no_state_returns_false() {
-        let mut app = App::new();
-        app.input = "/model".into();
-        app.input_cursor = 6;
-        app.slash_state = None;
-        assert!(!app.accept_selected_slash_completion());
     }
 }
