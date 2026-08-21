@@ -252,12 +252,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
     let cache = &app.card_cache;
 
     // Auto-invalidate if messages shrank (clear/retain)
-    if app.messages.len() < cache.processed_messages {
+    if app.chat.messages.len() < cache.processed_messages {
         app.card_cache.invalidate();
     }
 
     // Cache hit — nothing new
-    if app.messages.len() == app.card_cache.processed_messages {
+    if app.chat.messages.len() == app.card_cache.processed_messages {
         return &app.card_cache.cards;
     }
 
@@ -273,9 +273,9 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         // entries are transparent and should not split a tool batch.
         let mut idx = app.card_cache.processed_messages;
         while idx > 0 {
-            match app.messages.get(idx - 1) {
+            match app.chat.messages.get(idx - 1) {
                 Some(ChatEntry::ToolCall { .. }) => idx -= 1,
-                Some(ChatEntry::Thinking { .. }) if !app.show_thinking => idx -= 1,
+                Some(ChatEntry::Thinking { .. }) if !app.chat.show_thinking => idx -= 1,
                 _ => break,
             }
         }
@@ -318,12 +318,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 })
                 .or_else(|| app.delegates.delegate_entries.get(sequential_idx))
         };
-    let mut delegate_idx = app.messages[..start_idx]
+    let mut delegate_idx = app.chat.messages[..start_idx]
         .iter()
         .filter(|entry| matches!(entry, ChatEntry::ToolCall { name, .. } if name == "delegate"))
         .count();
 
-    for entry in &app.messages[start_idx..] {
+    for entry in &app.chat.messages[start_idx..] {
         match entry {
             ChatEntry::User { text, .. } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
@@ -335,7 +335,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
             } => {
                 flush_tools(&mut pending_tools, &mut app.card_cache.cards);
                 let mut blocks = Vec::new();
-                if app.show_thinking
+                if app.chat.show_thinking
                     && let Some(thinking_text) = thinking
                 {
                     let mut rendered =
@@ -353,7 +353,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                     .push(Card::new(CardKind::Assistant, blocks));
             }
             ChatEntry::Thinking { content, .. } => {
-                if app.show_thinking {
+                if app.chat.show_thinking {
                     flush_tools(&mut pending_tools, &mut app.card_cache.cards);
                     let mut blocks = markdown::render(content, Theme::thinking_text(), &app.hl);
                     markdown::prepend_span_to_first_text(
@@ -667,7 +667,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
     }
 
     flush_tools(&mut pending_tools, &mut app.card_cache.cards);
-    app.card_cache.processed_messages = app.messages.len();
+    app.card_cache.processed_messages = app.chat.messages.len();
 
     &app.card_cache.cards
 }
@@ -725,32 +725,32 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
 
     let mut right_spans: Vec<Span<'static>> = Vec::new();
 
-    if let Some(dur) = app.llm_request_elapsed() {
+    if let Some(dur) = app.chat.llm_request_elapsed() {
         right_spans.push(Span::styled(
             format!(" {} ", format_status_duration(dur)),
             Theme::status(),
         ));
     }
 
-    if let Some(context_tokens) = app.session_stats.latest_context_tokens
+    if let Some(context_tokens) = app.chat.session_stats.latest_context_tokens
         && context_tokens > 0
-        && app.context_limit > 0
+        && app.chat.context_limit > 0
     {
-        let pct = (context_tokens as f64 / app.context_limit as f64 * 100.0) as u32;
+        let pct = (context_tokens as f64 / app.chat.context_limit as f64 * 100.0) as u32;
         right_spans.push(Span::styled(
             format!(" {ICON_CONTEXT} {pct}% "),
             Theme::status(),
         ));
     }
 
-    if app.session_stats.total_tool_calls > 0 {
+    if app.chat.session_stats.total_tool_calls > 0 {
         right_spans.push(Span::styled(
-            format!(" {ICON_TOOLS} {} ", app.session_stats.total_tool_calls),
+            format!(" {ICON_TOOLS} {} ", app.chat.session_stats.total_tool_calls),
             Theme::status(),
         ));
     }
 
-    if let Some(cost) = app.cumulative_cost
+    if let Some(cost) = app.chat.cumulative_cost
         && cost > 0.0
     {
         right_spans.push(Span::styled(
@@ -1013,7 +1013,7 @@ fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
 fn elicitation_option_rows(app: &App, width: u16) -> u16 {
     use crate::domain::elicitation::ElicitationFieldKind;
 
-    let (Some(state), Some(ui)) = (&app.elicitation, &app.elicitation_ui) else {
+    let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui) else {
         return 0;
     };
     let schema_rows = match ui
@@ -1046,7 +1046,7 @@ fn elicitation_option_rows(app: &App, width: u16) -> u16 {
 }
 
 fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
-    if let (Some(state), Some(ui)) = (&app.elicitation, &app.elicitation_ui) {
+    if let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui) {
         let message_width = area.width.saturating_sub(4).max(1);
         let message_rows = wrapped_text_rows(&state.message, message_width);
         let option_width = area.width.saturating_sub(6).max(1);
@@ -1075,15 +1075,15 @@ fn draw_input_panel(
     input_layout: InputVisualLayout,
 ) {
     // input border line reflects active session state
-    let border_style = match &app.activity {
+    let border_style = match &app.chat.activity {
         ActivityState::SessionOp(SessionOp::Undo) => Theme::input_border_undo(),
         ActivityState::SessionOp(SessionOp::Redo) => Theme::input_border_redo(),
-        _ if app.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
+        _ if app.chat.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
         ActivityState::Compacting { .. } => Theme::input_border_compacting(),
         ActivityState::Thinking | ActivityState::Streaming | ActivityState::RunningTool { .. } => {
             Theme::input_border_thinking()
         }
-        _ if app.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
+        _ if app.chat.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
         _ => Theme::mode_border(&app.sessions.agent_mode),
     };
     let border_line =
@@ -1098,7 +1098,7 @@ fn draw_input_panel(
     app.composer.input_line_width = (inner.width as usize).max(1);
     f.render_widget(input_bg, input_area);
 
-    let (label_text, label_style) = match &app.activity {
+    let (label_text, label_style) = match &app.chat.activity {
         ActivityState::SessionOp(SessionOp::Undo) => (
             format!("{} undoing ", spinner(SpinnerKind::Braille, app.tick)),
             Theme::input_undo(),
@@ -1107,7 +1107,7 @@ fn draw_input_panel(
             format!("{} redoing ", spinner(SpinnerKind::Braille, app.tick)),
             Theme::input_redo(),
         ),
-        _ if app.cancel_confirm_active() => (
+        _ if app.chat.cancel_confirm_active() => (
             format!(
                 "{} Esc again to stop ",
                 spinner(SpinnerKind::Braille, app.tick)
@@ -1121,14 +1121,14 @@ fn draw_input_panel(
             format!("{} ", spinner(SpinnerKind::Braille, app.tick)),
             Theme::input_thinking(),
         ),
-        _ if app.elicitation.is_some() => (
+        _ if app.chat.elicitation.is_some() => (
             format!("  answer above {ARROW_UP} "),
             Theme::input_thinking(),
         ),
         _ => ("> ".into(), Theme::mode_border(&app.sessions.agent_mode)),
     };
     let input_style = Theme::input();
-    let hide_input_contents = app.should_hide_input_contents();
+    let hide_input_contents = app.chat.should_hide_input_contents();
 
     if hide_input_contents {
         app.composer.input_scroll = 0;
@@ -1186,7 +1186,10 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let (Some(state), Some(ui)) = (app.elicitation.as_mut(), app.elicitation_ui.as_mut()) else {
+    let (Some(state), Some(ui)) = (
+        app.chat.elicitation.as_mut(),
+        app.chat.elicitation_ui.as_mut(),
+    ) else {
         return;
     };
 
@@ -1572,7 +1575,7 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
 
 /// Build the transient streaming/thinking card (not cached, rebuilt every frame).
 fn build_streaming_card(app: &mut App) -> Option<Card> {
-    let activity_text = match &app.activity {
+    let activity_text = match &app.chat.activity {
         ActivityState::RunningTool { name } => {
             format!("{} tool: {name}", spinner(SpinnerKind::Braille, app.tick))
         }
@@ -1585,20 +1588,23 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
         _ => format!("{} thinking", spinner(SpinnerKind::Braille, app.tick)),
     };
 
-    let has_thinking = app.show_thinking && !app.streaming_thinking.is_empty();
-    let has_content = !app.streaming_content.is_empty();
+    let has_thinking = app.chat.show_thinking && !app.chat.streaming_thinking.is_empty();
+    let has_content = !app.chat.streaming_content.is_empty();
 
     if has_thinking || has_content {
         let mut blocks = Vec::new();
 
         if has_thinking {
-            let thinking_len = app.streaming_thinking.len();
+            let thinking_len = app.chat.streaming_thinking.len();
             let mut thinking_blocks =
                 if let Some(cached) = app.streaming_thinking_cache.get(thinking_len) {
                     cached.to_vec()
                 } else {
-                    let rendered =
-                        markdown::render(&app.streaming_thinking, Theme::thinking_text(), &app.hl);
+                    let rendered = markdown::render(
+                        &app.chat.streaming_thinking,
+                        Theme::thinking_text(),
+                        &app.hl,
+                    );
                     app.streaming_thinking_cache
                         .store(thinking_len, rendered.clone());
                     rendered
@@ -1614,12 +1620,15 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
         }
 
         if has_content {
-            let content_len = app.streaming_content.len();
+            let content_len = app.chat.streaming_content.len();
             let content_blocks = if let Some(cached) = app.streaming_cache.get(content_len) {
                 cached.to_vec()
             } else {
-                let rendered =
-                    markdown::render(&app.streaming_content, Theme::assistant_text(), &app.hl);
+                let rendered = markdown::render(
+                    &app.chat.streaming_content,
+                    Theme::assistant_text(),
+                    &app.hl,
+                );
                 app.streaming_cache.store(content_len, rendered.clone());
                 rendered
             };
@@ -1631,7 +1640,7 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
             Theme::thinking(),
         ))));
         Some(Card::new(CardKind::Streaming, blocks))
-    } else if app.is_turn_active() {
+    } else if app.chat.is_turn_active() {
         Some(Card::new(
             CardKind::Thinking,
             vec![crate::markdown::CardBlock::Text(Line::from(Span::styled(
@@ -1997,9 +2006,9 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     // max scroll = how far we can scroll from the bottom
     let max_scroll = total_height.saturating_sub(area.height);
     // clamp so we never scroll past the top
-    app.scroll_offset = app.scroll_offset.min(max_scroll);
+    app.chat.scroll_offset = app.chat.scroll_offset.min(max_scroll);
     // scroll_offset 0 = pinned to bottom, higher = scrolled up
-    let scroll = max_scroll.saturating_sub(app.scroll_offset);
+    let scroll = max_scroll.saturating_sub(app.chat.scroll_offset);
 
     let all_cards: Vec<&Card> = app
         .card_cache

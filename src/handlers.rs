@@ -6,7 +6,7 @@ use crate::auth_state::{AuthPanel, AuthUiNotice};
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::chat::{ChatEntry, format_outcome_labels};
+use crate::domain::chat::format_outcome_labels;
 use crate::domain::model::ModelEntry;
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 
@@ -60,7 +60,10 @@ pub(crate) fn handle_elicitation_key(
 ) -> anyhow::Result<()> {
     use crate::domain::elicitation::ElicitationFieldKind;
 
-    let (Some(state), Some(ui)) = (app.elicitation.as_mut(), app.elicitation_ui.as_mut()) else {
+    let (Some(state), Some(ui)) = (
+        app.chat.elicitation.as_mut(),
+        app.chat.elicitation_ui.as_mut(),
+    ) else {
         return Ok(());
     };
     let Some(field_index) = ui.current_field_index(state.fields.len()) else {
@@ -490,8 +493,8 @@ pub(crate) fn handle_key(
     key: KeyEvent,
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<AppAction> {
-    if key.code != KeyCode::Esc && app.pending_cancel_confirm_until.is_some() {
-        app.clear_cancel_confirm();
+    if key.code != KeyCode::Esc && app.chat.pending_cancel_confirm_until.is_some() {
+        app.chat.clear_cancel_confirm();
         app.refresh_transient_status();
     }
 
@@ -534,7 +537,7 @@ pub(crate) fn handle_key(
     }
 
     // elicitation popup takes full control of input when active
-    if app.elicitation.is_some() {
+    if app.chat.elicitation.is_some() {
         handle_elicitation_key(app, key, cmd_tx)?;
         return Ok(AppAction::None);
     }
@@ -667,10 +670,10 @@ pub(crate) fn handle_key(
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match (mouse.kind, &app.navigation.screen, &app.navigation.popup) {
         (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.scroll_offset = app.scroll_offset.saturating_add(3);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(3);
         }
         (MouseEventKind::ScrollDown, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(3);
         }
         _ => {}
     }
@@ -766,20 +769,20 @@ pub(crate) fn handle_chord(
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if app.is_turn_active() {
+            if app.chat.is_turn_active() {
                 app.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
-            } else if app.has_pending_session_op() || app.has_pending_undo() {
+            } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "undo already pending");
-            } else if let Some(turn) = app.current_undo_target().cloned() {
+            } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
                 }
-                app.push_pending_undo(&turn);
-                app.activity = ActivityState::SessionOp(SessionOp::Undo);
+                app.chat.push_pending_undo(&turn);
+                app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
@@ -792,16 +795,16 @@ pub(crate) fn handle_chord(
             if !can_send_server_commands(app) {
                 return Ok(());
             }
-            if app.is_turn_active() {
+            if app.chat.is_turn_active() {
                 app.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
-            } else if app.has_pending_session_op() || app.has_pending_undo() {
+            } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "undo already pending");
-            } else if app.can_redo() {
-                app.activity = ActivityState::SessionOp(SessionOp::Redo);
+            } else if app.chat.can_redo() {
+                app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(Command::Redo)?;
             } else {
@@ -1154,23 +1157,23 @@ fn handle_delegate_view_key(
 ) -> anyhow::Result<AppAction> {
     match key.code {
         KeyCode::Up => {
-            app.scroll_offset = app.scroll_offset.saturating_add(1);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(1);
         }
         KeyCode::Down => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(1);
         }
         KeyCode::PageUp => {
-            app.scroll_offset = app.scroll_offset.saturating_add(10);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10);
         }
         KeyCode::PageDown => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10);
         }
         KeyCode::Home => {
             // Scroll to top: set a large offset (draw_messages clamps it).
-            app.scroll_offset = u16::MAX;
+            app.chat.scroll_offset = u16::MAX;
         }
         KeyCode::End => {
-            app.scroll_offset = 0;
+            app.chat.scroll_offset = 0;
         }
         KeyCode::Esc => {
             // Go back to parent session.
@@ -1283,15 +1286,15 @@ fn begin_fork_session(
     message_id: String,
     cmd_tx: &mpsc::UnboundedSender<Command>,
 ) -> anyhow::Result<()> {
-    if app.pending_fork_message_id.is_some() {
+    if app.chat.pending_fork_message_id.is_some() {
         app.set_status(LogLevel::Warn, "fork", "fork already pending");
         return Ok(());
     }
-    if app.is_turn_active() {
+    if app.chat.is_turn_active() {
         app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
         return Ok(());
     }
-    if app.has_pending_session_op() {
+    if app.chat.has_pending_session_op() {
         app.set_status(LogLevel::Warn, "fork", "session operation already pending");
         return Ok(());
     }
@@ -1300,7 +1303,7 @@ fn begin_fork_session(
         return Ok(());
     }
 
-    app.pending_fork_message_id = Some(message_id.clone());
+    app.chat.pending_fork_message_id = Some(message_id.clone());
     app.set_status(LogLevel::Info, "fork", "forking session...");
     cmd_tx.send(Command::ForkSession { message_id })?;
     Ok(())
@@ -1313,18 +1316,18 @@ pub(crate) fn handle_fork_turn_popup_key(
 ) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.move_fork_cursor(-1),
-        KeyCode::Down => app.move_fork_cursor(1),
-        KeyCode::Backspace => app.fork_filter_backspace(),
+        KeyCode::Up => app.chat.move_fork_cursor(-1),
+        KeyCode::Down => app.chat.move_fork_cursor(1),
+        KeyCode::Backspace => app.chat.fork_filter_backspace(),
         KeyCode::Enter => {
-            if let Some(turn) = app.selected_fork_turn() {
+            if let Some(turn) = app.chat.selected_fork_turn() {
                 begin_fork_session(app, turn.message_id, cmd_tx)?;
             } else {
                 app.set_status(LogLevel::Warn, "fork", "no forkable turns");
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.fork_filter_insert(c);
+            app.chat.fork_filter_insert(c);
         }
         _ => {}
     }
@@ -1532,24 +1535,24 @@ pub(crate) fn handle_chat_key(
     if app.composer.input_line_width == 0 {
         app.composer.input_line_width = 1;
     }
-    let input_blocked = app.input_blocked_by_activity();
+    let input_blocked = app.chat.input_blocked_by_activity();
     match key.code {
         KeyCode::Esc => {
             // Dismiss whichever completion popup is open first.
             if app.composer.mention_state.is_some() || app.composer.slash_state.is_some() {
                 app.composer.mention_state = None;
                 app.composer.slash_state = None;
-                app.clear_cancel_confirm();
-            } else if app.has_cancellable_activity() {
-                if app.cancel_confirm_active() {
-                    app.clear_cancel_confirm();
+                app.chat.clear_cancel_confirm();
+            } else if app.chat.has_cancellable_activity() {
+                if app.chat.cancel_confirm_active() {
+                    app.chat.clear_cancel_confirm();
                     app.set_status(LogLevel::Warn, "activity", "stopping...");
                     cmd_tx.send(Command::CancelSession)?;
                 } else {
                     app.arm_cancel_confirm();
                 }
             } else {
-                app.clear_cancel_confirm();
+                app.chat.clear_cancel_confirm();
             }
         }
         KeyCode::Enter => {
@@ -1597,15 +1600,7 @@ pub(crate) fn handle_chat_key(
                     prompt,
                     local_id: local_id.clone(),
                 }) {
-                    app.messages.retain(|entry| {
-                        !matches!(
-                            entry,
-                            ChatEntry::User {
-                                message_id: Some(message_id),
-                                ..
-                            } if message_id == &local_id
-                        )
-                    });
+                    app.chat.rollback_pending_prompt(&local_id);
                     app.card_cache.invalidate();
                     return Err(error.into());
                 }
@@ -1652,10 +1647,10 @@ pub(crate) fn handle_chat_key(
             }
         }
         KeyCode::PageUp => {
-            app.scroll_offset = app.scroll_offset.saturating_add(10);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10);
         }
         KeyCode::PageDown => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10);
         }
         KeyCode::Backspace if !input_blocked => {
             app.composer.input_backspace();
@@ -1674,9 +1669,9 @@ pub(crate) fn handle_chat_key(
         }
         KeyCode::End => {
             if input_blocked {
-                app.scroll_offset = 0;
+                app.chat.scroll_offset = 0;
             } else if app.composer.input.is_empty() {
-                app.scroll_offset = 0; // snap to bottom
+                app.chat.scroll_offset = 0; // snap to bottom
             } else {
                 app.composer.input_end();
             }
@@ -1937,13 +1932,13 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            if app.pending_fork_message_id.is_some() {
+            if app.chat.pending_fork_message_id.is_some() {
                 app.set_status(LogLevel::Warn, "fork", "fork already pending");
-            } else if app.has_pending_session_op() {
+            } else if app.chat.has_pending_session_op() {
                 app.set_status(LogLevel::Warn, "fork", "session operation already pending");
-            } else if app.is_turn_active() {
+            } else if app.chat.is_turn_active() {
                 app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
-            } else if let Some(turn) = app.latest_fork_boundary() {
+            } else if let Some(turn) = app.chat.latest_fork_boundary() {
                 begin_fork_session(app, turn.message_id, cmd_tx)?;
             } else {
                 app.set_status(LogLevel::Warn, "fork", "no forkable turns");
@@ -1956,20 +1951,20 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            if app.is_turn_active() {
+            if app.chat.is_turn_active() {
                 app.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
-            } else if app.has_pending_session_op() || app.has_pending_undo() {
+            } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "undo already pending");
-            } else if let Some(turn) = app.current_undo_target().cloned() {
+            } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
                 }
-                app.push_pending_undo(&turn);
-                app.activity = ActivityState::SessionOp(SessionOp::Undo);
+                app.chat.push_pending_undo(&turn);
+                app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(LogLevel::Info, "session", "undoing...");
                 cmd_tx.send(Command::Undo {
                     message_id: turn.message_id,
@@ -1983,16 +1978,16 @@ fn try_execute_slash_command(
             if !can_send_server_commands(app) {
                 return Ok(SlashResult::Handled);
             }
-            if app.is_turn_active() {
+            if app.chat.is_turn_active() {
                 app.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
-            } else if app.has_pending_session_op() || app.has_pending_undo() {
+            } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
                 app.set_status(LogLevel::Warn, "session", "redo already pending");
-            } else if app.can_redo() {
-                app.activity = ActivityState::SessionOp(SessionOp::Redo);
+            } else if app.chat.can_redo() {
+                app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(LogLevel::Info, "session", "redoing...");
                 cmd_tx.send(Command::Redo)?;
             } else {
@@ -2005,8 +2000,8 @@ fn try_execute_slash_command(
         }
         "cancel" => {
             app.take_input();
-            if app.has_cancellable_activity() {
-                app.clear_cancel_confirm();
+            if app.chat.has_cancellable_activity() {
+                app.chat.clear_cancel_confirm();
                 app.set_status(LogLevel::Warn, "activity", "stopping...");
                 cmd_tx.send(Command::CancelSession)?;
             } else {
@@ -2573,6 +2568,7 @@ mod model_popup_tests {
     use crate::app::App;
     use crate::command::PromptBlock;
     use crate::config::TestPersistenceGuard;
+    use crate::domain::chat::ChatEntry;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
     use crate::domain::session::{SessionGroup, SessionSummary};
@@ -2607,7 +2603,7 @@ mod model_popup_tests {
         handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
 
         assert!(app.composer.input.is_empty());
-        let local_id = match app.messages.as_slice() {
+        let local_id = match app.chat.messages.as_slice() {
             [
                 ChatEntry::User {
                     text,
@@ -2630,7 +2626,7 @@ mod model_popup_tests {
         drop(rx);
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
-        app.messages.push(ChatEntry::Assistant {
+        app.chat.messages.push(ChatEntry::Assistant {
             content: "keep".into(),
             thinking: None,
             message_id: Some("assistant-1".into()),
@@ -2641,7 +2637,7 @@ mod model_popup_tests {
 
         assert!(app.composer.input.is_empty());
         assert!(matches!(
-            app.messages.as_slice(),
+            app.chat.messages.as_slice(),
             [ChatEntry::Assistant { content, .. }] if content == "keep"
         ));
     }
@@ -2657,7 +2653,7 @@ mod model_popup_tests {
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
         app.composer.refresh_slash_state();
-        app.scroll_offset = 7;
+        app.chat.scroll_offset = 7;
 
         assert_eq!(app.take_input(), "/mo");
         assert_eq!(app.composer.input_cursor, 0);
@@ -2665,7 +2661,7 @@ mod model_popup_tests {
         assert_eq!(app.composer.input_preferred_col, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_none());
-        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(app.chat.scroll_offset, 0);
     }
 
     #[test]
