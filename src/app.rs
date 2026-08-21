@@ -8,54 +8,13 @@ use crate::connection_state::{ConnState, ConnectionState};
 use crate::delegates_state::DelegatesState;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{DelegateChildState, DelegateStats};
-use crate::highlight::Highlighter;
-use crate::markdown::CardBlock;
 use crate::mesh_state::MeshState;
 use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
 use crate::protocol::audit::EventKind;
+use crate::render_state::RenderState;
 use crate::session_state::SessionsState;
-use crate::ui::CardCache;
-
-/// Cache for rendered streaming markdown to avoid re-parsing every frame.
-/// Invalidated when `streaming_content` grows or is cleared.
-pub struct StreamingCache {
-    /// Length of `streaming_content` at the time of last render.
-    rendered_len: usize,
-    /// Cached rendered blocks (without the spinner).
-    blocks: Vec<CardBlock>,
-}
-
-impl StreamingCache {
-    pub fn new() -> Self {
-        Self {
-            rendered_len: 0,
-            blocks: Vec::new(),
-        }
-    }
-
-    /// Returns cached blocks if content length hasn't changed, otherwise None.
-    pub fn get(&self, content_len: usize) -> Option<&[CardBlock]> {
-        if content_len > 0 && content_len == self.rendered_len {
-            Some(&self.blocks)
-        } else {
-            None
-        }
-    }
-
-    /// Store freshly rendered blocks and the content length they correspond to.
-    pub fn store(&mut self, content_len: usize, blocks: Vec<CardBlock>) {
-        self.rendered_len = content_len;
-        self.blocks = blocks;
-    }
-
-    /// Reset the cache (call when streaming_content is cleared).
-    pub fn invalidate(&mut self) {
-        self.rendered_len = 0;
-        self.blocks.clear();
-    }
-}
 
 // ── Delegation tracking ───────────────────────────────────────────────────────
 
@@ -177,12 +136,6 @@ pub struct App {
     // chat
     pub(crate) chat: ChatState,
     pub(crate) composer: ComposerState,
-    /// Total content height (in rows) from the last render frame.
-    /// Used to compensate chat scroll when content grows while the user
-    /// is scrolled up, so the viewport stays at the same absolute position.
-    pub prev_total_height: u16,
-    pub streaming_cache: StreamingCache,
-    pub streaming_thinking_cache: StreamingCache,
 
     // profile info
     pub(crate) profiles: ProfilesState,
@@ -199,16 +152,12 @@ pub struct App {
     // connection and server lifecycle
     pub(crate) connection: ConnectionState,
 
-    // syntax highlighting
-    pub hl: Highlighter,
-
-    // card cache for incremental rendering
-    pub(crate) card_cache: CardCache,
+    // temporary render-local composition
+    pub(crate) render: RenderState,
 
     // auth popup state
     pub(crate) auth: AuthState,
 
-    pub tick: u64,
     pub should_quit: bool,
 }
 
@@ -246,18 +195,13 @@ impl App {
             delegates: DelegatesState::new(),
             chat: ChatState::new(),
             composer: ComposerState::new(),
-            prev_total_height: 0,
-            streaming_cache: StreamingCache::new(),
-            streaming_thinking_cache: StreamingCache::new(),
             profiles: ProfilesState::new(),
             models: ModelsState::new(),
             diagnostics: DiagnosticsState::new(),
             mesh: MeshState::new(),
             connection: ConnectionState::new(),
-            hl: Highlighter::new(),
-            card_cache: CardCache::new(),
+            render: RenderState::new(),
             auth: AuthState::new(),
-            tick: 0,
             should_quit: false,
         }
     }
@@ -270,21 +214,6 @@ impl App {
         self.composer.mention_state = None;
         self.composer.slash_state = None;
         std::mem::take(&mut self.composer.input)
-    }
-
-    /// Invalidate both streaming caches and clear the thinking buffer.
-    ///
-    /// Call this when a streaming turn ends (assistant message finalized,
-    /// new turn starts, session reloaded, etc.) so stale markdown renders
-    /// are discarded.
-    pub fn invalidate_streaming_caches(&mut self) {
-        self.streaming_cache.invalidate();
-        self.chat.clear_streaming_thinking();
-        self.streaming_thinking_cache.invalidate();
-    }
-
-    pub fn invalidate_delegate_render_cache(&mut self) {
-        self.card_cache.invalidate();
     }
 
     /// Cycle through `[auto, low, medium, high, max]` (wraps around).
@@ -369,19 +298,6 @@ impl App {
         self.set_status(LogLevel::Warn, "input", "press Esc again to stop");
     }
 
-    /// Adjust `scroll_offset` to compensate for content growth so the
-    /// viewport stays at the same absolute position when the user is
-    /// scrolled up.  No-op when `scroll_offset == 0` (auto-following).
-    ///
-    /// Call from the renderer after computing the new `total_height`.
-    pub fn compensate_scroll_for_growth(&mut self, total_height: u16) {
-        let growth = total_height.saturating_sub(self.prev_total_height);
-        if self.chat.scroll_offset > 0 && growth > 0 {
-            self.chat.scroll_offset = self.chat.scroll_offset.saturating_add(growth);
-        }
-        self.prev_total_height = total_height;
-    }
-
     pub fn open_fork_turn_popup(&mut self) {
         self.navigation.popup = Popup::ForkTurnSelect;
         self.chat.reset_fork_selector();
@@ -389,7 +305,7 @@ impl App {
 
     pub fn push_pending_prompt(&mut self, text: String) -> String {
         let local_id = self.chat.push_pending_prompt(text);
-        self.card_cache.invalidate();
+        self.render.invalidate_card_cache();
         local_id
     }
 
@@ -473,7 +389,7 @@ impl App {
     /// Mark the pending elicitation chat card with an outcome and clear the active state.
     pub fn resolve_elicitation(&mut self, elicitation_id: &str, outcome: &str) {
         self.chat.resolve_elicitation(elicitation_id, outcome);
-        self.card_cache.invalidate();
+        self.render.invalidate_card_cache();
         self.refresh_transient_status();
     }
 
