@@ -1,14 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::auth_state::AuthState;
 use crate::command::Command;
 use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
+use crate::delegates_state::DelegatesState;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
 use crate::domain::activity::{
-    ActivityState, DelegateChildState, DelegateEntry, DelegateStats, PendingDelegateToolCall,
-    SessionOp, SessionStatsLite,
+    ActivityState, DelegateChildState, DelegateStats, SessionOp, SessionStatsLite,
 };
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
@@ -211,8 +211,7 @@ pub struct App {
 
     // sessions
     pub(crate) sessions: SessionsState,
-    /// Last rendered visible row count for the delegates tab in the popup.
-    pub delegate_popup_visible_rows: usize,
+    pub(crate) delegates: DelegatesState,
 
     // chat
     pub messages: Vec<ChatEntry>,
@@ -281,27 +280,6 @@ pub struct App {
     // auth popup state
     pub(crate) auth: AuthState,
 
-    // delegate session listing (built from event stream)
-    pub delegate_entries: Vec<DelegateEntry>,
-    pub delegate_cursor: usize,
-    pub delegate_filter: String,
-    /// Parent session ID (set when viewing a delegate child session).
-    pub parent_session_id: Option<String>,
-    /// Staging field: set by delegate popup before LoadSession, consumed by session_loaded.
-    pub pending_parent_session_id: Option<String>,
-    /// Set after DelegationCompleted/DelegationFailed; consumed by the next
-    /// UserMessageStored to suppress the noisy batch-result message.
-    pub suppress_delegation_result: bool,
-    /// Child-session state observed before a delegation entry can be linked.
-    pub pending_delegate_child_states: HashMap<String, DelegateChildState>,
-    pub pending_delegate_child_stats: HashMap<String, DelegateStats>,
-    pub delegate_child_message_ids: HashMap<String, HashSet<String>>,
-    /// Latest lifecycle timestamp and bounded terminal metadata by delegation ID.
-    pub delegation_update_times: HashMap<String, i64>,
-    pub delegation_result_summaries: HashMap<String, String>,
-    pub delegation_errors: HashMap<String, String>,
-    /// Parent delegate ToolCallStart records awaiting DelegationRequested linkage.
-    pub pending_delegate_tool_calls: Vec<PendingDelegateToolCall>,
     /// While a reverted frontier turn is being suppressed, ignore any
     /// follow-up assistant/tool/cancelled events until a new prompt arrives.
     pub suppress_turn_output: bool,
@@ -349,7 +327,7 @@ impl App {
         Self {
             navigation: NavigationState::new(),
             sessions: SessionsState::new(),
-            delegate_popup_visible_rows: 0,
+            delegates: DelegatesState::new(),
             messages: Vec::new(),
             pending_prompt_seq: 0,
             composer: ComposerState::new(),
@@ -384,19 +362,6 @@ impl App {
             hl: Highlighter::new(),
             card_cache: CardCache::new(),
             auth: AuthState::new(),
-            delegate_entries: Vec::new(),
-            delegate_cursor: 0,
-            delegate_filter: String::new(),
-            parent_session_id: None,
-            pending_parent_session_id: None,
-            suppress_delegation_result: false,
-            pending_delegate_child_states: HashMap::new(),
-            pending_delegate_child_stats: HashMap::new(),
-            delegate_child_message_ids: HashMap::new(),
-            delegation_update_times: HashMap::new(),
-            delegation_result_summaries: HashMap::new(),
-            delegation_errors: HashMap::new(),
-            pending_delegate_tool_calls: Vec::new(),
             suppress_turn_output: false,
             tick: 0,
             should_quit: false,
@@ -1374,7 +1339,7 @@ mod reasoning_effort_tests {
 #[cfg(test)]
 mod delegate_entry_tests {
     use super::*;
-    use crate::domain::activity::DelegateStatus;
+    use crate::domain::activity::{DelegateEntry, DelegateStatus};
 
     fn make_entry(delegation_id: &str, objective: &str, status: DelegateStatus) -> DelegateEntry {
         DelegateEntry {
@@ -1396,28 +1361,28 @@ mod delegate_entry_tests {
     #[test]
     fn visible_entries_empty_when_no_entries() {
         let app = App::new();
-        assert!(app.visible_delegate_entries().is_empty());
+        assert!(app.delegates.visible_entries().is_empty());
     }
 
     #[test]
     fn visible_entries_returns_all_when_no_filter() {
         let mut app = App::new();
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             make_entry("d1", "Build feature", DelegateStatus::Completed),
             make_entry("d2", "Fix tests", DelegateStatus::InProgress),
         ];
-        assert_eq!(app.visible_delegate_entries().len(), 2);
+        assert_eq!(app.delegates.visible_entries().len(), 2);
     }
 
     #[test]
     fn visible_entries_filters_by_objective() {
         let mut app = App::new();
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             make_entry("d1", "Build feature", DelegateStatus::Completed),
             make_entry("d2", "Fix tests", DelegateStatus::InProgress),
         ];
-        app.delegate_filter = "build".into();
-        let entries = app.visible_delegate_entries();
+        app.delegates.delegate_filter = "build".into();
+        let entries = app.delegates.visible_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delegation_id, "d1");
     }
@@ -1425,12 +1390,12 @@ mod delegate_entry_tests {
     #[test]
     fn visible_entries_filters_by_delegation_id() {
         let mut app = App::new();
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             make_entry("abc123", "Build feature", DelegateStatus::Completed),
             make_entry("xyz789", "Fix tests", DelegateStatus::InProgress),
         ];
-        app.delegate_filter = "xyz".into();
-        let entries = app.visible_delegate_entries();
+        app.delegates.delegate_filter = "xyz".into();
+        let entries = app.delegates.visible_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delegation_id, "xyz789");
     }
@@ -1438,7 +1403,7 @@ mod delegate_entry_tests {
     #[test]
     fn visible_entries_filters_by_target_agent() {
         let mut app = App::new();
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             DelegateEntry {
                 delegation_id: "d1".into(),
                 child_session_id: None,
@@ -1464,8 +1429,8 @@ mod delegate_entry_tests {
                 child_state: DelegateChildState::None,
             },
         ];
-        app.delegate_filter = "planner".into();
-        let entries = app.visible_delegate_entries();
+        app.delegates.delegate_filter = "planner".into();
+        let entries = app.delegates.visible_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delegation_id, "d1");
     }
@@ -1473,9 +1438,10 @@ mod delegate_entry_tests {
     #[test]
     fn visible_entries_filter_is_case_insensitive() {
         let mut app = App::new();
-        app.delegate_entries = vec![make_entry("d1", "Build Feature", DelegateStatus::Completed)];
-        app.delegate_filter = "BUILD".into();
-        assert_eq!(app.visible_delegate_entries().len(), 1);
+        app.delegates.delegate_entries =
+            vec![make_entry("d1", "Build Feature", DelegateStatus::Completed)];
+        app.delegates.delegate_filter = "BUILD".into();
+        assert_eq!(app.delegates.visible_entries().len(), 1);
     }
 
     // ── delegation event processing ───────────────────────────────────────────

@@ -8,6 +8,7 @@ mod command;
 mod composer_state;
 mod config;
 mod connection_state;
+mod delegates_state;
 mod diagnostics;
 mod domain;
 mod handlers;

@@ -5,7 +5,6 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::app::App;
 use crate::composer_state::FileIndexEntryLite;
-use crate::domain::activity::DelegateEntry;
 use crate::navigation_state::Popup;
 
 impl App {
@@ -16,36 +15,6 @@ impl App {
         } else if self.sessions.is_remote_session_id(session_id) {
             self.profiles.remove_session_profile(session_id);
         }
-    }
-
-    /// Flat list of delegate entries that match `delegate_filter`.
-    /// Built from the parent session's event stream (DelegationRequested /
-    /// SessionForked / DelegationCompleted / DelegationFailed events).
-    /// When the filter is empty every entry matches in original order.
-    /// When the filter is non-empty, results are sorted by fuzzy match score (best first).
-    pub fn visible_delegate_entries(&self) -> Vec<&DelegateEntry> {
-        if self.delegate_filter.is_empty() {
-            return self.delegate_entries.iter().collect();
-        }
-        let matcher = SkimMatcherV2::default();
-        let q = self.delegate_filter.to_lowercase();
-        let mut scored: Vec<(i64, &DelegateEntry)> = self
-            .delegate_entries
-            .iter()
-            .filter_map(|e| {
-                let score = [
-                    matcher.fuzzy_match(&e.objective, &q),
-                    matcher.fuzzy_match(&e.delegation_id, &q),
-                    matcher.fuzzy_match(e.target_agent_id.as_deref().unwrap_or(""), &q),
-                ]
-                .into_iter()
-                .flatten()
-                .max();
-                score.map(|s| (s, e))
-            })
-            .collect();
-        scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-        scored.into_iter().map(|(_, e)| e).collect()
     }
 
     pub fn resolve_new_session_default_cwd(&self) -> Option<String> {
@@ -80,8 +49,7 @@ impl App {
     pub fn open_delegate_popup(&mut self) {
         self.navigation.popup = Popup::SessionSelect;
         self.sessions.session_popup_tab = 1;
-        self.delegate_cursor = 0;
-        self.delegate_filter.clear();
+        self.delegates.reset_popup();
     }
 
     pub fn open_new_session_popup(&mut self) {

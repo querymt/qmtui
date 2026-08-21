@@ -311,11 +311,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         |tool_call_id: Option<&String>, sequential_idx: usize| -> Option<&DelegateEntry> {
             tool_call_id
                 .and_then(|id| {
-                    app.delegate_entries
+                    app.delegates
+                        .delegate_entries
                         .iter()
                         .find(|entry| entry.delegate_tool_call_id.as_deref() == Some(id.as_str()))
                 })
-                .or_else(|| app.delegate_entries.get(sequential_idx))
+                .or_else(|| app.delegates.delegate_entries.get(sequential_idx))
         };
     let mut delegate_idx = app.messages[..start_idx]
         .iter()
@@ -758,11 +759,11 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         ));
     }
 
-    if !app.delegate_entries.is_empty() {
+    if !app.delegates.delegate_entries.is_empty() {
         use crate::domain::activity::DelegateStatus;
         let (mut done, mut has_failed, mut has_running, mut awaiting_input) =
             (0usize, false, false, false);
-        for e in &app.delegate_entries {
+        for e in &app.delegates.delegate_entries {
             match e.status {
                 DelegateStatus::Completed | DelegateStatus::Cancelled => done += 1,
                 DelegateStatus::Failed => has_failed = true,
@@ -770,7 +771,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
             }
             awaiting_input |= e.awaiting_input();
         }
-        let total = app.delegate_entries.len();
+        let total = app.delegates.delegate_entries.len();
         let style = if has_failed {
             Theme::error_on_dim()
         } else if has_running {
@@ -822,7 +823,7 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
         format!(" {} ", app.sessions.agent_mode),
         Theme::mode_badge(&app.sessions.agent_mode),
     ));
-    if app.parent_session_id.is_some() {
+    if app.delegates.parent_session_id.is_some() {
         left_spans.push(Span::styled(" \u{2b11} child ", Theme::status_accent()));
     }
     let profile_label = app.current_profile_label();

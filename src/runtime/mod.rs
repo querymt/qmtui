@@ -2863,7 +2863,7 @@ mod delegate_popup_key_tests {
         app.sessions.session_id = Some("parent-1".into());
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_entries = vec![
+        app.delegates.delegate_entries = vec![
             make_entry("d1", "Build feature", Some("child-1")),
             make_entry("d2", "Fix tests", Some("child-2")),
             make_entry("d3", "Write docs", Some("child-3")),
@@ -2875,52 +2875,52 @@ mod delegate_popup_key_tests {
     fn delegate_navigation_clamps_cursor_within_bounds() {
         let mut app = setup_delegate_app();
         apply_delegate_popup_key(&mut app, KeyCode::Up);
-        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.delegates.delegate_cursor, 0);
 
         apply_delegate_popup_key(&mut app, KeyCode::Down);
         apply_delegate_popup_key(&mut app, KeyCode::Down);
         apply_delegate_popup_key(&mut app, KeyCode::Down);
-        assert_eq!(app.delegate_cursor, 2);
+        assert_eq!(app.delegates.delegate_cursor, 2);
 
         apply_delegate_popup_key(&mut app, KeyCode::Up);
-        assert_eq!(app.delegate_cursor, 1);
+        assert_eq!(app.delegates.delegate_cursor, 1);
     }
 
     #[test]
     fn delegate_page_down_uses_visible_rows_with_overlap() {
         let mut app = setup_delegate_app();
-        app.delegate_entries.extend([
+        app.delegates.delegate_entries.extend([
             make_entry("d4", "Check logs", Some("child-4")),
             make_entry("d5", "Refactor code", Some("child-5")),
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegate_popup_visible_rows = 4;
+        app.delegates.delegate_popup_visible_rows = 4;
 
         apply_delegate_popup_key(&mut app, KeyCode::PageDown);
-        assert_eq!(app.delegate_cursor, 3);
+        assert_eq!(app.delegates.delegate_cursor, 3);
 
         apply_delegate_popup_key(&mut app, KeyCode::PageDown);
-        assert_eq!(app.delegate_cursor, 6);
+        assert_eq!(app.delegates.delegate_cursor, 6);
     }
 
     #[test]
     fn delegate_page_up_uses_visible_rows_with_overlap() {
         let mut app = setup_delegate_app();
-        app.delegate_entries.extend([
+        app.delegates.delegate_entries.extend([
             make_entry("d4", "Check logs", Some("child-4")),
             make_entry("d5", "Refactor code", Some("child-5")),
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegate_popup_visible_rows = 4;
-        app.delegate_cursor = 6;
+        app.delegates.delegate_popup_visible_rows = 4;
+        app.delegates.delegate_cursor = 6;
 
         apply_delegate_popup_key(&mut app, KeyCode::PageUp);
-        assert_eq!(app.delegate_cursor, 3);
+        assert_eq!(app.delegates.delegate_cursor, 3);
 
         apply_delegate_popup_key(&mut app, KeyCode::PageUp);
-        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.delegates.delegate_cursor, 0);
     }
 
     #[test]
@@ -2928,16 +2928,16 @@ mod delegate_popup_key_tests {
         let mut app = setup_delegate_app();
 
         apply_delegate_popup_key(&mut app, KeyCode::PageDown);
-        assert_eq!(app.delegate_cursor, 1);
+        assert_eq!(app.delegates.delegate_cursor, 1);
 
         apply_delegate_popup_key(&mut app, KeyCode::PageUp);
-        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.delegates.delegate_cursor, 0);
     }
 
     #[test]
     fn delegate_enter_loads_selected_child_session() {
         let mut app = setup_delegate_app();
-        app.delegate_cursor = 1;
+        app.delegates.delegate_cursor = 1;
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(
             action,
@@ -2955,7 +2955,7 @@ mod delegate_popup_key_tests {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_popup_tab = 1;
-        app.delegate_entries = vec![DelegateEntry {
+        app.delegates.delegate_entries = vec![DelegateEntry {
             delegation_id: "d1".into(),
             child_session_id: None,
             delegate_tool_call_id: None,
@@ -2975,18 +2975,18 @@ mod delegate_popup_key_tests {
     #[test]
     fn delegate_filter_updates_cursor_and_loads_filtered_result() {
         let mut app = setup_delegate_app();
-        app.delegate_cursor = 2;
+        app.delegates.delegate_cursor = 2;
         for c in "docs".chars() {
             apply_delegate_popup_key(&mut app, KeyCode::Char(c));
         }
-        assert_eq!(app.delegate_filter, "docs");
-        assert_eq!(app.delegate_cursor, 0);
-        assert_eq!(app.visible_delegate_entries().len(), 1);
-        assert_eq!(app.visible_delegate_entries()[0].delegation_id, "d3");
+        assert_eq!(app.delegates.delegate_filter, "docs");
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.delegates.visible_entries().len(), 1);
+        assert_eq!(app.delegates.visible_entries()[0].delegation_id, "d3");
 
         apply_delegate_popup_key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.delegate_filter, "doc");
-        assert_eq!(app.delegate_cursor, 0);
+        assert_eq!(app.delegates.delegate_filter, "doc");
+        assert_eq!(app.delegates.delegate_cursor, 0);
 
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -3002,8 +3002,8 @@ mod delegate_popup_key_tests {
     #[test]
     fn delegate_enter_loads_awaiting_input_child_session() {
         let mut app = setup_delegate_app();
-        app.delegate_entries[0].status = DelegateStatus::InProgress;
-        app.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
+        app.delegates.delegate_entries[0].status = DelegateStatus::InProgress;
+        app.delegates.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             requested_schema: serde_json::json!({ "properties": {} }),
@@ -3033,7 +3033,7 @@ mod delegate_popup_key_tests {
     fn delegate_popup_enter_sets_parent_for_sibling_navigation() {
         let mut app = setup_delegate_app();
         // Simulate being in a child session (parent_session_id is set).
-        app.parent_session_id = Some("parent-1".into());
+        app.delegates.parent_session_id = Some("parent-1".into());
         app.sessions.session_id = Some("child-old".into());
 
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
@@ -3042,7 +3042,7 @@ mod delegate_popup_key_tests {
             "enter must trigger LoadSession"
         );
         assert_eq!(
-            app.pending_parent_session_id.as_deref(),
+            app.delegates.pending_parent_session_id.as_deref(),
             Some("parent-1"),
             "pending_parent must be the real parent, not the child session_id"
         );
