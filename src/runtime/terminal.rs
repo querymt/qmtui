@@ -5,9 +5,9 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::{app::App, ui};
+use crate::application::ExternalEditorOutcome;
 
-use super::editor::{apply_external_editor_outcome, open_external_editor};
+use super::editor::open_external_editor;
 
 pub(super) type AppTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 
@@ -32,22 +32,34 @@ pub(super) fn leave(terminal: &mut AppTerminal) -> anyhow::Result<()> {
 
 pub(super) fn open_external_editor_with_terminal(
     terminal: &mut AppTerminal,
-    app: &mut App,
-) -> anyhow::Result<()> {
+    initial_text: &str,
+) -> ExternalEditorOutcome {
+    match run_external_editor_with_terminal(terminal, initial_text) {
+        Ok(outcome) => outcome,
+        Err(error) => ExternalEditorOutcome::Failed(error.to_string()),
+    }
+}
+
+fn run_external_editor_with_terminal(
+    terminal: &mut AppTerminal,
+    initial_text: &str,
+) -> anyhow::Result<ExternalEditorOutcome> {
     terminal.show_cursor()?;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    let result = open_external_editor(&app.composer.input);
+    let outcome = open_external_editor(initial_text);
 
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
     terminal.clear()?;
     terminal.autoresize()?;
-    app.render.invalidate_card_cache();
-    app.render.invalidate_content_cache();
-    apply_external_editor_outcome(app, result);
-    terminal.draw(|frame| ui::draw(frame, app))?;
+    Ok(outcome)
+}
+
+pub(super) fn redraw(terminal: &mut AppTerminal) -> anyhow::Result<()> {
+    terminal.clear()?;
+    terminal.autoresize()?;
     Ok(())
 }

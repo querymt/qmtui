@@ -1,28 +1,20 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use tokio::sync::mpsc;
-
 use crate::app::App;
-use crate::auth_state::{AuthPanel, AuthUiNotice};
+use crate::application::{ClipboardTarget, Effect};
+use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::chat::format_outcome_labels;
 use crate::domain::model::ModelEntry;
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn popup_page_step(visible_rows: usize) -> usize {
     visible_rows.saturating_sub(1).max(1)
 }
 use crate::command::{Command, PromptBlock};
-use crate::config;
 use crate::connection_state::ConnState;
 use crate::theme;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppAction {
-    None,
-    OpenExternalEditor,
-}
 
 pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
     if app.connection.conn == ConnState::Connected {
@@ -38,36 +30,32 @@ pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
 }
 
 fn send_load_session_commands(
-    cmd_tx: &mpsc::UnboundedSender<Command>,
     session_id: String,
     cwd: Option<String>,
     agent_id: Option<String>,
-) -> anyhow::Result<()> {
-    for command in Command::load_session_commands(session_id, cwd, agent_id) {
-        cmd_tx.send(command)?;
-    }
-    Ok(())
+) -> Vec<Effect> {
+    Command::load_session_commands(session_id, cwd, agent_id)
+        .into_iter()
+        .map(Effect::Command)
+        .collect()
 }
 
 /// Handle all keyboard input while an elicitation popup is active.
 ///
 /// Returns `Ok(())` in all cases; the caller should return immediately after
 /// this to avoid routing the key to the normal chat handler.
-pub(crate) fn handle_elicitation_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     use crate::domain::elicitation::ElicitationFieldKind;
 
+    let mut effects = Vec::new();
     let (Some(state), Some(ui)) = (
         app.chat.elicitation.as_mut(),
         app.chat.elicitation_ui.as_mut(),
     ) else {
-        return Ok(());
+        return effects;
     };
     let Some(field_index) = ui.current_field_index(state.fields.len()) else {
-        return Ok(());
+        return effects;
     };
 
     let selected_display = |state: &crate::domain::elicitation::ElicitationState,
@@ -123,11 +111,11 @@ pub(crate) fn handle_elicitation_key(
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(Some(&state.custom_input));
                 let display = selected_display(state, true);
-                cmd_tx.send(Command::ElicitationResponse {
+                effects.push(Effect::Command(Command::ElicitationResponse {
                     elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
-                })?;
+                }));
                 app.resolve_elicitation(&elicitation_id, &display);
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -143,7 +131,7 @@ pub(crate) fn handle_elicitation_key(
             KeyCode::Down => ui.custom_move_visual(&state.custom_input, 1),
             _ => {}
         }
-        return Ok(());
+        return effects;
     }
 
     let field = &state.fields[field_index];
@@ -158,11 +146,11 @@ pub(crate) fn handle_elicitation_key(
     match key.code {
         KeyCode::Esc => {
             let elicitation_id = state.elicitation_id.clone();
-            cmd_tx.send(Command::ElicitationResponse {
+            effects.push(Effect::Command(Command::ElicitationResponse {
                 elicitation_id: elicitation_id.clone(),
                 action: "decline".into(),
                 content: None,
-            })?;
+            }));
             app.resolve_elicitation(&elicitation_id, "declined");
         }
         KeyCode::Down => {
@@ -184,7 +172,7 @@ pub(crate) fn handle_elicitation_key(
                     ui.custom_active = true;
                     ui.custom_cursor = state.custom_input.len();
                     state.clear_selection(field_index);
-                    return Ok(());
+                    return effects;
                 }
                 ElicitationFieldKind::SingleSelect { .. } => {
                     state.select_option(field_index, ui.option_cursor);
@@ -193,7 +181,7 @@ pub(crate) fn handle_elicitation_key(
                     ui.custom_active = true;
                     ui.custom_cursor = state.custom_input.len();
                     state.clear_selection(field_index);
-                    return Ok(());
+                    return effects;
                 }
                 ElicitationFieldKind::MultiSelect { .. }
                 | ElicitationFieldKind::TextInput
@@ -205,11 +193,11 @@ pub(crate) fn handle_elicitation_key(
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(None);
                 let display = selected_display(state, false);
-                cmd_tx.send(Command::ElicitationResponse {
+                effects.push(Effect::Command(Command::ElicitationResponse {
                     elicitation_id: elicitation_id.clone(),
                     action: "accept".into(),
                     content: Some(content),
-                })?;
+                }));
                 app.resolve_elicitation(&elicitation_id, &display);
             }
         }
@@ -238,40 +226,35 @@ pub(crate) fn handle_elicitation_key(
         }
         _ => {}
     }
-    Ok(())
+    effects
 }
 
-fn open_model_popup(app: &mut App, cmd_tx: &mpsc::UnboundedSender<Command>) -> anyhow::Result<()> {
+fn open_model_popup(app: &mut App) -> Vec<Effect> {
     if app.navigation.screen != Screen::Chat {
         app.set_status(
             LogLevel::Warn,
             "model",
             "model select is only available in chat",
         );
-        return Ok(());
+        return Vec::new();
     }
     if !can_send_server_commands(app) {
-        return Ok(());
+        return Vec::new();
     }
     app.navigation.popup = Popup::ModelSelect;
     app.models.reset_for_open();
-    cmd_tx.send(Command::ListAllModels { refresh: true })?;
-    Ok(())
+    vec![Effect::Command(Command::ListAllModels { refresh: true })]
 }
 
-fn open_session_popup(
-    app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+fn open_session_popup(app: &mut App) -> Vec<Effect> {
     if !can_send_server_commands(app) {
-        return Ok(());
+        return Vec::new();
     }
     app.navigation.popup = Popup::SessionSelect;
     app.sessions.reset_browser_for_open();
-    if let Some(request) = app.begin_session_discovery() {
-        cmd_tx.send(request)?;
-    }
-    Ok(())
+    app.begin_session_discovery()
+        .map(|command| vec![Effect::Command(command)])
+        .unwrap_or_default()
 }
 
 fn open_log_popup(app: &mut App) {
@@ -280,43 +263,40 @@ fn open_log_popup(app: &mut App) {
     app.diagnostics.log_filter.clear();
 }
 
-fn execute_command_palette_action(
-    app: &mut App,
-    action: CommandPaletteAction,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+fn execute_command_palette_action(app: &mut App, action: CommandPaletteAction) -> Vec<Effect> {
+    let mut effects = Vec::new();
     match action {
         CommandPaletteAction::OpenMesh | CommandPaletteAction::AttachRemoteSession => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_mesh_popup();
-            cmd_tx.send(Command::ListRemoteNodes)?;
+            effects.push(Effect::Command(Command::ListRemoteNodes));
         }
         CommandPaletteAction::CreateRemoteSession => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_mesh_popup();
-            cmd_tx.send(Command::ListRemoteNodes)?;
+            effects.push(Effect::Command(Command::ListRemoteNodes));
         }
         CommandPaletteAction::CreateMeshInvite => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_mesh_invite_form();
         }
-        CommandPaletteAction::ModelSelect => open_model_popup(app, cmd_tx)?,
-        CommandPaletteAction::SessionSelect => open_session_popup(app, cmd_tx)?,
+        CommandPaletteAction::ModelSelect => effects.extend(open_model_popup(app)),
+        CommandPaletteAction::SessionSelect => effects.extend(open_session_popup(app)),
         CommandPaletteAction::DelegateSessions => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_delegate_popup();
         }
         CommandPaletteAction::NewSession => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_new_session_popup();
         }
@@ -328,41 +308,36 @@ fn execute_command_palette_action(
         CommandPaletteAction::Log => open_log_popup(app),
         CommandPaletteAction::ProviderAuth => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_auth_popup();
-            cmd_tx.send(Command::ListAuthProviders)?;
+            effects.push(Effect::Command(Command::ListAuthProviders));
         }
-        CommandPaletteAction::ForkTurnSelect => {
-            app.open_fork_turn_popup();
-        }
+        CommandPaletteAction::ForkTurnSelect => app.open_fork_turn_popup(),
         CommandPaletteAction::ProfileSelect => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_profile_popup();
-            cmd_tx.send(Command::ListProfiles)?;
+            effects.push(Effect::Command(Command::ListProfiles));
         }
     }
-    Ok(())
+    effects
 }
 
-pub(crate) fn handle_mesh_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_mesh_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let mut effects = Vec::new();
     match key.code {
         KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.mesh.toggle_focus(),
         KeyCode::Up => match app.mesh.mesh_focus {
             crate::mesh_state::MeshFocus::Nodes => {
                 if let Some(node_id) = app.mesh.move_mesh_node_cursor(-1) {
-                    cmd_tx.send(Command::ListRemoteSessions {
+                    effects.push(Effect::Command(Command::ListRemoteSessions {
                         node_id,
                         offset: 0,
                         limit: 50,
-                    })?;
+                    }));
                 }
             }
             crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(-1),
@@ -370,66 +345,63 @@ pub(crate) fn handle_mesh_popup_key(
         KeyCode::Down => match app.mesh.mesh_focus {
             crate::mesh_state::MeshFocus::Nodes => {
                 if let Some(node_id) = app.mesh.move_mesh_node_cursor(1) {
-                    cmd_tx.send(Command::ListRemoteSessions {
+                    effects.push(Effect::Command(Command::ListRemoteSessions {
                         node_id,
                         offset: 0,
                         limit: 50,
-                    })?;
+                    }));
                 }
             }
             crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(1),
         },
-        KeyCode::Char('r') => cmd_tx.send(Command::ListRemoteNodes)?,
+        KeyCode::Char('r') => effects.push(Effect::Command(Command::ListRemoteNodes)),
         KeyCode::Enter => match app.mesh.mesh_focus {
             crate::mesh_state::MeshFocus::Nodes => {
                 app.mesh.focus_sessions();
                 if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                    cmd_tx.send(Command::ListRemoteSessions {
+                    effects.push(Effect::Command(Command::ListRemoteSessions {
                         node_id: node_id.to_string(),
                         offset: 0,
                         limit: 50,
-                    })?;
+                    }));
                 }
             }
             crate::mesh_state::MeshFocus::Sessions => {
                 if let Some(session) = app.mesh.selected_remote_session() {
-                    cmd_tx.send(Command::AttachRemoteSession {
+                    effects.push(Effect::Command(Command::AttachRemoteSession {
                         node_id: session.node_id.clone(),
                         session_id: session.id.clone(),
-                    })?;
+                    }));
                 }
             }
         },
         KeyCode::Char('n') => {
             if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                cmd_tx.send(Command::CreateRemoteSession {
+                effects.push(Effect::Command(Command::CreateRemoteSession {
                     node_id: node_id.to_string(),
                     cwd: None,
-                })?;
+                }));
             }
         }
         _ => {}
     }
-    Ok(())
+    effects
 }
 
-pub(crate) fn handle_mesh_invite_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.mesh.consume_clipboard_fallback() {
-        return Ok(());
+        return Vec::new();
     }
 
+    let mut effects = Vec::new();
     match key.code {
         KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.mesh.move_invite_form_field(-1),
         KeyCode::Down | KeyCode::Tab => app.mesh.move_invite_form_field(1),
         KeyCode::Backspace => app.mesh.invite_form_backspace(),
         KeyCode::Enter => {
-            if let Some(msg) = app.mesh_invite_form_command() {
-                cmd_tx.send(msg)?;
+            if let Some(command) = app.mesh_invite_form_command() {
+                effects.push(Effect::Command(command));
                 app.set_status(LogLevel::Info, "mesh", "creating invite...");
             }
         }
@@ -438,12 +410,12 @@ pub(crate) fn handle_mesh_invite_popup_key(
         }
         _ => {}
     }
-    Ok(())
+    effects
 }
 
-pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.mesh.consume_clipboard_fallback() {
-        return Ok(());
+        return Vec::new();
     }
 
     match key.code {
@@ -452,24 +424,19 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> a
             app.mesh.show_invite_url_fallback();
         }
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(url) = app.mesh.invite_url().map(str::to_string) {
-                if copy_text_to_clipboard(&url) {
-                    app.set_status(LogLevel::Info, "mesh", "invite URL copied");
-                } else {
-                    app.mesh.set_clipboard_fallback(url);
-                }
+            if let Some(text) = app.mesh.invite_url().map(str::to_string) {
+                return vec![Effect::CopyToClipboard {
+                    target: ClipboardTarget::MeshInvite,
+                    text,
+                }];
             }
         }
         _ => {}
     }
-    Ok(())
+    Vec::new()
 }
 
-pub(crate) fn handle_command_palette_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_command_palette_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
         KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.navigation.move_command_palette_cursor(-1),
@@ -477,7 +444,7 @@ pub(crate) fn handle_command_palette_key(
         KeyCode::Backspace => app.navigation.command_palette_filter_backspace(),
         KeyCode::Enter => {
             if let Some(action) = app.navigation.selected_command_palette_action() {
-                execute_command_palette_action(app, action, cmd_tx)?;
+                return execute_command_palette_action(app, action);
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -485,39 +452,31 @@ pub(crate) fn handle_command_palette_key(
         }
         _ => {}
     }
-    Ok(())
+    Vec::new()
 }
 
-pub(crate) fn handle_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<AppAction> {
+pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if key.code != KeyCode::Esc && app.chat.pending_cancel_confirm_until.is_some() {
         app.chat.clear_cancel_confirm();
         app.refresh_transient_status();
     }
 
-    // ctrl-c: clear input first, quit on second press
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if !app.composer.input.is_empty() {
             app.composer.clear_input();
-        } else {
-            app.should_quit = true;
+            return Vec::new();
         }
-        return Ok(AppAction::None);
+        return vec![Effect::Quit];
     }
 
-    // direct: ctrl+p opens the command palette, replacing any active popup.
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
     {
         app.navigation.chord = false;
         app.navigation.open_command_palette();
-        return Ok(AppAction::None);
+        return Vec::new();
     }
 
-    // chord second key: ctrl+x was pressed, now handle the follow-up
     if app.navigation.chord {
         app.navigation.chord = false;
         app.set_status(LogLevel::Debug, "input", "ready");
@@ -528,33 +487,31 @@ pub(crate) fn handle_key(
                     "editor",
                     "external editor is only available in chat",
                 );
-                return Ok(AppAction::None);
+                return Vec::new();
             }
-            return Ok(AppAction::OpenExternalEditor);
+            return vec![Effect::OpenExternalEditor {
+                initial_text: app.composer.input.clone(),
+            }];
         }
-        handle_chord(app, key, cmd_tx)?;
-        return Ok(AppAction::None);
+        return handle_chord(app, key);
     }
 
-    // elicitation popup takes full control of input when active
     if app.chat.elicitation.is_some() {
-        handle_elicitation_key(app, key, cmd_tx)?;
-        return Ok(AppAction::None);
+        return handle_elicitation_key(app, key);
     }
 
-    // direct: ctrl+t cycles thinking level
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
         if !can_send_server_commands(app) {
-            return Ok(AppAction::None);
+            return Vec::new();
         }
-        match app.cycle_reasoning_effort() {
-            Some(msg) => {
-                cmd_tx.send(msg)?;
+        return match app.cycle_reasoning_effort() {
+            Some(command) => {
                 app.set_status(
                     LogLevel::Info,
                     "model",
                     format!("thinking: {}", app.models.reasoning_effort_label()),
                 );
+                vec![Effect::Command(command)]
             }
             None => {
                 app.set_status(
@@ -565,109 +522,67 @@ pub(crate) fn handle_key(
                         app.models.reasoning_effort
                     ),
                 );
+                Vec::new()
             }
-        }
-        return Ok(AppAction::None);
+        };
     }
 
-    // direct: ctrl+l opens log popup
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
     {
         open_log_popup(app);
-        return Ok(AppAction::None);
+        return Vec::new();
     }
 
-    // chord start: ctrl+x
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.navigation.chord = true;
         app.set_status(LogLevel::Debug, "input", "C-x ...");
-        return Ok(AppAction::None);
+        return Vec::new();
     }
 
-    // popup handling
     match app.navigation.popup {
-        Popup::CommandPalette => {
-            handle_command_palette_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::Mesh => {
-            handle_mesh_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::MeshInvite => {
-            handle_mesh_invite_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::MeshInviteQr => {
-            handle_mesh_invite_qr_popup_key(app, key)?;
-            return Ok(AppAction::None);
-        }
-        Popup::ModelSelect => {
-            handle_model_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::SessionSelect => {
-            handle_session_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::NewSession => {
-            handle_new_session_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::ThemeSelect => {
-            handle_theme_popup_key(app, key)?;
-            return Ok(AppAction::None);
-        }
+        Popup::CommandPalette => return handle_command_palette_key(app, key),
+        Popup::Mesh => return handle_mesh_popup_key(app, key),
+        Popup::MeshInvite => return handle_mesh_invite_popup_key(app, key),
+        Popup::MeshInviteQr => return handle_mesh_invite_qr_popup_key(app, key),
+        Popup::ModelSelect => return handle_model_popup_key(app, key),
+        Popup::SessionSelect => return handle_session_popup_key(app, key),
+        Popup::NewSession => return handle_new_session_popup_key(app, key),
+        Popup::ThemeSelect => return handle_theme_popup_key(app, key),
         Popup::Help => {
             match key.code {
-                KeyCode::Esc => {
-                    app.navigation.popup = Popup::None;
-                }
+                KeyCode::Esc => app.navigation.popup = Popup::None,
                 KeyCode::Up => app.navigation.scroll_help_up(),
                 KeyCode::Down => app.navigation.scroll_help_down(),
                 _ => {}
             }
-            return Ok(AppAction::None);
+            return Vec::new();
         }
         Popup::Log => {
-            handle_log_popup_key(app, key)?;
-            return Ok(AppAction::None);
+            let _ = handle_log_popup_key(app, key);
+            return Vec::new();
         }
-        Popup::ProviderAuth => {
-            handle_auth_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::ForkTurnSelect => {
-            handle_fork_turn_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-        Popup::ProfileSelect => {
-            handle_profile_popup_key(app, key, cmd_tx)?;
-            return Ok(AppAction::None);
-        }
-
+        Popup::ProviderAuth => return handle_auth_popup_key(app, key),
+        Popup::ForkTurnSelect => return handle_fork_turn_popup_key(app, key),
+        Popup::ProfileSelect => return handle_profile_popup_key(app, key),
         Popup::None => {}
     }
 
-    // global: tab toggles mode when no popup is active
     if key.code == KeyCode::Tab {
         if !can_send_server_commands(app) {
-            return Ok(AppAction::None);
+            return Vec::new();
         }
-        switch_mode(app, cmd_tx, &app.sessions.next_mode())?;
-        return Ok(AppAction::None);
+        return switch_mode(app, &app.sessions.next_mode());
     }
 
     match app.navigation.screen {
-        Screen::Sessions => handle_sessions_key(app, key, cmd_tx)?,
-        Screen::Chat => return handle_chat_key(app, key, cmd_tx),
-        Screen::Delegate => return handle_delegate_view_key(app, key, cmd_tx),
+        Screen::Sessions => handle_sessions_key(app, key),
+        Screen::Chat => handle_chat_key(app, key),
+        Screen::Delegate => handle_delegate_view_key(app, key),
     }
-    Ok(AppAction::None)
 }
 
-pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Vec<Effect> {
     match (mouse.kind, &app.navigation.screen, &app.navigation.popup) {
         (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
             app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(3);
@@ -677,58 +592,41 @@ pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         _ => {}
     }
-}
-
-/// Persist current app state to `~/.qmt/qmtui.toml`.  Called at every
-/// user-initiated change that should survive a restart.
-pub(crate) fn save_config(app: &App) {
-    let merged = config::TuiConfig::load().with_app_settings(app);
-    merged.save();
+    Vec::new()
 }
 
 /// Handle second key of a ctrl+x chord. Works in any screen.
-pub(crate) fn handle_chord(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let mut effects = Vec::new();
     match key.code {
-        KeyCode::Char('m') => {
-            open_model_popup(app, cmd_tx)?;
-        }
+        KeyCode::Char('m') => effects.extend(open_model_popup(app)),
         KeyCode::Char('n') => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_new_session_popup();
         }
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-        }
+        KeyCode::Char('q') => effects.push(Effect::Quit),
         KeyCode::Char('e') => {
             app.set_status(LogLevel::Warn, "editor", "external editor unavailable here");
         }
-
         KeyCode::Char('t') => app
             .navigation
             .open_theme_selector(theme::Theme::current_index()),
-        KeyCode::Char('l') => {
-            open_session_popup(app, cmd_tx)?;
-        }
+        KeyCode::Char('l') => effects.extend(open_session_popup(app)),
         KeyCode::Char('a') => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_auth_popup();
-            cmd_tx.send(Command::ListAuthProviders)?;
+            effects.push(Effect::Command(Command::ListAuthProviders));
         }
-
         KeyCode::Char('p') => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             app.open_profile_popup();
-            cmd_tx.send(Command::ListProfiles)?;
+            effects.push(Effect::Command(Command::ListProfiles));
         }
         KeyCode::Char('j') => {
             if !matches!(app.navigation.screen, Screen::Chat | Screen::Delegate) {
@@ -737,18 +635,17 @@ pub(crate) fn handle_chord(
                     "session",
                     "parent jump only available in chat",
                 );
-                return Ok(());
+                return effects;
             }
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
-                send_load_session_commands(
-                    cmd_tx,
+                effects.extend(send_load_session_commands(
                     parent_sid,
                     app.current_session_cwd(),
                     app.sessions.agent_id.clone(),
-                )?;
+                ));
             } else {
                 app.set_status(LogLevel::Info, "session", "no parent session");
             }
@@ -761,13 +658,13 @@ pub(crate) fn handle_chord(
                     "fork",
                     "fork selector is only available in chat",
                 );
-                return Ok(());
+                return effects;
             }
             app.open_fork_turn_popup();
         }
         KeyCode::Char('u') => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             if app.chat.is_turn_active() {
                 app.set_status(
@@ -784,16 +681,16 @@ pub(crate) fn handle_chord(
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(LogLevel::Info, "session", "undoing...");
-                cmd_tx.send(Command::Undo {
+                effects.push(Effect::Command(Command::Undo {
                     message_id: turn.message_id,
-                })?;
+                }));
             } else {
                 app.set_status(LogLevel::Warn, "session", "nothing to undo");
             }
         }
         KeyCode::Char('r') => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             if app.chat.is_turn_active() {
                 app.set_status(
@@ -806,84 +703,45 @@ pub(crate) fn handle_chord(
             } else if app.chat.can_redo() {
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(LogLevel::Info, "session", "redoing...");
-                cmd_tx.send(Command::Redo)?;
+                effects.push(Effect::Command(Command::Redo));
             } else {
                 app.set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
-        _ => {
-            app.set_status(LogLevel::Debug, "input", "unknown chord");
-        }
+        _ => app.set_status(LogLevel::Debug, "input", "unknown chord"),
     }
-    Ok(())
+    effects
 }
 
-pub(crate) fn handle_sessions_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.should_quit = true;
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        match apply_session_fork_toggle_key(app, false) {
-            SessionKeyAction::LoadMoreSessions {
-                group_idx,
-                parent_path,
-            } => {
-                if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request)?;
-                }
-            }
-            SessionKeyAction::None => {}
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    match apply_sessions_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    ) {
+fn session_action_effects(app: &mut App, action: SessionKeyAction) -> Vec<Effect> {
+    match action {
         SessionKeyAction::LoadSession {
             session_id,
             agent_id,
             cwd,
-        } => {
-            send_load_session_commands(
-                cmd_tx,
-                session_id,
-                cwd,
-                agent_id.or_else(|| app.sessions.agent_id.clone()),
-            )?;
-        }
+        } => send_load_session_commands(
+            session_id,
+            cwd,
+            agent_id.or_else(|| app.sessions.agent_id.clone()),
+        ),
         SessionKeyAction::AttachRemoteSession {
             node_id,
             session_id,
-        } => {
-            cmd_tx.send(Command::AttachRemoteSession {
-                node_id,
-                session_id,
-            })?;
-        }
+        } => vec![Effect::Command(Command::AttachRemoteSession {
+            node_id,
+            session_id,
+        })],
         SessionKeyAction::DeleteSession { session_id } => {
-            cmd_tx.send(Command::DeleteSession { session_id })?;
+            vec![Effect::Command(Command::DeleteSession { session_id })]
         }
         SessionKeyAction::DismissRemoteSession { session_id } => {
-            cmd_tx.send(Command::DismissRemoteSession { session_id })?;
+            vec![Effect::Command(Command::DismissRemoteSession {
+                session_id,
+            })]
         }
         SessionKeyAction::NewSession => {
             app.open_new_session_popup();
+            Vec::new()
         }
         SessionKeyAction::LoadMoreSessions {
             group_idx,
@@ -894,107 +752,80 @@ pub(crate) fn handle_sessions_key(
             } else {
                 app.session_child_page_request(group_idx, &parent_path)
             };
-            if let Some(request) = request {
-                cmd_tx.send(request)?;
-            }
+            request
+                .map(|command| vec![Effect::Command(command)])
+                .unwrap_or_default()
         }
-        SessionKeyAction::None => {}
+        SessionKeyAction::None => Vec::new(),
     }
-    Ok(())
 }
 
-pub(crate) fn handle_session_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
-    // Tab / BackTab: switch between sessions and delegates tabs
-    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        app.sessions.switch_session_popup_tab();
-        return Ok(());
-    }
-
-    if app.sessions.session_popup_tab == 1 {
-        // Delegates tab
-        return handle_delegate_popup_key(app, key, cmd_tx);
-    }
-
-    // Sessions tab
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
-        if !can_send_server_commands(app) {
-            return Ok(());
-        }
-        app.open_new_session_popup();
-        return Ok(());
+pub(crate) fn handle_sessions_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+        return vec![Effect::Quit];
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        match apply_session_fork_toggle_key(app, true) {
-            SessionKeyAction::LoadMoreSessions {
-                group_idx,
-                parent_path,
-            } => {
-                if let Some(request) = app.session_child_page_request(group_idx, &parent_path) {
-                    cmd_tx.send(request)?;
-                }
-            }
-            SessionKeyAction::None => {}
-            _ => {}
+        if let SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        } = apply_session_fork_toggle_key(app, false)
+            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
+        {
+            return vec![Effect::Command(request)];
         }
-        return Ok(());
+        return Vec::new();
     }
 
-    match apply_popup_session_key(
+    let action = apply_sessions_key(
         app,
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             KeyCode::Null
         } else {
             key.code
         },
-    ) {
-        SessionKeyAction::LoadSession {
-            session_id,
-            agent_id,
-            cwd,
-        } => {
-            send_load_session_commands(
-                cmd_tx,
-                session_id,
-                cwd,
-                agent_id.or_else(|| app.sessions.agent_id.clone()),
-            )?;
+    );
+    session_action_effects(app, action)
+}
+
+pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        app.sessions.switch_session_popup_tab();
+        return Vec::new();
+    }
+
+    if app.sessions.session_popup_tab == 1 {
+        return handle_delegate_popup_key(app, key);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+        if can_send_server_commands(app) {
+            app.open_new_session_popup();
         }
-        SessionKeyAction::AttachRemoteSession {
-            node_id,
-            session_id,
-        } => {
-            cmd_tx.send(Command::AttachRemoteSession {
-                node_id,
-                session_id,
-            })?;
-        }
-        SessionKeyAction::DeleteSession { session_id } => {
-            cmd_tx.send(Command::DeleteSession { session_id })?;
-        }
-        SessionKeyAction::DismissRemoteSession { session_id } => {
-            cmd_tx.send(Command::DismissRemoteSession { session_id })?;
-        }
-        SessionKeyAction::LoadMoreSessions {
+        return Vec::new();
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        if let SessionKeyAction::LoadMoreSessions {
             group_idx,
             parent_path,
-        } => {
-            let request = if parent_path.is_empty() {
-                app.session_group_page_request(group_idx)
-            } else {
-                app.session_child_page_request(group_idx, &parent_path)
-            };
-            if let Some(request) = request {
-                cmd_tx.send(request)?;
-            }
+        } = apply_session_fork_toggle_key(app, true)
+            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
+        {
+            return vec![Effect::Command(request)];
         }
-        SessionKeyAction::NewSession | SessionKeyAction::None => {}
+        return Vec::new();
     }
-    Ok(())
+
+    let action = apply_popup_session_key(
+        app,
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            KeyCode::Null
+        } else {
+            key.code
+        },
+    );
+    session_action_effects(app, action)
 }
 
 /// Pure key-handler for the session popup. Returns a [`SessionKeyAction`] that
@@ -1150,82 +981,40 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
 
 // ── Delegate view key handler (read-only child session) ──────────────────────
 
-fn handle_delegate_view_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<AppAction> {
+fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
-        KeyCode::Up => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(1);
-        }
-        KeyCode::Down => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(1);
-        }
-        KeyCode::PageUp => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10);
-        }
-        KeyCode::PageDown => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10);
-        }
-        KeyCode::Home => {
-            // Scroll to top: set a large offset (draw_messages clamps it).
-            app.chat.scroll_offset = u16::MAX;
-        }
-        KeyCode::End => {
-            app.chat.scroll_offset = 0;
-        }
+        KeyCode::Up => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(1),
+        KeyCode::Down => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(1),
+        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
+        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
+        KeyCode::Home => app.chat.scroll_offset = u16::MAX,
+        KeyCode::End => app.chat.scroll_offset = 0,
         KeyCode::Esc => {
-            // Go back to parent session.
             if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
-                send_load_session_commands(
-                    cmd_tx,
+                return send_load_session_commands(
                     parent_sid,
                     app.current_session_cwd(),
                     app.sessions.agent_id.clone(),
-                )?;
+                );
             }
         }
         _ => {}
     }
-    Ok(AppAction::None)
+    Vec::new()
 }
 
 // ── Delegate popup key handler ────────────────────────────────────────────────
 
-pub(crate) fn handle_delegate_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
-    match apply_delegate_popup_key(
+pub(crate) fn handle_delegate_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let action = apply_delegate_popup_key(
         app,
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             KeyCode::Null
         } else {
             key.code
         },
-    ) {
-        SessionKeyAction::LoadSession {
-            session_id,
-            agent_id,
-            cwd,
-        } => {
-            send_load_session_commands(
-                cmd_tx,
-                session_id,
-                cwd,
-                agent_id.or_else(|| app.sessions.agent_id.clone()),
-            )?;
-        }
-        SessionKeyAction::NewSession
-        | SessionKeyAction::AttachRemoteSession { .. }
-        | SessionKeyAction::DeleteSession { .. }
-        | SessionKeyAction::DismissRemoteSession { .. }
-        | SessionKeyAction::LoadMoreSessions { .. }
-        | SessionKeyAction::None => {}
-    }
-    Ok(())
+    );
+    session_action_effects(app, action)
 }
 
 /// Pure key-handler for the delegate popup. Returns a [`SessionKeyAction`]
@@ -1281,39 +1070,30 @@ pub(crate) fn apply_delegate_popup_key(
     SessionKeyAction::None
 }
 
-fn begin_fork_session(
-    app: &mut App,
-    message_id: String,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+fn begin_fork_session(app: &mut App, message_id: String) -> Vec<Effect> {
     if app.chat.pending_fork_message_id.is_some() {
         app.set_status(LogLevel::Warn, "fork", "fork already pending");
-        return Ok(());
+        return Vec::new();
     }
     if app.chat.is_turn_active() {
         app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
-        return Ok(());
+        return Vec::new();
     }
     if app.chat.has_pending_session_op() {
         app.set_status(LogLevel::Warn, "fork", "session operation already pending");
-        return Ok(());
+        return Vec::new();
     }
     if message_id.is_empty() {
         app.set_status(LogLevel::Warn, "fork", "selected turn has no message id");
-        return Ok(());
+        return Vec::new();
     }
 
     app.chat.pending_fork_message_id = Some(message_id.clone());
     app.set_status(LogLevel::Info, "fork", "forking session...");
-    cmd_tx.send(Command::ForkSession { message_id })?;
-    Ok(())
+    vec![Effect::Command(Command::ForkSession { message_id })]
 }
 
-pub(crate) fn handle_fork_turn_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_fork_turn_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
         KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.chat.move_fork_cursor(-1),
@@ -1321,17 +1101,16 @@ pub(crate) fn handle_fork_turn_popup_key(
         KeyCode::Backspace => app.chat.fork_filter_backspace(),
         KeyCode::Enter => {
             if let Some(turn) = app.chat.selected_fork_turn() {
-                begin_fork_session(app, turn.message_id, cmd_tx)?;
-            } else {
-                app.set_status(LogLevel::Warn, "fork", "no forkable turns");
+                return begin_fork_session(app, turn.message_id);
             }
+            app.set_status(LogLevel::Warn, "fork", "no forkable turns");
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.chat.fork_filter_insert(c);
         }
         _ => {}
     }
-    Ok(())
+    Vec::new()
 }
 
 pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
@@ -1376,15 +1155,10 @@ pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Resu
     Ok(())
 }
 
-pub(crate) fn handle_profile_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let mut effects = Vec::new();
     match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.profiles.move_profile_cursor(-1),
         KeyCode::Down => app.profiles.move_profile_cursor(1),
         KeyCode::Backspace => {
@@ -1397,7 +1171,7 @@ pub(crate) fn handle_profile_popup_key(
         }
         KeyCode::Enter => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return effects;
             }
             if let Some(profile_id) = app
                 .profiles
@@ -1407,9 +1181,9 @@ pub(crate) fn handle_profile_popup_key(
                 app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
                     app.models.clear_profile_agents();
-                    cmd_tx.send(Command::ListProfileAgents {
+                    effects.push(Effect::Command(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
-                    })?;
+                    }));
                 }
                 app.navigation.popup = Popup::None;
                 app.set_status(
@@ -1417,31 +1191,21 @@ pub(crate) fn handle_profile_popup_key(
                     "profile",
                     format!("new sessions will use {profile_id}"),
                 );
-                save_config(app);
+                effects.push(Effect::PersistConfig);
             } else {
                 app.set_status(LogLevel::Warn, "profile", "no matching profile");
             }
         }
         _ => {}
     }
-    Ok(())
+    effects
 }
 
-pub(crate) fn handle_new_session_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_new_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => {
-            app.sessions.move_new_session_completion_selection(-1);
-        }
-        KeyCode::Down => {
-            app.sessions.move_new_session_completion_selection(1);
-        }
+        KeyCode::Esc => app.navigation.popup = Popup::None,
+        KeyCode::Up => app.sessions.move_new_session_completion_selection(-1),
+        KeyCode::Down => app.sessions.move_new_session_completion_selection(1),
         KeyCode::Tab => {
             app.accept_selected_new_session_completion();
         }
@@ -1471,25 +1235,23 @@ pub(crate) fn handle_new_session_popup_key(
         }
         KeyCode::Enter => {
             if !can_send_server_commands(app) {
-                return Ok(());
+                return Vec::new();
             }
             let cwd = app.normalize_new_session_path(&app.sessions.new_session_path);
             app.navigation.popup = Popup::None;
-            cmd_tx.send(Command::NewSession {
+            return vec![Effect::Command(Command::NewSession {
                 cwd,
                 profile_id: app.profiles.active_profile_id.clone(),
-            })?;
+            })];
         }
         _ => {}
     }
-    Ok(())
+    Vec::new()
 }
 
-pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
+pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Up => app.navigation.move_theme_cursor_up(),
         KeyCode::Down => {
             let filtered_len = app
@@ -1507,7 +1269,7 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Re
                 theme::Theme::begin_frame();
                 app.render.invalidate_theme_caches();
                 app.navigation.popup = Popup::None;
-                save_config(app);
+                return vec![Effect::PersistConfig];
             }
         }
         KeyCode::Backspace => app.navigation.theme_filter_backspace(),
@@ -1516,21 +1278,17 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Re
         }
         _ => {}
     }
-    Ok(())
+    Vec::new()
 }
 
-pub(crate) fn handle_chat_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<AppAction> {
+pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.composer.input_line_width == 0 {
         app.composer.input_line_width = 1;
     }
     let input_blocked = app.chat.input_blocked_by_activity();
+    let mut effects = Vec::new();
     match key.code {
         KeyCode::Esc => {
-            // Dismiss whichever completion popup is open first.
             if app.composer.mention_state.is_some() || app.composer.slash_state.is_some() {
                 app.composer.mention_state = None;
                 app.composer.slash_state = None;
@@ -1539,7 +1297,7 @@ pub(crate) fn handle_chat_key(
                 if app.chat.cancel_confirm_active() {
                     app.chat.clear_cancel_confirm();
                     app.set_status(LogLevel::Warn, "activity", "stopping...");
-                    cmd_tx.send(Command::CancelSession)?;
+                    effects.push(Effect::Command(Command::CancelSession));
                 } else {
                     app.arm_cancel_confirm();
                 }
@@ -1548,29 +1306,32 @@ pub(crate) fn handle_chat_key(
             }
         }
         KeyCode::Enter => {
-            // 1. Complete slash completion, then fall through to execute.
             if app.composer.slash_state.is_some() {
                 app.composer.accept_selected_slash_completion();
             }
-            // 2. Try slash command execution (input starts with '/').
             if !app.composer.input.is_empty() && app.composer.input.trim_start().starts_with('/') {
-                match try_execute_slash_command(app, cmd_tx)? {
-                    SlashResult::OpenEditor => return Ok(AppAction::OpenExternalEditor),
-                    SlashResult::Handled => return Ok(AppAction::None),
+                let (result, slash_effects) = try_execute_slash_command(app);
+                effects.extend(slash_effects);
+                match result {
+                    SlashResult::OpenEditor => {
+                        effects.push(Effect::OpenExternalEditor {
+                            initial_text: app.composer.input.clone(),
+                        });
+                        return effects;
+                    }
+                    SlashResult::Handled => return effects,
                     SlashResult::NotACommand => {}
                 }
             }
-            // 3. Accept mention completion.
             if app.composer.mention_state.is_some() && app.composer.accept_selected_mention() {
                 if app.composer.prepare_file_index_request() {
-                    cmd_tx.send(Command::GetFileIndex)?;
+                    effects.push(Effect::Command(Command::GetFileIndex));
                 }
-                return Ok(AppAction::None);
+                return effects;
             }
-            // 4. Normal prompt send.
             if !app.composer.input.is_empty() {
                 if input_blocked || !can_send_server_commands(app) {
-                    return Ok(AppAction::None);
+                    return effects;
                 }
                 let (text, links) = app
                     .composer
@@ -1578,7 +1339,7 @@ pub(crate) fn handle_chat_key(
                 let text = text.trim().to_string();
                 let _ = app.take_input();
                 if text.is_empty() {
-                    return Ok(AppAction::None);
+                    return effects;
                 }
                 let mut prompt = vec![PromptBlock::Text { text: text.clone() }];
                 for path in links {
@@ -1588,14 +1349,7 @@ pub(crate) fn handle_chat_key(
                     });
                 }
                 let local_id = app.push_pending_prompt(text);
-                if let Err(error) = cmd_tx.send(Command::Prompt {
-                    prompt,
-                    local_id: local_id.clone(),
-                }) {
-                    app.chat.rollback_pending_prompt(&local_id);
-                    app.render.invalidate_card_cache();
-                    return Err(error.into());
-                }
+                effects.push(Effect::Command(Command::Prompt { prompt, local_id }));
             }
         }
         KeyCode::Tab if !input_blocked => {
@@ -1605,18 +1359,18 @@ pub(crate) fn handle_chat_key(
                 && app.composer.accept_selected_mention()
                 && app.composer.prepare_file_index_request()
             {
-                cmd_tx.send(Command::GetFileIndex)?;
+                effects.push(Effect::Command(Command::GetFileIndex));
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
             app.composer.input_insert(c);
             if app.composer.prepare_file_index_request() {
-                cmd_tx.send(Command::GetFileIndex)?;
+                effects.push(Effect::Command(Command::GetFileIndex));
             }
         }
         KeyCode::Up => {
             if input_blocked {
-                return Ok(AppAction::None);
+                return effects;
             }
             if app.composer.slash_state.is_some() {
                 app.composer.move_slash_selection(-1);
@@ -1628,7 +1382,7 @@ pub(crate) fn handle_chat_key(
         }
         KeyCode::Down => {
             if input_blocked {
-                return Ok(AppAction::None);
+                return effects;
             }
             if app.composer.slash_state.is_some() {
                 app.composer.move_slash_selection(1);
@@ -1638,39 +1392,23 @@ pub(crate) fn handle_chat_key(
                 app.composer.input_down_visual(2);
             }
         }
-        KeyCode::PageUp => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10);
-        }
-        KeyCode::PageDown => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10);
-        }
-        KeyCode::Backspace if !input_blocked => {
-            app.composer.input_backspace();
-        }
-        KeyCode::Delete if !input_blocked => {
-            app.composer.input_delete();
-        }
-        KeyCode::Left if !input_blocked => {
-            app.composer.input_left();
-        }
-        KeyCode::Right if !input_blocked => {
-            app.composer.input_right();
-        }
-        KeyCode::Home if !input_blocked => {
-            app.composer.input_home();
-        }
+        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
+        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
+        KeyCode::Backspace if !input_blocked => app.composer.input_backspace(),
+        KeyCode::Delete if !input_blocked => app.composer.input_delete(),
+        KeyCode::Left if !input_blocked => app.composer.input_left(),
+        KeyCode::Right if !input_blocked => app.composer.input_right(),
+        KeyCode::Home if !input_blocked => app.composer.input_home(),
         KeyCode::End => {
-            if input_blocked {
+            if input_blocked || app.composer.input.is_empty() {
                 app.chat.scroll_offset = 0;
-            } else if app.composer.input.is_empty() {
-                app.chat.scroll_offset = 0; // snap to bottom
             } else {
                 app.composer.input_end();
             }
         }
         _ => {}
     }
-    Ok(AppAction::None)
+    effects
 }
 
 // ── Mode switching ─────────────────────────────────────────────────────────────
@@ -1678,19 +1416,12 @@ pub(crate) fn handle_chat_key(
 /// Switch the agent mode to `target` (e.g. "build", "plan").
 /// Caches the outgoing mode state, sends `SetAgentMode`, restores cached state
 /// for the target mode, and persists config/cache.
-fn switch_mode(
-    app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-    target: &str,
-) -> anyhow::Result<()> {
-    cmd_tx.send(Command::SetAgentMode {
+fn switch_mode(app: &mut App, target: &str) -> Vec<Effect> {
+    let command = Effect::Command(Command::SetAgentMode {
         mode: target.to_string(),
-    })?;
-
+    });
     app.sessions.apply_mode_transition(target);
-
-    save_config(app);
-    Ok(())
+    vec![command, Effect::PersistConfig]
 }
 
 // ── Slash command execution ────────────────────────────────────────────────────
@@ -1711,11 +1442,7 @@ enum SlashResult {
 /// Expects `app.composer.input` to begin with `/`.  Always calls `app.take_input()`
 /// before performing any side-effects so the command text is cleared first
 /// (this allows `/undo` to optionally restore the previous turn text).
-fn try_execute_slash_command(
-    app: &mut App,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<SlashResult> {
-    // Extract the command name (first word after '/') and optional argument.
+fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
     let after_slash = app.composer.input.trim_start_matches('/');
     let cmd = after_slash
         .split_whitespace()
@@ -1727,9 +1454,10 @@ fn try_execute_slash_command(
         .unwrap_or("")
         .trim()
         .to_string();
+    let mut effects = Vec::new();
 
     if cmd.is_empty() {
-        return Ok(SlashResult::NotACommand);
+        return (SlashResult::NotACommand, effects);
     }
 
     match cmd.as_str() {
@@ -1741,10 +1469,10 @@ fn try_execute_slash_command(
                     "model",
                     "model select is only available in chat",
                 );
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             app.navigation.popup = Popup::ModelSelect;
             if arg.is_empty() {
@@ -1757,11 +1485,10 @@ fn try_execute_slash_command(
         "mode" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if arg.is_empty() {
-                // No arg: cycle to next mode (same as Tab).
-                switch_mode(app, cmd_tx, &app.sessions.next_mode())?;
+                effects.extend(switch_mode(app, &app.sessions.next_mode()));
             } else {
                 match arg.as_str() {
                     "build" | "plan" => {
@@ -1772,28 +1499,26 @@ fn try_execute_slash_command(
                                 format!("already in {} mode", arg),
                             );
                         } else {
-                            switch_mode(app, cmd_tx, &arg)?;
+                            effects.extend(switch_mode(app, &arg));
                         }
                     }
-                    _ => {
-                        app.set_status(
-                            LogLevel::Warn,
-                            "mode",
-                            format!("unknown mode: {} (try build or plan)", arg),
-                        );
-                    }
+                    _ => app.set_status(
+                        LogLevel::Warn,
+                        "mode",
+                        format!("unknown mode: {} (try build or plan)", arg),
+                    ),
                 }
             }
         }
         "review" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if app.sessions.agent_mode == "review" {
                 app.set_status(LogLevel::Info, "mode", "already in review mode");
             } else {
-                switch_mode(app, cmd_tx, "review")?;
+                effects.extend(switch_mode(app, "review"));
             }
         }
         "thinking" => {
@@ -1817,10 +1542,11 @@ fn try_execute_slash_command(
                     );
                 } else {
                     if !can_send_server_commands(app) {
-                        return Ok(SlashResult::Handled);
+                        return (SlashResult::Handled, effects);
                     }
-                    let msg = app.set_reasoning_effort(Some(&level)).unwrap();
-                    cmd_tx.send(msg)?;
+                    effects.push(Effect::Command(
+                        app.set_reasoning_effort(Some(&level)).unwrap(),
+                    ));
                     app.set_status(
                         LogLevel::Info,
                         "model",
@@ -1837,25 +1563,25 @@ fn try_execute_slash_command(
         "profile" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if arg.is_empty() {
                 app.open_profile_popup();
-                cmd_tx.send(Command::ListProfiles)?;
+                effects.push(Effect::Command(Command::ListProfiles));
             } else if let Some(profile_id) = app.profiles.find_profile_id(&arg) {
                 app.profiles.active_profile_id = Some(profile_id.clone());
                 if app.current_session_profile_id().is_none() {
                     app.models.clear_profile_agents();
-                    cmd_tx.send(Command::ListProfileAgents {
+                    effects.push(Effect::Command(Command::ListProfileAgents {
                         profile_id: profile_id.clone(),
-                    })?;
+                    }));
                 }
                 app.set_status(
                     LogLevel::Info,
                     "profile",
                     format!("new sessions will use {profile_id}"),
                 );
-                save_config(app);
+                effects.push(Effect::PersistConfig);
             } else {
                 app.set_status(
                     LogLevel::Warn,
@@ -1867,12 +1593,12 @@ fn try_execute_slash_command(
         "sessions" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             app.navigation.popup = Popup::SessionSelect;
             app.sessions.reset_browser_for_open();
             if let Some(request) = app.begin_session_discovery() {
-                cmd_tx.send(request)?;
+                effects.push(Effect::Command(request));
             }
         }
         "delegates" => {
@@ -1883,17 +1609,17 @@ fn try_execute_slash_command(
                     "delegates",
                     "delegates only available in chat",
                 );
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             app.open_delegate_popup();
         }
         "new" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             app.open_new_session_popup();
         }
@@ -1903,26 +1629,24 @@ fn try_execute_slash_command(
         }
         "logs" => {
             app.take_input();
-            app.navigation.popup = Popup::Log;
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-            app.diagnostics.log_filter.clear();
+            open_log_popup(app);
         }
         "auth" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             app.open_auth_popup();
-            cmd_tx.send(Command::ListAuthProviders)?;
+            effects.push(Effect::Command(Command::ListAuthProviders));
         }
         "fork" => {
             app.take_input();
             if app.navigation.screen != Screen::Chat {
                 app.set_status(LogLevel::Warn, "fork", "forking is only available in chat");
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if app.chat.pending_fork_message_id.is_some() {
                 app.set_status(LogLevel::Warn, "fork", "fork already pending");
@@ -1931,17 +1655,15 @@ fn try_execute_slash_command(
             } else if app.chat.is_turn_active() {
                 app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
             } else if let Some(turn) = app.chat.latest_fork_boundary() {
-                begin_fork_session(app, turn.message_id, cmd_tx)?;
+                effects.extend(begin_fork_session(app, turn.message_id));
             } else {
                 app.set_status(LogLevel::Warn, "fork", "no forkable turns");
             }
         }
         "undo" => {
-            // Clear '/undo' first so the undo logic can optionally restore
-            // the previous turn's text into the now-empty input.
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if app.chat.is_turn_active() {
                 app.set_status(
@@ -1958,9 +1680,9 @@ fn try_execute_slash_command(
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
                 app.set_status(LogLevel::Info, "session", "undoing...");
-                cmd_tx.send(Command::Undo {
+                effects.push(Effect::Command(Command::Undo {
                     message_id: turn.message_id,
-                })?;
+                }));
             } else {
                 app.set_status(LogLevel::Warn, "session", "nothing to undo");
             }
@@ -1968,7 +1690,7 @@ fn try_execute_slash_command(
         "redo" => {
             app.take_input();
             if !can_send_server_commands(app) {
-                return Ok(SlashResult::Handled);
+                return (SlashResult::Handled, effects);
             }
             if app.chat.is_turn_active() {
                 app.set_status(
@@ -1981,48 +1703,44 @@ fn try_execute_slash_command(
             } else if app.chat.can_redo() {
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
                 app.set_status(LogLevel::Info, "session", "redoing...");
-                cmd_tx.send(Command::Redo)?;
+                effects.push(Effect::Command(Command::Redo));
             } else {
                 app.set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
         "editor" => {
             app.take_input();
-            return Ok(SlashResult::OpenEditor);
+            return (SlashResult::OpenEditor, effects);
         }
         "cancel" => {
             app.take_input();
             if app.chat.has_cancellable_activity() {
                 app.chat.clear_cancel_confirm();
                 app.set_status(LogLevel::Warn, "activity", "stopping...");
-                cmd_tx.send(Command::CancelSession)?;
+                effects.push(Effect::Command(Command::CancelSession));
             } else {
                 app.set_status(LogLevel::Warn, "activity", "nothing to cancel");
             }
         }
         "quit" => {
             app.take_input();
-            app.should_quit = true;
+            effects.push(Effect::Quit);
         }
-        _ => return Ok(SlashResult::NotACommand),
+        _ => return (SlashResult::NotACommand, effects),
     }
 
-    Ok(SlashResult::Handled)
+    (SlashResult::Handled, effects)
 }
 
 // ── Auth popup key handler ─────────────────────────────────────────────────────
 
-pub(crate) fn handle_auth_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
-    // Clipboard fallback popup: any key dismisses it
+pub(crate) fn handle_auth_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.auth.clipboard_fallback.is_some() {
         app.auth.clipboard_fallback = None;
-        return Ok(());
+        return Vec::new();
     }
 
+    let mut effects = Vec::new();
     match app.auth.panel {
         AuthPanel::List => match key.code {
             KeyCode::Esc => {
@@ -2048,7 +1766,6 @@ pub(crate) fn handle_auth_popup_key(
                     app.auth.ui_notice = None;
                     if provider.is_unconfigurable() {
                         app.auth.selected = Some(real_idx);
-                        // Stay in list — the draw fn shows the info message
                     } else if provider.is_api_key_only() {
                         app.auth.selected = Some(real_idx);
                         app.auth.panel = AuthPanel::ApiKeyInput;
@@ -2058,35 +1775,29 @@ pub(crate) fn handle_auth_popup_key(
                         && provider.oauth_status != Some(OAuthStatus::Connected)
                     {
                         app.auth.selected = Some(real_idx);
-                        let provider_id = provider.provider.clone();
-                        cmd_tx.send(Command::StartOAuthLogin {
-                            provider: provider_id,
-                        })?;
+                        effects.push(Effect::Command(Command::StartOAuthLogin {
+                            provider: provider.provider.clone(),
+                        }));
                     } else {
-                        // Multi-method or connected OAuth-only: select for detail
                         app.auth.selected = Some(real_idx);
                     }
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+D: disconnect/clear credential for selected provider
                 if let Some(idx) = app.auth.selected {
                     let provider = &app.auth.providers[idx];
                     if provider.oauth_status == Some(OAuthStatus::Connected) {
-                        let provider_id = provider.provider.clone();
-                        cmd_tx.send(Command::DisconnectOAuth {
-                            provider: provider_id,
-                        })?;
+                        effects.push(Effect::Command(Command::DisconnectOAuth {
+                            provider: provider.provider.clone(),
+                        }));
                     } else if provider.has_stored_api_key {
-                        let provider_id = provider.provider.clone();
-                        cmd_tx.send(Command::ClearApiToken {
-                            provider: provider_id,
-                        })?;
+                        effects.push(Effect::Command(Command::ClearApiToken {
+                            provider: provider.provider.clone(),
+                        }));
                     }
                 }
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+K: open API key panel for selected provider
                 let filtered = app.auth.filtered_providers();
                 if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
                     let provider = &app.auth.providers[real_idx];
@@ -2100,17 +1811,15 @@ pub(crate) fn handle_auth_popup_key(
                 }
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+O: start OAuth for selected provider
                 let filtered = app.auth.filtered_providers();
                 if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
                     let provider = &app.auth.providers[real_idx];
                     if provider.supports_oauth {
                         app.auth.ui_notice = None;
                         app.auth.selected = Some(real_idx);
-                        let provider_id = provider.provider.clone();
-                        cmd_tx.send(Command::StartOAuthLogin {
-                            provider: provider_id,
-                        })?;
+                        effects.push(Effect::Command(Command::StartOAuthLogin {
+                            provider: provider.provider.clone(),
+                        }));
                     }
                 }
             }
@@ -2134,22 +1843,19 @@ pub(crate) fn handle_auth_popup_key(
                 if let Some(idx) = app.auth.selected {
                     let trimmed = app.auth.api_key_input.trim().to_string();
                     if !trimmed.is_empty() {
-                        let provider = app.auth.providers[idx].provider.clone();
-                        cmd_tx.send(Command::SetApiToken {
-                            provider,
+                        effects.push(Effect::Command(Command::SetApiToken {
+                            provider: app.auth.providers[idx].provider.clone(),
                             api_key: trimmed,
-                        })?;
+                        }));
                     }
                 }
             }
-            KeyCode::Tab => {
-                app.auth.api_key_masked = !app.auth.api_key_masked;
-            }
+            KeyCode::Tab => app.auth.api_key_masked = !app.auth.api_key_masked,
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Clear stored key
                 if let Some(idx) = app.auth.selected {
-                    let provider = app.auth.providers[idx].provider.clone();
-                    cmd_tx.send(Command::ClearApiToken { provider })?;
+                    effects.push(Effect::Command(Command::ClearApiToken {
+                        provider: app.auth.providers[idx].provider.clone(),
+                    }));
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2189,16 +1895,19 @@ pub(crate) fn handle_auth_popup_key(
                 app.auth.oauth_response_cursor = 0;
             }
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Copy authorization URL to clipboard (C-y to avoid global C-c quit)
                 if let Some(ref flow) = app.auth.oauth_flow {
-                    let provider = flow.provider.clone();
-                    let url = flow.authorization_url.clone();
-                    try_copy_to_clipboard(app, &provider, &url);
+                    app.auth.ui_notice = None;
+                    app.auth.clipboard_fallback = None;
+                    effects.push(Effect::CopyToClipboard {
+                        target: ClipboardTarget::Auth {
+                            provider: flow.provider.clone(),
+                        },
+                        text: flow.authorization_url.clone(),
+                    });
                 }
             }
             KeyCode::Enter => {
                 if let Some(ref flow) = app.auth.oauth_flow {
-                    let flow_id = flow.flow_id.clone();
                     let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
                     let response = if is_device_poll {
                         String::new()
@@ -2206,7 +1915,10 @@ pub(crate) fn handle_auth_popup_key(
                         app.auth.oauth_response.trim().to_string()
                     };
                     if is_device_poll || !response.is_empty() {
-                        cmd_tx.send(Command::CompleteOAuthLogin { flow_id, response })?;
+                        effects.push(Effect::Command(Command::CompleteOAuthLogin {
+                            flow_id: flow.flow_id.clone(),
+                            response,
+                        }));
                     }
                 }
             }
@@ -2242,68 +1954,16 @@ pub(crate) fn handle_auth_popup_key(
             _ => {}
         },
     }
-    Ok(())
+    effects
 }
 
-/// Try to copy text to the system clipboard. On failure, store in the fallback
-/// field so the draw function can show a popup with the URL for manual copy.
-fn copy_text_to_clipboard(text: &str) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let commands = [
-        ("xclip", &["-selection", "clipboard"] as &[&str]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("wl-copy", &[]),
-        ("pbcopy", &[]),
-    ];
-
-    for (cmd, args) in &commands {
-        if let Ok(mut child) = Command::new(cmd)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            if child.wait().is_ok_and(|s| s.success()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn try_copy_to_clipboard(app: &mut App, provider: &str, text: &str) {
-    app.auth.ui_notice = None;
-    app.auth.clipboard_fallback = None;
-    if copy_text_to_clipboard(text) {
-        app.auth.ui_notice = Some(AuthUiNotice {
-            provider: Some(provider.to_string()),
-            success: true,
-            message: "Copied to clipboard".into(),
-        });
-    } else {
-        app.auth.ui_notice = None;
-        app.auth.clipboard_fallback = Some(text.to_string());
-    }
-}
-
-pub(crate) fn handle_model_popup_key(
-    app: &mut App,
-    key: KeyEvent,
-    cmd_tx: &mpsc::UnboundedSender<Command>,
-) -> anyhow::Result<()> {
+pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let mut effects = Vec::new();
     match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
+        KeyCode::Esc => app.navigation.popup = Popup::None,
         KeyCode::Tab | KeyCode::BackTab => {
             if !app.models.model_popup_has_tabs() {
-                return Ok(());
+                return effects;
             }
             let agent_id = app
                 .models
@@ -2344,18 +2004,18 @@ pub(crate) fn handle_model_popup_key(
                 {
                     if !app.sessions.current_session_is_remote() {
                         if let Some(session_id) = app.sessions.session_id.clone() {
-                            cmd_tx.send(Command::SetSessionModel {
+                            effects.push(Effect::Command(Command::SetSessionModel {
                                 session_id,
                                 model_id: model.id.clone(),
                                 node_id: model.node_id.clone(),
-                            })?;
+                            }));
                         }
                         app.models.apply_model_selection_from_entry(&model);
                         if app.models.reasoning_effort.is_some() {
                             app.models.reasoning_effort = None;
-                            cmd_tx.send(Command::SetReasoningEffort {
+                            effects.push(Effect::Command(Command::SetReasoningEffort {
                                 reasoning_effort: "auto".into(),
-                            })?;
+                            }));
                         }
                     }
                     app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
@@ -2371,12 +2031,12 @@ pub(crate) fn handle_model_popup_key(
                     if app.delegates.parent_session_id.is_none()
                         && let Some(session_id) = app.sessions.session_id.clone()
                     {
-                        cmd_tx.send(Command::SetDelegateModel {
+                        effects.push(Effect::Command(Command::SetDelegateModel {
                             session_id,
                             agent_id,
                             model_id: Some(model.id.clone()),
                             node_id: model.node_id.clone(),
-                        })?;
+                        }));
                     }
                     app.set_status(
                         LogLevel::Info,
@@ -2384,7 +2044,7 @@ pub(crate) fn handle_model_popup_key(
                         format!("{tab_label}: {}", model.label),
                     );
                 }
-                save_config(app);
+                effects.push(Effect::PersistConfig);
             }
         }
         KeyCode::Delete
@@ -2403,19 +2063,19 @@ pub(crate) fn handle_model_popup_key(
                 if app.delegates.parent_session_id.is_none()
                     && let Some(session_id) = app.sessions.session_id.clone()
                 {
-                    cmd_tx.send(Command::SetDelegateModel {
+                    effects.push(Effect::Command(Command::SetDelegateModel {
                         session_id,
                         agent_id,
                         model_id: None,
                         node_id: None,
-                    })?;
+                    }));
                 }
                 app.set_status(
                     LogLevel::Info,
                     "model",
                     "delegate model uses profile default",
                 );
-                save_config(app);
+                effects.push(Effect::PersistConfig);
             }
         }
         KeyCode::Backspace => app.models.model_filter_backspace(),
@@ -2424,7 +2084,7 @@ pub(crate) fn handle_model_popup_key(
         }
         _ => {}
     }
-    Ok(())
+    effects
 }
 
 // ── Pure key logic for the sessions screen ────────────────────────────────────
@@ -2564,8 +2224,8 @@ mod model_popup_tests {
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
     use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::runtime::TestEffects;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -2573,26 +2233,29 @@ mod model_popup_tests {
 
     #[test]
     fn mention_typing_prepares_and_sends_file_index_request_once() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
 
-        handle_chat_key(&mut app, key(KeyCode::Char('@')), &tx).unwrap();
-        handle_chat_key(&mut app, key(KeyCode::Char('s')), &tx).unwrap();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Char('@'))));
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Char('s'))));
 
-        assert!(matches!(rx.try_recv(), Ok(Command::GetFileIndex)));
-        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::GetFileIndex)
+        ));
+        assert!(effects.next_command().is_none());
         assert!(app.composer.file_index_loading);
         assert_eq!(app.composer.input, "@s");
     }
 
     #[test]
     fn prompt_send_is_optimistic_and_clears_input_before_dispatch() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.composer.replace_input(" hello ".into());
 
-        handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.composer.input.is_empty());
         let local_id = match app.chat.messages.as_slice() {
@@ -2605,8 +2268,8 @@ mod model_popup_tests {
             messages => panic!("unexpected optimistic messages: {messages:?}"),
         };
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::Prompt { prompt, local_id: sent_id })
+            effects.next_command(),
+            Some(Command::Prompt { prompt, local_id: sent_id })
                 if sent_id == local_id
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "hello")
         ));
@@ -2614,8 +2277,7 @@ mod model_popup_tests {
 
     #[test]
     fn failed_prompt_dispatch_rolls_back_only_optimistic_message() {
-        let (tx, rx) = mpsc::unbounded_channel::<Command>();
-        drop(rx);
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.chat.messages.push(ChatEntry::Assistant {
@@ -2625,7 +2287,18 @@ mod model_popup_tests {
         });
         app.composer.replace_input("send me".into());
 
-        assert!(handle_chat_key(&mut app, key(KeyCode::Enter), &tx).is_err());
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
+        let command = effects.next_command().expect("prompt effect");
+        assert!(matches!(command, Command::Prompt { .. }));
+        crate::application::update(
+            &mut app,
+            crate::application::AppEvent::Runtime(
+                crate::application::RuntimeEvent::CommandFailed {
+                    command,
+                    message: "command channel closed".into(),
+                },
+            ),
+        );
 
         assert!(app.composer.input.is_empty());
         assert!(matches!(
@@ -2771,14 +2444,11 @@ mod model_popup_tests {
         app.navigation.command_palette_filter = "old".into();
         app.navigation.theme_filter = "keep".into();
         app.navigation.help_scroll = 9;
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(app.navigation.popup, Popup::CommandPalette));
         assert!(!app.navigation.chord);
@@ -2793,19 +2463,19 @@ mod model_popup_tests {
         let mut app = App::new();
         app.navigation.open_help();
         app.sessions.session_filter = "keep".into();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Char('x'))));
         assert_eq!(app.sessions.session_filter, "keep");
         assert_eq!(app.navigation.popup, Popup::Help);
 
-        handle_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Down)));
         assert_eq!(app.navigation.help_scroll, 1);
-        handle_key(&mut app, key(KeyCode::Up), &tx).unwrap();
-        handle_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Up)));
+        effects.extend(handle_key(&mut app, key(KeyCode::Up)));
         assert_eq!(app.navigation.help_scroll, 0);
 
-        handle_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Esc)));
         assert_eq!(app.navigation.popup, Popup::None);
     }
 
@@ -2816,9 +2486,9 @@ mod model_popup_tests {
         app.navigation.theme_filter = "no theme matches this".into();
         app.navigation.theme_cursor = 8;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Down)).unwrap();
+        handle_theme_popup_key(&mut app, key(KeyCode::Down));
         assert_eq!(app.navigation.theme_cursor, 0);
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter)).unwrap();
+        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.navigation.popup, Popup::ThemeSelect);
     }
 
@@ -2829,7 +2499,7 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ThemeSelect;
         app.navigation.theme_cursor = theme::Theme::available_themes().len() + 10;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter)).unwrap();
+        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
 
         assert_eq!(app.navigation.popup, Popup::None);
     }
@@ -2839,9 +2509,8 @@ mod model_popup_tests {
         let mut app = App::new();
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "theme".into();
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_command_palette_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(app.navigation.popup, Popup::ThemeSelect));
     }
@@ -2852,12 +2521,14 @@ mod model_popup_tests {
         app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "open mesh".into();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_command_palette_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(app.navigation.popup, Popup::Mesh));
-        assert!(matches!(rx.try_recv(), Ok(Command::ListRemoteNodes)));
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::ListRemoteNodes)
+        ));
     }
 
     #[test]
@@ -2879,13 +2550,12 @@ mod model_popup_tests {
                 ..Default::default()
             }],
         );
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_mesh_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_mesh_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::AttachRemoteSession { node_id, session_id })
+            effects.next_command(),
+            Some(Command::AttachRemoteSession { node_id, session_id })
                 if node_id == "node-1" && session_id == "remote-1"
         ));
     }
@@ -2900,12 +2570,11 @@ mod model_popup_tests {
             label: "framework".into(),
             ..Default::default()
         }];
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_mesh_popup_key(&mut app, key(KeyCode::Char('n')), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_mesh_popup_key(&mut app, key(KeyCode::Char('n'))));
 
         assert_eq!(
-            rx.try_recv().unwrap(),
+            effects.next_command().unwrap(),
             Command::CreateRemoteSession {
                 node_id: "node-1".into(),
                 cwd: None,
@@ -2919,9 +2588,8 @@ mod model_popup_tests {
         app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::CommandPalette;
         app.navigation.command_palette_filter = "mesh invite".into();
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_command_palette_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(app.navigation.popup, Popup::MeshInvite));
         assert_eq!(app.mesh.mesh_invite_ttl, "24h");
@@ -2932,9 +2600,8 @@ mod model_popup_tests {
     fn mesh_popup_i_no_longer_opens_invite_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::Mesh;
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_mesh_popup_key(&mut app, key(KeyCode::Char('i')), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_mesh_popup_key(&mut app, key(KeyCode::Char('i'))));
 
         assert!(matches!(app.navigation.popup, Popup::Mesh));
     }
@@ -2952,14 +2619,14 @@ mod model_popup_tests {
             mesh_name: None,
         });
 
-        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Char('u'))).unwrap();
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Char('u')));
 
         assert_eq!(
             app.mesh.mesh_clipboard_fallback.as_deref(),
             Some("qmt://mesh/join/token")
         );
 
-        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc));
 
         assert!(matches!(app.navigation.popup, Popup::MeshInviteQr));
         assert!(app.mesh.mesh_clipboard_fallback.is_none());
@@ -2970,11 +2637,10 @@ mod model_popup_tests {
         let mut app = App::new();
         app.open_mesh_invite_form();
         app.mesh.mesh_invite_ttl = "lol".into();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(
             app.mesh.mesh_error.as_deref(),
             Some("ttl must be like 30m, 1d3h, or 1d3h5m")
@@ -2982,9 +2648,9 @@ mod model_popup_tests {
 
         app.mesh.mesh_invite_ttl = "24h".into();
         app.mesh.mesh_invite_max_uses = "0".into();
-        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter)));
 
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(
             app.mesh.mesh_error.as_deref(),
             Some("max uses must be at least 1")
@@ -2998,13 +2664,12 @@ mod model_popup_tests {
         app.open_mesh_invite_form();
         app.mesh.mesh_invite_name = "Team Mesh".into();
         app.mesh.mesh_invite_ttl = "1d3h5m".into();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::CreateMeshInvite { mesh_name, ttl, max_uses })
+            effects.next_command(),
+            Some(Command::CreateMeshInvite { mesh_name, ttl, max_uses })
                 if mesh_name.as_deref() == Some("Team Mesh")
                     && ttl.as_deref() == Some("1d3h5m")
                     && max_uses == Some(1)
@@ -3023,7 +2688,7 @@ mod model_popup_tests {
             mesh_name: None,
         });
 
-        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
+        handle_mesh_invite_qr_popup_key(&mut app, key(KeyCode::Esc));
 
         assert!(matches!(app.navigation.popup, Popup::MeshInvite));
     }
@@ -3038,14 +2703,16 @@ mod model_popup_tests {
         app.profiles.active_profile_id = Some("deep".into());
         app.profiles.profile_filter = "stale".into();
         app.profiles.profile_cursor = 0;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_command_palette_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_command_palette_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(app.navigation.popup, Popup::ProfileSelect));
         assert!(app.profiles.profile_filter.is_empty());
         assert_eq!(app.profiles.profile_cursor, 1);
-        assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::ListProfiles)
+        ));
     }
 
     #[test]
@@ -3055,13 +2722,19 @@ mod model_popup_tests {
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/profile".into();
         app.composer.input_cursor = app.composer.input.len();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(matches!(action, AppAction::None));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::OpenExternalEditor { .. }))
+        );
         assert!(matches!(app.navigation.popup, Popup::ProfileSelect));
-        assert!(matches!(rx.try_recv(), Ok(Command::ListProfiles)));
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::ListProfiles)
+        ));
     }
 
     #[test]
@@ -3074,19 +2747,21 @@ mod model_popup_tests {
         app.profiles.active_profile_id = Some("old".into());
         app.composer.input = "/profile Fast".into();
         app.composer.input_cursor = app.composer.input.len();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::ListProfileAgents { profile_id }) if profile_id == "fast"
+            effects.next_command(),
+            Some(Command::ListProfileAgents { profile_id }) if profile_id == "fast"
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
         assert_eq!(app.current_session_profile_id(), None);
-        let saved = crate::config::TuiConfig::load();
-        assert_eq!(saved.profile.id.as_deref(), Some("fast"));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistConfig))
+        );
     }
 
     #[test]
@@ -3097,19 +2772,21 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ProfileSelect;
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.profile_cursor = 1;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_profile_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(app.navigation.popup, Popup::None));
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
+            effects.next_command(),
+            Some(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
-        let saved = crate::config::TuiConfig::load();
-        assert_eq!(saved.profile.id.as_deref(), Some("deep"));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistConfig))
+        );
     }
 
     #[test]
@@ -3122,11 +2799,10 @@ mod model_popup_tests {
         app.profiles
             .bind_session_profile("session".into(), "current".into());
         app.profiles.profiles = vec![make_profile("fast", "Fast")];
+        let mut effects = TestEffects::default();
+        effects.extend(handle_profile_popup_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_profile_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
         assert_eq!(app.current_session_profile_id(), Some("current"));
     }
@@ -3139,13 +2815,12 @@ mod model_popup_tests {
         app.sessions.new_session_path = "/repo".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
         app.profiles.active_profile_id = Some("coder-delegate".into());
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_new_session_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_new_session_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::NewSession { profile_id: Some(profile_id), .. })
+            effects.next_command(),
+            Some(Command::NewSession { profile_id: Some(profile_id), .. })
                 if profile_id == "coder-delegate"
         ));
     }
@@ -3176,15 +2851,13 @@ mod model_popup_tests {
                     i,
                     crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].model == "claude-sonnet"
                 )
-            })
-            .unwrap();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+            }).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::SetDelegateModel {
+            effects.next_command(),
+            Some(Command::SetDelegateModel {
                 ref session_id,
                 ref agent_id,
                 ref model_id,
@@ -3220,9 +2893,8 @@ mod model_popup_tests {
         let model = make_model("anthropic", "claude-sonnet");
         app.models
             .set_delegate_model_preference("profile", "coder", &model);
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Delete), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Delete)));
 
         assert!(
             app.models
@@ -3230,8 +2902,8 @@ mod model_popup_tests {
                 .is_none()
         );
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::SetDelegateModel {
+            effects.next_command(),
+            Some(Command::SetDelegateModel {
                 ref session_id,
                 ref agent_id,
                 model_id: None,
@@ -3257,11 +2929,10 @@ mod model_popup_tests {
         app.models.models = vec![make_model("anthropic", "claude-sonnet")];
         app.models.model_popup_agent_tab = 1;
         app.models.model_cursor = 1;
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert!(
             app.models
                 .get_delegate_model_preference("profile", "coder")
@@ -3293,19 +2964,19 @@ mod model_popup_tests {
                     i,
                     crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].model == "claude-sonnet"
                 )
-            })
-            .unwrap();
+            }).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        let msg1 = rx.try_recv().expect("expected SetSessionModel");
+        let msg1 = effects.next_command().expect("expected SetSessionModel");
         assert!(matches!(msg1, Command::SetSessionModel { .. }));
-        let msg2 = rx.try_recv().expect("expected SetReasoningEffort auto");
+        let msg2 = effects
+            .next_command()
+            .expect("expected SetReasoningEffort auto");
         assert!(
             matches!(msg2, Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto")
         );
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
 
         assert_eq!(app.models.current_provider.as_deref(), Some("anthropic"));
         assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
@@ -3343,13 +3014,11 @@ mod model_popup_tests {
                     i,
                     crate::models_state::ModelPopupItem::Model { model_idx } if app.models.models[*model_idx].node_id.is_some()
                 )
-            })
-            .unwrap();
+            }).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        match rx.try_recv().expect("SetSessionModel") {
+        match effects.next_command().expect("SetSessionModel") {
             Command::SetSessionModel {
                 node_id, model_id, ..
             } => {
@@ -3358,7 +3027,7 @@ mod model_popup_tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(app.models.current_provider.as_deref(), Some("anthropic"));
         assert_eq!(app.models.current_model.as_deref(), Some("claude"));
         assert_eq!(app.models.current_model_node_id.as_deref(), Some("node-a"));
@@ -3387,10 +3056,9 @@ mod model_popup_tests {
             .iter()
             .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_model_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert!(rx.try_recv().is_err());
+        let mut effects = TestEffects::default();
+        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -3402,9 +3070,8 @@ mod model_popup_tests {
         app.models.current_provider = Some("openai".into());
         app.models.current_model = Some("gpt-4o".into());
         app.models.models = vec![make_model("openai", "gpt-4o")];
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_chord(&mut app, key(KeyCode::Char('m')), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chord(&mut app, key(KeyCode::Char('m'))));
 
         assert!(matches!(app.navigation.popup, Popup::ModelSelect));
         assert_eq!(app.models.model_popup_agent_tab, 0);
@@ -3425,11 +3092,14 @@ mod model_popup_tests {
         app.models.models = vec![make_model("openai", "gpt-4o")];
         app.composer.input = "/model".into();
         app.composer.input_cursor = app.composer.input.len();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-
-        assert!(matches!(action, AppAction::None));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::OpenExternalEditor { .. }))
+        );
         assert!(matches!(app.navigation.popup, Popup::ModelSelect));
         assert_eq!(app.models.model_popup_agent_tab, 0);
         assert_eq!(
@@ -3447,26 +3117,29 @@ mod model_popup_tests {
         app.sessions.agent_mode = "plan".into();
         app.composer.input = "/review".into();
         app.composer.input_cursor = app.composer.input.len();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert!(matches!(action, AppAction::None));
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::OpenExternalEditor { .. }))
+        );
         assert_eq!(app.sessions.agent_mode, "review");
         assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
         assert!(matches!(
-            rx.try_recv().expect("expected SetAgentMode(review)"),
+            effects.next_command().expect("expected SetAgentMode(review)"),
             Command::SetAgentMode { mode } if mode == "review"
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
 
-        handle_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Tab)));
         assert_eq!(app.sessions.agent_mode, "plan");
         assert_eq!(app.sessions.mode_before_review, None);
         assert!(matches!(
-            rx.try_recv().expect("expected SetAgentMode(plan)"),
+            effects.next_command().expect("expected SetAgentMode(plan)"),
             Command::SetAgentMode { mode } if mode == "plan"
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -3490,20 +3163,19 @@ mod model_popup_tests {
             ended_at: None,
             child_state: DelegateChildState::None,
         });
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_delegate_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_delegate_popup_key(&mut app, key(KeyCode::Enter)));
 
         assert!(matches!(
-            rx.try_recv().expect("expected LoadSession"),
+            effects.next_command().expect("expected LoadSession"),
             Command::LoadSession { session_id, .. } if session_id == "child-1"
         ));
         assert!(matches!(
-            rx.try_recv().expect("expected SubscribeSession"),
+            effects.next_command().expect("expected SubscribeSession"),
             Command::SubscribeSession { session_id, agent_id }
                 if session_id == "child-1" && agent_id.as_deref() == Some("coder")
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -3515,13 +3187,16 @@ mod model_popup_tests {
         app.sessions.mode_before_review = Some("plan".into());
         app.composer.input = "/review".into();
         app.composer.input_cursor = app.composer.input.len();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let action = handle_chat_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert!(matches!(action, AppAction::None));
+        let mut effects = TestEffects::default();
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::OpenExternalEditor { .. }))
+        );
         assert_eq!(app.sessions.agent_mode, "review");
         assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert_eq!(app.diagnostics.status, "already in review mode");
     }
 }
