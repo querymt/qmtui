@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, EventStream};
+use crossterm::event::{Event, EventStream};
 use futures::{FutureExt, Stream, StreamExt};
 use tokio::{
     sync::mpsc,
@@ -151,17 +151,6 @@ pub(super) async fn run_loop(
             && execute_event(terminal, app, executor, event)?
         {
             return Ok(());
-        }
-
-        while let Ok(true) = event::poll(Duration::ZERO) {
-            let Ok(event) = event::read() else {
-                break;
-            };
-            if let Some(event) = crossterm_event(event)
-                && execute_event(terminal, app, executor, event)?
-            {
-                return Ok(());
-            }
         }
     }
 }
@@ -319,6 +308,61 @@ mod tests {
 
         assert!(saw_supervisor);
         assert!(!conn_rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuous_terminal_input_does_not_starve_other_sources_or_ticks() {
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
+        let (sup_tx, mut sup_rx) = mpsc::unbounded_channel();
+        let mut term_events = stream::repeat_with(|| {
+            Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+        });
+        let mut tick_interval = application_tick_interval();
+        let mut scheduler = EventScheduler::new();
+
+        conn_tx.send(connection_event(1)).unwrap();
+        srv_tx
+            .send(ServerChannelMsg::Acp(AcpAppEvent::Error {
+                message: "acp-ready".into(),
+            }))
+            .unwrap();
+        sup_tx.send(server_manager::ServerEvent::Started).unwrap();
+        tokio::time::sleep(TICK_INTERVAL + Duration::from_millis(20)).await;
+
+        let mut saw_connection = false;
+        let mut saw_acp = false;
+        let mut saw_supervisor = false;
+        let mut saw_tick = false;
+        let mut terminal_events = 0;
+        for _ in 0..(NON_TICK_SOURCE_COUNT * 2 + 2) {
+            match scheduler
+                .next_event(
+                    &mut tick_interval,
+                    &mut conn_rx,
+                    &mut srv_rx,
+                    &mut sup_rx,
+                    &mut term_events,
+                )
+                .await
+            {
+                Some(AppEvent::Connection(_)) => saw_connection = true,
+                Some(AppEvent::Acp(_)) => saw_acp = true,
+                Some(AppEvent::Supervisor(_)) => saw_supervisor = true,
+                Some(AppEvent::Tick) => saw_tick = true,
+                Some(AppEvent::Key(_)) => terminal_events += 1,
+                _ => {}
+            }
+        }
+
+        assert!(saw_connection);
+        assert!(saw_acp);
+        assert!(saw_supervisor);
+        assert!(saw_tick);
+        assert!(terminal_events >= 2);
     }
 
     #[tokio::test]
