@@ -65,10 +65,25 @@ impl<'a> EffectExecutor<'a> {
         while let Some(effect) = effects.next() {
             let runtime_event = match effect {
                 Effect::Command(command) => self.send_command(command),
-                Effect::CommandThen { command, on_sent } => match self.send_command(command) {
-                    Some(failed) => Some(failed),
-                    None => Some(on_sent),
-                },
+                Effect::ElicitationResponse {
+                    elicitation_id,
+                    action,
+                    content,
+                    outcome,
+                } => {
+                    let command = Command::ElicitationResponse {
+                        elicitation_id: elicitation_id.clone(),
+                        action,
+                        content,
+                    };
+                    match self.send_command(command) {
+                        Some(failed) => Some(failed),
+                        None => Some(RuntimeEvent::ElicitationResponseSent {
+                            elicitation_id,
+                            outcome,
+                        }),
+                    }
+                }
                 Effect::PersistConfig => {
                     config::TuiConfig::load().with_app_settings(app).save();
                     None
@@ -107,13 +122,16 @@ impl<'a> EffectExecutor<'a> {
     }
 
     fn send_command(&self, command: Command) -> Option<RuntimeEvent> {
-        self.cmd_tx
-            .send(command.clone())
-            .err()
-            .map(|error| RuntimeEvent::CommandFailed {
-                command,
-                message: error.to_string(),
-            })
+        match self.cmd_tx.send(command) {
+            Ok(()) => None,
+            Err(error) => {
+                let message = error.to_string();
+                Some(RuntimeEvent::CommandFailed {
+                    command: error.0,
+                    message,
+                })
+            }
+        }
     }
 }
 
@@ -159,12 +177,22 @@ impl TestEffects {
     pub(crate) fn next_command(&mut self) -> Option<Command> {
         if !matches!(
             self.effects.first(),
-            Some(Effect::Command(_) | Effect::CommandThen { .. })
+            Some(Effect::Command(_) | Effect::ElicitationResponse { .. })
         ) {
             return None;
         }
         match self.effects.remove(0) {
-            Effect::Command(command) | Effect::CommandThen { command, .. } => Some(command),
+            Effect::Command(command) => Some(command),
+            Effect::ElicitationResponse {
+                elicitation_id,
+                action,
+                content,
+                ..
+            } => Some(Command::ElicitationResponse {
+                elicitation_id,
+                action,
+                content,
+            }),
             _ => unreachable!("first effect must contain a command"),
         }
     }
@@ -185,6 +213,7 @@ impl TestEffects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::PromptBlock;
     use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
     use crate::domain::elicitation::{
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
@@ -272,12 +301,11 @@ mod tests {
                 &mut terminal,
                 &mut app,
                 vec![
-                    Effect::CommandThen {
-                        command: command.clone(),
-                        on_sent: RuntimeEvent::ElicitationResponseSent {
-                            elicitation_id: "test-id".into(),
-                            outcome: format!("{OUTCOME_BULLET}Alpha"),
-                        },
+                    Effect::ElicitationResponse {
+                        elicitation_id: "test-id".into(),
+                        action: "accept".into(),
+                        content: Some(serde_json::json!({ "choice": "a" })),
+                        outcome: format!("{OUTCOME_BULLET}Alpha"),
                     },
                     Effect::Command(Command::Init),
                 ],
@@ -296,28 +324,21 @@ mod tests {
     }
 
     #[test]
-    fn effect_executor_command_then_failure_keeps_elicitation_open() {
+    fn effect_executor_elicitation_send_failure_keeps_elicitation_open() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         let mut executor = EffectExecutor::new(&tx);
         let mut terminal = test_terminal();
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let command = Command::ElicitationResponse {
-            elicitation_id: "test-id".into(),
-            action: "decline".into(),
-            content: None,
-        };
-
         executor
             .execute(
                 &mut terminal,
                 &mut app,
-                vec![Effect::CommandThen {
-                    command,
-                    on_sent: RuntimeEvent::ElicitationResponseSent {
-                        elicitation_id: "test-id".into(),
-                        outcome: "declined".into(),
-                    },
+                vec![Effect::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "decline".into(),
+                    content: None,
+                    outcome: "declined".into(),
                 }],
             )
             .unwrap();
@@ -349,6 +370,31 @@ mod tests {
         let persisted = config::TuiConfig::load();
         assert_eq!(persisted.profile.id.as_deref(), Some("fast"));
         assert_eq!(persisted.show_thinking, Some(false));
+    }
+
+    #[test]
+    fn effect_executor_failed_send_preserves_owned_command() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let executor = EffectExecutor::new(&tx);
+        let command = Command::Prompt {
+            prompt: vec![PromptBlock::Text {
+                text: "owned payload".into(),
+            }],
+            local_id: "local-owned".into(),
+        };
+
+        let event = executor
+            .send_command(command.clone())
+            .expect("closed receiver should reject command");
+
+        assert!(matches!(
+            event,
+            RuntimeEvent::CommandFailed {
+                command: failed,
+                message,
+            } if failed == command && message.contains("channel closed")
+        ));
     }
 
     #[test]
@@ -452,16 +498,11 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "accept".into(),
-                    content: Some(serde_json::json!({ "choice": "b" })),
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: format!("{OUTCOME_BULLET}Beta"),
-                },
+            vec![Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "choice": "b" })),
+                outcome: format!("{OUTCOME_BULLET}Beta"),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -501,16 +542,11 @@ mod tests {
         assert!(app.chat.elicitation.is_some());
         assert_eq!(
             effects.as_slice(),
-            &[Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "accept".into(),
-                    content: Some(serde_json::json!({ "choice": "custom\nanswer" })),
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: format!("{OUTCOME_BULLET}custom\nanswer"),
-                },
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "choice": "custom\nanswer" })),
+                outcome: format!("{OUTCOME_BULLET}custom\nanswer"),
             }]
         );
     }
@@ -537,16 +573,11 @@ mod tests {
         assert!(app.chat.elicitation.is_some());
         assert_eq!(
             effects.as_slice(),
-            &[Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "decline".into(),
-                    content: None,
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: "declined".into(),
-                },
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "decline".into(),
+                content: None,
+                outcome: "declined".into(),
             }]
         );
     }
@@ -574,16 +605,11 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "decline".into(),
-                    content: None,
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: "declined".into(),
-                },
+            vec![Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "decline".into(),
+                content: None,
+                outcome: "declined".into(),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -608,16 +634,11 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "accept".into(),
-                    content: Some(serde_json::json!({ "name": "Alice" })),
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: "Alice".into(),
-                },
+            vec![Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "name": "Alice" })),
+                outcome: "Alice".into(),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -699,16 +720,11 @@ mod tests {
         assert!(app.chat.elicitation.is_some());
         assert_eq!(
             effects.as_slice(),
-            &[Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "accept".into(),
-                    content: Some(serde_json::json!({ "confirm": true })),
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: "Yes".into(),
-                },
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "confirm": true })),
+                outcome: "Yes".into(),
             }]
         );
     }
@@ -733,16 +749,11 @@ mod tests {
         assert!(app.chat.elicitation.is_some());
         assert_eq!(
             effects.as_slice(),
-            &[Effect::CommandThen {
-                command: Command::ElicitationResponse {
-                    elicitation_id: "test-id".into(),
-                    action: "accept".into(),
-                    content: Some(serde_json::json!({ "confirm": false })),
-                },
-                on_sent: RuntimeEvent::ElicitationResponseSent {
-                    elicitation_id: "test-id".into(),
-                    outcome: "No".into(),
-                },
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "confirm": false })),
+                outcome: "No".into(),
             }]
         );
     }

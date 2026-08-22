@@ -57,9 +57,11 @@ pub(crate) enum ExternalEditorOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
     Command(Command),
-    CommandThen {
-        command: Command,
-        on_sent: RuntimeEvent,
+    ElicitationResponse {
+        elicitation_id: String,
+        action: String,
+        content: Option<serde_json::Value>,
+        outcome: String,
     },
     PersistConfig,
     CopyToClipboard {

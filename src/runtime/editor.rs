@@ -52,7 +52,7 @@ fn run_external_editor(command: &EditorCommand, path: &Path) -> anyhow::Result<O
         .arg(path)
         .status()?;
     if !status.success() {
-        return Ok(None);
+        anyhow::bail!("external editor exited with status {status}");
     }
     Ok(Some(fs::read_to_string(path)?))
 }
@@ -92,7 +92,8 @@ fn open_external_editor_with_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{editor_command_from_env, open_external_editor_with_command};
+    use super::{EditorCommand, editor_command_from_env, open_external_editor_with_command};
+    use crate::application::ExternalEditorOutcome;
     use std::ffi::OsString;
 
     #[test]
@@ -121,8 +122,29 @@ mod tests {
         let outcome = open_external_editor_with_command("draft", None);
         assert!(matches!(
             outcome,
-            crate::application::ExternalEditorOutcome::Failed(message)
+            ExternalEditorOutcome::Failed(message)
                 if message == "set $VISUAL or $EDITOR to use an external editor"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_editor_exit_returns_typed_failure_with_status() {
+        let command = EditorCommand {
+            program: OsString::from("sh"),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("exit 7"),
+                OsString::from("sh"),
+            ],
+        };
+
+        let outcome = open_external_editor_with_command("draft", Some(command));
+
+        assert!(matches!(
+            outcome,
+            ExternalEditorOutcome::Failed(message)
+                if message == "external editor exited with status exit status: 7"
         ));
     }
 }
