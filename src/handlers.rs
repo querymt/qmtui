@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::application::{ClipboardTarget, Effect};
+use crate::application::{ClipboardTarget, Effect, RuntimeEvent};
 use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
@@ -42,8 +42,8 @@ fn send_load_session_commands(
 
 /// Handle all keyboard input while an elicitation popup is active.
 ///
-/// Returns `Ok(())` in all cases; the caller should return immediately after
-/// this to avoid routing the key to the normal chat handler.
+/// Returns the ordered effects for the key; the caller should return immediately
+/// afterward to avoid routing the key to the normal chat handler.
 pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     use crate::domain::elicitation::ElicitationFieldKind;
 
@@ -111,12 +111,17 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(Some(&state.custom_input));
                 let display = selected_display(state, true);
-                effects.push(Effect::Command(Command::ElicitationResponse {
-                    elicitation_id: elicitation_id.clone(),
-                    action: "accept".into(),
-                    content: Some(content),
-                }));
-                app.resolve_elicitation(&elicitation_id, &display);
+                effects.push(Effect::CommandThen {
+                    command: Command::ElicitationResponse {
+                        elicitation_id: elicitation_id.clone(),
+                        action: "accept".into(),
+                        content: Some(content),
+                    },
+                    on_sent: RuntimeEvent::ElicitationResponseSent {
+                        elicitation_id,
+                        outcome: display,
+                    },
+                });
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.custom_insert(&mut state.custom_input, character);
@@ -146,12 +151,17 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
     match key.code {
         KeyCode::Esc => {
             let elicitation_id = state.elicitation_id.clone();
-            effects.push(Effect::Command(Command::ElicitationResponse {
-                elicitation_id: elicitation_id.clone(),
-                action: "decline".into(),
-                content: None,
-            }));
-            app.resolve_elicitation(&elicitation_id, "declined");
+            effects.push(Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: elicitation_id.clone(),
+                    action: "decline".into(),
+                    content: None,
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id,
+                    outcome: "declined".into(),
+                },
+            });
         }
         KeyCode::Down => {
             let max = option_count + usize::from(custom_available);
@@ -193,12 +203,17 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(None);
                 let display = selected_display(state, false);
-                effects.push(Effect::Command(Command::ElicitationResponse {
-                    elicitation_id: elicitation_id.clone(),
-                    action: "accept".into(),
-                    content: Some(content),
-                }));
-                app.resolve_elicitation(&elicitation_id, &display);
+                effects.push(Effect::CommandThen {
+                    command: Command::ElicitationResponse {
+                        elicitation_id: elicitation_id.clone(),
+                        action: "accept".into(),
+                        content: Some(content),
+                    },
+                    on_sent: RuntimeEvent::ElicitationResponseSent {
+                        elicitation_id,
+                        outcome: display,
+                    },
+                });
             }
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3126,20 +3141,28 @@ mod model_popup_tests {
         );
         assert_eq!(app.sessions.agent_mode, "review");
         assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
-        assert!(matches!(
-            effects.next_command().expect("expected SetAgentMode(review)"),
-            Command::SetAgentMode { mode } if mode == "review"
-        ));
-        assert!(effects.next_command().is_none());
+        assert_eq!(
+            effects.as_slice(),
+            &[
+                Effect::Command(Command::SetAgentMode {
+                    mode: "review".into(),
+                }),
+                Effect::PersistConfig,
+            ]
+        );
 
-        effects.extend(handle_key(&mut app, key(KeyCode::Tab)));
+        let effects = handle_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.sessions.agent_mode, "plan");
         assert_eq!(app.sessions.mode_before_review, None);
-        assert!(matches!(
-            effects.next_command().expect("expected SetAgentMode(plan)"),
-            Command::SetAgentMode { mode } if mode == "plan"
-        ));
-        assert!(effects.next_command().is_none());
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::SetAgentMode {
+                    mode: "plan".into(),
+                }),
+                Effect::PersistConfig,
+            ]
+        );
     }
 
     #[test]

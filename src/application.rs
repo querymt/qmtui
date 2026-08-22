@@ -7,6 +7,7 @@ use crate::{
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
+    domain::chat::ChatEntry,
     handlers,
     server_manager::ServerEvent,
 };
@@ -30,6 +31,10 @@ pub(crate) enum RuntimeEvent {
     ExternalEditorFinished {
         outcome: ExternalEditorOutcome,
     },
+    ElicitationResponseSent {
+        elicitation_id: String,
+        outcome: String,
+    },
     CommandFailed {
         command: Command,
         message: String,
@@ -52,6 +57,10 @@ pub(crate) enum ExternalEditorOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
     Command(Command),
+    CommandThen {
+        command: Command,
+        on_sent: RuntimeEvent,
+    },
     PersistConfig,
     CopyToClipboard {
         target: ClipboardTarget,
@@ -235,6 +244,34 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             }
             vec![Effect::Terminal(TerminalAction::Redraw)]
         }
+        RuntimeEvent::ElicitationResponseSent {
+            elicitation_id,
+            outcome,
+        } => {
+            let is_active = app
+                .chat
+                .elicitation
+                .as_ref()
+                .is_some_and(|state| state.elicitation_id == elicitation_id);
+            if is_active {
+                app.resolve_elicitation(&elicitation_id, &outcome);
+            } else if let Some(ChatEntry::Elicitation {
+                outcome: card_outcome,
+                ..
+            }) = app.chat.messages.iter_mut().find(|entry| {
+                matches!(
+                    entry,
+                    ChatEntry::Elicitation {
+                        elicitation_id: existing_id,
+                        ..
+                    } if existing_id == &elicitation_id
+                )
+            }) {
+                *card_outcome = Some(outcome);
+                app.render.invalidate_card_cache();
+            }
+            Vec::new()
+        }
         RuntimeEvent::CommandFailed { command, message } => {
             if let Command::Prompt { local_id, .. } = command {
                 app.chat.rollback_pending_prompt(&local_id);
@@ -254,10 +291,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        chat_state::ElicitationUiState,
         connection_state::ServerState,
         domain::{
             auth::{OAuthFlow, OAuthFlowKind},
             chat::ChatEntry,
+            elicitation::ElicitationState,
             mesh::MeshInviteCreatedInfo,
             profile::ProfileInfo,
             session::{SessionGroup, SessionSummary},
@@ -265,14 +304,20 @@ mod tests {
         navigation_state::Screen,
     };
 
-    fn commands(effects: &[Effect]) -> Vec<&Command> {
-        effects
-            .iter()
-            .filter_map(|effect| match effect {
-                Effect::Command(command) => Some(command),
-                _ => None,
-            })
-            .collect()
+    fn add_elicitation(app: &mut App, elicitation_id: &str, active: bool) {
+        app.chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: elicitation_id.into(),
+            message: format!("Question {elicitation_id}"),
+            source: "builtin:question".into(),
+            outcome: None,
+        });
+        if active {
+            let mut state = ElicitationState::new_for_test(Vec::new());
+            state.elicitation_id = elicitation_id.into();
+            state.message = format!("Question {elicitation_id}");
+            app.chat.elicitation = Some(state);
+            app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        }
     }
 
     #[test]
@@ -347,19 +392,19 @@ mod tests {
         let effects = update(&mut app, AppEvent::Connection(ConnectionEvent::Connected));
 
         assert_eq!(
-            commands(&effects),
+            effects,
             vec![
-                &Command::Init,
-                &Command::list_sessions_browse(),
-                &Command::ListAllModels { refresh: false },
-                &Command::LoadSession {
+                Effect::Command(Command::Init),
+                Effect::Command(Command::list_sessions_browse()),
+                Effect::Command(Command::ListAllModels { refresh: false }),
+                Effect::Command(Command::LoadSession {
                     session_id: "session-1".into(),
                     cwd: Some("/repo".into()),
-                },
-                &Command::SubscribeSession {
+                }),
+                Effect::Command(Command::SubscribeSession {
                     session_id: "session-1".into(),
                     agent_id: Some("agent-1".into()),
-                },
+                }),
             ]
         );
     }
@@ -376,15 +421,18 @@ mod tests {
 
         let effects = update(&mut app, AppEvent::Connection(ConnectionEvent::Connected));
 
-        assert!(matches!(
-            commands(&effects).as_slice(),
-            [
-                Command::Init,
-                Command::ListSessions { .. },
-                Command::ListAllModels { refresh: false },
-                Command::AttachRemoteSession { node_id, session_id },
-            ] if node_id == "node-1" && session_id == "remote-1"
-        ));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::Init),
+                Effect::Command(Command::list_sessions_browse()),
+                Effect::Command(Command::ListAllModels { refresh: false }),
+                Effect::Command(Command::AttachRemoteSession {
+                    node_id: "node-1".into(),
+                    session_id: "remote-1".into(),
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -403,11 +451,11 @@ mod tests {
         let effects = update(&mut app, AppEvent::Connection(ConnectionEvent::Connected));
 
         assert_eq!(
-            commands(&effects),
+            effects,
             vec![
-                &Command::Init,
-                &Command::list_sessions_browse(),
-                &Command::ListAllModels { refresh: false },
+                Effect::Command(Command::Init),
+                Effect::Command(Command::list_sessions_browse()),
+                Effect::Command(Command::ListAllModels { refresh: false }),
             ]
         );
         assert_eq!(
@@ -675,6 +723,97 @@ mod tests {
             "external editor failed: editor exited"
         );
         assert_eq!(effects, vec![Effect::Terminal(TerminalAction::Redraw)]);
+    }
+
+    #[test]
+    fn elicitation_response_ack_resolves_the_matching_active_card() {
+        let mut app = App::new();
+        add_elicitation(&mut app, "elic-1", true);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
+                elicitation_id: "elic-1".into(),
+                outcome: "accepted".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(app.chat.elicitation.is_none());
+        assert!(app.chat.elicitation_ui.is_none());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
+                if elicitation_id == "elic-1" && outcome == "accepted"
+        ));
+    }
+
+    #[test]
+    fn elicitation_command_failure_leaves_active_card_pending() {
+        let mut app = App::new();
+        add_elicitation(&mut app, "elic-1", true);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::CommandFailed {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "elic-1".into(),
+                    action: "decline".into(),
+                    content: None,
+                },
+                message: "channel closed".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-1")
+        );
+        assert!(app.chat.elicitation_ui.is_some());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
+                if elicitation_id == "elic-1"
+        ));
+        assert_eq!(app.diagnostics.status, "channel closed");
+    }
+
+    #[test]
+    fn stale_elicitation_ack_backfills_old_card_without_clearing_newer_active() {
+        let mut app = App::new();
+        add_elicitation(&mut app, "elic-old", false);
+        add_elicitation(&mut app, "elic-new", true);
+        app.render.card_cache.processed_messages = 2;
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
+                elicitation_id: "elic-old".into(),
+                outcome: "accepted".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-new")
+        );
+        assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::Elicitation { elicitation_id: old_id, outcome: Some(outcome), .. },
+                ChatEntry::Elicitation { elicitation_id: new_id, outcome: None, .. },
+            ] if old_id == "elic-old" && outcome == "accepted" && new_id == "elic-new"
+        ));
     }
 
     #[test]
