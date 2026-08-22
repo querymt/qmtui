@@ -64,12 +64,11 @@ impl<'a> EffectExecutor<'a> {
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
             let runtime_event = match effect {
-                Effect::Command(command) => self.cmd_tx.send(command.clone()).err().map(|error| {
-                    RuntimeEvent::CommandFailed {
-                        command,
-                        message: error.to_string(),
-                    }
-                }),
+                Effect::Command(command) => self.send_command(command),
+                Effect::CommandThen { command, on_sent } => match self.send_command(command) {
+                    Some(failed) => Some(failed),
+                    None => Some(on_sent),
+                },
                 Effect::PersistConfig => {
                     config::TuiConfig::load().with_app_settings(app).save();
                     None
@@ -83,7 +82,7 @@ impl<'a> EffectExecutor<'a> {
                         outcome: terminal::open_external_editor_with_terminal(
                             terminal,
                             &initial_text,
-                        ),
+                        )?,
                     })
                 }
                 Effect::Terminal(TerminalAction::Redraw) => {
@@ -92,7 +91,7 @@ impl<'a> EffectExecutor<'a> {
                 }
                 Effect::Quit => {
                     app.should_quit = true;
-                    None
+                    return Ok(());
                 }
             };
 
@@ -105,6 +104,16 @@ impl<'a> EffectExecutor<'a> {
             }
         }
         Ok(())
+    }
+
+    fn send_command(&self, command: Command) -> Option<RuntimeEvent> {
+        self.cmd_tx
+            .send(command.clone())
+            .err()
+            .map(|error| RuntimeEvent::CommandFailed {
+                command,
+                message: error.to_string(),
+            })
     }
 }
 
@@ -148,13 +157,15 @@ impl TestEffects {
     }
 
     pub(crate) fn next_command(&mut self) -> Option<Command> {
-        let index = self
-            .effects
-            .iter()
-            .position(|effect| matches!(effect, Effect::Command(_)))?;
-        match self.effects.remove(index) {
-            Effect::Command(command) => Some(command),
-            _ => unreachable!("located effect must be a command"),
+        if !matches!(
+            self.effects.first(),
+            Some(Effect::Command(_) | Effect::CommandThen { .. })
+        ) {
+            return None;
+        }
+        match self.effects.remove(0) {
+            Effect::Command(command) | Effect::CommandThen { command, .. } => Some(command),
+            _ => unreachable!("first effect must contain a command"),
         }
     }
 
@@ -201,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effects_next_command_preserves_non_command_effects() {
+    fn test_effects_next_command_does_not_skip_non_command_effects() {
         let mut effects = TestEffects::default();
         effects.extend(vec![
             Effect::PersistConfig,
@@ -209,8 +220,15 @@ mod tests {
             Effect::Quit,
         ]);
 
-        assert_eq!(effects.next_command(), Some(Command::Init));
-        assert_eq!(effects.as_slice(), &[Effect::PersistConfig, Effect::Quit]);
+        assert_eq!(effects.next_command(), None);
+        assert_eq!(
+            effects.as_slice(),
+            &[
+                Effect::PersistConfig,
+                Effect::Command(Command::Init),
+                Effect::Quit,
+            ]
+        );
     }
 
     #[test]
@@ -232,13 +250,86 @@ mod tests {
             )
             .unwrap();
 
-        assert!(matches!(rx.try_recv(), Ok(Command::Init)));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::ListAllModels { refresh: false })
-        ));
+        assert_eq!(rx.try_recv(), Ok(Command::Init));
         assert!(rx.try_recv().is_err());
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn effect_executor_runs_runtime_effects_before_remaining_effects() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut executor = EffectExecutor::new(&tx);
+        let mut terminal = test_terminal();
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let command = Command::ElicitationResponse {
+            elicitation_id: "test-id".into(),
+            action: "accept".into(),
+            content: Some(serde_json::json!({ "choice": "a" })),
+        };
+
+        executor
+            .execute(
+                &mut terminal,
+                &mut app,
+                vec![
+                    Effect::CommandThen {
+                        command: command.clone(),
+                        on_sent: RuntimeEvent::ElicitationResponseSent {
+                            elicitation_id: "test-id".into(),
+                            outcome: format!("{OUTCOME_BULLET}Alpha"),
+                        },
+                    },
+                    Effect::Command(Command::Init),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(rx.try_recv(), Ok(command));
+        assert_eq!(rx.try_recv(), Ok(Command::Init));
+        assert!(rx.try_recv().is_err());
+        assert!(app.chat.elicitation.is_none());
+        assert!(app.chat.messages.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Elicitation { outcome: Some(outcome), .. }
+                if outcome == &format!("{OUTCOME_BULLET}Alpha")
+        )));
+    }
+
+    #[test]
+    fn effect_executor_command_then_failure_keeps_elicitation_open() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut executor = EffectExecutor::new(&tx);
+        let mut terminal = test_terminal();
+        let mut app = make_app_with_elicitation(make_elicitation_single_select());
+        let command = Command::ElicitationResponse {
+            elicitation_id: "test-id".into(),
+            action: "decline".into(),
+            content: None,
+        };
+
+        executor
+            .execute(
+                &mut terminal,
+                &mut app,
+                vec![Effect::CommandThen {
+                    command,
+                    on_sent: RuntimeEvent::ElicitationResponseSent {
+                        elicitation_id: "test-id".into(),
+                        outcome: "declined".into(),
+                    },
+                }],
+            )
+            .unwrap();
+
+        assert!(app.chat.elicitation.is_some());
+        assert!(
+            app.chat
+                .messages
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::Elicitation { outcome: None, .. }))
+        );
+        assert!(app.diagnostics.status.contains("channel closed"));
     }
 
     #[test]
@@ -353,27 +444,31 @@ mod tests {
     }
 
     #[test]
-    fn elicitation_enter_on_single_select_sends_accept_and_resolves() {
+    fn elicitation_enter_on_single_select_defers_resolution_until_send_ack() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let mut effects = TestEffects::default();
-        // Move to Beta and press Enter
-        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
-        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        assert!(handle_elicitation_key(&mut app, key(KeyCode::Down)).is_empty());
 
-        // Elicitation should be cleared
-        assert!(app.chat.elicitation.is_none());
+        let effects = handle_elicitation_key(&mut app, key(KeyCode::Enter));
 
-        // Accept response sent
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(msg,
-            Command::ElicitationResponse { action, content: Some(ref c), .. }
-            if action == "accept" && c["choice"] == "b"
+        assert_eq!(
+            effects,
+            vec![Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "accept".into(),
+                    content: Some(serde_json::json!({ "choice": "b" })),
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: format!("{OUTCOME_BULLET}Beta"),
+                },
+            }]
+        );
+        assert!(app.chat.elicitation.is_some());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { outcome: None, .. }]
         ));
-
-        // Chat card updated with the selected label
-        assert!(app.chat.messages.iter().any(|m| matches!(m,
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
-        )));
     }
 
     #[test]
@@ -403,11 +498,21 @@ mod tests {
         }
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
-        assert!(app.chat.elicitation.is_none());
-        assert!(matches!(effects.next_command().expect("message sent"),
-            Command::ElicitationResponse { action, content: Some(ref c), .. }
-            if action == "accept" && c["choice"] == "custom\nanswer"
-        ));
+        assert!(app.chat.elicitation.is_some());
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "accept".into(),
+                    content: Some(serde_json::json!({ "choice": "custom\nanswer" })),
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: format!("{OUTCOME_BULLET}custom\nanswer"),
+                },
+            }]
+        );
     }
 
     #[test]
@@ -429,10 +534,21 @@ mod tests {
         assert!(effects.next_command().is_none());
 
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
-        assert!(app.chat.elicitation.is_none());
-        assert!(matches!(effects.next_command().expect("decline sent"),
-            Command::ElicitationResponse { action, .. } if action == "decline"
-        ));
+        assert!(app.chat.elicitation.is_some());
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "decline".into(),
+                    content: None,
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: "declined".into(),
+                },
+            }]
+        );
     }
 
     #[test]
@@ -451,19 +567,30 @@ mod tests {
     }
 
     #[test]
-    fn elicitation_esc_sends_decline_and_resolves() {
+    fn elicitation_esc_defers_decline_resolution_until_send_ack() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let mut effects = TestEffects::default();
-        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
 
-        assert!(app.chat.elicitation.is_none());
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(msg,
-            Command::ElicitationResponse { action, .. } if action == "decline"
+        let effects = handle_elicitation_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(
+            effects,
+            vec![Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "decline".into(),
+                    content: None,
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: "declined".into(),
+                },
+            }]
+        );
+        assert!(app.chat.elicitation.is_some());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { outcome: None, .. }]
         ));
-        assert!(app.chat.messages.iter().any(|m| matches!(m,
-            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "declined"
-        )));
     }
 
     #[test]
@@ -477,18 +604,27 @@ mod tests {
                 kind: ElicitationFieldKind::TextInput,
             }]));
         app.chat.elicitation.as_mut().unwrap().text_input = "Alice".into();
-        let mut effects = TestEffects::default();
-        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        let effects = handle_elicitation_key(&mut app, key(KeyCode::Enter));
 
-        assert!(app.chat.elicitation.is_none());
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(msg,
-            Command::ElicitationResponse { action, content: Some(ref c), .. }
-            if action == "accept" && c["name"] == "Alice"
+        assert_eq!(
+            effects,
+            vec![Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "accept".into(),
+                    content: Some(serde_json::json!({ "name": "Alice" })),
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: "Alice".into(),
+                },
+            }]
+        );
+        assert!(app.chat.elicitation.is_some());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { outcome: None, .. }]
         ));
-        assert!(app.chat.messages.iter().any(|m| matches!(m,
-            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "Alice"
-        )));
     }
 
     #[test]
@@ -560,15 +696,21 @@ mod tests {
 
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
-        assert!(app.chat.elicitation.is_none());
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(msg,
-            Command::ElicitationResponse { action, content: Some(ref c), .. }
-            if action == "accept" && c["confirm"] == true
-        ));
-        assert!(app.chat.messages.iter().any(|m| matches!(m,
-            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "Yes"
-        )));
+        assert!(app.chat.elicitation.is_some());
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "accept".into(),
+                    content: Some(serde_json::json!({ "confirm": true })),
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: "Yes".into(),
+                },
+            }]
+        );
     }
 
     #[test]
@@ -588,15 +730,21 @@ mod tests {
 
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
-        assert!(app.chat.elicitation.is_none());
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(msg,
-            Command::ElicitationResponse { action, content: Some(ref c), .. }
-            if action == "accept" && c["confirm"] == false
-        ));
-        assert!(app.chat.messages.iter().any(|m| matches!(m,
-            ChatEntry::Elicitation { outcome: Some(o), .. } if o == "No"
-        )));
+        assert!(app.chat.elicitation.is_some());
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::CommandThen {
+                command: Command::ElicitationResponse {
+                    elicitation_id: "test-id".into(),
+                    action: "accept".into(),
+                    content: Some(serde_json::json!({ "confirm": false })),
+                },
+                on_sent: RuntimeEvent::ElicitationResponseSent {
+                    elicitation_id: "test-id".into(),
+                    outcome: "No".into(),
+                },
+            }]
+        );
     }
 
     #[test]

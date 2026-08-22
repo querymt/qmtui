@@ -33,16 +33,6 @@ pub(super) fn leave(terminal: &mut AppTerminal) -> anyhow::Result<()> {
 pub(super) fn open_external_editor_with_terminal(
     terminal: &mut AppTerminal,
     initial_text: &str,
-) -> ExternalEditorOutcome {
-    match run_external_editor_with_terminal(terminal, initial_text) {
-        Ok(outcome) => outcome,
-        Err(error) => ExternalEditorOutcome::Failed(error.to_string()),
-    }
-}
-
-fn run_external_editor_with_terminal(
-    terminal: &mut AppTerminal,
-    initial_text: &str,
 ) -> anyhow::Result<ExternalEditorOutcome> {
     terminal.show_cursor()?;
     disable_raw_mode()?;
@@ -53,8 +43,6 @@ fn run_external_editor_with_terminal(
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
-    terminal.clear()?;
-    terminal.autoresize()?;
     Ok(outcome)
 }
 
