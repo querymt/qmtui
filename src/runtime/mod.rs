@@ -4,12 +4,17 @@ mod endpoint;
 mod event_loop;
 mod terminal;
 
-use std::time::Duration;
+use std::{
+    io::Write,
+    process::{Command as ProcessCommand, Stdio},
+    time::Duration,
+};
 
 use crate::{
     acp_client,
     acp_state::AcpAppEvent,
     app::{self, App},
+    application::{self, AppEvent, Effect, RuntimeEvent, TerminalAction},
     command::Command,
     config,
     connection_state::ServerState,
@@ -24,6 +29,7 @@ use endpoint::{
     Cli, EndpointSelection, default_acp_ws_url, detect_launch_cwd, select_acp_endpoint,
 };
 use event_loop::run_loop;
+use terminal::AppTerminal;
 
 use tokio::sync::mpsc;
 
@@ -40,6 +46,131 @@ pub(crate) enum ServerChannelMsg {
     Acp(AcpAppEvent),
 }
 
+pub(super) struct EffectExecutor<'a> {
+    cmd_tx: &'a mpsc::UnboundedSender<Command>,
+}
+
+impl<'a> EffectExecutor<'a> {
+    fn new(cmd_tx: &'a mpsc::UnboundedSender<Command>) -> Self {
+        Self { cmd_tx }
+    }
+
+    pub(super) fn execute(
+        &mut self,
+        terminal: &mut AppTerminal,
+        app: &mut App,
+        effects: Vec<Effect>,
+    ) -> anyhow::Result<()> {
+        let mut effects = effects.into_iter();
+        while let Some(effect) = effects.next() {
+            let runtime_event = match effect {
+                Effect::Command(command) => self.cmd_tx.send(command.clone()).err().map(|error| {
+                    RuntimeEvent::CommandFailed {
+                        command,
+                        message: error.to_string(),
+                    }
+                }),
+                Effect::PersistConfig => {
+                    config::TuiConfig::load().with_app_settings(app).save();
+                    None
+                }
+                Effect::CopyToClipboard { target, text } => Some(RuntimeEvent::ClipboardFinished {
+                    target,
+                    success: copy_text_to_clipboard(&text),
+                }),
+                Effect::OpenExternalEditor { initial_text } => {
+                    Some(RuntimeEvent::ExternalEditorFinished {
+                        outcome: terminal::open_external_editor_with_terminal(
+                            terminal,
+                            &initial_text,
+                        ),
+                    })
+                }
+                Effect::Terminal(TerminalAction::Redraw) => {
+                    terminal::redraw(terminal)?;
+                    None
+                }
+                Effect::Quit => {
+                    app.should_quit = true;
+                    None
+                }
+            };
+
+            if let Some(event) = runtime_event {
+                effects = application::update(app, AppEvent::Runtime(event))
+                    .into_iter()
+                    .chain(effects)
+                    .collect::<Vec<_>>()
+                    .into_iter();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> bool {
+    let commands = [
+        ("xclip", &["-selection", "clipboard"] as &[&str]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("wl-copy", &[]),
+        ("pbcopy", &[]),
+    ];
+
+    for (command, args) in commands {
+        if let Ok(mut child) = ProcessCommand::new(command)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|status| status.success()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestEffects {
+    effects: Vec<Effect>,
+}
+
+#[cfg(test)]
+impl TestEffects {
+    pub(crate) fn extend(&mut self, effects: Vec<Effect>) {
+        self.effects.extend(effects);
+    }
+
+    pub(crate) fn next_command(&mut self) -> Option<Command> {
+        let index = self
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::Command(_)))?;
+        match self.effects.remove(index) {
+            Effect::Command(command) => Some(command),
+            _ => unreachable!("located effect must be a command"),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Effect] {
+        &self.effects
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Effect> {
+        self.effects.iter()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,7 +181,6 @@ mod tests {
     use crate::domain::tool::ToolDetail;
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -58,6 +188,102 @@ mod tests {
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn test_terminal() -> AppTerminal {
+        ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_effects_next_command_preserves_non_command_effects() {
+        let mut effects = TestEffects::default();
+        effects.extend(vec![
+            Effect::PersistConfig,
+            Effect::Command(Command::Init),
+            Effect::Quit,
+        ]);
+
+        assert_eq!(effects.next_command(), Some(Command::Init));
+        assert_eq!(effects.as_slice(), &[Effect::PersistConfig, Effect::Quit]);
+    }
+
+    #[test]
+    fn effect_executor_sends_commands_once_in_order_and_applies_quit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut executor = EffectExecutor::new(&tx);
+        let mut terminal = test_terminal();
+        let mut app = App::new();
+
+        executor
+            .execute(
+                &mut terminal,
+                &mut app,
+                vec![
+                    Effect::Command(Command::Init),
+                    Effect::Quit,
+                    Effect::Command(Command::ListAllModels { refresh: false }),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(Command::Init)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::ListAllModels { refresh: false })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn effect_executor_persists_current_app_settings() {
+        let _guard = crate::config::TestPersistenceGuard::new("effect-executor-persist");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut executor = EffectExecutor::new(&tx);
+        let mut terminal = test_terminal();
+        let mut app = App::new();
+        app.profiles.active_profile_id = Some("fast".into());
+        app.chat.show_thinking = false;
+
+        executor
+            .execute(&mut terminal, &mut app, vec![Effect::PersistConfig])
+            .unwrap();
+
+        let persisted = config::TuiConfig::load();
+        assert_eq!(persisted.profile.id.as_deref(), Some("fast"));
+        assert_eq!(persisted.show_thinking, Some(false));
+    }
+
+    #[test]
+    fn effect_executor_routes_command_failure_back_through_update() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let mut executor = EffectExecutor::new(&tx);
+        let mut terminal = test_terminal();
+        let mut app = App::new();
+        let local_id = app.chat.push_pending_prompt("pending".into());
+
+        executor
+            .execute(
+                &mut terminal,
+                &mut app,
+                vec![Effect::Command(Command::Prompt {
+                    prompt: vec![],
+                    local_id: local_id.clone(),
+                })],
+            )
+            .unwrap();
+
+        assert!(app.chat.messages.iter().all(|entry| {
+            !matches!(entry, ChatEntry::User { message_id: Some(id), .. } if id == &local_id)
+        }));
+        assert!(app.diagnostics.status.contains("channel closed"));
     }
 
     fn make_elicitation_single_select() -> ElicitationState {
@@ -113,32 +339,32 @@ mod tests {
     #[test]
     fn elicitation_down_moves_option_cursor() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
         assert_eq!(app.chat.elicitation_ui.as_ref().unwrap().option_cursor, 1);
     }
 
     #[test]
     fn elicitation_up_does_not_go_below_zero() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Up)));
         assert_eq!(app.chat.elicitation_ui.as_ref().unwrap().option_cursor, 0);
     }
 
     #[test]
     fn elicitation_enter_on_single_select_sends_accept_and_resolves() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
         // Move to Beta and press Enter
-        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         // Elicitation should be cleared
         assert!(app.chat.elicitation.is_none());
 
         // Accept response sent
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["choice"] == "b"
@@ -153,11 +379,11 @@ mod tests {
     #[test]
     fn elicitation_other_opens_multiline_editor_and_submits_custom_answer() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
         assert!(
             app.chat
                 .elicitation_ui
@@ -166,21 +392,19 @@ mod tests {
         );
 
         for c in "custom".chars() {
-            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+            effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(c))));
         }
-        handle_elicitation_key(
+        effects.extend(handle_elicitation_key(
             &mut app,
             modified_key(KeyCode::Enter, KeyModifiers::SHIFT),
-            &tx,
-        )
-        .unwrap();
+        ));
         for c in "answer".chars() {
-            handle_elicitation_key(&mut app, key(KeyCode::Char(c)), &tx).unwrap();
+            effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(c))));
         }
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_none());
-        assert!(matches!(rx.try_recv().expect("message sent"),
+        assert!(matches!(effects.next_command().expect("message sent"),
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["choice"] == "custom\nanswer"
         ));
@@ -189,12 +413,12 @@ mod tests {
     #[test]
     fn elicitation_custom_esc_returns_to_choices_before_declining() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
         for _ in 0..2 {
-            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+            effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
         }
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
 
         assert!(
             app.chat
@@ -202,11 +426,11 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ui| !ui.custom_active)
         );
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
 
-        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
         assert!(app.chat.elicitation.is_none());
-        assert!(matches!(rx.try_recv().expect("decline sent"),
+        assert!(matches!(effects.next_command().expect("decline sent"),
             Command::ElicitationResponse { action, .. } if action == "decline"
         ));
     }
@@ -214,26 +438,26 @@ mod tests {
     #[test]
     fn elicitation_empty_custom_answer_stays_open() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
         for _ in 0..2 {
-            handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+            effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
         }
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_some());
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
     fn elicitation_esc_sends_decline_and_resolves() {
         let mut app = make_app_with_elicitation(make_elicitation_single_select());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
 
         assert!(app.chat.elicitation.is_none());
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, .. } if action == "decline"
         ));
@@ -253,11 +477,11 @@ mod tests {
                 kind: ElicitationFieldKind::TextInput,
             }]));
         app.chat.elicitation.as_mut().unwrap().text_input = "Alice".into();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_none());
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["name"] == "Alice"
@@ -277,9 +501,9 @@ mod tests {
                 required: false,
                 kind: ElicitationFieldKind::TextInput,
             }]));
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Char('H')), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Char('i')), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char('H'))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char('i'))));
         assert_eq!(app.chat.elicitation.as_ref().unwrap().text_input, "Hi");
     }
 
@@ -295,20 +519,23 @@ mod tests {
             }]));
         app.chat.elicitation.as_mut().unwrap().text_input = "Hi".into();
         app.chat.elicitation_ui.as_mut().unwrap().text_cursor = 2;
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Backspace)));
         assert_eq!(app.chat.elicitation.as_ref().unwrap().text_input, "H");
     }
 
     #[test]
     fn elicitation_enter_on_required_boolean_without_toggle_does_not_submit() {
         let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_some(), "popup should remain open");
-        assert!(rx.try_recv().is_err(), "no response should be sent");
+        assert!(
+            effects.next_command().is_none(),
+            "no response should be sent"
+        );
         assert!(
             app.chat
                 .messages
@@ -320,9 +547,9 @@ mod tests {
     #[test]
     fn elicitation_boolean_space_toggles_true_then_enter_submits() {
         let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
         assert_eq!(
             app.chat
                 .elicitation
@@ -331,10 +558,10 @@ mod tests {
             Some(&serde_json::json!(true))
         );
 
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_none());
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == true
@@ -347,10 +574,10 @@ mod tests {
     #[test]
     fn elicitation_boolean_second_space_toggles_false_and_still_submits() {
         let mut app = make_app_with_elicitation(make_boolean_elicitation(true));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
         assert_eq!(
             app.chat
                 .elicitation
@@ -359,10 +586,10 @@ mod tests {
             Some(&serde_json::json!(false))
         );
 
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_none());
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg,
             Command::ElicitationResponse { action, content: Some(ref c), .. }
             if action == "accept" && c["confirm"] == false
@@ -375,16 +602,19 @@ mod tests {
     #[test]
     fn elicitation_key_handler_ignores_empty_field_list() {
         let mut app = make_app_with_elicitation(ElicitationState::new_for_test(vec![]));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_elicitation_key(&mut app, key(KeyCode::Down), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Char(' ')), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        handle_elicitation_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char('x'))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Backspace)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.chat.elicitation.is_some());
-        assert!(rx.try_recv().is_err(), "no response should be sent");
+        assert!(
+            effects.next_command().is_none(),
+            "no response should be sent"
+        );
     }
 
     #[test]
@@ -512,7 +742,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_up_down_navigate_wrapped_input_without_scrolling_history() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "abcdef".into();
@@ -520,97 +750,83 @@ mod external_editor_tests {
         app.composer.input_line_width = 4;
         app.chat.scroll_offset = 7;
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input_cursor, 2);
         assert_eq!(app.chat.scroll_offset, 7);
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input_cursor, 4);
         assert_eq!(app.chat.scroll_offset, 7);
     }
 
     #[test]
     fn chat_pageup_pagedown_still_scroll_history() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.chat.scroll_offset = 3;
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.chat.scroll_offset, 13);
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.chat.scroll_offset, 3);
     }
 
     #[test]
     fn ctrl_x_e_returns_open_editor_action_in_chat() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "draft".into();
-        assert_eq!(
-            handle_key(&mut app, ctrl_x(), &tx).unwrap(),
-            AppAction::None
-        );
+        assert!(handle_key(&mut app, ctrl_x()).is_empty());
 
-        let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
+        effects.extend(handle_key(&mut app, plain_key('e')));
 
-        assert_eq!(action, AppAction::OpenExternalEditor);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenExternalEditor { initial_text }] if initial_text == "draft"
+        ));
         assert!(!app.navigation.chord);
         assert_eq!(app.composer.input, "draft");
     }
 
     #[test]
     fn ctrl_x_e_outside_chat_stays_in_tui() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Sessions;
-        assert_eq!(
-            handle_key(&mut app, ctrl_x(), &tx).unwrap(),
-            AppAction::None
-        );
+        assert!(handle_key(&mut app, ctrl_x()).is_empty());
 
-        let action = handle_key(&mut app, plain_key('e'), &tx).unwrap();
+        effects.extend(handle_key(&mut app, plain_key('e')));
 
-        assert_eq!(action, AppAction::None);
+        assert!(effects.is_empty());
         assert!(app.diagnostics.status.contains("only available in chat"));
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "editor"));
     }
 
     #[test]
     fn ctrl_x_m_outside_chat_does_not_open_model_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Sessions;
-        assert_eq!(
-            handle_key(&mut app, ctrl_x(), &tx).unwrap(),
-            AppAction::None
-        );
+        assert!(handle_key(&mut app, ctrl_x()).is_empty());
 
-        let action = handle_key(&mut app, plain_key('m'), &tx).unwrap();
+        effects.extend(handle_key(&mut app, plain_key('m')));
 
-        assert_eq!(action, AppAction::None);
+        assert!(effects.is_empty());
         assert_ne!(app.navigation.popup, Popup::ModelSelect);
         assert!(app.diagnostics.status.contains("only available in chat"));
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "model"));
@@ -658,7 +874,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_input_accepts_typing_and_submit_while_turn_active() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -666,21 +882,17 @@ mod external_editor_tests {
             name: "read_tool".into(),
         };
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
-        handle_chat_key(
+        ));
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv().expect("prompt sent"),
+            effects.next_command().expect("prompt sent"),
             Command::Prompt { prompt, local_id }
                 if local_id.starts_with("local:pending:")
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "n")
@@ -695,22 +907,20 @@ mod external_editor_tests {
 
     #[test]
     fn chat_submit_normalizes_prompt_before_sending_and_rendering() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.composer.input = "  first line\nsecond line\n  ".into();
         app.composer.input_cursor = app.composer.input.len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv().expect("prompt sent"),
+            effects.next_command().expect("prompt sent"),
             Command::Prompt { prompt, .. }
                 if matches!(prompt.as_slice(), [PromptBlock::Text { text }]
                     if text == "first line\nsecond line")
@@ -723,21 +933,19 @@ mod external_editor_tests {
 
     #[test]
     fn whitespace_only_chat_submit_does_not_send_or_render_prompt() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.composer.input = " \n  ".into();
         app.composer.input_cursor = app.composer.input.len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert!(app.chat.messages.is_empty());
         assert!(app.composer.input.is_empty());
     }
@@ -746,7 +954,7 @@ mod external_editor_tests {
 
     #[test]
     fn left_arrow_with_slash_input_does_not_crash() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/model".into();
@@ -756,12 +964,10 @@ mod external_editor_tests {
 
         // hold left until cursor reaches 0 — must not panic at any step
         for _ in 0..=app.composer.input.len() {
-            handle_chat_key(
+            effects.extend(handle_chat_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
-                &tx,
-            )
-            .unwrap();
+            ));
         }
         assert_eq!(app.composer.input_cursor, 0);
         assert!(app.composer.slash_state.is_none());
@@ -769,7 +975,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_esc_clears_slash_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/mo".into();
@@ -777,31 +983,27 @@ mod external_editor_tests {
         app.composer.refresh_slash_state();
         assert!(app.composer.slash_state.is_some());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.composer.slash_state.is_none());
     }
 
     #[test]
     fn slash_enter_opens_help_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/help".into();
         app.composer.input_cursor = "/help".len();
         app.composer.refresh_slash_state();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::Help);
         assert!(app.composer.input.is_empty());
@@ -809,7 +1011,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_enter_with_partial_completion_executes_command() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/hel".into();
@@ -817,12 +1019,10 @@ mod external_editor_tests {
         app.composer.refresh_slash_state();
         assert!(app.composer.slash_state.is_some());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::Help);
         assert!(app.composer.input.is_empty());
@@ -831,19 +1031,17 @@ mod external_editor_tests {
 
     #[test]
     fn slash_tab_completes_command_name_without_executing() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/hel".into();
         app.composer.input_cursor = "/hel".len();
         app.composer.refresh_slash_state();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         // Completed but not executed — no popup opened
         assert_eq!(app.composer.input, "/help ");
@@ -853,7 +1051,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_down_up_navigates_selection() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/".into();
@@ -861,23 +1059,19 @@ mod external_editor_tests {
         app.composer.refresh_slash_state();
         let initial = app.composer.slash_state.as_ref().unwrap().selected_index;
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(
             app.composer.slash_state.as_ref().unwrap().selected_index,
             initial + 1
         );
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(
             app.composer.slash_state.as_ref().unwrap().selected_index,
             initial
@@ -888,7 +1082,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_mode_no_arg_cycles_mode() {
         let _guard = TestPersistenceGuard::new("slash-mode-cycle");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -897,18 +1091,16 @@ mod external_editor_tests {
         app.composer.input = "/mode".into();
         app.composer.input_cursor = "/mode".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.agent_mode, "plan");
         assert!(app.composer.input.is_empty());
         // SetAgentMode should have been sent
         assert!(matches!(
-            rx.try_recv().expect("SetAgentMode sent"),
+            effects.next_command().expect("SetAgentMode sent"),
             Command::SetAgentMode { mode } if mode == "plan"
         ));
     }
@@ -917,7 +1109,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_mode_plan_switches_to_plan() {
         let _guard = TestPersistenceGuard::new("slash-mode-plan");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -926,23 +1118,21 @@ mod external_editor_tests {
         app.composer.input = "/mode plan".into();
         app.composer.input_cursor = "/mode plan".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.agent_mode, "plan");
         assert!(matches!(
-            rx.try_recv().expect("SetAgentMode sent"),
+            effects.next_command().expect("SetAgentMode sent"),
             Command::SetAgentMode { mode } if mode == "plan"
         ));
     }
 
     #[test]
     fn slash_mode_same_is_idempotent() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -951,12 +1141,10 @@ mod external_editor_tests {
         app.composer.input = "/mode build".into();
         app.composer.input_cursor = "/mode build".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.agent_mode, "build");
         assert!(app.diagnostics.status.contains("already in build"));
@@ -964,7 +1152,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_mode_unknown_shows_error() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -972,12 +1160,10 @@ mod external_editor_tests {
         app.composer.input = "/mode xyz".into();
         app.composer.input_cursor = "/mode xyz".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.diagnostics.status.contains("unknown mode"));
     }
@@ -986,7 +1172,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_high_sets_level() {
         let _guard = TestPersistenceGuard::new("slash-thinking-high");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -994,16 +1180,14 @@ mod external_editor_tests {
         app.composer.input = "/thinking high".into();
         app.composer.input_cursor = "/thinking high".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.models.reasoning_effort, Some("high".into()));
         assert!(matches!(
-            rx.try_recv().expect("SetReasoningEffort sent"),
+            effects.next_command().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "high"
         ));
     }
@@ -1012,7 +1196,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_auto_clears_level() {
         let _guard = TestPersistenceGuard::new("slash-thinking-auto");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1021,16 +1205,14 @@ mod external_editor_tests {
         app.composer.input = "/thinking auto".into();
         app.composer.input_cursor = "/thinking auto".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.models.reasoning_effort, None);
         assert!(matches!(
-            rx.try_recv().expect("SetReasoningEffort sent"),
+            effects.next_command().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "auto"
         ));
     }
@@ -1039,7 +1221,7 @@ mod external_editor_tests {
     #[serial]
     fn slash_thinking_med_alias_sets_medium() {
         let _guard = TestPersistenceGuard::new("slash-thinking-med");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1047,72 +1229,64 @@ mod external_editor_tests {
         app.composer.input = "/thinking med".into();
         app.composer.input_cursor = "/thinking med".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.models.reasoning_effort, Some("medium".into()));
         assert!(matches!(
-            rx.try_recv().expect("SetReasoningEffort sent"),
+            effects.next_command().expect("SetReasoningEffort sent"),
             Command::SetReasoningEffort { reasoning_effort } if reasoning_effort == "medium"
         ));
     }
 
     #[test]
     fn slash_thinking_no_arg_shows_current() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.models.reasoning_effort = Some("high".into());
         app.composer.input = "/thinking".into();
         app.composer.input_cursor = "/thinking".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.diagnostics.status.contains("thinking: high"));
     }
 
     #[test]
     fn slash_thinking_unknown_shows_error() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "/thinking xyz".into();
         app.composer.input_cursor = "/thinking xyz".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.diagnostics.status.contains("unknown level"));
     }
 
     #[test]
     fn slash_thinking_when_disconnected_does_not_change_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.models.reasoning_effort = Some("high".into());
         app.composer.input = "/thinking max".into();
         app.composer.input_cursor = "/thinking max".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         // state must not change when disconnected
         assert_eq!(app.models.reasoning_effort, Some("high".into()));
@@ -1143,20 +1317,18 @@ mod external_editor_tests {
 
     #[test]
     fn slash_fork_sends_latest_boundary() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
         app.composer.input = "/fork".into();
         app.composer.input_cursor = "/fork".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv().expect("ForkSession sent"),
+            effects.next_command().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "user-2"
         ));
         assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("user-2"));
@@ -1164,12 +1336,12 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_f_opens_fork_popup_and_filter_captures_text() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
 
-        handle_key(&mut app, ctrl_x(), &tx).unwrap();
-        handle_key(&mut app, plain_key('f'), &tx).unwrap();
-        handle_key(&mut app, plain_key('b'), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_x()));
+        effects.extend(handle_key(&mut app, plain_key('f')));
+        effects.extend(handle_key(&mut app, plain_key('b')));
 
         assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
         assert_eq!(app.chat.fork_filter, "b");
@@ -1179,35 +1351,33 @@ mod external_editor_tests {
 
     #[test]
     fn ctrl_x_f_in_delegate_view_does_not_open_fork_popup() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
         app.navigation.screen = Screen::Delegate;
 
-        handle_key(&mut app, ctrl_x(), &tx).unwrap();
-        handle_key(&mut app, plain_key('f'), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_x()));
+        effects.extend(handle_key(&mut app, plain_key('f')));
 
         assert_ne!(app.navigation.popup, Popup::ForkTurnSelect);
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert!(app.diagnostics.status.contains("only available in chat"));
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "fork"));
     }
 
     #[test]
     fn slash_fork_in_delegate_view_sends_nothing() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
         app.navigation.screen = Screen::Delegate;
         app.composer.input = "/fork".into();
         app.composer.input_cursor = "/fork".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert!(app.chat.pending_fork_message_id.is_none());
         assert!(app.diagnostics.status.contains("only available in chat"));
         assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "fork"));
@@ -1215,20 +1385,18 @@ mod external_editor_tests {
 
     #[test]
     fn fork_popup_enter_sends_selected_turn() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
         app.open_fork_turn_popup();
         app.chat.fork_filter = "alpha".into();
 
-        handle_fork_turn_popup_key(
+        effects.extend(handle_fork_turn_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv().expect("ForkSession sent"),
+            effects.next_command().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "asst-1"
         ));
         assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("asst-1"));
@@ -1236,19 +1404,17 @@ mod external_editor_tests {
 
     #[test]
     fn fork_popup_enter_with_default_cursor_sends_latest_visible_turn() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = app_with_forkable_messages();
         app.open_fork_turn_popup();
 
-        handle_fork_turn_popup_key(
+        effects.extend(handle_fork_turn_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv().expect("ForkSession sent"),
+            effects.next_command().expect("ForkSession sent"),
             Command::ForkSession { message_id } if message_id == "user-2"
         ));
         assert_eq!(app.chat.pending_fork_message_id.as_deref(), Some("user-2"));
@@ -1256,26 +1422,24 @@ mod external_editor_tests {
 
     #[test]
     fn fork_popup_enter_with_no_eligible_turns_sends_nothing() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
         app.open_fork_turn_popup();
 
-        handle_fork_turn_popup_key(
+        effects.extend(handle_fork_turn_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
         assert!(app.diagnostics.status.contains("no forkable turns"));
     }
 
     #[test]
     fn slash_model_with_arg_prefilters_popup() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1283,12 +1447,10 @@ mod external_editor_tests {
         app.composer.input = "/model sonnet".into();
         app.composer.input_cursor = "/model sonnet".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
         assert_eq!(app.models.model_filter, "sonnet");
@@ -1297,7 +1459,7 @@ mod external_editor_tests {
 
     #[test]
     fn slash_model_no_arg_opens_popup_unfiltered() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1305,12 +1467,10 @@ mod external_editor_tests {
         app.composer.input = "/model".into();
         app.composer.input_cursor = "/model".len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
         assert!(app.models.model_filter.is_empty());
@@ -1318,29 +1478,25 @@ mod external_editor_tests {
 
     #[test]
     fn chat_double_esc_cancels_running_tool_phase() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert!(app.chat.cancel_confirm_active());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert!(matches!(
-            rx.try_recv().expect("cancel sent"),
+            effects.next_command().expect("cancel sent"),
             Command::CancelSession
         ));
         assert_eq!(app.diagnostics.status, "stopping...");
@@ -1352,7 +1508,7 @@ mod external_editor_tests {
 
     #[test]
     fn chat_input_is_blocked_while_undo_is_pending() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1360,43 +1516,35 @@ mod external_editor_tests {
         app.composer.input = "draft".into();
         app.composer.input_cursor = app.composer.input.len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input, "draft");
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input, "draft");
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input_cursor, "draft".len());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input, "draft");
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
     fn chat_input_is_blocked_while_cancel_confirm_is_active() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -1406,48 +1554,37 @@ mod external_editor_tests {
         app.composer.input = "draft".into();
         app.composer.input_cursor = app.composer.input.len();
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert!(app.chat.cancel_confirm_active());
         assert!(app.chat.input_blocked_by_activity());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.composer.input, "draft");
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.diagnostics.status, "press Esc again to stop");
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
 
-        handle_chat_key(
+        effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.diagnostics.status, "stopping...");
         assert!(matches!(
-            rx.try_recv().expect("cancel sent"),
+            effects.next_command().expect("cancel sent"),
             Command::CancelSession
         ));
     }
 }
-
-#[cfg(test)]
-use crate::handlers::handle_key;
 
 fn log_server_binary_discovery(
     app: &mut App,
@@ -1603,13 +1740,14 @@ pub async fn run() -> anyhow::Result<()> {
     let mut terminal = terminal::enter()?;
 
     app.connection.server_state = initial_server_state;
+    let mut executor = EffectExecutor::new(&cmd_tx);
     let result = run_loop(
         &mut terminal,
         &mut app,
         &mut srv_rx,
         &mut conn_rx,
         &mut sup_event_rx,
-        &cmd_tx,
+        &mut executor,
     )
     .await;
 
@@ -1645,7 +1783,6 @@ mod sessions_key_tests {
     use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
         SessionGroup {
@@ -1748,26 +1885,24 @@ mod sessions_key_tests {
         app.sessions.agent_id = Some("agent-1".into());
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abc12345"])];
         app.sessions.session_cursor = 1;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_sessions_key(
+        effects.extend(handle_sessions_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::LoadSession { session_id, cwd: Some(cwd) })
+            effects.next_command(),
+            Some(Command::LoadSession { session_id, cwd: Some(cwd) })
                 if session_id == "abc12345" && cwd == "/a"
         ));
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::SubscribeSession { session_id, agent_id })
+            effects.next_command(),
+            Some(Command::SubscribeSession { session_id, agent_id })
                 if session_id == "abc12345" && agent_id.as_deref() == Some("agent-1")
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -1849,19 +1984,17 @@ mod sessions_key_tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 1;
         app.sessions.session_cursor = 1;
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_sessions_key(
+        effects.extend(handle_sessions_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.sessions.expanded_session_children.contains("root"));
         assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(Command::ListSessionChildren {
+            effects.next_command(),
+            Some(Command::ListSessionChildren {
                 parent_session_id,
                 ..
             }) if parent_session_id == "root"
@@ -1877,17 +2010,15 @@ mod sessions_key_tests {
             .expanded_session_children
             .insert("root".to_string());
         app.sessions.session_cursor = 1;
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_sessions_key(
+        effects.extend(handle_sessions_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert!(!app.sessions.expanded_session_children.contains("root"));
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -2354,20 +2485,18 @@ mod session_popup_key_tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 1;
         app.sessions.session_cursor = 1;
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_session_popup_key(
+        effects.extend(handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert!(app.sessions.expanded_session_children.contains("root"));
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
         assert!(matches!(
-            cmd_rx.try_recv(),
-            Ok(Command::ListSessionChildren {
+            effects.next_command(),
+            Some(Command::ListSessionChildren {
                 parent_session_id,
                 ..
             }) if parent_session_id == "root"
@@ -2384,18 +2513,16 @@ mod session_popup_key_tests {
             .expanded_session_children
             .insert("root".to_string());
         app.sessions.session_cursor = 1;
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_session_popup_key(
+        effects.extend(handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert!(!app.sessions.expanded_session_children.contains("root"));
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -2405,19 +2532,17 @@ mod session_popup_key_tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 1;
         app.sessions.session_cursor = 1;
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_session_popup_key(
+        effects.extend(handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.session_filter, "o");
         assert!(!app.sessions.expanded_session_children.contains("root"));
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -2542,9 +2667,8 @@ mod session_popup_key_tests {
         app.navigation.popup = Popup::SessionSelect;
         app.connection.conn = ConnState::Connected;
         app.connection.launch_cwd = Some("/launch".into());
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        handle_session_popup_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_session_popup_key(
             &mut app,
             KeyEvent {
                 code: KeyCode::Char('n'),
@@ -2552,13 +2676,11 @@ mod session_popup_key_tests {
                 kind: crossterm::event::KeyEventKind::Press,
                 state: crossterm::event::KeyEventState::NONE,
             },
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::NewSession);
         assert_eq!(app.sessions.new_session_path, "/launch");
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -2566,18 +2688,15 @@ mod session_popup_key_tests {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        handle_session_popup_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            &cmd_tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
         assert_eq!(app.sessions.session_filter, "n");
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -2585,44 +2704,36 @@ mod session_popup_key_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.connection.launch_cwd = Some("/launch".into());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
-        handle_key(
+        ));
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::NewSession);
         assert_eq!(app.sessions.new_session_path, "/launch");
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
     fn global_ctrl_x_l_opens_session_popup() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
-        handle_key(
+        ));
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
         assert_eq!(app.sessions.session_popup_tab, 0);
@@ -2631,14 +2742,12 @@ mod session_popup_key_tests {
     #[test]
     fn global_ctrl_l_opens_log_popup() {
         let mut app = App::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::Log);
         assert_eq!(app.diagnostics.log_cursor, 0);
@@ -2651,39 +2760,30 @@ mod session_popup_key_tests {
         app.navigation.popup = Popup::Log;
         app.diagnostics.log_cursor = 2;
         app.diagnostics.log_level_filter = LogLevel::Info;
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.diagnostics.log_filter, "x");
         assert_eq!(app.diagnostics.log_cursor, 0);
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert!(app.diagnostics.log_filter.is_empty());
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.diagnostics.log_level_filter, LogLevel::Warn);
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
         assert_eq!(app.navigation.popup, Popup::None);
     }
 
@@ -2695,19 +2795,16 @@ mod session_popup_key_tests {
         app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path.clear();
         app.sessions.new_session_cursor = 0;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_new_session_popup_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::None);
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::NewSession {
+            effects.next_command(),
+            Some(Command::NewSession {
                 cwd: Some(ref cwd),
                 profile_id: None
             }) if cwd == "/launch"
@@ -2722,18 +2819,15 @@ mod session_popup_key_tests {
         app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path = "proj/subdir".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_new_session_popup_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::NewSession {
+            effects.next_command(),
+            Some(Command::NewSession {
                 cwd: Some(ref cwd),
                 profile_id: None
             }) if cwd == "/launch/proj/subdir"
@@ -2752,14 +2846,11 @@ mod session_popup_key_tests {
                 is_dir: true,
             }],
         });
-
-        let (tx, _rx) = mpsc::unbounded_channel();
-        handle_new_session_popup_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.new_session_path, "/launch/project/");
         assert!(app.sessions.new_session_completion.is_none());
@@ -2779,19 +2870,16 @@ mod session_popup_key_tests {
                 is_dir: true,
             }],
         });
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        handle_key(
+        let mut effects = TestEffects::default();
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.sessions.new_session_path, "/launch/project/");
         assert!(app.sessions.new_session_completion.is_none());
         assert_eq!(app.sessions.agent_mode, "build");
-        assert!(rx.try_recv().is_err());
+        assert!(effects.next_command().is_none());
     }
 
     #[test]
@@ -3057,9 +3145,9 @@ mod delegate_popup_key_tests {
 #[cfg(test)]
 mod chord_reasoning_effort_tests {
     use super::*;
+    use crate::handlers::handle_key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
-    use tokio::sync::mpsc;
 
     fn ctrl_t() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
@@ -3071,15 +3159,17 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_cycles_effort_and_sends_msg() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         assert_eq!(app.models.reasoning_effort, None);
 
-        handle_key(&mut app, ctrl_t(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_t()));
 
         assert_eq!(app.models.reasoning_effort, Some("low".into()));
-        let msg = rx.try_recv().expect("expected SetReasoningEffort message");
+        let msg = effects
+            .next_command()
+            .expect("expected SetReasoningEffort message");
         match msg {
             Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "low");
@@ -3092,15 +3182,17 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_full_cycle_sends_auto_on_wrap() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.models.reasoning_effort = Some("max".into());
 
-        handle_key(&mut app, ctrl_t(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_t()));
 
         assert_eq!(app.models.reasoning_effort, None);
-        let msg = rx.try_recv().expect("expected SetReasoningEffort message");
+        let msg = effects
+            .next_command()
+            .expect("expected SetReasoningEffort message");
         match msg {
             Command::SetReasoningEffort { reasoning_effort } => {
                 assert_eq!(reasoning_effort, "auto");
@@ -3113,10 +3205,10 @@ mod chord_reasoning_effort_tests {
     #[serial]
     fn ctrl_t_status_updated() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
-        handle_key(&mut app, ctrl_t(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_t()));
         // status should reflect the new level
         assert!(
             app.diagnostics.status.contains("low"),
@@ -3127,11 +3219,11 @@ mod chord_reasoning_effort_tests {
 
     #[test]
     fn ctrl_t_when_disconnected_does_not_change_state() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.models.reasoning_effort = Some("high".into());
 
-        handle_key(&mut app, ctrl_t(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_t()));
 
         // state must not change when disconnected
         assert_eq!(app.models.reasoning_effort, Some("high".into()));
@@ -3143,9 +3235,9 @@ mod chord_reasoning_effort_tests {
 mod reasoning_effort_integration_tests {
     use super::*;
     use crate::domain::model::ModelEntry;
+    use crate::handlers::handle_key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
-    use tokio::sync::mpsc;
 
     fn make_model(provider: &str, model: &str) -> ModelEntry {
         ModelEntry {
@@ -3172,21 +3264,19 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn ctrl_t_cycles_reasoning_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.models.reasoning_effort, Some("low".into()));
         assert!(matches!(
-            rx.try_recv(),
-            Ok(Command::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
+            effects.next_command(),
+            Some(Command::SetReasoningEffort { reasoning_effort }) if reasoning_effort == "low"
         ));
     }
 
@@ -3194,7 +3284,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn tab_switches_mode_without_changing_model_or_effort() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
@@ -3203,13 +3293,13 @@ mod reasoning_effort_integration_tests {
         app.models.current_model = Some("claude-sonnet".into());
         app.models.reasoning_effort = Some("high".into());
 
-        handle_key(&mut app, tab_key(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, tab_key()));
 
         assert_eq!(app.sessions.agent_mode, "plan");
         assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
         assert_eq!(app.models.reasoning_effort, Some("high".into()));
 
-        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs: Vec<_> = std::iter::from_fn(|| effects.next_command()).collect();
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, Command::SetAgentMode { mode } if mode == "plan")),
@@ -3227,7 +3317,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn tab_no_cache_entry_leaves_model_and_effort_unchanged() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
@@ -3237,13 +3327,13 @@ mod reasoning_effort_integration_tests {
         app.models.reasoning_effort = Some("high".into());
         // No plan cache entry
 
-        handle_key(&mut app, tab_key(), &tx).unwrap();
+        effects.extend(handle_key(&mut app, tab_key()));
 
         // Mode switched but model/effort unchanged (no cache to restore from)
         assert_eq!(app.sessions.agent_mode, "plan");
         assert_eq!(app.models.reasoning_effort, Some("high".into()));
         assert_eq!(app.models.current_model.as_deref(), Some("claude-sonnet"));
-        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs: Vec<_> = std::iter::from_fn(|| effects.next_command()).collect();
         assert!(
             !msgs
                 .iter()
@@ -3258,7 +3348,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn ctrl_x_m_opens_model_popup_at_current_mode_model() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, _rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.connection.conn = ConnState::Connected;
@@ -3272,18 +3362,14 @@ mod reasoning_effort_integration_tests {
             make_model("openai", "o3-mini"),
         ];
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            &tx,
-        )
-        .unwrap();
-        handle_key(
+        ));
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.navigation.popup, Popup::ModelSelect);
         assert_eq!(app.models.model_filter, "");
@@ -3295,7 +3381,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn model_select_drops_effort_to_auto() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
@@ -3313,16 +3399,14 @@ mod reasoning_effort_integration_tests {
             .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
         assert_eq!(app.models.reasoning_effort, None);
 
-        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs: Vec<_> = std::iter::from_fn(|| effects.next_command()).collect();
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
@@ -3337,7 +3421,7 @@ mod reasoning_effort_integration_tests {
     #[serial]
     fn model_select_no_effort_msg_when_already_auto() {
         let _guard = PersistenceGuard::new("main-test");
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.sessions.session_id = Some("s1".into());
@@ -3355,14 +3439,12 @@ mod reasoning_effort_integration_tests {
             .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
 
-        handle_key(
+        effects.extend(handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+        ));
 
-        let msgs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs: Vec<_> = std::iter::from_fn(|| effects.next_command()).collect();
         assert!(
             !msgs
                 .iter()
@@ -3495,8 +3577,8 @@ mod auth_tests {
     #[test]
     fn auth_list_esc_closes_popup_when_no_selection() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Esc)));
         assert_eq!(app.navigation.popup, Popup::None);
     }
 
@@ -3514,8 +3596,8 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Esc)));
         assert_eq!(app.navigation.popup, Popup::ProviderAuth);
         assert!(app.auth.selected.is_none());
         assert!(app.auth.last_result.is_none());
@@ -3529,15 +3611,15 @@ mod auth_tests {
             make_provider("Groq"),
             make_provider("DeepSeek"),
         ]);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
         assert_eq!(app.auth.cursor, 0);
-        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Down)));
         assert_eq!(app.auth.cursor, 1);
-        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Down)));
         assert_eq!(app.auth.cursor, 2);
-        handle_auth_popup_key(&mut app, key(KeyCode::Down), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Down)));
         assert_eq!(app.auth.cursor, 2); // clamped
-        handle_auth_popup_key(&mut app, key(KeyCode::Up), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Up)));
         assert_eq!(app.auth.cursor, 1);
     }
 
@@ -3554,8 +3636,8 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
         assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
         assert_eq!(app.auth.selected, Some(0));
         assert!(app.auth.last_result.is_none());
@@ -3570,10 +3652,10 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
         assert_eq!(app.auth.selected, Some(0));
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "codex"));
         assert!(app.auth.ui_notice.is_none());
     }
@@ -3586,8 +3668,8 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
         assert_eq!(app.auth.selected, Some(0));
         assert_eq!(app.auth.panel, AuthPanel::List);
         assert!(app.auth.ui_notice.is_none());
@@ -3596,8 +3678,8 @@ mod auth_tests {
     #[test]
     fn auth_list_char_input_filters() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI"), make_provider("Groq")]);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('g')), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('g'))));
         assert_eq!(app.auth.filter, "g");
         assert_eq!(app.auth.cursor, 0);
     }
@@ -3606,8 +3688,8 @@ mod auth_tests {
     fn auth_list_backspace_removes_filter() {
         let mut app = make_app_with_providers(vec![make_provider("OpenAI")]);
         app.auth.filter = "op".into();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Backspace)));
         assert_eq!(app.auth.filter, "o");
     }
 
@@ -3619,8 +3701,8 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, ctrl('k'), &tx).unwrap();
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('k')));
         assert_eq!(app.auth.panel, AuthPanel::ApiKeyInput);
         assert_eq!(app.auth.selected, Some(0));
         assert!(app.auth.ui_notice.is_none());
@@ -3634,9 +3716,9 @@ mod auth_tests {
             success: true,
             message: "old notice".into(),
         });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        handle_auth_popup_key(&mut app, ctrl('o'), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        let mut effects = TestEffects::default();
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('o')));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg, Command::StartOAuthLogin { provider } if provider == "openai"));
         assert!(app.auth.ui_notice.is_none());
     }
@@ -3648,20 +3730,20 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('é')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('ß')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('é'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('ß'))));
         assert_eq!(app.auth.api_key_input, "éß");
         assert_eq!(app.auth.api_key_cursor, 4);
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Left), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Left)));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('x'))));
         assert_eq!(app.auth.api_key_input, "éxß");
         assert_eq!(app.auth.api_key_cursor, 3);
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Right), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Backspace)));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Right)));
         assert_eq!(app.auth.api_key_input, "éß");
         assert_eq!(app.auth.api_key_cursor, 4);
     }
@@ -3671,15 +3753,15 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('s')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('k')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('s'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('k'))));
         assert_eq!(app.auth.api_key_input, "sk");
         assert_eq!(app.auth.api_key_cursor, 2);
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(
             msg,
             Command::SetApiToken { provider, api_key }
@@ -3694,9 +3776,9 @@ mod auth_tests {
         app.auth.panel = AuthPanel::ApiKeyInput;
         app.auth.api_key_input = "abc".into();
         app.auth.api_key_cursor = 3;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Backspace)));
         assert_eq!(app.auth.api_key_input, "ab");
         assert_eq!(app.auth.api_key_cursor, 2);
     }
@@ -3707,9 +3789,9 @@ mod auth_tests {
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
         app.auth.api_key_input = "draft".into();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Esc)));
         assert_eq!(app.auth.panel, AuthPanel::List);
         assert!(app.auth.api_key_input.is_empty());
     }
@@ -3720,11 +3802,11 @@ mod auth_tests {
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
         assert!(app.auth.api_key_masked);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Tab)));
         assert!(!app.auth.api_key_masked);
-        handle_auth_popup_key(&mut app, key(KeyCode::Tab), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Tab)));
         assert!(app.auth.api_key_masked);
     }
 
@@ -3733,10 +3815,10 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg, Command::ClearApiToken { provider } if provider == "groq"));
     }
 
@@ -3745,10 +3827,10 @@ mod auth_tests {
         let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
         app.auth.selected = Some(0);
         app.auth.panel = AuthPanel::ApiKeyInput;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        assert!(rx.try_recv().is_err()); // nothing sent
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
+        assert!(effects.next_command().is_none()); // nothing sent
     }
 
     // ── Key handler tests: OAuth flow panel ───────────────────────────────────
@@ -3764,9 +3846,9 @@ mod auth_tests {
             authorization_url: "https://example.com".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Esc), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Esc)));
         assert_eq!(app.auth.panel, AuthPanel::List);
         assert!(app.auth.oauth_flow.is_none());
     }
@@ -3782,16 +3864,16 @@ mod auth_tests {
             authorization_url: "https://example.com".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('c')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('o')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('d')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('e')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('c'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('o'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('d'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('e'))));
         assert_eq!(app.auth.oauth_response, "code");
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(
             msg,
             Command::CompleteOAuthLogin { flow_id, response }
@@ -3810,10 +3892,10 @@ mod auth_tests {
             authorization_url: "https://example.com/device".into(),
             flow_kind: OAuthFlowKind::DevicePoll,
         });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Enter), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(
             msg,
             Command::CompleteOAuthLogin { flow_id, response }
@@ -3832,17 +3914,17 @@ mod auth_tests {
             authorization_url: "https://example.com".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('é')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('ß')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('é'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('ß'))));
         assert_eq!(app.auth.oauth_response, "éß");
         assert_eq!(app.auth.oauth_response_cursor, 4);
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Left), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Backspace), &tx).unwrap();
-        handle_auth_popup_key(&mut app, key(KeyCode::Right), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Left)));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('x'))));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Backspace)));
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Right)));
         assert_eq!(app.auth.oauth_response, "éß");
         assert_eq!(app.auth.oauth_response_cursor, 4);
     }
@@ -3986,7 +4068,10 @@ mod auth_tests {
         }));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Command::ListAuthProviders));
+        assert!(matches!(
+            cmds[0],
+            Effect::Command(Command::ListAuthProviders)
+        ));
         assert!(app.auth.oauth_flow.is_none());
         assert_eq!(app.auth.panel, AuthPanel::List);
         assert_eq!(
@@ -4019,7 +4104,10 @@ mod auth_tests {
         let cmds = app.handle_acp_event(AcpAppEvent::OAuthResult(result.clone()));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Command::ListAuthProviders));
+        assert!(matches!(
+            cmds[0],
+            Effect::Command(Command::ListAuthProviders)
+        ));
         assert_eq!(app.auth.oauth_flow, Some(flow));
         assert_eq!(app.auth.panel, AuthPanel::OAuthFlow);
         assert_eq!(app.auth.last_result, Some(result));
@@ -4051,10 +4139,10 @@ mod auth_tests {
         provider.oauth_status = Some(OAuthStatus::Connected);
         let mut app = make_app_with_providers(vec![provider]);
         app.auth.selected = Some(0);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(
             msg,
             Command::DisconnectOAuth { provider } if provider == "openai"
@@ -4067,10 +4155,10 @@ mod auth_tests {
         provider.has_stored_api_key = true;
         let mut app = make_app_with_providers(vec![provider]);
         app.auth.selected = Some(0);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(
             msg,
             Command::ClearApiToken { provider } if provider == "groq"
@@ -4082,10 +4170,10 @@ mod auth_tests {
         let app_provider = make_provider("OpenAI"); // not connected, no stored key
         let mut app = make_app_with_providers(vec![app_provider]);
         app.auth.selected = Some(0);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        assert!(rx.try_recv().is_err()); // nothing sent
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        assert!(effects.next_command().is_none()); // nothing sent
     }
 
     #[test]
@@ -4094,10 +4182,10 @@ mod auth_tests {
         provider.oauth_status = Some(OAuthStatus::Connected);
         let mut app = make_app_with_providers(vec![provider]);
         // auth_selected is None
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        assert!(rx.try_recv().is_err()); // nothing sent
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        assert!(effects.next_command().is_none()); // nothing sent
     }
 
     #[test]
@@ -4108,10 +4196,10 @@ mod auth_tests {
         provider.has_stored_api_key = true;
         let mut app = make_app_with_providers(vec![provider]);
         app.auth.selected = Some(0);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('d'), &tx).unwrap();
-        let msg = rx.try_recv().expect("message sent");
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('d')));
+        let msg = effects.next_command().expect("message sent");
         // Should disconnect OAuth first, not clear API key
         assert!(matches!(msg, Command::DisconnectOAuth { .. }));
     }
@@ -4129,26 +4217,19 @@ mod auth_tests {
             authorization_url: "https://auth.example.com/authorize".into(),
             flow_kind: OAuthFlowKind::RedirectCode,
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, ctrl('y'), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, ctrl('y')));
 
-        let expected_notice = AuthUiNotice {
-            provider: Some("codex".into()),
-            success: true,
-            message: "Copied to clipboard".into(),
-        };
-        let expected_url = "https://auth.example.com/authorize";
-        assert!(
-            matches!(
-                (&app.auth.ui_notice, &app.auth.clipboard_fallback),
-                (Some(notice), None) if notice == &expected_notice
-            ) || matches!(
-                (&app.auth.ui_notice, &app.auth.clipboard_fallback),
-                (None, Some(url)) if url == expected_url
-            ),
-            "C-y should show the provider notice or exact fallback URL"
-        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CopyToClipboard {
+                target: crate::application::ClipboardTarget::Auth { provider },
+                text,
+            }] if provider == "codex" && text == "https://auth.example.com/authorize"
+        ));
+        assert!(app.auth.ui_notice.is_none());
+        assert!(app.auth.clipboard_fallback.is_none());
         assert!(app.auth.last_result.is_none());
     }
 
@@ -4156,9 +4237,9 @@ mod auth_tests {
     fn auth_clipboard_fallback_dismisses_on_any_key() {
         let mut app = make_app_with_providers(vec![make_oauth_only("Codex")]);
         app.auth.clipboard_fallback = Some("https://example.com".into());
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
 
-        handle_auth_popup_key(&mut app, key(KeyCode::Char('x')), &tx).unwrap();
+        effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('x'))));
         assert!(app.auth.clipboard_fallback.is_none());
     }
 
@@ -4166,21 +4247,21 @@ mod auth_tests {
 
     #[test]
     fn chord_a_opens_auth_popup_and_sends_list() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut effects = TestEffects::default();
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
 
         // Activate chord mode
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        handle_key(&mut app, ctrl_x, &tx).unwrap();
+        effects.extend(handle_key(&mut app, ctrl_x));
         assert!(app.navigation.chord);
 
         // Press 'a'
-        handle_key(&mut app, key(KeyCode::Char('a')), &tx).unwrap();
+        effects.extend(handle_key(&mut app, key(KeyCode::Char('a'))));
         assert_eq!(app.navigation.popup, Popup::ProviderAuth);
         assert!(!app.navigation.chord);
 
-        let msg = rx.try_recv().expect("message sent");
+        let msg = effects.next_command().expect("message sent");
         assert!(matches!(msg, Command::ListAuthProviders));
     }
 }

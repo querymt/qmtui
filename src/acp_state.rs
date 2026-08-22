@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::acp_client::DelegateModelOverrideInfo;
+use crate::application::Effect;
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::DelegateLifecycleUpdate;
 use crate::diagnostics::LogLevel;
@@ -181,7 +182,10 @@ pub(crate) enum AcpAppEvent {
 }
 
 impl crate::app::App {
-    pub(crate) fn handle_acp_event(&mut self, event: AcpAppEvent) -> Vec<Command> {
+    pub(crate) fn handle_acp_event(&mut self, event: AcpAppEvent) -> Vec<Effect> {
+        fn effects(commands: Vec<Command>) -> Vec<Effect> {
+            commands.into_iter().map(Effect::Command).collect()
+        }
         match event {
             AcpAppEvent::Initialized {
                 agent_id,
@@ -228,7 +232,7 @@ impl crate::app::App {
             AcpAppEvent::Profiles {
                 profiles,
                 active_profile_id,
-            } => self.apply_profile_catalog(profiles, active_profile_id),
+            } => effects(self.apply_profile_catalog(profiles, active_profile_id)),
             AcpAppEvent::ProfileAgents { profile_id, agents } => {
                 if self.desired_agents_profile_id() == Some(profile_id.as_str()) {
                     self.models.replace_profile_agents(profile_id, agents);
@@ -238,7 +242,9 @@ impl crate::app::App {
                             self.models.agents_profile_id.as_deref(),
                         )
                     {
-                        return self.delegate_model_commands_for_session(session_id, profile_id);
+                        return effects(
+                            self.delegate_model_commands_for_session(session_id, profile_id),
+                        );
                     }
                 }
                 vec![]
@@ -290,7 +296,7 @@ impl crate::app::App {
                 self.apply_mesh_status(status);
                 vec![]
             }
-            AcpAppEvent::MeshNodes(nodes) => self.apply_mesh_nodes(nodes),
+            AcpAppEvent::MeshNodes(nodes) => effects(self.apply_mesh_nodes(nodes)),
             AcpAppEvent::MeshInviteCreated(invite) => {
                 self.apply_mesh_invite_created(invite);
                 vec![]
@@ -300,10 +306,10 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::RemoteSessionAttached(attached) => {
-                self.apply_remote_session_attached(attached)
+                effects(self.apply_remote_session_attached(attached))
             }
             AcpAppEvent::SessionList { request, page } => {
-                self.apply_acp_session_list(request, page)
+                effects(self.apply_acp_session_list(request, page))
             }
             AcpAppEvent::SessionListFailed { request, message } => {
                 self.apply_acp_session_list_failure(&request);
@@ -315,12 +321,12 @@ impl crate::app::App {
                 agent_id,
                 session_id,
                 profile_id,
-            } => self.apply_acp_session_created(agent_id, session_id, profile_id),
+            } => effects(self.apply_acp_session_created(agent_id, session_id, profile_id)),
             AcpAppEvent::SessionLoaded {
                 agent_id,
                 session_id,
                 profile_id,
-            } => self.apply_acp_session_loaded(agent_id, session_id, profile_id),
+            } => effects(self.apply_acp_session_loaded(agent_id, session_id, profile_id)),
             AcpAppEvent::SessionUpdate {
                 session_id,
                 update,
@@ -372,12 +378,14 @@ impl crate::app::App {
                         self.render.invalidate_content_cache();
                         self.set_status(LogLevel::Info, "session", "undone - reloading session");
                         if let Some(ref sid) = self.sessions.session_id {
-                            return Command::load_session_commands(
-                                sid.clone(),
-                                self.current_session_cwd(),
-                                self.sessions.agent_id.clone(),
-                            )
-                            .into();
+                            return effects(
+                                Command::load_session_commands(
+                                    sid.clone(),
+                                    self.current_session_cwd(),
+                                    self.sessions.agent_id.clone(),
+                                )
+                                .into(),
+                            );
                         }
                     }
                     UndoResult::Rejected {
@@ -410,12 +418,14 @@ impl crate::app::App {
                             .build_undo_state_from_server_stack(&stack, None, None);
                         self.set_status(LogLevel::Info, "session", "redone - reloading session");
                         if let Some(ref sid) = self.sessions.session_id {
-                            return Command::load_session_commands(
-                                sid.clone(),
-                                self.current_session_cwd(),
-                                self.sessions.agent_id.clone(),
-                            )
-                            .into();
+                            return effects(
+                                Command::load_session_commands(
+                                    sid.clone(),
+                                    self.current_session_cwd(),
+                                    self.sessions.agent_id.clone(),
+                                )
+                                .into(),
+                            );
                         }
                     }
                     RedoResult::Rejected { message, stack } => {
@@ -441,12 +451,14 @@ impl crate::app::App {
                     } => {
                         self.navigation.popup = Popup::None;
                         self.set_status(LogLevel::Info, "fork", "forked - loading session");
-                        return Command::load_session_commands(
-                            forked_session_id,
-                            self.current_session_cwd(),
-                            self.sessions.agent_id.clone(),
-                        )
-                        .into();
+                        return effects(
+                            Command::load_session_commands(
+                                forked_session_id,
+                                self.current_session_cwd(),
+                                self.sessions.agent_id.clone(),
+                            )
+                            .into(),
+                        );
                     }
                     ForkResult::Succeeded {
                         source_session_id: _,
@@ -524,7 +536,7 @@ impl crate::app::App {
                 self.push_log(level, "auth", &result.message);
                 let applied_success = self.auth.apply_oauth_result(result);
                 debug_assert_eq!(applied_success, is_success);
-                vec![Command::ListAuthProviders]
+                vec![Effect::Command(Command::ListAuthProviders)]
             }
             AcpAppEvent::InfoLog { target, message } => {
                 self.push_log(LogLevel::Info, target, message);
@@ -1552,6 +1564,16 @@ fn acp_content_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
+
+    fn command_refs(effects: &[Effect]) -> Vec<&Command> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Command(command) => Some(command),
+                _ => None,
+            })
+            .collect()
+    }
     use crate::chat_state::ElicitationUiState;
     use crate::composer_state::{FileIndexEntryLite, MentionState};
     use crate::domain::activity::{
@@ -1791,7 +1813,7 @@ mod tests {
         });
 
         assert!(matches!(
-            commands.as_slice(),
+            command_refs(&commands).as_slice(),
             [Command::ListProfileAgents { profile_id }] if profile_id == "fast"
         ));
     }
@@ -1825,7 +1847,7 @@ mod tests {
 
         assert_eq!(app.current_session_profile_id(), Some("fast"));
         assert!(matches!(
-            commands.as_slice(),
+            command_refs(&commands).as_slice(),
             [
                 Command::SetAgentMode { mode },
                 Command::ListProfileAgents { profile_id },
@@ -1849,7 +1871,7 @@ mod tests {
 
         assert!(app.current_session_profile_id().is_none());
         assert!(matches!(
-            commands.as_slice(),
+            command_refs(&commands).as_slice(),
             [Command::SetAgentMode { mode }] if mode == "build"
         ));
     }
@@ -2136,7 +2158,7 @@ mod tests {
         });
 
         assert!(matches!(
-            commands.as_slice(),
+            command_refs(&commands).as_slice(),
             [Command::SetDelegateModel {
                 session_id,
                 agent_id,
@@ -2200,7 +2222,7 @@ mod tests {
             "stale-session"
         );
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [Command::ListRemoteSessions { node_id, offset: 0, limit: 50 }]
                 if node_id == "node-1"
         ));
@@ -2309,7 +2331,7 @@ mod tests {
             Some("node-1")
         );
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [
                 Command::LoadSession { session_id: load_id, cwd: None },
                 Command::SubscribeSession { session_id: subscribe_id, agent_id },
@@ -2340,7 +2362,7 @@ mod tests {
             },
         ));
         assert!(matches!(
-            attached.as_slice(),
+            command_refs(&attached).as_slice(),
             [
                 Command::LoadSession { session_id, cwd: Some(cwd) },
                 Command::SubscribeSession { session_id: subscribed_id, agent_id },
@@ -2364,14 +2386,14 @@ mod tests {
             Some("node-2")
         );
         assert_eq!(app.sessions.session_remote_cwd("remote-2"), None);
-        assert_eq!(
-            detached,
-            vec![Command::ListRemoteSessions {
-                node_id: "node-2".into(),
+        assert!(matches!(
+            detached.as_slice(),
+            [Effect::Command(Command::ListRemoteSessions {
+                node_id,
                 offset: 0,
                 limit: 50,
-            }]
-        );
+            })] if node_id == "node-2"
+        ));
     }
 
     #[test]
@@ -2426,18 +2448,18 @@ mod tests {
         assert_eq!(app.sessions.session_groups[0].next_cursor, None);
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            Command::ListSessions {
+            Effect::Command(Command::ListSessions {
                 request: SessionListRequest::WorkspaceFirstPage { cwd },
                 cursor: None,
                 ..
-            } if cwd == "/repo"
+            }) if cwd == "/repo"
         )));
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            Command::ListSessions {
+            Effect::Command(Command::ListSessions {
                 request: SessionListRequest::Discovery,
                 cursor: Some(cursor),
-            } if cursor == "opaque-root-2"
+            }) if cursor == "opaque-root-2"
         )));
     }
 
@@ -2508,10 +2530,10 @@ mod tests {
         );
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            Command::ListSessions {
+            Effect::Command(Command::ListSessions {
                 request: SessionListRequest::WorkspaceFirstPage { cwd },
                 ..
-            } if cwd == "/later"
+            }) if cwd == "/later"
         )));
     }
 
@@ -2680,7 +2702,7 @@ mod tests {
         assert_eq!(app.mesh.mesh_invite_name, "preserved");
         assert_seeded_model_state(&app);
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [
                 Command::SubscribeSession { session_id, agent_id },
                 Command::ListProfileAgents { profile_id },
@@ -2764,7 +2786,7 @@ mod tests {
         assert_eq!(app.delegates.delegate_entries.len(), 1);
         assert_seeded_model_state(&app);
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [Command::SetAgentMode { mode }] if mode == "plan"
         ));
     }
@@ -3620,7 +3642,7 @@ mod tests {
             ["src/main.rs"]
         );
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [
                 Command::LoadSession { session_id: load_id, cwd },
                 Command::SubscribeSession { session_id: subscribe_id, agent_id },
@@ -3739,7 +3761,7 @@ mod tests {
         assert_eq!(app.diagnostics.status, "redone - reloading session");
         assert!(app.chat.can_redo());
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [
                 Command::LoadSession { session_id: load_id, cwd },
                 Command::SubscribeSession { session_id: subscribe_id, agent_id },
@@ -3790,7 +3812,7 @@ mod tests {
         assert_eq!(app.diagnostics.status, "forked - loading session");
         assert_eq!(replies.len(), 2);
         assert!(matches!(
-            replies.as_slice(),
+            command_refs(&replies).as_slice(),
             [
                 Command::LoadSession { session_id: load_id, .. },
                 Command::SubscribeSession { session_id: subscribe_id, agent_id }

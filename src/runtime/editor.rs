@@ -5,8 +5,7 @@ use std::{
     process::Command,
 };
 
-use crate::app::App;
-use crate::diagnostics::LogLevel;
+use crate::application::ExternalEditorOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EditorCommand {
@@ -66,52 +65,35 @@ fn cleanup_temp_editor_file(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-pub(super) fn open_external_editor(initial_text: &str) -> anyhow::Result<Option<String>> {
-    let command = system_editor_command()
-        .ok_or_else(|| anyhow::anyhow!("set $VISUAL or $EDITOR to use an external editor"))?;
-    let path = temp_editor_file_path();
-    fs::write(&path, initial_text)?;
-    let result = run_external_editor(&command, &path);
-    cleanup_temp_editor_file(&path)?;
-    result
+pub(super) fn open_external_editor(initial_text: &str) -> ExternalEditorOutcome {
+    open_external_editor_with_command(initial_text, system_editor_command())
 }
 
-pub(super) fn apply_external_editor_result(app: &mut App, updated_input: String) {
-    app.composer.replace_input_from_editor(updated_input);
-}
+fn open_external_editor_with_command(
+    initial_text: &str,
+    command: Option<EditorCommand>,
+) -> ExternalEditorOutcome {
+    let result = (|| {
+        let command = command
+            .ok_or_else(|| anyhow::anyhow!("set $VISUAL or $EDITOR to use an external editor"))?;
+        let path = temp_editor_file_path();
+        fs::write(&path, initial_text)?;
+        let result = run_external_editor(&command, &path);
+        cleanup_temp_editor_file(&path)?;
+        result
+    })();
 
-pub(super) fn apply_external_editor_outcome(app: &mut App, result: anyhow::Result<Option<String>>) {
     match result {
-        Ok(Some(updated_input)) => {
-            apply_external_editor_result(app, updated_input);
-            app.set_status(
-                LogLevel::Info,
-                "editor",
-                "loaded prompt from external editor",
-            );
-        }
-        Ok(None) => {
-            app.set_status(LogLevel::Info, "editor", "external editor cancelled");
-        }
-        Err(err) => {
-            app.set_status(
-                LogLevel::Error,
-                "editor",
-                format!("external editor failed: {err}"),
-            );
-        }
+        Ok(Some(updated_input)) => ExternalEditorOutcome::Completed(updated_input),
+        Ok(None) => ExternalEditorOutcome::Cancelled,
+        Err(error) => ExternalEditorOutcome::Failed(error.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{editor_command_from_env, open_external_editor_with_command};
     use std::ffi::OsString;
-
-    use crate::app::App;
-
-    use super::{
-        apply_external_editor_outcome, apply_external_editor_result, editor_command_from_env,
-    };
 
     #[test]
     fn editor_command_prefers_visual_over_editor() {
@@ -134,42 +116,13 @@ mod tests {
         let env = [("VISUAL", Some("   ")), ("EDITOR", Some(""))];
         assert!(editor_command_from_env(&env).is_none());
     }
-
     #[test]
-    fn apply_external_editor_result_updates_input_and_cursor() {
-        let mut app = App::new();
-        app.composer.input = "old".into();
-        app.composer.input_cursor = 1;
-        app.composer.input_scroll = 3;
-
-        apply_external_editor_result(&mut app, "new text".into());
-
-        assert_eq!(app.composer.input, "new text");
-        assert_eq!(app.composer.input_cursor, "new text".len());
-        assert_eq!(app.composer.input_scroll, 0);
-    }
-
-    #[test]
-    fn apply_external_editor_outcome_updates_input_on_success() {
-        let mut app = App::new();
-        app.composer.input = "draft".into();
-
-        apply_external_editor_outcome(&mut app, Ok(Some("revised prompt".into())));
-
-        assert_eq!(app.composer.input, "revised prompt");
-        assert_eq!(app.composer.input_cursor, "revised prompt".len());
-        assert_eq!(app.diagnostics.status, "loaded prompt from external editor");
-        assert!(matches!(app.diagnostics.logs.last(), Some(entry) if entry.target == "editor"));
-    }
-
-    #[test]
-    fn apply_external_editor_outcome_keeps_input_on_cancel() {
-        let mut app = App::new();
-        app.composer.input = "draft".into();
-
-        apply_external_editor_outcome(&mut app, Ok(None));
-
-        assert_eq!(app.composer.input, "draft");
-        assert_eq!(app.diagnostics.status, "external editor cancelled");
+    fn missing_editor_returns_typed_failure() {
+        let outcome = open_external_editor_with_command("draft", None);
+        assert!(matches!(
+            outcome,
+            crate::application::ExternalEditorOutcome::Failed(message)
+                if message == "set $VISUAL or $EDITOR to use an external editor"
+        ));
     }
 }
