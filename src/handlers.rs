@@ -3132,8 +3132,7 @@ mod model_popup_tests {
         app.sessions.agent_mode = "plan".into();
         app.composer.input = "/review".into();
         app.composer.input_cursor = app.composer.input.len();
-        let mut effects = TestEffects::default();
-        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
+        let effects = handle_chat_key(&mut app, key(KeyCode::Enter));
         assert!(
             effects
                 .iter()
@@ -3142,8 +3141,8 @@ mod model_popup_tests {
         assert_eq!(app.sessions.agent_mode, "review");
         assert_eq!(app.sessions.mode_before_review.as_deref(), Some("plan"));
         assert_eq!(
-            effects.as_slice(),
-            &[
+            effects,
+            vec![
                 Effect::Command(Command::SetAgentMode {
                     mode: "review".into(),
                 }),
