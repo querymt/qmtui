@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod acp;
 mod acp_client;
 mod acp_state;
 mod app;
@@ -24,6 +25,7 @@ mod profiles_state;
 mod protocol;
 mod render_state;
 pub mod runtime;
+mod runtime_events;
 mod server_manager;
 mod session;
 mod session_state;
@@ -33,4 +35,4 @@ mod themes_gen;
 mod tool_detail;
 mod ui;
 
-pub(crate) use runtime::{ConnectionManagerEvent, ServerChannelMsg};
+pub(crate) use runtime_events::{ConnectionManagerEvent, ServerChannelMsg};

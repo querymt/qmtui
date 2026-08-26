@@ -26,7 +26,7 @@ use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshScopeInfo, MeshStatusInfo, RemoteNodeInfo,
     RemoteSessionAttachInfo, RemoteSessionInfo, RemoteSessionListInfo,
 };
-use crate::domain::model::ModelEntry;
+use crate::domain::model::{DelegateModelOverrideInfo, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
     ForkResult, RedoResult, SessionGroup, SessionListPage, SessionSummary, UndoResult,
@@ -123,13 +123,6 @@ struct AcpProfilesResponse {
 struct AcpProfileAgentsResponse {
     profile_id: String,
     agents: Vec<AgentInfo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct DelegateModelOverrideInfo {
-    pub model_id: String,
-    #[serde(default)]
-    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

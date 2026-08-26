@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
-use crate::{acp_client::AcpEndpoint, config, connection_state::ServerState, server_manager};
+use crate::{acp::AcpEndpoint, config, connection_state::ServerState, server_manager};
 
 pub(super) const DEFAULT_ACP_WS_HOST: &str = "127.0.0.1";
 const DEFAULT_ACP_WS_PORT: &str = "3030";
@@ -177,7 +177,7 @@ pub(super) fn detect_launch_cwd() -> Option<String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use crate::{acp_client::AcpEndpoint, config, connection_state::ServerState};
+    use crate::{acp::AcpEndpoint, config, connection_state::ServerState};
 
     use super::{
         Cli, DEFAULT_ACP_WS_HOST, EndpointSelection, normalize_acp_ws_url, select_acp_endpoint,

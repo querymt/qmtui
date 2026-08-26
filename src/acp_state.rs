@@ -2,7 +2,6 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::acp_client::DelegateModelOverrideInfo;
 use crate::application::Effect;
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::DelegateLifecycleUpdate;
@@ -16,7 +15,7 @@ use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
     RemoteSessionListInfo,
 };
-use crate::domain::model::ModelEntry;
+use crate::domain::model::{DelegateModelOverrideInfo, ModelEntry};
 use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
     ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot,
