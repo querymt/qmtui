@@ -55,7 +55,7 @@ impl WebSocketConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-            .unwrap_or_else(JoinSet::new);
+            .unwrap_or_default();
         let drained = tokio::time::timeout(Duration::from_secs(1), async {
             while spawned.join_next().await.is_some() {}
         })
