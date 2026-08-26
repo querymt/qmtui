@@ -26,7 +26,7 @@ pub(in crate::acp) struct Model {
 }
 
 impl Model {
-    pub(super) fn to_app_model(&self) -> ModelEntry {
+    pub(in crate::acp) fn to_app_model(&self) -> ModelEntry {
         ModelEntry {
             id: self.id.clone(),
             label: self.label.clone(),
@@ -43,13 +43,13 @@ impl Model {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(in crate::acp) struct ModelsMeta {
     #[serde(default)]
-    pub(super) stale: bool,
+    pub(in crate::acp) stale: bool,
     #[serde(default)]
-    pub(super) refresh_in_progress: bool,
+    pub(in crate::acp) refresh_in_progress: bool,
     #[serde(default)]
-    pub(super) remote_node_count: u32,
+    pub(in crate::acp) remote_node_count: u32,
     #[serde(default)]
-    pub(super) remote_timeout_count: u32,
+    pub(in crate::acp) remote_timeout_count: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub(in crate::acp) struct ModelsResponse {
 }
 
 impl ModelsResponse {
-    pub(super) fn should_retry_empty(&self) -> bool {
+    pub(in crate::acp) fn should_retry_empty(&self) -> bool {
         self.models.is_empty()
             || self
                 .meta
@@ -68,7 +68,7 @@ impl ModelsResponse {
     }
 }
 
-pub(super) async fn list<C: AcpConnection>(
+pub(in crate::acp) async fn list<C: AcpConnection>(
     connection: &C,
     refresh: bool,
 ) -> Result<ModelsResponse, acp_sdk::Error> {

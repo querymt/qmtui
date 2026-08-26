@@ -10,14 +10,14 @@ use super::{call, payload};
 use crate::acp::connection::AcpConnection;
 
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct DelegateModelResponse {
-    pub(super) session_id: String,
-    pub(super) agent_id: String,
+pub(in crate::acp) struct DelegateModelResponse {
+    pub(in crate::acp) session_id: String,
+    pub(in crate::acp) agent_id: String,
     #[serde(default)]
-    pub(super) model: Option<DelegateModelOverrideInfo>,
+    pub(in crate::acp) model: Option<DelegateModelOverrideInfo>,
 }
 
-pub(super) async fn set_model<C: AcpConnection>(
+pub(in crate::acp) async fn set_model<C: AcpConnection>(
     connection: &C,
     session_id: String,
     agent_id: String,
@@ -38,7 +38,9 @@ pub(super) async fn set_model<C: AcpConnection>(
     serde_json::from_value(payload(&response).clone()).map_err(acp_sdk::Error::into_internal_error)
 }
 
-pub(super) fn from_value(value: Value) -> Result<Option<DelegationUpdate>, serde_json::Error> {
+pub(in crate::acp) fn from_value(
+    value: Value,
+) -> Result<Option<DelegationUpdate>, serde_json::Error> {
     serde_json::from_value(value).map(from_wire)
 }
 

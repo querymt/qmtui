@@ -7,14 +7,14 @@ use crate::protocol::auth::{AuthProvidersDto, OAuthFlowDto, OAuthResultDto};
 use super::{call, payload};
 use crate::acp::connection::AcpConnection;
 
-pub(super) async fn providers<C: AcpConnection>(
+pub(in crate::acp) async fn providers<C: AcpConnection>(
     connection: &C,
 ) -> Result<Option<AuthProvidersDto>, acp_sdk::Error> {
     let response = call(connection, "querymt/auth/status", json!({})).await?;
     Ok(serde_json::from_value(payload(&response).clone()).ok())
 }
 
-pub(super) async fn start<C: AcpConnection>(
+pub(in crate::acp) async fn start<C: AcpConnection>(
     connection: &C,
     provider: String,
 ) -> Result<Option<OAuthFlow>, acp_sdk::Error> {
@@ -31,7 +31,7 @@ pub(super) async fn start<C: AcpConnection>(
     )
 }
 
-pub(super) async fn complete<C: AcpConnection>(
+pub(in crate::acp) async fn complete<C: AcpConnection>(
     connection: &C,
     flow_id: String,
     response: String,
@@ -44,7 +44,7 @@ pub(super) async fn complete<C: AcpConnection>(
     .await
 }
 
-pub(super) async fn logout<C: AcpConnection>(
+pub(in crate::acp) async fn logout<C: AcpConnection>(
     connection: &C,
     provider: String,
 ) -> Result<Option<OAuthResult>, acp_sdk::Error> {

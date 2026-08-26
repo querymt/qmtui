@@ -7,7 +7,7 @@ use crate::protocol::session::{RedoResultDto, UndoResultDto, UndoStackFrameDto};
 use super::{call, payload};
 use crate::acp::connection::AcpConnection;
 
-pub(super) async fn undo<C: AcpConnection>(
+pub(in crate::acp) async fn undo<C: AcpConnection>(
     connection: &C,
     session_id: String,
     message_id: String,
@@ -25,7 +25,7 @@ pub(super) async fn undo<C: AcpConnection>(
     )
 }
 
-pub(super) async fn redo<C: AcpConnection>(
+pub(in crate::acp) async fn redo<C: AcpConnection>(
     connection: &C,
     session_id: String,
 ) -> Result<Option<RedoResult>, acp_sdk::Error> {
@@ -42,7 +42,7 @@ pub(super) async fn redo<C: AcpConnection>(
     )
 }
 
-pub(super) async fn stack<C: AcpConnection>(
+pub(in crate::acp) async fn stack<C: AcpConnection>(
     connection: &C,
     session_id: &str,
 ) -> Result<UndoStackSnapshot, acp_sdk::Error> {

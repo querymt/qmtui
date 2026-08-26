@@ -8,26 +8,26 @@ use super::{call, payload};
 use crate::acp::connection::AcpConnection;
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub(super) struct ProfilesResponse {
-    pub(super) profiles: Vec<ProfileInfo>,
+pub(in crate::acp) struct ProfilesResponse {
+    pub(in crate::acp) profiles: Vec<ProfileInfo>,
     #[serde(default)]
-    pub(super) active_profile_id: Option<String>,
+    pub(in crate::acp) active_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct ProfileAgentsResponse {
-    pub(super) profile_id: String,
-    pub(super) agents: Vec<AgentInfo>,
+pub(in crate::acp) struct ProfileAgentsResponse {
+    pub(in crate::acp) profile_id: String,
+    pub(in crate::acp) agents: Vec<AgentInfo>,
 }
 
-pub(super) async fn list<C: AcpConnection>(
+pub(in crate::acp) async fn list<C: AcpConnection>(
     connection: &C,
 ) -> Result<ProfilesResponse, acp_sdk::Error> {
     let response = call(connection, "querymt/profiles", json!({})).await?;
     serde_json::from_value(payload(&response).clone()).map_err(acp_sdk::Error::into_internal_error)
 }
 
-pub(super) async fn agents<C: AcpConnection>(
+pub(in crate::acp) async fn agents<C: AcpConnection>(
     connection: &C,
     profile_id: &str,
 ) -> Result<ProfileAgentsResponse, acp_sdk::Error> {

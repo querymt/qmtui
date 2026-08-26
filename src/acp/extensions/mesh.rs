@@ -13,7 +13,7 @@ use crate::protocol::mesh::{
 use super::{call, payload};
 use crate::acp::connection::AcpConnection;
 
-pub(super) async fn status<C: AcpConnection>(
+pub(in crate::acp) async fn status<C: AcpConnection>(
     connection: &C,
 ) -> Result<Option<MeshStatusInfo>, acp_sdk::Error> {
     tolerant_call(
@@ -25,13 +25,13 @@ pub(super) async fn status<C: AcpConnection>(
     .await
 }
 
-pub(super) async fn nodes<C: AcpConnection>(
+pub(in crate::acp) async fn nodes<C: AcpConnection>(
     connection: &C,
 ) -> Result<Option<MeshNodesInfo>, acp_sdk::Error> {
     tolerant_call(connection, "querymt/mesh/nodes", json!({}), nodes_from_wire).await
 }
 
-pub(super) async fn remote_sessions<C: AcpConnection>(
+pub(in crate::acp) async fn remote_sessions<C: AcpConnection>(
     connection: &C,
     node_id: String,
     offset: u32,
@@ -46,7 +46,7 @@ pub(super) async fn remote_sessions<C: AcpConnection>(
     .await
 }
 
-pub(super) async fn create_remote_session<C: AcpConnection>(
+pub(in crate::acp) async fn create_remote_session<C: AcpConnection>(
     connection: &C,
     node_id: String,
     cwd: Option<String>,
@@ -60,7 +60,7 @@ pub(super) async fn create_remote_session<C: AcpConnection>(
     .await
 }
 
-pub(super) async fn attach_remote_session<C: AcpConnection>(
+pub(in crate::acp) async fn attach_remote_session<C: AcpConnection>(
     connection: &C,
     node_id: String,
     session_id: String,
@@ -74,7 +74,7 @@ pub(super) async fn attach_remote_session<C: AcpConnection>(
     .await
 }
 
-pub(super) async fn create_invite<C: AcpConnection>(
+pub(in crate::acp) async fn create_invite<C: AcpConnection>(
     connection: &C,
     mesh_name: Option<String>,
     ttl: Option<String>,

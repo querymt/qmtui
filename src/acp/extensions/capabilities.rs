@@ -4,6 +4,6 @@ use serde_json::{Value, json};
 use super::call;
 use crate::acp::connection::AcpConnection;
 
-pub(super) async fn get<C: AcpConnection>(connection: &C) -> Result<Value, acp_sdk::Error> {
+pub(in crate::acp) async fn get<C: AcpConnection>(connection: &C) -> Result<Value, acp_sdk::Error> {
     call(connection, "querymt/capabilities", json!({})).await
 }
