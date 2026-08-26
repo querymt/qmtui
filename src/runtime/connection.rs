@@ -1,20 +1,13 @@
-use std::time::Duration;
-
 use tokio::sync::mpsc;
 
 use crate::{
-    acp_client::{self, AcpEndpoint},
+    acp::{self, AcpEndpoint},
     app::ConnectionEvent,
     command::Command,
     server_manager::ServerEvent,
 };
 
 use super::{ConnectionManagerEvent, ServerChannelMsg};
-
-fn reconnect_delay_ms(attempt: u32) -> u64 {
-    let capped = attempt.min(5);
-    250 * (1u64 << capped)
-}
 
 pub(super) async fn connection_manager(
     endpoint: AcpEndpoint,
@@ -27,23 +20,9 @@ pub(super) async fn connection_manager(
     match endpoint {
         AcpEndpoint::Stdio { argv } => {
             let _ = sup_event_tx.send(ServerEvent::Starting);
-            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
-                Ok(agent) => agent,
-                Err(err) => {
-                    let message = format!("invalid ACP stdio command: {err:?}");
-                    let _ = sup_event_tx.send(ServerEvent::StartFailed {
-                        error: message.clone(),
-                    });
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        ConnectionEvent::Disconnected { reason: message },
-                    ));
-                    return;
-                }
-            };
-
             let _ = sup_event_tx.send(ServerEvent::Started);
-            let result = acp_client::run_stdio_agent(
-                agent,
+            let result = acp::run(
+                AcpEndpoint::Stdio { argv },
                 &mut cmd_rx,
                 srv_tx,
                 conn_tx.clone(),
@@ -76,18 +55,18 @@ pub(super) async fn connection_manager(
             let mut attempt = 0u32;
             loop {
                 if attempt > 0 {
-                    let delay_ms = reconnect_delay_ms(attempt - 1);
+                    let delay_ms = acp::websocket_retry_delay(attempt - 1).as_millis() as u64;
                     let _ =
                         conn_tx.send(ConnectionManagerEvent::State(ConnectionEvent::Connecting {
                             attempt,
                             delay_ms,
                         }));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(acp::websocket_retry_delay(attempt - 1)).await;
                 }
 
                 let _ = sup_event_tx.send(ServerEvent::Starting);
-                let result = acp_client::run_websocket_agent(
-                    url.clone(),
+                let result = acp::run(
+                    AcpEndpoint::WebSocket { url: url.clone() },
                     &mut cmd_rx,
                     srv_tx.clone(),
                     conn_tx.clone(),
@@ -119,21 +98,5 @@ pub(super) async fn connection_manager(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::reconnect_delay_ms;
-
-    #[test]
-    fn reconnect_delay_caps_after_five_steps() {
-        assert_eq!(reconnect_delay_ms(0), 250);
-        assert_eq!(reconnect_delay_ms(1), 500);
-        assert_eq!(reconnect_delay_ms(2), 1000);
-        assert_eq!(reconnect_delay_ms(3), 2000);
-        assert_eq!(reconnect_delay_ms(4), 4000);
-        assert_eq!(reconnect_delay_ms(5), 8000);
-        assert_eq!(reconnect_delay_ms(8), 8000);
     }
 }

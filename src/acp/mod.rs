@@ -6,7 +6,13 @@ use crate::acp_client;
 use crate::command::Command;
 use crate::runtime_events::{ConnectionManagerEvent, ServerChannelMsg};
 
+mod connection;
+mod retry;
+mod transport;
+
 pub(crate) use crate::acp_client::AcpEndpoint;
+
+pub(crate) use retry::websocket_delay as websocket_retry_delay;
 
 pub(crate) async fn run(
     endpoint: AcpEndpoint,
