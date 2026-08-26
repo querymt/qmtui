@@ -10,6 +10,8 @@ mod commands;
 mod configuration;
 mod connection;
 mod context;
+#[cfg(test)]
+mod contract_tests;
 mod elicitation;
 mod events;
 mod extensions;
@@ -24,6 +26,17 @@ mod transport;
 pub(crate) enum AcpEndpoint {
     Stdio { argv: Vec<String> },
     WebSocket { url: String },
+}
+
+impl AcpEndpoint {
+    pub(crate) fn validate(&self) -> Result<(), agent_client_protocol::Error> {
+        match self {
+            Self::Stdio { argv } => {
+                agent_client_protocol::AcpAgent::from_args(argv.clone()).map(|_| ())
+            }
+            Self::WebSocket { .. } => Ok(()),
+        }
+    }
 }
 
 pub(crate) use retry::websocket_delay as websocket_retry_delay;

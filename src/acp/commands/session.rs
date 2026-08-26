@@ -33,7 +33,7 @@ pub(super) async fn list<C: AcpConnection>(
         }),
         Err(err) => ctx.events.send(AcpAppEvent::SessionListFailed {
             request,
-            message: format!("acp session/list failed: {err:?}"),
+            message: format!("ACP session/list failed: {err:?}"),
         }),
     }
 }
@@ -172,7 +172,7 @@ pub(super) async fn prompt<C: AcpConnection>(
             }
             Err(err) => events.send(AcpAppEvent::PromptFailed {
                 local_id,
-                message: format!("acp prompt failed: {err:?}"),
+                message: format!("ACP prompt failed: {err:?}"),
             }),
         }
         Ok(())

@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::{
     self as acp_sdk, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -20,7 +20,34 @@ use super::super::inbound;
 use super::super::runtime::RuntimeState;
 use super::jsonrpc::Peer;
 
-impl AcpConnection for Peer {
+#[derive(Clone)]
+struct WebSocketConnection {
+    peer: Peer,
+    spawned: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl WebSocketConnection {
+    fn new(peer: Peer) -> Self {
+        Self {
+            peer,
+            spawned: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn abort_spawned(&self) {
+        let handles = std::mem::take(
+            &mut *self
+                .spawned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
+
+impl AcpConnection for WebSocketConnection {
     async fn request<R>(&self, request: R) -> Result<R::Response, acp_sdk::Error>
     where
         R: JsonRpcRequest + Send + Sync + 'static,
@@ -28,7 +55,7 @@ impl AcpConnection for Peer {
     {
         let message = request.to_untyped_message()?;
         let method = message.method.clone();
-        let result = self.request(&message.method, message.params).await?;
+        let result = self.peer.request(&message.method, message.params).await?;
         R::Response::from_value(&method, result)
     }
 
@@ -37,16 +64,20 @@ impl AcpConnection for Peer {
         N: JsonRpcNotification + Send + Sync + 'static,
     {
         let message = notification.to_untyped_message()?;
-        self.notify(&message.method, message.params)
+        self.peer.notify(&message.method, message.params)
     }
 
     fn spawn(
         &self,
         future: impl Future<Output = Result<(), acp_sdk::Error>> + Send + 'static,
     ) -> Result<(), acp_sdk::Error> {
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = future.await;
         });
+        self.spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handle.abort_handle());
         Ok(())
     }
 }
@@ -66,6 +97,7 @@ pub(in crate::acp) async fn run(
     let (mut socket_write, mut socket_read) = socket.split();
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Message>();
     let peer = Peer::new(write_tx);
+    let connection = WebSocketConnection::new(peer.clone());
 
     let writer_peer = peer.clone();
     let writer = tokio::spawn(async move {
@@ -81,6 +113,7 @@ pub(in crate::acp) async fn run(
     });
 
     let reader_peer = peer.clone();
+    let reader_connection = connection.clone();
     let reader_state = state.clone();
     let reader_events = events.clone();
     let reader = tokio::spawn(async move {
@@ -90,13 +123,14 @@ pub(in crate::acp) async fn run(
                 Ok(Message::Text(text)) => {
                     if let Err(err) = inbound::websocket_text(
                         &reader_peer,
+                        &reader_connection,
                         &reader_state,
                         &reader_events,
                         text.as_ref(),
                     )
                     .await
                     {
-                        reader_events.error(format!("acp websocket message failed: {err:?}"));
+                        reader_events.error(format!("ACP WebSocket message failed: {err:?}"));
                     }
                 }
                 Ok(Message::Close(frame)) => {
@@ -108,7 +142,7 @@ pub(in crate::acp) async fn run(
                 Ok(_) => {}
                 Err(err) => {
                     reason = format!("read failed: {err}");
-                    reader_events.error(format!("acp websocket read failed: {err}"));
+                    reader_events.error(format!("ACP WebSocket read failed: {err}"));
                     break;
                 }
             }
@@ -127,18 +161,18 @@ pub(in crate::acp) async fn run(
                     break Ok(());
                 };
                 let context = CommandContext {
-                    connection: &peer,
+                    connection: &connection,
                     state: &state,
                     events: &events,
                 };
                 if let Err(err) = commands::dispatch(context, command).await {
-                    events.error(format!("acp request failed: {err:?}"));
+                    events.error(format!("ACP request failed: {err:?}"));
                 }
             }
             reader_result = &mut reader => {
                 let reason = reader_result.unwrap_or_else(|err| err.to_string());
                 break Err(super::super::connection::internal_error(format!(
-                    "acp websocket connection closed: {reason}"
+                    "ACP WebSocket connection closed: {reason}"
                 )));
             }
             writer_result = &mut writer => {
@@ -147,7 +181,7 @@ pub(in crate::acp) async fn run(
                     .unwrap_or_else(|err| err.to_string());
                 peer.fail_all(&reason).await;
                 break Err(super::super::connection::internal_error(format!(
-                    "acp websocket connection closed: {reason}"
+                    "ACP WebSocket connection closed: {reason}"
                 )));
             }
         }
@@ -155,8 +189,49 @@ pub(in crate::acp) async fn run(
 
     reader.as_mut().abort();
     writer.as_mut().abort();
+    connection.abort_spawned();
     peer.fail_all("connection shutdown").await;
     state.elicitations.clear().await;
     state.assistants.clear().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn abort_spawned_cancels_owned_prompt_work() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let connection = WebSocketConnection::new(Peer::new(tx));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        connection
+            .spawn(async move {
+                struct DropFlag(Arc<AtomicBool>);
+                impl Drop for DropFlag {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _flag = DropFlag(task_dropped);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .expect("spawn owned task");
+        tokio::task::yield_now().await;
+
+        connection.abort_spawned();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned task aborted");
+    }
 }

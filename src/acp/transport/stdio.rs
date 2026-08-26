@@ -114,7 +114,7 @@ pub(in crate::acp) async fn run(
                     events: &events,
                 };
                 if let Err(err) = commands::dispatch(context, command).await {
-                    events.error(format!("acp request failed: {err:?}"));
+                    events.error(format!("ACP request failed: {err:?}"));
                 }
             }
             state.elicitations.clear().await;

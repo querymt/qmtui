@@ -112,7 +112,7 @@ impl Peer {
             return Err(err);
         }
         rx.await
-            .map_err(|_| internal_error(format!("acp websocket request dropped: {method}")))?
+            .map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?
     }
 
     pub(in crate::acp) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
@@ -131,7 +131,7 @@ impl Peer {
         let text = serde_json::to_string(&envelope).map_err(acp_sdk::Error::into_internal_error)?;
         self.tx
             .send(Message::Text(text.into()))
-            .map_err(|err| internal_error(format!("acp websocket send failed: {err}")))
+            .map_err(|err| internal_error(format!("ACP WebSocket send failed: {err}")))
     }
 
     pub(in crate::acp) async fn resolve(&self, envelope: Envelope) {
@@ -143,7 +143,7 @@ impl Peer {
         };
         let result = if let Some(error) = envelope.error {
             Err(internal_error(format!(
-                "acp websocket {} failed: {error}",
+                "ACP WebSocket {} failed: {error}",
                 pending.method
             )))
         } else {
@@ -156,7 +156,7 @@ impl Peer {
         let pending = std::mem::take(&mut *self.pending.lock().await);
         for (_, request) in pending {
             let _ = request.tx.send(Err(internal_error(format!(
-                "acp websocket {} failed: {reason}",
+                "ACP WebSocket {} failed: {reason}",
                 request.method
             ))));
         }

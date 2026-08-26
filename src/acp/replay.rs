@@ -395,6 +395,69 @@ mod tests {
     }
 
     #[test]
+    fn missing_snapshot_returns_no_updates_or_provider() {
+        assert!(snapshot_updates(&json!({})).is_empty());
+        assert!(provider_change(&json!({})).is_none());
+        assert!(delegation_updates(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn native_usage_and_timing_are_not_duplicated() {
+        let replay = vec![
+            AcpSessionUpdate::TimingUpdate { duration_secs: 1 },
+            AcpSessionUpdate::UsageUpdate {
+                used: 1,
+                size: 10,
+                cost_usd: None,
+            },
+        ];
+        let merged = merge_snapshot_stats(
+            replay,
+            vec![
+                AcpSessionUpdate::TimingUpdate { duration_secs: 2 },
+                AcpSessionUpdate::UsageUpdate {
+                    used: 2,
+                    size: 10,
+                    cost_usd: Some(1.0),
+                },
+            ],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(
+            &merged[0],
+            AcpSessionUpdate::TimingUpdate { duration_secs: 1 }
+        ));
+        assert!(matches!(
+            &merged[1],
+            AcpSessionUpdate::UsageUpdate { used: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn provider_change_uses_last_valid_snapshot_event() {
+        let change = provider_change(&json!({
+            "_meta": {
+                SESSION_LOAD_SNAPSHOT_META_KEY: {
+                    "audit": { "events": [
+                        { "kind": { "type": "provider_changed", "data": {
+                            "provider": "first", "model": "one"
+                        } } },
+                        { "kind": { "type": "provider_changed", "data": {
+                            "provider": "second", "model": "two",
+                            "context_limit": "100", "provider_node_id": "node"
+                        } } }
+                    ] }
+                }
+            }
+        }))
+        .expect("provider change");
+        assert_eq!(change.provider, "second");
+        assert_eq!(change.model, "two");
+        assert_eq!(change.context_limit, Some(100));
+        assert_eq!(change.provider_node_id.as_deref(), Some("node"));
+    }
+
+    #[test]
     fn snapshot_decoding_restores_stats_without_wall_clock_age() {
         let updates = snapshot_updates(&json!({
             "_meta": {

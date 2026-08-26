@@ -31,7 +31,7 @@ pub(super) async fn fork<C: AcpConnection>(
             })),
         Err(err) => ctx.events.send(AcpAppEvent::ForkResult(ForkResult::Failed {
             source_session_id: Some(session_id),
-            message: Some(format!("acp fork failed: {err:?}")),
+            message: Some(format!("ACP fork failed: {err:?}")),
         })),
     }
     Ok(())

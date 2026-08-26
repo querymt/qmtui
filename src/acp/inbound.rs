@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
 
+use super::connection::AcpConnection;
 use super::elicitation::{self, PendingResponse};
 use super::events::EventSink;
 use super::extensions::{delegation, mesh, models};
@@ -42,9 +43,16 @@ pub(super) async fn session_notification(
 }
 
 pub(super) fn delegation_notification(events: &EventSink, params: Value) {
+    let version = params.get("version").and_then(Value::as_u64);
     match delegation::from_value(params) {
         Ok(Some(update)) => events.send(AcpAppEvent::DelegationUpdate(update)),
-        Ok(None) => events.info("delegation", "ignored delegation notification version"),
+        Ok(None) => events.info(
+            "delegation",
+            version.map_or_else(
+                || "ignored delegation notification version".to_string(),
+                |version| format!("ignored delegation notification version {version}"),
+            ),
+        ),
         Err(err) => events.info(
             "delegation",
             format!("invalid delegation notification: {err}"),
@@ -52,8 +60,9 @@ pub(super) fn delegation_notification(events: &EventSink, params: Value) {
     }
 }
 
-pub(super) async fn websocket_text(
+pub(super) async fn websocket_text<C: AcpConnection>(
     peer: &Peer,
+    connection: &C,
     state: &Arc<RuntimeState>,
     events: &EventSink,
     text: &str,
@@ -94,10 +103,10 @@ pub(super) async fn websocket_text(
                 delegation_notification(events, envelope.params)
             }
             Some(ExtensionNotification::ModelsChanged) => {
-                spawn_model_refresh(peer.clone(), state.clone(), events.clone())
+                spawn_model_refresh(connection.clone(), state.clone(), events.clone())
             }
             Some(ExtensionNotification::MeshChanged) => {
-                spawn_mesh_refresh(peer.clone(), events.clone())
+                spawn_mesh_refresh(connection.clone(), events.clone())
             }
             None => {}
         },
@@ -105,9 +114,14 @@ pub(super) async fn websocket_text(
     Ok(())
 }
 
-fn spawn_model_refresh(peer: Peer, state: Arc<RuntimeState>, events: EventSink) {
-    tokio::spawn(async move {
-        if let Ok(response) = models::list(&peer, false).await {
+fn spawn_model_refresh<C: AcpConnection>(
+    connection: C,
+    state: Arc<RuntimeState>,
+    events: EventSink,
+) {
+    let task_connection = connection.clone();
+    let _ = connection.spawn(async move {
+        if let Ok(response) = models::list(&task_connection, false).await {
             state.set_models(response.models.clone()).await;
             events.send(AcpAppEvent::Models {
                 models: response
@@ -124,14 +138,17 @@ fn spawn_model_refresh(peer: Peer, state: Arc<RuntimeState>, events: EventSink) 
                     }),
             });
         }
+        Ok(())
     });
 }
 
-fn spawn_mesh_refresh(peer: Peer, events: EventSink) {
-    tokio::spawn(async move {
-        if let Ok(Some(nodes)) = mesh::nodes(&peer).await {
+fn spawn_mesh_refresh<C: AcpConnection>(connection: C, events: EventSink) {
+    let task_connection = connection.clone();
+    let _ = connection.spawn(async move {
+        if let Ok(Some(nodes)) = mesh::nodes(&task_connection).await {
             events.send(AcpAppEvent::MeshNodes(nodes));
         }
+        Ok(())
     });
 }
 
@@ -226,7 +243,22 @@ fn string_alias(params: &Value, camel: &str, snake: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::*;
+
+    fn delegation_value(version: u32) -> Value {
+        json!({
+            "version": version,
+            "sessionId": "parent",
+            "delegationId": "d1",
+            "state": "requested",
+            "targetAgentId": "coder",
+            "objective": "implement",
+            "requestedAt": 1,
+            "updatedAt": 1
+        })
+    }
 
     #[test]
     fn extension_routing_documents_shared_and_websocket_only_styles() {
@@ -247,5 +279,40 @@ mod tests {
             Some(ExtensionNotification::MeshChanged)
         );
         assert_eq!(extension_notification("session/update"), None);
+    }
+
+    #[test]
+    fn delegation_notification_emits_supported_domain_update() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        delegation_notification(&EventSink::new(tx), delegation_value(1));
+        assert!(matches!(
+            rx.try_recv().expect("delegation event"),
+            crate::runtime_events::ServerChannelMsg::Acp(AcpAppEvent::DelegationUpdate(update))
+                if update.delegation_id == "d1"
+        ));
+    }
+
+    #[test]
+    fn delegation_notification_logs_exact_unsupported_version() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        delegation_notification(&EventSink::new(tx), delegation_value(2));
+        assert!(matches!(
+            rx.try_recv().expect("delegation log"),
+            crate::runtime_events::ServerChannelMsg::Acp(AcpAppEvent::InfoLog { target, message })
+                if target == "delegation"
+                    && message == "ignored delegation notification version 2"
+        ));
+    }
+
+    #[test]
+    fn delegation_notification_logs_malformed_payload() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        delegation_notification(&EventSink::new(tx), json!({ "version": 1 }));
+        assert!(matches!(
+            rx.try_recv().expect("delegation log"),
+            crate::runtime_events::ServerChannelMsg::Acp(AcpAppEvent::InfoLog { target, message })
+                if target == "delegation"
+                    && message.starts_with("invalid delegation notification: ")
+        ));
     }
 }

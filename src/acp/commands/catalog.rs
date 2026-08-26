@@ -47,7 +47,7 @@ pub(super) async fn set_session_model<C: AcpConnection>(
     ctx.events.info(
         "acp",
         format!(
-            "acp setsessionmodel: provider={} model={} id={}{node_part}",
+            "ACP SetSessionModel: provider={} model={} id={}{node_part}",
             model.provider, model.model, model_id
         ),
     );
