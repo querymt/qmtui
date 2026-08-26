@@ -11,18 +11,18 @@ use tokio_tungstenite::tungstenite::Message;
 use super::super::connection::internal_error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct Envelope {
-    pub(super) jsonrpc: String,
+pub(in crate::acp) struct Envelope {
+    pub(in crate::acp) jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<Value>,
+    pub(in crate::acp) id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) method: Option<String>,
+    pub(in crate::acp) method: Option<String>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub(super) params: Value,
+    pub(in crate::acp) params: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) result: Option<Value>,
+    pub(in crate::acp) result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<Value>,
+    pub(in crate::acp) error: Option<Value>,
 }
 
 impl Envelope {
@@ -78,14 +78,14 @@ struct PendingRequest {
 }
 
 #[derive(Clone)]
-pub(super) struct Peer {
+pub(in crate::acp) struct Peer {
     tx: mpsc::UnboundedSender<Message>,
     pending: Arc<Mutex<HashMap<i64, PendingRequest>>>,
     next_id: Arc<AtomicI64>,
 }
 
 impl Peer {
-    pub(super) fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
+    pub(in crate::acp) fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
         Self {
             tx,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -93,7 +93,7 @@ impl Peer {
         }
     }
 
-    pub(super) async fn request(
+    pub(in crate::acp) async fn request(
         &self,
         method: &str,
         params: Value,
@@ -115,11 +115,11 @@ impl Peer {
             .map_err(|_| internal_error(format!("acp websocket request dropped: {method}")))?
     }
 
-    pub(super) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
+    pub(in crate::acp) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
         self.send(Envelope::notification(method, params))
     }
 
-    pub(super) fn respond(
+    pub(in crate::acp) fn respond(
         &self,
         id: Value,
         result: Result<Value, acp_sdk::Error>,
@@ -134,7 +134,7 @@ impl Peer {
             .map_err(|err| internal_error(format!("acp websocket send failed: {err}")))
     }
 
-    pub(super) async fn resolve(&self, envelope: Envelope) {
+    pub(in crate::acp) async fn resolve(&self, envelope: Envelope) {
         let Some(id) = envelope.id.and_then(|id| id.as_i64()) else {
             return;
         };
@@ -152,7 +152,7 @@ impl Peer {
         let _ = pending.tx.send(result);
     }
 
-    pub(super) async fn fail_all(&self, reason: &str) {
+    pub(in crate::acp) async fn fail_all(&self, reason: &str) {
         let pending = std::mem::take(&mut *self.pending.lock().await);
         for (_, request) in pending {
             let _ = request.tx.send(Err(internal_error(format!(

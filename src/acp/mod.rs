@@ -6,8 +6,15 @@ use crate::acp_client;
 use crate::command::Command;
 use crate::runtime_events::{ConnectionManagerEvent, ServerChannelMsg};
 
+mod assistant_buffer;
+mod configuration;
 mod connection;
+mod elicitation;
+mod events;
+mod extensions;
+mod replay;
 mod retry;
+mod runtime;
 mod transport;
 
 pub(crate) use crate::acp_client::AcpEndpoint;
