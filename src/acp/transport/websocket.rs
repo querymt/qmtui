@@ -1,11 +1,13 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agent_client_protocol::{
     self as acp_sdk, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::app::ConnectionEvent;
@@ -23,26 +25,44 @@ use super::jsonrpc::Peer;
 #[derive(Clone)]
 struct WebSocketConnection {
     peer: Peer,
-    spawned: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    spawned: Arc<Mutex<Option<JoinSet<()>>>>,
 }
 
 impl WebSocketConnection {
     fn new(peer: Peer) -> Self {
         Self {
             peer,
-            spawned: Arc::new(Mutex::new(Vec::new())),
+            spawned: Arc::new(Mutex::new(Some(JoinSet::new()))),
         }
     }
 
+    #[cfg(test)]
     fn abort_spawned(&self) {
-        let handles = std::mem::take(
-            &mut *self
-                .spawned
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for handle in handles {
-            handle.abort();
+        if let Some(spawned) = self
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            spawned.abort_all();
+        }
+    }
+
+    async fn shutdown(&self, reason: &str) {
+        self.peer.fail_all(reason).await;
+        let mut spawned = self
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(JoinSet::new);
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            while spawned.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            spawned.abort_all();
+            while spawned.join_next().await.is_some() {}
         }
     }
 }
@@ -71,13 +91,16 @@ impl AcpConnection for WebSocketConnection {
         &self,
         future: impl Future<Output = Result<(), acp_sdk::Error>> + Send + 'static,
     ) -> Result<(), acp_sdk::Error> {
-        let handle = tokio::spawn(async move {
-            let _ = future.await;
-        });
-        self.spawned
+        if let Some(spawned) = self
+            .spawned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(handle.abort_handle());
+            .as_mut()
+        {
+            spawned.spawn(async move {
+                let _ = future.await;
+            });
+        }
         Ok(())
     }
 }
@@ -187,10 +210,9 @@ pub(in crate::acp) async fn run(
         }
     };
 
+    connection.shutdown("connection shutdown").await;
     reader.as_mut().abort();
     writer.as_mut().abort();
-    connection.abort_spawned();
-    peer.fail_all("connection shutdown").await;
     state.elicitations.clear().await;
     state.assistants.clear().await;
     result
@@ -201,7 +223,129 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_async;
+
+    use crate::acp_state::AcpAppEvent;
+    use crate::command::PromptBlock;
+
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_publishes_prompt_failure_before_returning() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket listener");
+        let url = format!("ws://{}", listener.local_addr().expect("listener address"));
+        let (prompt_seen_tx, prompt_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept WebSocket client");
+            let mut socket = accept_async(stream).await.expect("accept WebSocket");
+
+            let message = socket
+                .next()
+                .await
+                .expect("new-session request")
+                .expect("valid new-session message");
+            let Message::Text(text) = message else {
+                panic!("expected text new-session request");
+            };
+            let request: serde_json::Value =
+                serde_json::from_str(text.as_ref()).expect("new-session JSON");
+            assert_eq!(request["method"], "session/new");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send new-session response");
+
+            let message = socket
+                .next()
+                .await
+                .expect("prompt request")
+                .expect("valid prompt message");
+            let Message::Text(text) = message else {
+                panic!("expected text prompt request");
+            };
+            let request: serde_json::Value =
+                serde_json::from_str(text.as_ref()).expect("prompt JSON");
+            assert_eq!(request["method"], "session/prompt");
+            prompt_seen_tx.send(()).expect("signal pending prompt");
+            std::future::pending::<()>().await;
+        });
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let mut connection_task =
+            tokio::spawn(async move { run(url, &mut cmd_rx, srv_tx, conn_tx, None).await });
+        cmd_tx
+            .send(Command::NewSession {
+                cwd: None,
+                profile_id: None,
+            })
+            .expect("send new-session command");
+        cmd_tx
+            .send(Command::Prompt {
+                prompt: vec![PromptBlock::Text {
+                    text: "hello".to_string(),
+                }],
+                local_id: "local-1".to_string(),
+            })
+            .expect("send prompt command");
+        tokio::time::timeout(Duration::from_secs(1), prompt_seen_rx)
+            .await
+            .expect("prompt request reached WebSocket")
+            .expect("prompt signal sender");
+
+        drop(cmd_tx);
+        let prompt_message = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    message = srv_rx.recv() => {
+                        if let Some(ServerChannelMsg::Acp(AcpAppEvent::PromptFailed {
+                            local_id,
+                            message,
+                        })) = message
+                        {
+                            break (local_id, message);
+                        }
+                    }
+                    result = &mut connection_task => {
+                        panic!("WebSocket teardown returned before PromptFailed: {result:?}");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("prompt failure published during teardown");
+        assert_eq!(prompt_message.0, "local-1");
+        assert!(prompt_message.1.contains("connection shutdown"));
+        connection_task
+            .await
+            .expect("WebSocket connection task")
+            .expect("command-channel shutdown");
+
+        let duplicate_failures = std::iter::from_fn(|| srv_rx.try_recv().ok())
+            .filter(|message| {
+                matches!(
+                    message,
+                    ServerChannelMsg::Acp(AcpAppEvent::PromptFailed { .. })
+                )
+            })
+            .count();
+        assert_eq!(duplicate_failures, 0);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn abort_spawned_cancels_owned_prompt_work() {
