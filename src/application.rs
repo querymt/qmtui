@@ -260,7 +260,7 @@ mod tests {
         domain::{
             activity::{
                 ActivityState, DelegateChildState, DelegateStatus, DelegationState,
-                DelegationUpdate,
+                DelegationUpdate, SessionOp,
             },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::ChatEntry,
@@ -268,9 +268,12 @@ mod tests {
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             model::DelegateModelPreference,
             profile::{AgentInfo, ProfileInfo},
-            session::{SessionGroup, SessionListPage, SessionSummary},
+            session::{
+                ForkResult, RedoResult, SessionGroup, SessionListPage, SessionSummary, UndoResult,
+                UndoStackSnapshot, UndoableTurn,
+            },
         },
-        navigation_state::Screen,
+        navigation_state::{Popup, Screen},
     };
 
     fn add_elicitation(app: &mut App, elicitation_id: &str, active: bool) {
@@ -1564,6 +1567,447 @@ mod tests {
         assert_eq!(diagnostics[0].message, "error: backend rejected prompt");
         assert_eq!(app.composer.input, "preserved input");
         assert_eq!(app.mesh.mesh_invite_name, "preserved invite");
+    }
+
+    #[test]
+    fn chat_history_stack_route_replaces_only_undo_state() {
+        let mut app = App::new();
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.streaming_content = "content".into();
+        app.chat.streaming_content_message_id = Some("content-id".into());
+        app.chat.streaming_thinking = "thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-id".into());
+        app.chat.recent_prompt_text = Some("prompt".into());
+        app.chat.pending_fork_message_id = Some("fork-target".into());
+        app.render.streaming_cache.store(7, Vec::new());
+        app.render.streaming_thinking_cache.store(8, Vec::new());
+        app.render.card_cache.processed_messages = 9;
+        let log_count = app.diagnostics.logs.len();
+        let status = app.diagnostics.status.clone();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::UndoStack(UndoStackSnapshot {
+                message_ids: vec!["one".into()],
+            })),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::SessionOp(SessionOp::Undo));
+        assert_eq!(app.chat.streaming_content, "content");
+        assert_eq!(
+            app.chat.streaming_content_message_id.as_deref(),
+            Some("content-id")
+        );
+        assert_eq!(app.chat.streaming_thinking, "thinking");
+        assert_eq!(
+            app.chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert_eq!(app.chat.recent_prompt_text.as_deref(), Some("prompt"));
+        assert_eq!(
+            app.chat.pending_fork_message_id.as_deref(),
+            Some("fork-target")
+        );
+        assert_eq!(
+            app.chat
+                .undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("one")
+        );
+        assert!(app.render.streaming_cache.get(7).is_some());
+        assert!(app.render.streaming_thinking_cache.get(8).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(app.diagnostics.logs.len(), log_count);
+        assert_eq!(app.diagnostics.status, status);
+    }
+
+    #[test]
+    fn chat_history_undo_routes_apply_release_sensitive_asymmetry_and_reload_context() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.sessions.agent_id = Some("agent-current".into());
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/group".into()),
+            sessions: vec![SessionSummary {
+                session_id: "active".into(),
+                cwd: Some("/active-session".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.connection.launch_cwd = Some("/launch".into());
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.undoable_turns = vec![
+            UndoableTurn {
+                turn_id: "turn-one".into(),
+                message_id: "one".into(),
+                text: "first".into(),
+            },
+            UndoableTurn {
+                turn_id: "turn-two".into(),
+                message_id: "two".into(),
+                text: "second".into(),
+            },
+        ];
+        app.chat.streaming_content = "discard content".into();
+        app.chat.streaming_content_message_id = Some("content-id".into());
+        app.chat.streaming_thinking = "keep thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-id".into());
+        app.chat.recent_prompt_text = Some("discard prompt".into());
+        app.render.streaming_cache.store(15, Vec::new());
+        app.render.streaming_thinking_cache.store(13, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        let log_count = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::UndoResult(UndoResult::Applied {
+                target_message_id: None,
+                reverted_files: vec!["src/main.rs".into()],
+                message: Some("ignored success".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into(), "two".into()],
+                },
+            })),
+        );
+
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_content_message_id.is_none());
+        assert_eq!(app.chat.streaming_thinking, "keep thinking");
+        assert_eq!(
+            app.chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert!(app.chat.recent_prompt_text.is_none());
+        let state = app.chat.undo_state.as_ref().expect("undo state");
+        assert_eq!(state.frontier_message_id.as_deref(), Some("two"));
+        assert!(state.stack[0].reverted_files.is_empty());
+        assert_eq!(state.stack[1].reverted_files, ["src/main.rs"]);
+        assert!(app.render.streaming_cache.get(15).is_none());
+        assert!(app.render.streaming_thinking_cache.get(13).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(app.diagnostics.status, "undone - reloading session");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "session");
+        assert_eq!(diagnostics[0].message, "undone - reloading session");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "active".into(),
+                    cwd: Some("/active-session".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "active".into(),
+                    agent_id: Some("agent-current".into()),
+                }),
+            ]
+        );
+
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.streaming_content = "preserve content".into();
+        app.chat.streaming_content_message_id = Some("preserve-content-id".into());
+        app.chat.streaming_thinking = "preserve thinking".into();
+        app.chat.streaming_thinking_message_id = Some("preserve-thinking-id".into());
+        app.chat.recent_prompt_text = Some("preserve prompt".into());
+        app.render.streaming_cache.store(16, Vec::new());
+        app.render.streaming_thinking_cache.store(17, Vec::new());
+        app.render.card_cache.processed_messages = 8;
+        let log_count = app.diagnostics.logs.len();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::UndoResult(UndoResult::Rejected {
+                target_message_id: Some("one".into()),
+                message: None,
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into(), "two".into()],
+                },
+            })),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(app.chat.streaming_content, "preserve content");
+        assert_eq!(
+            app.chat.streaming_content_message_id.as_deref(),
+            Some("preserve-content-id")
+        );
+        assert_eq!(app.chat.streaming_thinking, "preserve thinking");
+        assert_eq!(
+            app.chat.streaming_thinking_message_id.as_deref(),
+            Some("preserve-thinking-id")
+        );
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserve prompt")
+        );
+        assert_eq!(
+            app.chat
+                .undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("one")
+        );
+        assert!(app.render.streaming_cache.get(16).is_some());
+        assert!(app.render.streaming_thinking_cache.get(17).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert_eq!(app.diagnostics.status, "undo failed");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Warn);
+        assert_eq!(diagnostics[0].target, "session");
+        assert_eq!(diagnostics[0].message, "undo failed");
+    }
+
+    #[test]
+    fn chat_history_redo_routes_preserve_streams_and_reload_only_when_applied() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.sessions.agent_id = Some("agent-current".into());
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/group-cwd".into()),
+            sessions: vec![SessionSummary {
+                session_id: "active".into(),
+                cwd: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.connection.launch_cwd = Some("/launch".into());
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        app.chat.streaming_content = "keep content".into();
+        app.chat.streaming_content_message_id = Some("content-id".into());
+        app.chat.streaming_thinking = "keep thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-id".into());
+        app.chat.recent_prompt_text = Some("keep prompt".into());
+        app.render.streaming_cache.store(12, Vec::new());
+        app.render.streaming_thinking_cache.store(13, Vec::new());
+        app.render.card_cache.processed_messages = 14;
+        let log_count = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::RedoResult(RedoResult::Applied {
+                message: Some("ignored success".into()),
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into()],
+                },
+            })),
+        );
+
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(app.chat.streaming_content, "keep content");
+        assert_eq!(
+            app.chat.streaming_content_message_id.as_deref(),
+            Some("content-id")
+        );
+        assert_eq!(app.chat.streaming_thinking, "keep thinking");
+        assert_eq!(
+            app.chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert_eq!(app.chat.recent_prompt_text.as_deref(), Some("keep prompt"));
+        assert!(app.render.streaming_cache.get(12).is_some());
+        assert!(app.render.streaming_thinking_cache.get(13).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 14);
+        assert_eq!(app.diagnostics.status, "redone - reloading session");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "session");
+        assert_eq!(diagnostics[0].message, "redone - reloading session");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "active".into(),
+                    cwd: Some("/group-cwd".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "active".into(),
+                    agent_id: Some("agent-current".into()),
+                }),
+            ]
+        );
+
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        let log_count = app.diagnostics.logs.len();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::RedoResult(RedoResult::Rejected {
+                message: None,
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into(), "two".into()],
+                },
+            })),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(app.diagnostics.status, "redo failed");
+        assert_eq!(
+            app.chat
+                .undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("one")
+        );
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Warn);
+        assert_eq!(diagnostics[0].target, "session");
+        assert_eq!(diagnostics[0].message, "redo failed");
+    }
+
+    #[test]
+    fn chat_history_fork_routes_apply_popup_diagnostics_and_load_context_exactly() {
+        let mut app = App::new();
+        app.sessions.agent_id = Some("agent-current".into());
+        app.connection.launch_cwd = Some("/launch-cwd".into());
+        app.navigation.popup = Popup::ForkTurnSelect;
+        app.chat.pending_fork_message_id = Some("fork-target".into());
+        let log_count = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ForkResult(ForkResult::Succeeded {
+                source_session_id: Some("ignored-source".into()),
+                forked_session_id: Some("forked".into()),
+                message: Some("ignored success".into()),
+            })),
+        );
+
+        assert!(app.chat.pending_fork_message_id.is_none());
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.diagnostics.status, "forked - loading session");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "fork");
+        assert_eq!(diagnostics[0].message, "forked - loading session");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "forked".into(),
+                    cwd: Some("/launch-cwd".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "forked".into(),
+                    agent_id: Some("agent-current".into()),
+                }),
+            ]
+        );
+
+        app.navigation.popup = Popup::ForkTurnSelect;
+        app.chat.pending_fork_message_id = Some("fork-target".into());
+        let log_count = app.diagnostics.logs.len();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ForkResult(ForkResult::Succeeded {
+                source_session_id: Some("ignored-source".into()),
+                forked_session_id: None,
+                message: None,
+            })),
+        );
+        assert!(effects.is_empty());
+        assert!(app.chat.pending_fork_message_id.is_none());
+        assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
+        assert_eq!(app.diagnostics.status, "fork succeeded without session id");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Warn);
+        assert_eq!(diagnostics[0].target, "fork");
+        assert_eq!(diagnostics[0].message, "fork succeeded without session id");
+
+        app.chat.pending_fork_message_id = Some("fork-target".into());
+        let log_count = app.diagnostics.logs.len();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ForkResult(ForkResult::Failed {
+                source_session_id: Some("ignored-source".into()),
+                message: None,
+            })),
+        );
+        assert!(effects.is_empty());
+        assert!(app.chat.pending_fork_message_id.is_none());
+        assert_eq!(app.navigation.popup, Popup::ForkTurnSelect);
+        assert_eq!(app.diagnostics.status, "fork failed");
+        let diagnostics = &app.diagnostics.logs[log_count..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Warn);
+        assert_eq!(diagnostics[0].target, "fork");
+        assert_eq!(diagnostics[0].message, "fork failed");
+    }
+
+    #[test]
+    fn chat_history_applied_results_without_active_session_still_coordinate_in_release() {
+        let mut app = App::new();
+        app.sessions.agent_id = Some("unused-agent".into());
+        app.connection.launch_cwd = Some("/unused-cwd".into());
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.chat.streaming_content = "discard".into();
+        app.chat.streaming_content_message_id = Some("content-id".into());
+        app.chat.streaming_thinking = "keep thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-id".into());
+        app.chat.recent_prompt_text = Some("discard prompt".into());
+        app.render.streaming_cache.store(7, Vec::new());
+        app.render.streaming_thinking_cache.store(8, Vec::new());
+        let log_count = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::UndoResult(UndoResult::Applied {
+                target_message_id: None,
+                reverted_files: Vec::new(),
+                message: None,
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into()],
+                },
+            })),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_content_message_id.is_none());
+        assert_eq!(app.chat.streaming_thinking, "keep thinking");
+        assert!(app.chat.recent_prompt_text.is_none());
+        assert!(app.render.streaming_cache.get(7).is_none());
+        assert!(app.render.streaming_thinking_cache.get(8).is_some());
+        assert_eq!(app.diagnostics.status, "undone - reloading session");
+        assert_eq!(app.diagnostics.logs.len(), log_count + 1);
+
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        app.chat.streaming_content = "keep redo content".into();
+        app.chat.streaming_content_message_id = Some("redo-content-id".into());
+        app.chat.recent_prompt_text = Some("keep redo prompt".into());
+        let log_count = app.diagnostics.logs.len();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::RedoResult(RedoResult::Applied {
+                message: None,
+                stack: UndoStackSnapshot {
+                    message_ids: vec!["one".into()],
+                },
+            })),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(app.chat.streaming_content, "keep redo content");
+        assert_eq!(
+            app.chat.streaming_content_message_id.as_deref(),
+            Some("redo-content-id")
+        );
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("keep redo prompt")
+        );
+        assert_eq!(app.diagnostics.status, "redone - reloading session");
+        assert_eq!(app.diagnostics.logs.len(), log_count + 1);
     }
 
     #[test]

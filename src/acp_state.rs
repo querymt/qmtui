@@ -6,8 +6,8 @@ use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::chat_state::{
     ChatAction, ChatCoordination, ChatOutcome, ChatToolAction, ChatToolOutcome, ChatToolTransition,
-    ChatUsageAction, ChatUsageOutcome, ElicitationAction, ElicitationOutcome,
-    ToolStartPreparationTransition,
+    ChatUsageAction, ChatUsageOutcome, ElicitationAction, ElicitationOutcome, HistoryAction,
+    HistoryCoordination, HistoryOutcome, ToolStartPreparationTransition,
 };
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
@@ -360,135 +360,17 @@ impl crate::app::App {
                 }
                 effects
             }
-            AcpAppEvent::UndoStack(undo_stack) => {
-                self.chat.undo_state =
-                    self.chat
-                        .build_undo_state_from_server_stack(&undo_stack, None, None);
-                vec![]
+            AcpAppEvent::UndoStack(stack) => {
+                self.apply_chat_history_action(HistoryAction::ReplaceStack(stack))
             }
             AcpAppEvent::UndoResult(result) => {
-                self.chat.activity = ActivityState::Idle;
-                match result {
-                    UndoResult::Applied {
-                        target_message_id,
-                        reverted_files,
-                        message: _,
-                        stack,
-                    } => {
-                        let message_id_for_files =
-                            target_message_id.or_else(|| stack.message_ids.last().cloned());
-                        self.chat.undo_state = self.chat.build_undo_state_from_server_stack(
-                            &stack,
-                            message_id_for_files.as_deref(),
-                            Some(&reverted_files),
-                        );
-                        self.chat.recent_prompt_text = None;
-                        self.chat.streaming_content.clear();
-                        self.chat.streaming_content_message_id = None;
-                        self.render.invalidate_content_cache();
-                        self.set_status(LogLevel::Info, "session", "undone - reloading session");
-                        if let Some(ref sid) = self.sessions.session_id {
-                            return effects(
-                                Command::load_session_commands(
-                                    sid.clone(),
-                                    self.current_session_cwd(),
-                                    self.sessions.agent_id.clone(),
-                                )
-                                .into(),
-                            );
-                        }
-                    }
-                    UndoResult::Rejected {
-                        target_message_id,
-                        message,
-                        stack,
-                    } => {
-                        let preferred =
-                            target_message_id.or_else(|| stack.message_ids.last().cloned());
-                        self.chat.undo_state = self.chat.build_undo_state_from_server_stack(
-                            &stack,
-                            preferred.as_deref(),
-                            None,
-                        );
-                        self.set_status(
-                            LogLevel::Warn,
-                            "session",
-                            message.unwrap_or_else(|| "undo failed".into()),
-                        );
-                    }
-                }
-                vec![]
+                self.apply_chat_history_action(HistoryAction::UndoCompleted(result))
             }
             AcpAppEvent::RedoResult(result) => {
-                self.chat.activity = ActivityState::Idle;
-                match result {
-                    RedoResult::Applied { message: _, stack } => {
-                        self.chat.undo_state = self
-                            .chat
-                            .build_undo_state_from_server_stack(&stack, None, None);
-                        self.set_status(LogLevel::Info, "session", "redone - reloading session");
-                        if let Some(ref sid) = self.sessions.session_id {
-                            return effects(
-                                Command::load_session_commands(
-                                    sid.clone(),
-                                    self.current_session_cwd(),
-                                    self.sessions.agent_id.clone(),
-                                )
-                                .into(),
-                            );
-                        }
-                    }
-                    RedoResult::Rejected { message, stack } => {
-                        self.chat.undo_state = self
-                            .chat
-                            .build_undo_state_from_server_stack(&stack, None, None);
-                        self.set_status(
-                            LogLevel::Warn,
-                            "session",
-                            message.unwrap_or_else(|| "redo failed".into()),
-                        );
-                    }
-                }
-                vec![]
+                self.apply_chat_history_action(HistoryAction::RedoCompleted(result))
             }
             AcpAppEvent::ForkResult(result) => {
-                self.chat.pending_fork_message_id = None;
-                match result {
-                    ForkResult::Succeeded {
-                        source_session_id: _,
-                        forked_session_id: Some(forked_session_id),
-                        message: _,
-                    } => {
-                        self.navigation.popup = Popup::None;
-                        self.set_status(LogLevel::Info, "fork", "forked - loading session");
-                        return effects(
-                            Command::load_session_commands(
-                                forked_session_id,
-                                self.current_session_cwd(),
-                                self.sessions.agent_id.clone(),
-                            )
-                            .into(),
-                        );
-                    }
-                    ForkResult::Succeeded {
-                        source_session_id: _,
-                        forked_session_id: None,
-                        message,
-                    } => self.set_status(
-                        LogLevel::Warn,
-                        "fork",
-                        message.unwrap_or_else(|| "fork succeeded without session id".into()),
-                    ),
-                    ForkResult::Failed {
-                        source_session_id: _,
-                        message,
-                    } => self.set_status(
-                        LogLevel::Warn,
-                        "fork",
-                        message.unwrap_or_else(|| "fork failed".into()),
-                    ),
-                }
-                vec![]
+                self.apply_chat_history_action(HistoryAction::ForkCompleted(result))
             }
             AcpAppEvent::DelegationUpdate(update) => self.apply_acp_delegation_update(update),
             AcpAppEvent::DelegationReplay {
@@ -720,6 +602,52 @@ impl crate::app::App {
             effects,
         } = self.chat.reduce(action);
         self.apply_chat_coordination(coordination);
+        effects
+    }
+
+    fn apply_chat_history_action(&mut self, action: HistoryAction) -> Vec<Effect> {
+        let HistoryOutcome {
+            transition: _,
+            coordination,
+            mut effects,
+        } = self.chat.reduce_history(action);
+        for coordination in coordination {
+            match coordination {
+                HistoryCoordination::InvalidateContentCache => {
+                    self.render.invalidate_content_cache();
+                }
+                HistoryCoordination::Status {
+                    level,
+                    target,
+                    message,
+                } => self.set_status(level, target, message),
+                HistoryCoordination::ClosePopup => self.navigation.popup = Popup::None,
+                HistoryCoordination::ReloadActiveSession => {
+                    if let Some(session_id) = self.sessions.session_id.clone() {
+                        effects.extend(
+                            Command::load_session_commands(
+                                session_id,
+                                self.current_session_cwd(),
+                                self.sessions.agent_id.clone(),
+                            )
+                            .into_iter()
+                            .map(Effect::Command),
+                        );
+                    }
+                }
+                HistoryCoordination::LoadForkedSession { session_id } => {
+                    effects.extend(
+                        Command::load_session_commands(
+                            session_id,
+                            self.current_session_cwd(),
+                            self.sessions.agent_id.clone(),
+                        )
+                        .into_iter()
+                        .map(Effect::Command),
+                    );
+                }
+            }
+        }
         effects
     }
 

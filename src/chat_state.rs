@@ -7,8 +7,8 @@ use crate::domain::activity::{ActivityState, SessionOp, SessionStatsLite};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::session::{
-    ForkBoundaryKind, ForkTurnItem, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState,
-    UndoableTurn,
+    ForkBoundaryKind, ForkResult, ForkTurnItem, RedoResult, UndoFrame, UndoFrameStatus, UndoResult,
+    UndoStackSnapshot, UndoState, UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
 use crate::tool_detail;
@@ -299,6 +299,41 @@ pub(crate) enum ChatTransition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryAction {
+    ReplaceStack(UndoStackSnapshot),
+    UndoCompleted(UndoResult),
+    RedoCompleted(RedoResult),
+    ForkCompleted(ForkResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryTransition {
+    StackReplaced,
+    UndoApplied,
+    UndoRejected,
+    RedoApplied,
+    RedoRejected,
+    ForkLoaded,
+    ForkMissingSessionId,
+    ForkFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryCoordination {
+    InvalidateContentCache,
+    Status {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
+    ClosePopup,
+    ReloadActiveSession,
+    LoadForkedSession {
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChatCoordination {
     InvalidateContentCache,
     InvalidateThinkingCache,
@@ -341,6 +376,13 @@ pub(crate) struct ChatUsageOutcome {
 pub(crate) struct ElicitationOutcome {
     pub(crate) transition: ElicitationTransition,
     pub(crate) coordination: Vec<ChatCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryOutcome {
+    pub(crate) transition: HistoryTransition,
+    pub(crate) coordination: Vec<HistoryCoordination>,
     pub(crate) effects: Vec<Effect>,
 }
 
@@ -514,6 +556,152 @@ impl ChatState {
             }
         };
         ChatOutcome {
+            transition,
+            coordination,
+            effects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reduce_history(&mut self, action: HistoryAction) -> HistoryOutcome {
+        let (transition, coordination) = match action {
+            HistoryAction::ReplaceStack(stack) => {
+                self.undo_state = self.build_undo_state_from_server_stack(&stack, None, None);
+                (HistoryTransition::StackReplaced, Vec::new())
+            }
+            HistoryAction::UndoCompleted(result) => {
+                self.activity = ActivityState::Idle;
+                match result {
+                    UndoResult::Applied {
+                        target_message_id,
+                        reverted_files,
+                        message: _,
+                        stack,
+                    } => {
+                        let preferred =
+                            target_message_id.or_else(|| stack.message_ids.last().cloned());
+                        self.undo_state = self.build_undo_state_from_server_stack(
+                            &stack,
+                            preferred.as_deref(),
+                            Some(&reverted_files),
+                        );
+                        self.recent_prompt_text = None;
+                        self.streaming_content.clear();
+                        self.streaming_content_message_id = None;
+                        (
+                            HistoryTransition::UndoApplied,
+                            vec![
+                                HistoryCoordination::InvalidateContentCache,
+                                HistoryCoordination::Status {
+                                    level: LogLevel::Info,
+                                    target: "session",
+                                    message: "undone - reloading session".into(),
+                                },
+                                HistoryCoordination::ReloadActiveSession,
+                            ],
+                        )
+                    }
+                    UndoResult::Rejected {
+                        target_message_id,
+                        message,
+                        stack,
+                    } => {
+                        let preferred =
+                            target_message_id.or_else(|| stack.message_ids.last().cloned());
+                        self.undo_state = self.build_undo_state_from_server_stack(
+                            &stack,
+                            preferred.as_deref(),
+                            None,
+                        );
+                        (
+                            HistoryTransition::UndoRejected,
+                            vec![HistoryCoordination::Status {
+                                level: LogLevel::Warn,
+                                target: "session",
+                                message: message.unwrap_or_else(|| "undo failed".into()),
+                            }],
+                        )
+                    }
+                }
+            }
+            HistoryAction::RedoCompleted(result) => {
+                self.activity = ActivityState::Idle;
+                match result {
+                    RedoResult::Applied { message: _, stack } => {
+                        self.undo_state =
+                            self.build_undo_state_from_server_stack(&stack, None, None);
+                        (
+                            HistoryTransition::RedoApplied,
+                            vec![
+                                HistoryCoordination::Status {
+                                    level: LogLevel::Info,
+                                    target: "session",
+                                    message: "redone - reloading session".into(),
+                                },
+                                HistoryCoordination::ReloadActiveSession,
+                            ],
+                        )
+                    }
+                    RedoResult::Rejected { message, stack } => {
+                        self.undo_state =
+                            self.build_undo_state_from_server_stack(&stack, None, None);
+                        (
+                            HistoryTransition::RedoRejected,
+                            vec![HistoryCoordination::Status {
+                                level: LogLevel::Warn,
+                                target: "session",
+                                message: message.unwrap_or_else(|| "redo failed".into()),
+                            }],
+                        )
+                    }
+                }
+            }
+            HistoryAction::ForkCompleted(result) => {
+                self.pending_fork_message_id = None;
+                match result {
+                    ForkResult::Succeeded {
+                        source_session_id: _,
+                        forked_session_id: Some(session_id),
+                        message: _,
+                    } => (
+                        HistoryTransition::ForkLoaded,
+                        vec![
+                            HistoryCoordination::ClosePopup,
+                            HistoryCoordination::Status {
+                                level: LogLevel::Info,
+                                target: "fork",
+                                message: "forked - loading session".into(),
+                            },
+                            HistoryCoordination::LoadForkedSession { session_id },
+                        ],
+                    ),
+                    ForkResult::Succeeded {
+                        source_session_id: _,
+                        forked_session_id: None,
+                        message,
+                    } => (
+                        HistoryTransition::ForkMissingSessionId,
+                        vec![HistoryCoordination::Status {
+                            level: LogLevel::Warn,
+                            target: "fork",
+                            message: message
+                                .unwrap_or_else(|| "fork succeeded without session id".into()),
+                        }],
+                    ),
+                    ForkResult::Failed {
+                        source_session_id: _,
+                        message,
+                    } => (
+                        HistoryTransition::ForkFailed,
+                        vec![HistoryCoordination::Status {
+                            level: LogLevel::Warn,
+                            target: "fork",
+                            message: message.unwrap_or_else(|| "fork failed".into()),
+                        }],
+                    ),
+                }
+            }
+        };
+        HistoryOutcome {
             transition,
             coordination,
             effects: Vec::new(),
@@ -2092,6 +2280,395 @@ mod tests {
         assert_eq!(state.stack[0].turn_id, "turn-three");
         assert_eq!(state.stack[1].turn_id, "unknown");
         assert_eq!(state.stack[1].reverted_files, ["src/lib.rs"]);
+    }
+
+    #[test]
+    fn history_stack_replacement_rebuilds_only_undo_state() {
+        let mut chat = ChatState::new();
+        chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        chat.streaming_content = "content".into();
+        chat.streaming_content_message_id = Some("content-id".into());
+        chat.streaming_thinking = "thinking".into();
+        chat.streaming_thinking_message_id = Some("thinking-id".into());
+        chat.recent_prompt_text = Some("prompt".into());
+        chat.pending_fork_message_id = Some("fork-target".into());
+        chat.undoable_turns = vec![turn("one")];
+
+        let outcome = chat.reduce_history(HistoryAction::ReplaceStack(UndoStackSnapshot {
+            message_ids: vec!["one".into()],
+        }));
+
+        assert_eq!(
+            outcome,
+            HistoryOutcome {
+                transition: HistoryTransition::StackReplaced,
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(chat.activity, ActivityState::SessionOp(SessionOp::Undo));
+        assert_eq!(chat.streaming_content, "content");
+        assert_eq!(
+            chat.streaming_content_message_id.as_deref(),
+            Some("content-id")
+        );
+        assert_eq!(chat.streaming_thinking, "thinking");
+        assert_eq!(
+            chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("prompt"));
+        assert_eq!(chat.pending_fork_message_id.as_deref(), Some("fork-target"));
+        let state = chat.undo_state.as_ref().expect("rebuilt undo state");
+        assert_eq!(state.frontier_message_id.as_deref(), Some("one"));
+        assert_eq!(state.stack[0].turn_id, "turn-one");
+    }
+
+    #[test]
+    fn history_applied_undo_prefers_explicit_target_and_clears_only_undo_stream_scope() {
+        let mut chat = ChatState::new();
+        chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        chat.undoable_turns = vec![turn("one"), turn("two")];
+        chat.streaming_content = "discard content".into();
+        chat.streaming_content_message_id = Some("content-id".into());
+        chat.streaming_thinking = "keep thinking".into();
+        chat.streaming_thinking_message_id = Some("thinking-id".into());
+        chat.recent_prompt_text = Some("discard prompt".into());
+
+        let outcome = chat.reduce_history(HistoryAction::UndoCompleted(UndoResult::Applied {
+            target_message_id: Some("one".into()),
+            reverted_files: vec!["src/lib.rs".into()],
+            message: Some("ignored success".into()),
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into(), "two".into()],
+            },
+        }));
+
+        assert_eq!(chat.activity, ActivityState::Idle);
+        assert!(chat.streaming_content.is_empty());
+        assert!(chat.streaming_content_message_id.is_none());
+        assert_eq!(chat.streaming_thinking, "keep thinking");
+        assert_eq!(
+            chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert!(chat.recent_prompt_text.is_none());
+        let state = chat.undo_state.as_ref().expect("rebuilt undo state");
+        assert_eq!(state.frontier_message_id.as_deref(), Some("one"));
+        assert_eq!(state.stack[0].reverted_files, ["src/lib.rs"]);
+        assert!(state.stack[1].reverted_files.is_empty());
+        assert_eq!(
+            outcome,
+            HistoryOutcome {
+                transition: HistoryTransition::UndoApplied,
+                coordination: vec![
+                    HistoryCoordination::InvalidateContentCache,
+                    HistoryCoordination::Status {
+                        level: LogLevel::Info,
+                        target: "session",
+                        message: "undone - reloading session".into(),
+                    },
+                    HistoryCoordination::ReloadActiveSession,
+                ],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn history_applied_undo_uses_stack_tail_for_reverted_file_attribution() {
+        let mut chat = ChatState::new();
+        chat.undoable_turns = vec![turn("one"), turn("two")];
+
+        chat.reduce_history(HistoryAction::UndoCompleted(UndoResult::Applied {
+            target_message_id: None,
+            reverted_files: vec!["src/main.rs".into()],
+            message: None,
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into(), "two".into()],
+            },
+        }));
+
+        let state = chat.undo_state.as_ref().expect("rebuilt undo state");
+        assert_eq!(state.frontier_message_id.as_deref(), Some("two"));
+        assert!(state.stack[0].reverted_files.is_empty());
+        assert_eq!(state.stack[1].reverted_files, ["src/main.rs"]);
+    }
+
+    #[test]
+    fn history_rejected_undo_uses_fallback_frontier_and_preserves_live_state() {
+        let mut chat = ChatState::new();
+        chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        chat.undoable_turns = vec![turn("one"), turn("two")];
+        chat.streaming_content = "keep content".into();
+        chat.streaming_content_message_id = Some("content-id".into());
+        chat.streaming_thinking = "keep thinking".into();
+        chat.streaming_thinking_message_id = Some("thinking-id".into());
+        chat.recent_prompt_text = Some("keep prompt".into());
+
+        let outcome = chat.reduce_history(HistoryAction::UndoCompleted(UndoResult::Rejected {
+            target_message_id: None,
+            message: None,
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into(), "two".into()],
+            },
+        }));
+
+        assert_eq!(chat.activity, ActivityState::Idle);
+        assert_eq!(chat.streaming_content, "keep content");
+        assert_eq!(
+            chat.streaming_content_message_id.as_deref(),
+            Some("content-id")
+        );
+        assert_eq!(chat.streaming_thinking, "keep thinking");
+        assert_eq!(
+            chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("keep prompt"));
+        assert_eq!(
+            chat.undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("two")
+        );
+        assert_eq!(
+            outcome,
+            HistoryOutcome {
+                transition: HistoryTransition::UndoRejected,
+                coordination: vec![HistoryCoordination::Status {
+                    level: LogLevel::Warn,
+                    target: "session",
+                    message: "undo failed".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+
+        let outcome = chat.reduce_history(HistoryAction::UndoCompleted(UndoResult::Rejected {
+            target_message_id: Some("one".into()),
+            message: Some("explicit rejection".into()),
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into(), "two".into()],
+            },
+        }));
+        assert_eq!(
+            chat.undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("one")
+        );
+        assert_eq!(
+            outcome.coordination,
+            vec![HistoryCoordination::Status {
+                level: LogLevel::Warn,
+                target: "session",
+                message: "explicit rejection".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn history_redo_results_rebuild_without_undo_cleanup_and_coordinate_exactly() {
+        let mut chat = ChatState::new();
+        chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        chat.streaming_content = "keep content".into();
+        chat.streaming_content_message_id = Some("content-id".into());
+        chat.streaming_thinking = "keep thinking".into();
+        chat.streaming_thinking_message_id = Some("thinking-id".into());
+        chat.recent_prompt_text = Some("keep prompt".into());
+
+        let applied = chat.reduce_history(HistoryAction::RedoCompleted(RedoResult::Applied {
+            message: Some("ignored success".into()),
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into()],
+            },
+        }));
+
+        assert_eq!(chat.activity, ActivityState::Idle);
+        assert_eq!(chat.streaming_content, "keep content");
+        assert_eq!(
+            chat.streaming_content_message_id.as_deref(),
+            Some("content-id")
+        );
+        assert_eq!(chat.streaming_thinking, "keep thinking");
+        assert_eq!(
+            chat.streaming_thinking_message_id.as_deref(),
+            Some("thinking-id")
+        );
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("keep prompt"));
+        assert_eq!(
+            applied,
+            HistoryOutcome {
+                transition: HistoryTransition::RedoApplied,
+                coordination: vec![
+                    HistoryCoordination::Status {
+                        level: LogLevel::Info,
+                        target: "session",
+                        message: "redone - reloading session".into(),
+                    },
+                    HistoryCoordination::ReloadActiveSession,
+                ],
+                effects: Vec::new(),
+            }
+        );
+
+        chat.activity = ActivityState::SessionOp(SessionOp::Redo);
+        let rejected = chat.reduce_history(HistoryAction::RedoCompleted(RedoResult::Rejected {
+            message: None,
+            stack: UndoStackSnapshot {
+                message_ids: vec!["one".into(), "two".into()],
+            },
+        }));
+        assert_eq!(chat.activity, ActivityState::Idle);
+        assert_eq!(
+            chat.undo_state
+                .as_ref()
+                .and_then(|state| state.frontier_message_id.as_deref()),
+            Some("one")
+        );
+        assert_eq!(
+            rejected,
+            HistoryOutcome {
+                transition: HistoryTransition::RedoRejected,
+                coordination: vec![HistoryCoordination::Status {
+                    level: LogLevel::Warn,
+                    target: "session",
+                    message: "redo failed".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn history_fork_results_clear_pending_and_preserve_ignored_success_fields() {
+        let mut chat = ChatState::new();
+        chat.pending_fork_message_id = Some("fork-target".into());
+
+        let loaded = chat.reduce_history(HistoryAction::ForkCompleted(ForkResult::Succeeded {
+            source_session_id: Some("ignored-source".into()),
+            forked_session_id: Some("forked".into()),
+            message: Some("ignored success".into()),
+        }));
+        assert!(chat.pending_fork_message_id.is_none());
+        assert_eq!(
+            loaded,
+            HistoryOutcome {
+                transition: HistoryTransition::ForkLoaded,
+                coordination: vec![
+                    HistoryCoordination::ClosePopup,
+                    HistoryCoordination::Status {
+                        level: LogLevel::Info,
+                        target: "fork",
+                        message: "forked - loading session".into(),
+                    },
+                    HistoryCoordination::LoadForkedSession {
+                        session_id: "forked".into(),
+                    },
+                ],
+                effects: Vec::new(),
+            }
+        );
+
+        chat.pending_fork_message_id = Some("fork-target".into());
+        let missing_id = chat.reduce_history(HistoryAction::ForkCompleted(ForkResult::Succeeded {
+            source_session_id: Some("ignored-source".into()),
+            forked_session_id: None,
+            message: None,
+        }));
+        assert!(chat.pending_fork_message_id.is_none());
+        assert_eq!(
+            missing_id,
+            HistoryOutcome {
+                transition: HistoryTransition::ForkMissingSessionId,
+                coordination: vec![HistoryCoordination::Status {
+                    level: LogLevel::Warn,
+                    target: "fork",
+                    message: "fork succeeded without session id".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+
+        chat.pending_fork_message_id = Some("fork-target".into());
+        let failed = chat.reduce_history(HistoryAction::ForkCompleted(ForkResult::Failed {
+            source_session_id: Some("ignored-source".into()),
+            message: None,
+        }));
+        assert!(chat.pending_fork_message_id.is_none());
+        assert_eq!(
+            failed,
+            HistoryOutcome {
+                transition: HistoryTransition::ForkFailed,
+                coordination: vec![HistoryCoordination::Status {
+                    level: LogLevel::Warn,
+                    target: "fork",
+                    message: "fork failed".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn history_rejections_preserve_supplied_diagnostic_messages() {
+        let mut chat = ChatState::new();
+
+        let undo = chat.reduce_history(HistoryAction::UndoCompleted(UndoResult::Rejected {
+            target_message_id: None,
+            message: Some("undo rejected by server".into()),
+            stack: UndoStackSnapshot::default(),
+        }));
+        assert_eq!(
+            undo.coordination,
+            vec![HistoryCoordination::Status {
+                level: LogLevel::Warn,
+                target: "session",
+                message: "undo rejected by server".into(),
+            }]
+        );
+
+        let redo = chat.reduce_history(HistoryAction::RedoCompleted(RedoResult::Rejected {
+            message: Some("redo rejected by server".into()),
+            stack: UndoStackSnapshot::default(),
+        }));
+        assert_eq!(
+            redo.coordination,
+            vec![HistoryCoordination::Status {
+                level: LogLevel::Warn,
+                target: "session",
+                message: "redo rejected by server".into(),
+            }]
+        );
+
+        let missing_fork =
+            chat.reduce_history(HistoryAction::ForkCompleted(ForkResult::Succeeded {
+                source_session_id: None,
+                forked_session_id: None,
+                message: Some("fork response omitted an id".into()),
+            }));
+        assert_eq!(
+            missing_fork.coordination,
+            vec![HistoryCoordination::Status {
+                level: LogLevel::Warn,
+                target: "fork",
+                message: "fork response omitted an id".into(),
+            }]
+        );
+
+        let failed = chat.reduce_history(HistoryAction::ForkCompleted(ForkResult::Failed {
+            source_session_id: None,
+            message: Some("fork rejected by server".into()),
+        }));
+        assert_eq!(
+            failed.coordination,
+            vec![HistoryCoordination::Status {
+                level: LogLevel::Warn,
+                target: "fork",
+                message: "fork rejected by server".into(),
+            }]
+        );
     }
 
     #[test]
