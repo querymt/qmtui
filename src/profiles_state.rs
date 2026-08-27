@@ -5,6 +5,19 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::domain::profile::ProfileInfo;
 
+#[derive(Debug, Clone)]
+pub(crate) enum ProfileAction {
+    ReplaceCatalog {
+        profiles: Vec<ProfileInfo>,
+        backend_active_profile_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProfileOutcome {
+    pub(crate) active_profile_changed: bool,
+}
+
 pub(crate) struct ProfilesState {
     pub(crate) profiles: Vec<ProfileInfo>,
     pub(crate) active_profile_id: Option<String>,
@@ -14,6 +27,17 @@ pub(crate) struct ProfilesState {
 }
 
 impl ProfilesState {
+    pub(crate) fn reduce(&mut self, action: ProfileAction) -> ProfileOutcome {
+        match action {
+            ProfileAction::ReplaceCatalog {
+                profiles,
+                backend_active_profile_id,
+            } => ProfileOutcome {
+                active_profile_changed: self.apply_catalog(profiles, backend_active_profile_id),
+            },
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             profiles: Vec::new(),
@@ -184,6 +208,54 @@ mod tests {
             .into_iter()
             .map(|profile| profile.id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn reducer_catalog_preserves_selection_precedence_and_reports_change() {
+        let mut state = ProfilesState::new();
+        state.active_profile_id = Some("deep".into());
+
+        let outcome = state.reduce(ProfileAction::ReplaceCatalog {
+            profiles: vec![profile("fast", "Fast", None), profile("deep", "Deep", None)],
+            backend_active_profile_id: Some("fast".into()),
+        });
+        assert_eq!(outcome, ProfileOutcome::default());
+        assert_eq!(state.active_profile_id.as_deref(), Some("deep"));
+
+        state.active_profile_id = Some("removed".into());
+        let outcome = state.reduce(ProfileAction::ReplaceCatalog {
+            profiles: vec![profile("fast", "Fast", None), profile("deep", "Deep", None)],
+            backend_active_profile_id: Some("deep".into()),
+        });
+        assert_eq!(
+            outcome,
+            ProfileOutcome {
+                active_profile_changed: true,
+            }
+        );
+        assert_eq!(state.active_profile_id.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn reducer_empty_catalog_clears_selection_without_unowned_normalization() {
+        let mut state = ProfilesState::new();
+        state.profiles = vec![profile("old", "Old", None)];
+        state.active_profile_id = Some("old".into());
+        state.profile_cursor = 4;
+        state.profile_filter = "keep".into();
+        state.bind_session_profile("session".into(), "old".into());
+
+        let outcome = state.reduce(ProfileAction::ReplaceCatalog {
+            profiles: Vec::new(),
+            backend_active_profile_id: None,
+        });
+
+        assert!(outcome.active_profile_changed);
+        assert!(state.profiles.is_empty());
+        assert!(state.active_profile_id.is_none());
+        assert_eq!(state.profile_cursor, 0);
+        assert_eq!(state.profile_filter, "keep");
+        assert_eq!(state.session_profile_id("session"), Some("old"));
     }
 
     #[test]

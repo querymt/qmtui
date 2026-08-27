@@ -1,9 +1,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::application::Effect;
+use crate::command::Command;
+use crate::diagnostics::LogLevel;
 use crate::domain::mesh::{
-    MeshInviteCreatedInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionInfo,
+    MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteNodeInfo, RemoteSessionAttachInfo,
+    RemoteSessionInfo, RemoteSessionListInfo,
 };
+use crate::navigation_state::Popup;
 
 const INVITE_ERROR_TTL: Duration = Duration::from_secs(5);
 
@@ -20,6 +25,46 @@ pub(crate) enum MeshInviteFormField {
     MeshName,
     Ttl,
     MaxUses,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MeshAction {
+    Status(MeshStatusInfo),
+    Nodes(MeshNodesInfo),
+    InviteCreated(MeshInviteCreatedInfo),
+    RemoteSessions(RemoteSessionListInfo),
+    RemoteSessionAttached(RemoteSessionAttachInfo),
+    ClipboardFinished { success: bool },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MeshContext {
+    pub(crate) agent_id: Option<String>,
+    pub(crate) remote_session_cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MeshCoordination {
+    Log {
+        level: LogLevel,
+        message: String,
+    },
+    Status {
+        level: LogLevel,
+        message: String,
+    },
+    SetPopup(Popup),
+    RememberRemoteSession {
+        session_id: String,
+        node_id: String,
+        cwd: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MeshOutcome {
+    pub(crate) coordination: Vec<MeshCoordination>,
+    pub(crate) effects: Vec<Effect>,
 }
 
 pub(crate) struct MeshState {
@@ -41,6 +86,139 @@ pub(crate) struct MeshState {
 }
 
 impl MeshState {
+    pub(crate) fn reduce(&mut self, action: MeshAction, context: MeshContext) -> MeshOutcome {
+        match action {
+            MeshAction::Status(status) => {
+                let (enabled, peer_count) = self.replace_status(status);
+                MeshOutcome {
+                    coordination: vec![MeshCoordination::Log {
+                        level: LogLevel::Debug,
+                        message: format!("mesh status: enabled={enabled}, peers={peer_count}"),
+                    }],
+                    effects: Vec::new(),
+                }
+            }
+            MeshAction::Nodes(nodes) => {
+                let (count, selected_node_id) = self.replace_nodes(nodes.nodes);
+                MeshOutcome {
+                    coordination: vec![MeshCoordination::Log {
+                        level: LogLevel::Info,
+                        message: format!("mesh nodes: {count}"),
+                    }],
+                    effects: selected_node_id
+                        .map(|node_id| {
+                            Effect::Command(Command::ListRemoteSessions {
+                                node_id,
+                                offset: 0,
+                                limit: 50,
+                            })
+                        })
+                        .into_iter()
+                        .collect(),
+                }
+            }
+            MeshAction::InviteCreated(invite) => {
+                let url = self.store_invite(invite);
+                MeshOutcome {
+                    coordination: vec![
+                        MeshCoordination::SetPopup(Popup::MeshInviteQr),
+                        MeshCoordination::Status {
+                            level: LogLevel::Info,
+                            message: "mesh invite created".into(),
+                        },
+                        MeshCoordination::Log {
+                            level: LogLevel::Info,
+                            message: format!("mesh invite: {url}"),
+                        },
+                    ],
+                    effects: Vec::new(),
+                }
+            }
+            MeshAction::RemoteSessions(list) => {
+                let node_id = list.node_id;
+                let mut coordination = list
+                    .sessions
+                    .iter()
+                    .map(|session| MeshCoordination::RememberRemoteSession {
+                        session_id: session.id.clone(),
+                        node_id: session.node_id.clone(),
+                        cwd: session.cwd.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let count = self.replace_remote_sessions(&node_id, list.sessions);
+                coordination.push(MeshCoordination::Log {
+                    level: LogLevel::Info,
+                    message: format!("remote sessions: {count} for {node_id}"),
+                });
+                MeshOutcome {
+                    coordination,
+                    effects: Vec::new(),
+                }
+            }
+            MeshAction::RemoteSessionAttached(attached) => {
+                let RemoteSessionAttachInfo {
+                    session_id,
+                    node_id,
+                    attached,
+                    config_options: _,
+                    snapshot: _,
+                } = attached;
+                let mut coordination = vec![MeshCoordination::RememberRemoteSession {
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                    cwd: None,
+                }];
+                if attached {
+                    coordination.extend([
+                        MeshCoordination::SetPopup(Popup::None),
+                        MeshCoordination::Status {
+                            level: LogLevel::Info,
+                            message: "remote session attached".into(),
+                        },
+                    ]);
+                    MeshOutcome {
+                        coordination,
+                        effects: Command::load_session_commands(
+                            session_id,
+                            context.remote_session_cwd,
+                            context.agent_id,
+                        )
+                        .into_iter()
+                        .map(Effect::Command)
+                        .collect(),
+                    }
+                } else {
+                    coordination.push(MeshCoordination::Status {
+                        level: LogLevel::Info,
+                        message: "remote session created".into(),
+                    });
+                    MeshOutcome {
+                        coordination,
+                        effects: vec![Effect::Command(Command::ListRemoteSessions {
+                            node_id,
+                            offset: 0,
+                            limit: 50,
+                        })],
+                    }
+                }
+            }
+            MeshAction::ClipboardFinished { success } => {
+                if success {
+                    MeshOutcome {
+                        coordination: vec![MeshCoordination::Status {
+                            level: LogLevel::Info,
+                            message: "invite URL copied".into(),
+                        }],
+                        effects: Vec::new(),
+                    }
+                } else {
+                    self.show_invite_url_fallback();
+                    MeshOutcome::default()
+                }
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             mesh_node_count: None,
@@ -342,6 +520,241 @@ mod tests {
             max_uses: 1,
             mesh_name: None,
         }
+    }
+
+    #[test]
+    fn reducer_owns_status_and_node_events_with_exact_outcomes() {
+        let mut state = MeshState::new();
+        let status = state.reduce(
+            MeshAction::Status(MeshStatusInfo {
+                enabled: true,
+                known_peer_count: 2,
+                ..Default::default()
+            }),
+            MeshContext::default(),
+        );
+
+        assert!(
+            state
+                .mesh_status
+                .as_ref()
+                .is_some_and(|status| { status.enabled && status.known_peer_count == 2 })
+        );
+        assert_eq!(
+            status,
+            MeshOutcome {
+                coordination: vec![MeshCoordination::Log {
+                    level: LogLevel::Debug,
+                    message: "mesh status: enabled=true, peers=2".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+
+        state.mesh_node_cursor = 1;
+        let nodes = state.reduce(
+            MeshAction::Nodes(MeshNodesInfo {
+                nodes: vec![node("node-1"), node("node-2")],
+            }),
+            MeshContext::default(),
+        );
+
+        assert_eq!(state.mesh_node_count, Some(2));
+        assert_eq!(state.selected_mesh_node_id(), Some("node-2"));
+        assert_eq!(
+            nodes,
+            MeshOutcome {
+                coordination: vec![MeshCoordination::Log {
+                    level: LogLevel::Info,
+                    message: "mesh nodes: 2".into(),
+                }],
+                effects: vec![Effect::Command(Command::ListRemoteSessions {
+                    node_id: "node-2".into(),
+                    offset: 0,
+                    limit: 50,
+                })],
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_owns_invite_and_remote_session_events_with_exact_outcomes() {
+        let mut state = MeshState::new();
+        state.set_error("stale");
+        state.set_clipboard_fallback("old".into());
+
+        let created = state.reduce(
+            MeshAction::InviteCreated(invite("qmt://mesh/join/token")),
+            MeshContext::default(),
+        );
+
+        assert_eq!(state.invite_url(), Some("qmt://mesh/join/token"));
+        assert!(state.mesh_error.is_none());
+        assert!(state.mesh_clipboard_fallback.is_none());
+        assert_eq!(
+            created,
+            MeshOutcome {
+                coordination: vec![
+                    MeshCoordination::SetPopup(Popup::MeshInviteQr),
+                    MeshCoordination::Status {
+                        level: LogLevel::Info,
+                        message: "mesh invite created".into(),
+                    },
+                    MeshCoordination::Log {
+                        level: LogLevel::Info,
+                        message: "mesh invite: qmt://mesh/join/token".into(),
+                    },
+                ],
+                effects: Vec::new(),
+            }
+        );
+
+        state.remote_session_cursor = 3;
+        let mut remote = session("session-1", "node-1");
+        remote.cwd = Some("/remote/repo".into());
+        let sessions = state.reduce(
+            MeshAction::RemoteSessions(RemoteSessionListInfo {
+                node_id: "node-1".into(),
+                sessions: vec![remote.clone()],
+                next_offset: Some(50),
+                total_count: 51,
+            }),
+            MeshContext::default(),
+        );
+
+        assert_eq!(state.remote_session_cursor, 0);
+        assert_eq!(state.remote_sessions_by_node["node-1"][0].id, "session-1");
+        assert_eq!(
+            sessions,
+            MeshOutcome {
+                coordination: vec![
+                    MeshCoordination::RememberRemoteSession {
+                        session_id: "session-1".into(),
+                        node_id: "node-1".into(),
+                        cwd: Some("/remote/repo".into()),
+                    },
+                    MeshCoordination::Log {
+                        level: LogLevel::Info,
+                        message: "remote sessions: 1 for node-1".into(),
+                    },
+                ],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_remote_attach_preserves_attached_and_detached_ordering() {
+        let mut state = MeshState::new();
+        let attached = state.reduce(
+            MeshAction::RemoteSessionAttached(RemoteSessionAttachInfo {
+                session_id: "session-1".into(),
+                node_id: "node-1".into(),
+                attached: true,
+                config_options: vec![serde_json::json!({ "retained": true })],
+                snapshot: Some(serde_json::json!({ "ignored": "authoritative replay" })),
+            }),
+            MeshContext {
+                agent_id: Some("agent-1".into()),
+                remote_session_cwd: Some("/remote/repo".into()),
+            },
+        );
+
+        assert_eq!(
+            attached,
+            MeshOutcome {
+                coordination: vec![
+                    MeshCoordination::RememberRemoteSession {
+                        session_id: "session-1".into(),
+                        node_id: "node-1".into(),
+                        cwd: None,
+                    },
+                    MeshCoordination::SetPopup(Popup::None),
+                    MeshCoordination::Status {
+                        level: LogLevel::Info,
+                        message: "remote session attached".into(),
+                    },
+                ],
+                effects: vec![
+                    Effect::Command(Command::LoadSession {
+                        session_id: "session-1".into(),
+                        cwd: Some("/remote/repo".into()),
+                    }),
+                    Effect::Command(Command::SubscribeSession {
+                        session_id: "session-1".into(),
+                        agent_id: Some("agent-1".into()),
+                    }),
+                ],
+            }
+        );
+
+        let detached = state.reduce(
+            MeshAction::RemoteSessionAttached(RemoteSessionAttachInfo {
+                session_id: "session-2".into(),
+                node_id: "node-2".into(),
+                attached: false,
+                config_options: Vec::new(),
+                snapshot: None,
+            }),
+            MeshContext::default(),
+        );
+
+        assert_eq!(
+            detached,
+            MeshOutcome {
+                coordination: vec![
+                    MeshCoordination::RememberRemoteSession {
+                        session_id: "session-2".into(),
+                        node_id: "node-2".into(),
+                        cwd: None,
+                    },
+                    MeshCoordination::Status {
+                        level: LogLevel::Info,
+                        message: "remote session created".into(),
+                    },
+                ],
+                effects: vec![Effect::Command(Command::ListRemoteSessions {
+                    node_id: "node-2".into(),
+                    offset: 0,
+                    limit: 50,
+                })],
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_clipboard_results_preserve_status_and_fallback_contracts() {
+        let mut state = MeshState::new();
+        state.store_invite(invite("qmt://mesh/join/token"));
+
+        let failed = state.reduce(
+            MeshAction::ClipboardFinished { success: false },
+            MeshContext::default(),
+        );
+        assert_eq!(failed, MeshOutcome::default());
+        assert_eq!(
+            state.mesh_clipboard_fallback.as_deref(),
+            Some("qmt://mesh/join/token")
+        );
+
+        let succeeded = state.reduce(
+            MeshAction::ClipboardFinished { success: true },
+            MeshContext::default(),
+        );
+        assert_eq!(
+            succeeded,
+            MeshOutcome {
+                coordination: vec![MeshCoordination::Status {
+                    level: LogLevel::Info,
+                    message: "invite URL copied".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(
+            state.mesh_clipboard_fallback.as_deref(),
+            Some("qmt://mesh/join/token")
+        );
     }
 
     #[test]

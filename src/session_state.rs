@@ -4,10 +4,13 @@ use std::time::{Duration, Instant};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
+use crate::application::Effect;
+use crate::command::{Command, SessionListRequest};
 use crate::composer_state::FileIndexEntryLite;
+use crate::diagnostics::LogLevel;
 use crate::domain::activity::SessionActivity;
 use crate::domain::mesh::RemoteSessionLocation;
-use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionSummary};
+use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionListPage, SessionSummary};
 
 /// Maximum number of recent sessions shown per group on the start page.
 pub(crate) const MAX_RECENT_SESSIONS: usize = 3;
@@ -71,6 +74,61 @@ pub(crate) fn session_group_count_text(session_count: usize, session_total: Opti
         .unwrap_or_else(|| session_count.to_string())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SessionAction {
+    CatalogPage {
+        request: SessionListRequest,
+        page: SessionListPage,
+    },
+    CatalogFailed {
+        request: SessionListRequest,
+        message: String,
+    },
+    Created {
+        agent_id: String,
+        session_id: String,
+        profile_id: Option<String>,
+    },
+    Loaded {
+        agent_id: String,
+        session_id: String,
+        profile_id: Option<String>,
+    },
+    InitializeAgentId(String),
+    ReplaceAgentMode(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionCoordination {
+    PushChatError(String),
+    ClearDelegateParent,
+    SetChatIdle,
+    ResolveDelegateParent(Option<String>),
+    ApplyProfileBinding {
+        session_id: String,
+        profile_id: Option<String>,
+        remove_if_missing: bool,
+    },
+    ResetActiveSessionView,
+    SelectChat,
+    SelectLoadedSessionScreen,
+    Status {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
+    SynchronizeProfileCommands {
+        session_id: String,
+        root_only: bool,
+    },
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOutcome {
+    pub(crate) coordination: Vec<SessionCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
 pub(crate) struct SessionsState {
     pub(crate) session_groups: Vec<SessionGroup>,
     pub(crate) session_cursor: usize,
@@ -98,6 +156,143 @@ pub(crate) struct SessionsState {
 }
 
 impl SessionsState {
+    pub(crate) fn reduce(&mut self, action: SessionAction) -> SessionOutcome {
+        match action {
+            SessionAction::CatalogPage { request, page } => {
+                let SessionListPage {
+                    groups,
+                    next_cursor,
+                    total_count: _,
+                } = page;
+                let commands = match request {
+                    SessionListRequest::Discovery => {
+                        let (workspaces, next_discovery_cursor) =
+                            self.apply_discovery_page(groups, next_cursor);
+                        let mut commands = workspaces
+                            .into_iter()
+                            .map(Command::list_sessions_workspace)
+                            .collect::<Vec<_>>();
+                        if let Some(cursor) = next_discovery_cursor {
+                            commands.push(Command::list_sessions_discovery(Some(cursor)));
+                        }
+                        commands
+                    }
+                    SessionListRequest::WorkspaceFirstPage { cwd } => {
+                        self.apply_workspace_first_page(cwd, groups);
+                        Vec::new()
+                    }
+                    SessionListRequest::WorkspaceContinuation { cwd } => {
+                        self.apply_workspace_continuation(cwd, groups);
+                        Vec::new()
+                    }
+                };
+                SessionOutcome {
+                    coordination: Vec::new(),
+                    effects: commands.into_iter().map(Effect::Command).collect(),
+                }
+            }
+            SessionAction::CatalogFailed { request, message } => {
+                match request {
+                    SessionListRequest::Discovery => self.fail_discovery(),
+                    SessionListRequest::WorkspaceFirstPage { cwd }
+                    | SessionListRequest::WorkspaceContinuation { cwd } => {
+                        self.fail_workspace_request(&cwd);
+                    }
+                }
+                SessionOutcome {
+                    coordination: vec![
+                        SessionCoordination::PushChatError(message.clone()),
+                        SessionCoordination::Status {
+                            level: LogLevel::Error,
+                            target: "acp",
+                            message: format!("error: {message}"),
+                        },
+                    ],
+                    effects: Vec::new(),
+                }
+            }
+            SessionAction::Created {
+                agent_id,
+                session_id,
+                profile_id,
+            } => {
+                let remove_if_missing = self.is_remote_session_id(&session_id);
+                self.session_id = Some(session_id.clone());
+                self.agent_id = Some(agent_id);
+                self.mode_before_review = None;
+                SessionOutcome {
+                    coordination: vec![
+                        SessionCoordination::ClearDelegateParent,
+                        SessionCoordination::ApplyProfileBinding {
+                            session_id: session_id.clone(),
+                            profile_id,
+                            remove_if_missing,
+                        },
+                        SessionCoordination::ResetActiveSessionView,
+                        SessionCoordination::SelectChat,
+                        SessionCoordination::Status {
+                            level: LogLevel::Info,
+                            target: "session",
+                            message: "session created".into(),
+                        },
+                        SessionCoordination::SynchronizeProfileCommands {
+                            session_id: session_id.clone(),
+                            root_only: false,
+                        },
+                    ],
+                    effects: vec![Effect::Command(Command::SubscribeSession {
+                        session_id,
+                        agent_id: self.agent_id.clone(),
+                    })],
+                }
+            }
+            SessionAction::Loaded {
+                agent_id,
+                session_id,
+                profile_id,
+            } => {
+                let discovered_parent = self.session_parent_id(&session_id).map(str::to_owned);
+                let remove_if_missing = self.is_remote_session_id(&session_id);
+                self.session_id = Some(session_id.clone());
+                self.agent_id = Some(agent_id);
+                self.mode_before_review = None;
+                SessionOutcome {
+                    coordination: vec![
+                        SessionCoordination::SetChatIdle,
+                        SessionCoordination::ResolveDelegateParent(discovered_parent),
+                        SessionCoordination::ApplyProfileBinding {
+                            session_id: session_id.clone(),
+                            profile_id,
+                            remove_if_missing,
+                        },
+                        SessionCoordination::ResetActiveSessionView,
+                        SessionCoordination::SelectLoadedSessionScreen,
+                        SessionCoordination::Status {
+                            level: LogLevel::Debug,
+                            target: "activity",
+                            message: "ready".into(),
+                        },
+                        SessionCoordination::SynchronizeProfileCommands {
+                            session_id,
+                            root_only: true,
+                        },
+                    ],
+                    effects: vec![Effect::Command(Command::SetAgentMode {
+                        mode: self.agent_mode.clone(),
+                    })],
+                }
+            }
+            SessionAction::InitializeAgentId(agent_id) => {
+                self.agent_id = Some(agent_id);
+                SessionOutcome::default()
+            }
+            SessionAction::ReplaceAgentMode(mode) => {
+                self.replace_agent_mode(mode);
+                SessionOutcome::default()
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             session_groups: Vec::new(),
@@ -1010,6 +1205,291 @@ mod tests {
             sessions: ids.iter().map(|id| session(id)).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reducer_catalog_pages_preserve_request_order_and_remote_locations() {
+        let mut state = SessionsState::new();
+        state.session_discovery_in_progress = true;
+        state.remember_remote_session_location("remote", "node-1", Some("/remote".into()));
+
+        let outcome = state.reduce(SessionAction::CatalogPage {
+            request: SessionListRequest::Discovery,
+            page: SessionListPage {
+                groups: vec![group("/first", &["remote"]), group("/second", &["local"])],
+                next_cursor: Some("discovery-2".into()),
+                total_count: Some(2),
+            },
+        });
+
+        assert_eq!(
+            outcome,
+            SessionOutcome {
+                coordination: Vec::new(),
+                effects: vec![
+                    Effect::Command(Command::list_sessions_workspace("/first".into())),
+                    Effect::Command(Command::list_sessions_workspace("/second".into())),
+                    Effect::Command(Command::list_sessions_discovery(Some("discovery-2".into()))),
+                ],
+            }
+        );
+        assert_eq!(state.remote_session_locations["remote"].node_id, "node-1");
+        assert_eq!(
+            state.remote_session_locations["remote"].cwd.as_deref(),
+            Some("/remote")
+        );
+
+        let first_page = state.reduce(SessionAction::CatalogPage {
+            request: SessionListRequest::WorkspaceFirstPage {
+                cwd: "/first".into(),
+            },
+            page: SessionListPage {
+                groups: vec![group("/first", &["first-page"])],
+                ..Default::default()
+            },
+        });
+        assert_eq!(first_page, SessionOutcome::default());
+        let continuation = state.reduce(SessionAction::CatalogPage {
+            request: SessionListRequest::WorkspaceContinuation {
+                cwd: "/first".into(),
+            },
+            page: SessionListPage {
+                groups: vec![group("/first", &["continued"])],
+                ..Default::default()
+            },
+        });
+        assert_eq!(continuation, SessionOutcome::default());
+        assert_eq!(
+            state.session_groups[0]
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first-page", "continued"]
+        );
+    }
+
+    #[test]
+    fn reducer_catalog_failures_clear_only_the_requested_pending_state() {
+        let mut state = SessionsState::new();
+        state.session_discovery_in_progress = true;
+        state
+            .pending_session_group_loads
+            .insert(Some("/repo".into()));
+        state
+            .pending_session_group_loads
+            .insert(Some("/keep".into()));
+
+        let discovery = state.reduce(SessionAction::CatalogFailed {
+            request: SessionListRequest::Discovery,
+            message: "discovery failed".into(),
+        });
+        assert!(!state.session_discovery_in_progress);
+        assert_eq!(
+            discovery,
+            SessionOutcome {
+                coordination: vec![
+                    SessionCoordination::PushChatError("discovery failed".into()),
+                    SessionCoordination::Status {
+                        level: LogLevel::Error,
+                        target: "acp",
+                        message: "error: discovery failed".into(),
+                    },
+                ],
+                effects: Vec::new(),
+            }
+        );
+
+        let workspace = state.reduce(SessionAction::CatalogFailed {
+            request: SessionListRequest::WorkspaceContinuation {
+                cwd: "/repo".into(),
+            },
+            message: "workspace failed".into(),
+        });
+        assert!(
+            !state
+                .pending_session_group_loads
+                .contains(&Some("/repo".into()))
+        );
+        assert!(
+            state
+                .pending_session_group_loads
+                .contains(&Some("/keep".into()))
+        );
+        assert_eq!(workspace.coordination.len(), 2);
+        assert!(workspace.effects.is_empty());
+    }
+
+    #[test]
+    fn reducer_created_owns_active_ids_and_orders_external_coordination() {
+        let mut state = SessionsState::new();
+        state.mode_before_review = Some("plan".into());
+
+        let outcome = state.reduce(SessionAction::Created {
+            agent_id: "agent-1".into(),
+            session_id: "session-1".into(),
+            profile_id: Some("code".into()),
+        });
+
+        assert_eq!(state.session_id.as_deref(), Some("session-1"));
+        assert_eq!(state.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(state.mode_before_review, None);
+        assert_eq!(
+            outcome,
+            SessionOutcome {
+                coordination: vec![
+                    SessionCoordination::ClearDelegateParent,
+                    SessionCoordination::ApplyProfileBinding {
+                        session_id: "session-1".into(),
+                        profile_id: Some("code".into()),
+                        remove_if_missing: false,
+                    },
+                    SessionCoordination::ResetActiveSessionView,
+                    SessionCoordination::SelectChat,
+                    SessionCoordination::Status {
+                        level: LogLevel::Info,
+                        target: "session",
+                        message: "session created".into(),
+                    },
+                    SessionCoordination::SynchronizeProfileCommands {
+                        session_id: "session-1".into(),
+                        root_only: false,
+                    },
+                ],
+                effects: vec![Effect::Command(Command::SubscribeSession {
+                    session_id: "session-1".into(),
+                    agent_id: Some("agent-1".into()),
+                })],
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_loaded_reports_parent_remote_binding_and_mode_prefix() {
+        let mut child = session("child");
+        child.parent_session_id = Some("parent".into());
+        let mut state = SessionsState::new();
+        state.agent_mode = "plan".into();
+        state.mode_before_review = Some("build".into());
+        state.session_groups = vec![SessionGroup {
+            sessions: vec![child],
+            ..Default::default()
+        }];
+        state.remember_remote_session_location("child", "node-1", Some("/remote".into()));
+
+        let outcome = state.reduce(SessionAction::Loaded {
+            agent_id: "agent-1".into(),
+            session_id: "child".into(),
+            profile_id: None,
+        });
+
+        assert_eq!(state.session_id.as_deref(), Some("child"));
+        assert_eq!(state.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(state.mode_before_review, None);
+        assert_eq!(
+            outcome.coordination,
+            vec![
+                SessionCoordination::SetChatIdle,
+                SessionCoordination::ResolveDelegateParent(Some("parent".into())),
+                SessionCoordination::ApplyProfileBinding {
+                    session_id: "child".into(),
+                    profile_id: None,
+                    remove_if_missing: true,
+                },
+                SessionCoordination::ResetActiveSessionView,
+                SessionCoordination::SelectLoadedSessionScreen,
+                SessionCoordination::Status {
+                    level: LogLevel::Debug,
+                    target: "activity",
+                    message: "ready".into(),
+                },
+                SessionCoordination::SynchronizeProfileCommands {
+                    session_id: "child".into(),
+                    root_only: true,
+                },
+            ]
+        );
+        assert_eq!(
+            outcome.effects,
+            vec![Effect::Command(Command::SetAgentMode {
+                mode: "plan".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn reducer_loaded_marks_missing_local_profile_as_non_removing() {
+        let mut state = SessionsState::new();
+        let outcome = state.reduce(SessionAction::Loaded {
+            agent_id: "agent-1".into(),
+            session_id: "local".into(),
+            profile_id: None,
+        });
+        assert!(matches!(
+            outcome.coordination.get(2),
+            Some(SessionCoordination::ApplyProfileBinding {
+                session_id,
+                profile_id: None,
+                remove_if_missing: false,
+            }) if session_id == "local"
+        ));
+    }
+
+    #[test]
+    fn reducer_agent_initialization_changes_only_identity_with_empty_outcome() {
+        let mut state = SessionsState::new();
+        state.session_id = Some("session-1".into());
+        state.agent_id = Some("old-agent".into());
+        state.agent_mode = "review".into();
+        state.mode_before_review = Some("plan".into());
+        state.session_filter = "keep".into();
+        state.session_cursor = 4;
+        state.new_session_path = "/keep".into();
+        state.note_session_activity("session-1");
+        state.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        let activity_at = state.session_activity["session-1"].last_event_at;
+
+        let outcome = state.reduce(SessionAction::InitializeAgentId("agent-1".into()));
+
+        assert_eq!(outcome, SessionOutcome::default());
+        assert_eq!(state.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(state.session_id.as_deref(), Some("session-1"));
+        assert_eq!(state.agent_mode, "review");
+        assert_eq!(state.mode_before_review.as_deref(), Some("plan"));
+        assert_eq!(state.session_filter, "keep");
+        assert_eq!(state.session_cursor, 4);
+        assert_eq!(state.new_session_path, "/keep");
+        assert_eq!(
+            state.session_activity["session-1"].last_event_at,
+            activity_at
+        );
+        assert_eq!(state.session_remote_node_id("remote-1"), Some("node-1"));
+        assert_eq!(
+            state.session_remote_cwd("remote-1"),
+            Some("/remote/repo".into())
+        );
+    }
+
+    #[test]
+    fn reducer_agent_mode_replacement_preserves_review_return_semantics() {
+        let mut state = SessionsState::new();
+        state.agent_mode = "review".into();
+        state.mode_before_review = Some("plan".into());
+
+        assert_eq!(
+            state.reduce(SessionAction::ReplaceAgentMode("build".into())),
+            SessionOutcome::default()
+        );
+        assert_eq!(state.agent_mode, "build");
+        assert_eq!(state.mode_before_review, None);
+
+        state.mode_before_review = Some("plan".into());
+        assert_eq!(
+            state.reduce(SessionAction::ReplaceAgentMode("review".into())),
+            SessionOutcome::default()
+        );
+        assert_eq!(state.agent_mode, "review");
+        assert_eq!(state.mode_before_review.as_deref(), Some("plan"));
     }
 
     #[test]

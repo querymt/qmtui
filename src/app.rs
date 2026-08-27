@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::auth_state::AuthState;
 use crate::chat_state::ChatState;
 use crate::command::Command;
@@ -7,117 +5,12 @@ use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
 use crate::delegates_state::DelegatesState;
 use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
-use crate::domain::activity::{DelegateChildState, DelegateStats};
 use crate::mesh_state::MeshState;
 use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
-use crate::protocol::audit::EventKind;
 use crate::render_state::RenderState;
 use crate::session_state::SessionsState;
-
-// ── Delegation tracking ───────────────────────────────────────────────────────
-
-/// Update per-delegation stats from a single event arriving on a child session.
-pub(crate) fn accumulate_delegate_stats(stats: &mut DelegateStats, kind: &EventKind) {
-    match kind {
-        EventKind::ToolCallStart { .. } => {
-            stats.tool_calls = stats.tool_calls.saturating_add(1);
-        }
-        EventKind::AssistantMessageStored { .. } => {
-            stats.messages = stats.messages.saturating_add(1);
-        }
-        EventKind::LlmRequestEnd {
-            cost_usd,
-            context_tokens,
-            ..
-        } => {
-            if let Some(c) = cost_usd {
-                stats.cost_usd += c;
-            }
-            if let Some(ctx) = context_tokens {
-                stats.context_tokens = *ctx;
-            }
-        }
-        EventKind::ProviderChanged {
-            context_limit: Some(limit),
-            ..
-        } => {
-            stats.context_limit = *limit;
-        }
-        EventKind::LlmRequestStart { .. }
-        | EventKind::SnapshotStart { .. }
-        | EventKind::SnapshotEnd { .. }
-        | EventKind::ProgressRecorded { .. }
-        | EventKind::ArtifactRecorded { .. }
-        | EventKind::SessionQueued { .. }
-        | EventKind::SessionConfigured { .. }
-        | EventKind::ToolsAvailable { .. }
-        | EventKind::SessionCreated
-        | EventKind::Unknown => {}
-        _ => {}
-    }
-}
-
-pub(crate) fn update_delegate_child_state(state: &mut DelegateChildState, kind: &EventKind) {
-    match kind {
-        EventKind::ElicitationRequested {
-            elicitation_id,
-            message,
-            source,
-            requested_schema,
-            ..
-        } => {
-            *state = DelegateChildState::PendingElicitation {
-                elicitation_id: elicitation_id.clone(),
-                message: message.clone(),
-                requested_schema: requested_schema.clone(),
-                source: source.clone(),
-            };
-        }
-        EventKind::ToolCallEnd { tool_name, .. } if tool_name == "question" => {
-            *state = DelegateChildState::QuestionToolFinished;
-        }
-        EventKind::AssistantMessageStored { .. } => {
-            *state = DelegateChildState::AssistantMessage;
-        }
-        EventKind::UserMessageStored { .. } => {
-            *state = DelegateChildState::UserMessage;
-        }
-        EventKind::ToolCallStart { .. }
-        | EventKind::AssistantContentDelta { .. }
-        | EventKind::AssistantThinkingDelta { .. }
-        | EventKind::PromptReceived { .. }
-        | EventKind::LlmRequestStart { .. }
-        | EventKind::LlmRequestEnd { .. }
-        | EventKind::CompactionStart { .. }
-        | EventKind::CompactionEnd { .. }
-        | EventKind::SnapshotStart { .. }
-        | EventKind::SnapshotEnd { .. }
-        | EventKind::ProgressRecorded { .. }
-        | EventKind::ArtifactRecorded { .. }
-        | EventKind::SessionQueued { .. }
-        | EventKind::ProviderChanged { .. }
-        | EventKind::Error { .. }
-        | EventKind::Cancelled => {
-            *state = DelegateChildState::OtherProgress;
-        }
-        EventKind::TurnStarted
-        | EventKind::SessionModeChanged { .. }
-        | EventKind::SessionConfigured { .. }
-        | EventKind::ToolsAvailable { .. }
-        | EventKind::SessionCreated
-        | EventKind::DelegationRequested { .. }
-        | EventKind::DelegationCompleted { .. }
-        | EventKind::DelegationFailed { .. }
-        | EventKind::DelegationCancelled { .. }
-        | EventKind::SessionForked { .. }
-        | EventKind::Unknown => {}
-        EventKind::ToolCallEnd { .. } => {
-            *state = DelegateChildState::OtherProgress;
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
@@ -332,23 +225,6 @@ impl App {
         }
     }
 
-    pub fn apply_event_stats(&mut self, kind: &EventKind, timestamp: Option<i64>) {
-        match kind {
-            EventKind::ToolCallStart { .. } => self.chat.record_tool_call(),
-            EventKind::LlmRequestStart { .. } => self.chat.begin_llm_request_span(timestamp),
-            EventKind::LlmRequestEnd { context_tokens, .. } => {
-                self.chat.end_llm_request_span(timestamp);
-                if let Some(context_tokens) = context_tokens {
-                    self.chat.record_context_tokens(*context_tokens);
-                }
-            }
-            EventKind::Cancelled | EventKind::Error { .. } => {
-                self.chat.end_llm_request_span(timestamp);
-            }
-            _ => {}
-        }
-    }
-
     pub fn handle_connection_event(&mut self, event: ConnectionEvent) {
         self.chat.clear_cancel_confirm();
         match event {
@@ -386,13 +262,6 @@ impl App {
         }
     }
 
-    /// Mark the pending elicitation chat card with an outcome and clear the active state.
-    pub fn resolve_elicitation(&mut self, elicitation_id: &str, outcome: &str) {
-        self.chat.resolve_elicitation(elicitation_id, outcome);
-        self.render.invalidate_card_cache();
-        self.refresh_transient_status();
-    }
-
     // ── delegate model preference coordination ───────────────────────────────
 
     pub fn delegate_preference_profile_id(&self) -> Option<&str> {
@@ -409,26 +278,8 @@ impl App {
         session_id: &str,
         profile_id: &str,
     ) -> Vec<Command> {
-        let known_agents: HashSet<&str> = self
-            .models
-            .agents
-            .iter()
-            .skip(1)
-            .map(|agent| agent.id.as_str())
-            .collect();
         self.models
-            .delegate_model_preferences
-            .get(profile_id)
-            .into_iter()
-            .flat_map(|preferences| preferences.iter())
-            .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
-            .map(|(agent_id, preference)| Command::SetDelegateModel {
-                session_id: session_id.to_string(),
-                agent_id: agent_id.clone(),
-                model_id: Some(preference.model_id.clone()),
-                node_id: preference.node_id.clone(),
-            })
-            .collect()
+            .delegate_model_commands_for_session(session_id, profile_id)
     }
 
     /// Cursor position for a delegate agent's preferred model in the popup list.
@@ -780,7 +631,9 @@ mod reasoning_effort_tests {
 #[cfg(test)]
 mod delegate_entry_tests {
     use super::*;
-    use crate::domain::activity::{DelegateEntry, DelegateStatus};
+    use crate::domain::activity::{
+        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+    };
 
     fn make_entry(delegation_id: &str, objective: &str, status: DelegateStatus) -> DelegateEntry {
         DelegateEntry {
@@ -883,162 +736,6 @@ mod delegate_entry_tests {
             vec![make_entry("d1", "Build Feature", DelegateStatus::Completed)];
         app.delegates.delegate_filter = "BUILD".into();
         assert_eq!(app.delegates.visible_entries().len(), 1);
-    }
-
-    // ── delegation event processing ───────────────────────────────────────────
-
-    // ── DelegateStats accumulation ────────────────────────────────────────────
-
-    #[test]
-    fn stats_tool_call_increments() {
-        let mut stats = DelegateStats::default();
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::ToolCallStart {
-                tool_call_id: None,
-                tool_name: "read_tool".into(),
-                arguments: None,
-            },
-        );
-        assert_eq!(stats.tool_calls, 1);
-    }
-
-    #[test]
-    fn stats_message_increments_on_assistant_message() {
-        let mut stats = DelegateStats::default();
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::AssistantMessageStored {
-                content: "hello".into(),
-                thinking: None,
-                message_id: None,
-            },
-        );
-        assert_eq!(stats.messages, 1);
-    }
-
-    #[test]
-    fn stats_cost_accumulates_across_llm_requests() {
-        let mut stats = DelegateStats::default();
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::LlmRequestEnd {
-                finish_reason: None,
-                cost_usd: Some(0.01),
-                cumulative_cost_usd: None,
-                context_tokens: None,
-                tool_calls: None,
-                metrics: None,
-            },
-        );
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::LlmRequestEnd {
-                finish_reason: None,
-                cost_usd: Some(0.02),
-                cumulative_cost_usd: None,
-                context_tokens: None,
-                tool_calls: None,
-                metrics: None,
-            },
-        );
-        assert!((stats.cost_usd - 0.03).abs() < 1e-9);
-    }
-
-    #[test]
-    fn stats_context_tokens_takes_latest_value() {
-        let mut stats = DelegateStats::default();
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::LlmRequestEnd {
-                finish_reason: None,
-                cost_usd: None,
-                cumulative_cost_usd: None,
-                context_tokens: Some(1000),
-                tool_calls: None,
-                metrics: None,
-            },
-        );
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::LlmRequestEnd {
-                finish_reason: None,
-                cost_usd: None,
-                cumulative_cost_usd: None,
-                context_tokens: Some(2048),
-                tool_calls: None,
-                metrics: None,
-            },
-        );
-        assert_eq!(stats.context_tokens, 2048);
-    }
-
-    #[test]
-    fn stats_context_limit_set_from_provider_changed() {
-        let mut stats = DelegateStats::default();
-        accumulate_delegate_stats(
-            &mut stats,
-            &EventKind::ProviderChanged {
-                provider: "anthropic".into(),
-                model: "claude-sonnet".into(),
-                config_id: None,
-                context_limit: Some(200_000),
-                provider_node_id: None,
-            },
-        );
-        assert_eq!(stats.context_limit, 200_000);
-    }
-
-    #[test]
-    fn child_state_tracks_pending_elicitation_and_terminal_progress() {
-        let mut state = DelegateChildState::None;
-        update_delegate_child_state(
-            &mut state,
-            &EventKind::ElicitationRequested {
-                elicitation_id: "elic-1".into(),
-                session_id: "child-1".into(),
-                message: "Choose".into(),
-                requested_schema: serde_json::json!({"type":"string"}),
-                source: "builtin:question".into(),
-            },
-        );
-        assert!(matches!(
-            state,
-            DelegateChildState::PendingElicitation { ref elicitation_id, ref message, .. }
-                if elicitation_id == "elic-1" && message == "Choose"
-        ));
-
-        update_delegate_child_state(
-            &mut state,
-            &EventKind::AssistantMessageStored {
-                content: "answer".into(),
-                thinking: None,
-                message_id: None,
-            },
-        );
-        assert_eq!(state, DelegateChildState::AssistantMessage);
-
-        update_delegate_child_state(
-            &mut state,
-            &EventKind::ToolCallEnd {
-                tool_call_id: None,
-                tool_name: "question".into(),
-                result: None,
-                is_error: Some(false),
-            },
-        );
-        assert_eq!(state, DelegateChildState::QuestionToolFinished);
-
-        update_delegate_child_state(
-            &mut state,
-            &EventKind::ToolCallEnd {
-                tool_call_id: None,
-                tool_name: "read_tool".into(),
-                result: None,
-                is_error: Some(false),
-            },
-        );
-        assert_eq!(state, DelegateChildState::OtherProgress);
     }
 
     #[test]
@@ -1427,68 +1124,6 @@ mod tests {
         app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "redoing...");
-    }
-
-    #[test]
-    fn session_stats_track_llm_request_elapsed_context_and_tool_calls_from_events() {
-        let mut app = App::new();
-        app.apply_event_stats(
-            &EventKind::PromptReceived {
-                content: serde_json::json!("hi"),
-                message_id: None,
-            },
-            Some(100),
-        );
-        app.apply_event_stats(
-            &EventKind::LlmRequestStart {
-                message_count: Some(2),
-            },
-            Some(120),
-        );
-        app.apply_event_stats(
-            &EventKind::ToolCallStart {
-                tool_call_id: Some("call-1".into()),
-                tool_name: "read_tool".into(),
-                arguments: None,
-            },
-            Some(130),
-        );
-        app.apply_event_stats(
-            &EventKind::LlmRequestEnd {
-                finish_reason: None,
-                cost_usd: None,
-                cumulative_cost_usd: None,
-                context_tokens: Some(2048),
-                tool_calls: Some(99),
-                metrics: None,
-            },
-            Some(160),
-        );
-
-        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(2048));
-        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
-        assert_eq!(
-            app.chat.llm_request_elapsed(),
-            Some(Duration::from_secs(40))
-        );
-    }
-
-    #[test]
-    fn cancelled_closes_open_llm_request_span() {
-        let mut app = App::new();
-        app.apply_event_stats(
-            &EventKind::LlmRequestStart {
-                message_count: Some(1),
-            },
-            Some(200),
-        );
-        app.apply_event_stats(&EventKind::Cancelled, Some(215));
-        assert_eq!(
-            app.chat.llm_request_elapsed(),
-            Some(Duration::from_secs(15))
-        );
-        assert_eq!(app.chat.session_stats.open_llm_request_ts, None);
-        assert_eq!(app.chat.session_stats.open_llm_request_instant, None);
     }
 
     #[test]
