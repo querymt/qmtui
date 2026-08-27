@@ -820,6 +820,7 @@ mod tests {
         app.chat.messages.push(ChatEntry::Error("preserved".into()));
         app.chat.streaming_content = "active stream".into();
         app.chat.activity = ActivityState::Streaming;
+        app.chat.apply_usage(900, 9_000, Some(9.0));
         app.render.card_cache.processed_messages = 6;
 
         let effects = update(
@@ -851,6 +852,33 @@ mod tests {
             1
         );
 
+        let log_count_before_usage = app.diagnostics.logs.len();
+        for (used, size, cost_usd) in [(100, 1_000, Some(1.5)), (250, 2_000, Some(0.25))] {
+            let effects = update(
+                &mut app,
+                AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                    session_id: "child-1".into(),
+                    update: crate::acp_state::AcpSessionUpdate::UsageUpdate {
+                        used,
+                        size,
+                        cost_usd,
+                    },
+                    is_replay: false,
+                }),
+            );
+            assert!(effects.is_empty());
+        }
+        let child_stats = &app.delegates.pending_delegate_child_stats["child-1"];
+        assert_eq!(child_stats.messages, 1);
+        assert_eq!(child_stats.context_tokens, 250);
+        assert_eq!(child_stats.context_limit, 2_000);
+        assert_eq!(child_stats.cost_usd, 0.25);
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(900));
+        assert_eq!(app.chat.context_limit, 9_000);
+        assert_eq!(app.chat.cumulative_cost, Some(9.0));
+        assert_eq!(app.diagnostics.logs.len(), log_count_before_usage);
+        assert_eq!(app.render.card_cache.processed_messages, 6);
+
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
@@ -863,6 +891,9 @@ mod tests {
         let entry = &app.delegates.delegate_entries[0];
         assert_eq!(entry.child_session_id.as_deref(), Some("child-1"));
         assert_eq!(entry.stats.messages, 1);
+        assert_eq!(entry.stats.context_tokens, 250);
+        assert_eq!(entry.stats.context_limit, 2_000);
+        assert_eq!(entry.stats.cost_usd, 0.25);
         assert_eq!(entry.child_state, DelegateChildState::AssistantMessage);
         assert!(
             !app.delegates
@@ -876,6 +907,135 @@ mod tests {
         ));
         assert_eq!(app.chat.streaming_content, "active stream");
         assert_eq!(app.chat.activity, ActivityState::Streaming);
+    }
+
+    #[test]
+    fn chat_usage_and_timing_acp_route_is_owner_bounded_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.chat.apply_usage(128, 4_096, Some(1.5));
+        app.chat.add_active_llm_duration(Duration::from_secs(2));
+        app.render.streaming_cache.store(5, Vec::new());
+        app.render.streaming_thinking_cache.store(6, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        app.diagnostics.status = "preserved status".into();
+        app.push_log(LogLevel::Debug, "test", "before usage");
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::UsageUpdate {
+                used: 2_048,
+                size: 8_192,
+                cost_usd: Some(0.0123),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(2_048));
+        assert_eq!(app.chat.context_limit, 8_192);
+        assert_eq!(app.chat.cumulative_cost, Some(0.0123));
+
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::UsageUpdate {
+                used: 512,
+                size: 0,
+                cost_usd: None,
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(512));
+        assert_eq!(app.chat.context_limit, 8_192);
+        assert_eq!(app.chat.cumulative_cost, Some(0.0123));
+
+        app.sessions.session_activity.remove("active");
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::TimingUpdate { duration_secs: 3 },
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.llm_request_elapsed(), Some(Duration::from_secs(5)));
+
+        app.sessions.session_activity.remove("active");
+        let log_count_before_zero = app.diagnostics.logs.len();
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::TimingUpdate { duration_secs: 0 },
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.llm_request_elapsed(), Some(Duration::from_secs(5)));
+        assert_eq!(app.diagnostics.logs.len(), log_count_before_zero);
+
+        assert_eq!(app.diagnostics.status, "preserved status");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "usage");
+        assert_eq!(
+            diagnostics[0].message,
+            "usage: context 2048/8192 tokens (25%), cost $0.0123"
+        );
+        assert_eq!(diagnostics[1].level, LogLevel::Info);
+        assert_eq!(diagnostics[1].target, "usage");
+        assert_eq!(diagnostics[1].message, "usage: context 512/0 tokens");
+        assert_eq!(diagnostics[2].level, LogLevel::Info);
+        assert_eq!(diagnostics[2].target, "usage");
+        assert_eq!(diagnostics[2].message, "usage: active time 3s");
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(6).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+    }
+
+    #[test]
+    fn chat_usage_timing_replay_preserves_summary_and_diagnostic_order() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.render.streaming_cache.store(8, Vec::new());
+        app.render.streaming_thinking_cache.store(9, Vec::new());
+        app.render.card_cache.processed_messages = 10;
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionReplay {
+                session_id: "active".into(),
+                updates: vec![
+                    AcpSessionUpdate::TimingUpdate { duration_secs: 4 },
+                    AcpSessionUpdate::UsageUpdate {
+                        used: 30,
+                        size: 120,
+                        cost_usd: Some(0.5),
+                    },
+                ],
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.llm_request_elapsed(), Some(Duration::from_secs(4)));
+        assert_eq!(app.chat.session_stats.latest_context_tokens, Some(30));
+        assert_eq!(app.chat.context_limit, 120);
+        assert_eq!(app.chat.cumulative_cost, Some(0.5));
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "session");
+        assert_eq!(diagnostics[0].message, "session replay: 2 update(s)");
+        assert_eq!(diagnostics[1].level, LogLevel::Info);
+        assert_eq!(diagnostics[1].target, "usage");
+        assert_eq!(diagnostics[1].message, "usage: active time 4s");
+        assert_eq!(diagnostics[2].level, LogLevel::Info);
+        assert_eq!(diagnostics[2].target, "usage");
+        assert_eq!(
+            diagnostics[2].message,
+            "usage: context 30/120 tokens (25%), cost $0.5000"
+        );
+        assert!(app.render.streaming_cache.get(8).is_some());
+        assert!(app.render.streaming_thinking_cache.get(9).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 10);
     }
 
     #[test]

@@ -150,6 +150,25 @@ pub(crate) enum ChatToolAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ChatUsageAction {
+    UsageUpdated {
+        used: u64,
+        size: u64,
+        cost_usd: Option<f64>,
+    },
+    TimingUpdated {
+        duration_secs: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatUsageTransition {
+    UsageUpdated,
+    TimingUpdated,
+    NoOp,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolStartPreparationTransition {
     Suppressed,
@@ -238,6 +257,11 @@ pub(crate) enum ChatCoordination {
     InvalidateContentCache,
     InvalidateThinkingCache,
     InvalidateCardCache,
+    Log {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
     Status {
         level: LogLevel,
         target: &'static str,
@@ -255,6 +279,13 @@ pub(crate) struct ChatOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatToolOutcome {
     pub(crate) transition: ChatToolTransition,
+    pub(crate) coordination: Vec<ChatCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatUsageOutcome {
+    pub(crate) transition: ChatUsageTransition,
     pub(crate) coordination: Vec<ChatCoordination>,
     pub(crate) effects: Vec<Effect>,
 }
@@ -517,6 +548,51 @@ impl ChatState {
             }
         };
         ChatToolOutcome {
+            transition,
+            coordination,
+            effects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reduce_usage(&mut self, action: ChatUsageAction) -> ChatUsageOutcome {
+        let (transition, coordination) = match action {
+            ChatUsageAction::UsageUpdated {
+                used,
+                size,
+                cost_usd,
+            } => {
+                self.apply_usage(used, size, cost_usd);
+                let percentage = if used > 0 && size > 0 {
+                    format!(" ({}%)", (used as f64 / size as f64 * 100.0) as u32)
+                } else {
+                    String::new()
+                };
+                let cost = cost_usd
+                    .map(|amount| format!(", cost ${amount:.4}"))
+                    .unwrap_or_default();
+                (
+                    ChatUsageTransition::UsageUpdated,
+                    vec![ChatCoordination::Log {
+                        level: LogLevel::Info,
+                        target: "usage",
+                        message: format!("usage: context {used}/{size} tokens{percentage}{cost}"),
+                    }],
+                )
+            }
+            ChatUsageAction::TimingUpdated { duration_secs } if duration_secs > 0 => {
+                self.add_active_llm_duration(Duration::from_secs(duration_secs));
+                (
+                    ChatUsageTransition::TimingUpdated,
+                    vec![ChatCoordination::Log {
+                        level: LogLevel::Info,
+                        target: "usage",
+                        message: format!("usage: active time {duration_secs}s"),
+                    }],
+                )
+            }
+            ChatUsageAction::TimingUpdated { .. } => (ChatUsageTransition::NoOp, Vec::new()),
+        };
+        ChatUsageOutcome {
             transition,
             coordination,
             effects: Vec::new(),
@@ -1718,6 +1794,105 @@ mod tests {
         assert_eq!(chat.session_stats.total_tool_calls, 1);
         assert_eq!(chat.context_limit, 8192);
         assert_eq!(chat.cumulative_cost, Some(0.0123));
+    }
+
+    #[test]
+    fn usage_reducer_replaces_metrics_and_emits_exact_log_intent() {
+        let mut chat = ChatState::new();
+        chat.apply_usage(1024, 4096, Some(1.25));
+
+        let outcome = chat.reduce_usage(ChatUsageAction::UsageUpdated {
+            used: 2048,
+            size: 8192,
+            cost_usd: Some(0.0123),
+        });
+
+        assert_eq!(chat.session_stats.latest_context_tokens, Some(2048));
+        assert_eq!(chat.context_limit, 8192);
+        assert_eq!(chat.cumulative_cost, Some(0.0123));
+        assert_eq!(
+            outcome,
+            ChatUsageOutcome {
+                transition: ChatUsageTransition::UsageUpdated,
+                coordination: vec![ChatCoordination::Log {
+                    level: LogLevel::Info,
+                    target: "usage",
+                    message: "usage: context 2048/8192 tokens (25%), cost $0.0123".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn usage_reducer_preserves_absent_values_and_omits_zero_size_percentage() {
+        let mut chat = ChatState::new();
+        chat.apply_usage(128, 8192, Some(1.25));
+
+        let outcome = chat.reduce_usage(ChatUsageAction::UsageUpdated {
+            used: 512,
+            size: 0,
+            cost_usd: None,
+        });
+
+        assert_eq!(chat.session_stats.latest_context_tokens, Some(512));
+        assert_eq!(chat.context_limit, 8192);
+        assert_eq!(chat.cumulative_cost, Some(1.25));
+        assert_eq!(
+            outcome,
+            ChatUsageOutcome {
+                transition: ChatUsageTransition::UsageUpdated,
+                coordination: vec![ChatCoordination::Log {
+                    level: LogLevel::Info,
+                    target: "usage",
+                    message: "usage: context 512/0 tokens".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn timing_reducer_adds_repeated_durations_and_types_zero_as_noop() {
+        let mut chat = ChatState::new();
+        chat.add_active_llm_duration(Duration::from_secs(2));
+
+        let first = chat.reduce_usage(ChatUsageAction::TimingUpdated { duration_secs: 3 });
+        assert_eq!(
+            first,
+            ChatUsageOutcome {
+                transition: ChatUsageTransition::TimingUpdated,
+                coordination: vec![ChatCoordination::Log {
+                    level: LogLevel::Info,
+                    target: "usage",
+                    message: "usage: active time 3s".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+        let second = chat.reduce_usage(ChatUsageAction::TimingUpdated { duration_secs: 4 });
+        assert_eq!(second.transition, ChatUsageTransition::TimingUpdated);
+        assert_eq!(
+            second.coordination,
+            vec![ChatCoordination::Log {
+                level: LogLevel::Info,
+                target: "usage",
+                message: "usage: active time 4s".into(),
+            }]
+        );
+        assert!(second.effects.is_empty());
+        assert_eq!(chat.llm_request_elapsed(), Some(Duration::from_secs(9)));
+
+        let zero = chat.reduce_usage(ChatUsageAction::TimingUpdated { duration_secs: 0 });
+        assert_eq!(
+            zero,
+            ChatUsageOutcome {
+                transition: ChatUsageTransition::NoOp,
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(chat.llm_request_elapsed(), Some(Duration::from_secs(9)));
     }
 
     #[test]

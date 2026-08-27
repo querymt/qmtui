@@ -6,7 +6,7 @@ use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::chat_state::{
     ChatAction, ChatCoordination, ChatOutcome, ChatToolAction, ChatToolOutcome, ChatToolTransition,
-    ToolStartPreparationTransition,
+    ChatUsageAction, ChatUsageOutcome, ToolStartPreparationTransition,
 };
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
@@ -742,6 +742,16 @@ impl crate::app::App {
         (transition, effects)
     }
 
+    fn apply_chat_usage_action(&mut self, action: ChatUsageAction) -> Vec<Effect> {
+        let ChatUsageOutcome {
+            transition: _,
+            coordination,
+            effects,
+        } = self.chat.reduce_usage(action);
+        self.apply_chat_coordination(coordination);
+        effects
+    }
+
     fn apply_chat_coordination(&mut self, coordination: Vec<ChatCoordination>) {
         for coordination in coordination {
             match coordination {
@@ -754,6 +764,11 @@ impl crate::app::App {
                 ChatCoordination::InvalidateCardCache => {
                     self.render.invalidate_card_cache();
                 }
+                ChatCoordination::Log {
+                    level,
+                    target,
+                    message,
+                } => self.push_log(level, target, message),
                 ChatCoordination::Status {
                     level,
                     target,
@@ -948,31 +963,15 @@ impl crate::app::App {
                 size,
                 cost_usd,
             } => {
-                self.chat.apply_usage(used, size, cost_usd);
-                let pct = if used > 0 && size > 0 {
-                    format!(" ({}%)", (used as f64 / size as f64 * 100.0) as u32)
-                } else {
-                    String::new()
-                };
-                let cost = cost_usd
-                    .map(|amount| format!(", cost ${amount:.4}"))
-                    .unwrap_or_default();
-                self.push_log(
-                    LogLevel::Info,
-                    "usage",
-                    format!("usage: context {used}/{size} tokens{pct}{cost}"),
-                );
+                return self.apply_chat_usage_action(ChatUsageAction::UsageUpdated {
+                    used,
+                    size,
+                    cost_usd,
+                });
             }
             AcpSessionUpdate::TimingUpdate { duration_secs } => {
-                if duration_secs > 0 {
-                    self.chat
-                        .add_active_llm_duration(std::time::Duration::from_secs(duration_secs));
-                    self.push_log(
-                        LogLevel::Info,
-                        "usage",
-                        format!("usage: active time {duration_secs}s"),
-                    );
-                }
+                return self
+                    .apply_chat_usage_action(ChatUsageAction::TimingUpdated { duration_secs });
             }
             AcpSessionUpdate::ElicitationRequested {
                 elicitation_id,
