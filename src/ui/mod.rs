@@ -239,7 +239,7 @@ mod tests {
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
-    use crate::domain::chat::ChatEntry;
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::{
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
@@ -1707,7 +1707,7 @@ mod tests {
         let rendered = buffer_text(&buffer);
 
         assert!(
-            rendered.contains("Question"),
+            rendered.contains("\u{25B8} Question"),
             "missing popup title: {rendered}"
         );
         assert!(
@@ -2508,6 +2508,106 @@ mod tests {
         assert_eq!(app.render.card_cache.processed_messages, 0);
     }
 
+    fn elicitation_card_snapshot(
+        outcome: Option<ElicitationResponseOutcome>,
+    ) -> Vec<(String, ratatui::style::Style)> {
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Choose".into(),
+            source: "builtin:question".into(),
+            outcome,
+        });
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, CardKind::Elicitation);
+        cards[0]
+            .lines_for(120)
+            .iter()
+            .map(|line| {
+                (
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect(),
+                    line.spans.first().expect("elicitation line span").style,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn elicitation_cards_render_every_semantic_outcome_exactly() {
+        let cases = [
+            (
+                None,
+                vec![("  waiting for response\u{2026}", Theme::thinking())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Selected(vec![
+                    "Alpha".into(),
+                    "custom\nanswer".into(),
+                    "Beta".into(),
+                ])),
+                vec![
+                    ("  \u{25B8} Alpha", Theme::info_text()),
+                    ("  \u{25B8} custom", Theme::info_text()),
+                    ("  answer", Theme::info_text()),
+                    ("  \u{25B8} Beta", Theme::info_text()),
+                ],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Text(
+                    "line one\nline two".into(),
+                )),
+                vec![
+                    ("  line one", Theme::info_text()),
+                    ("  line two", Theme::info_text()),
+                ],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Boolean(true)),
+                vec![("  Yes", Theme::info_text())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Boolean(false)),
+                vec![("  No", Theme::info_text())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Declined),
+                vec![("  declined", Theme::status())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Cancelled),
+                vec![("  cancelled", Theme::status())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::UnsupportedSchema),
+                vec![(
+                    "  unsupported schema - cannot answer in TUI",
+                    Theme::info_text(),
+                )],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Responded),
+                vec![("  responded", Theme::info_text())],
+            ),
+        ];
+
+        for (outcome, expected_outcome) in cases {
+            let snapshot = elicitation_card_snapshot(outcome);
+            assert_eq!(
+                snapshot.first(),
+                Some(&("[?] Choose".into(), Theme::status_accent()))
+            );
+            let expected: Vec<(String, ratatui::style::Style)> = expected_outcome
+                .into_iter()
+                .map(|(text, style)| (text.into(), style))
+                .collect();
+            assert_eq!(&snapshot[1..], expected, "unexpected outcome rendering");
+        }
+    }
+
     #[test]
     fn message_cards_single_user() {
         let mut app = App::new();
@@ -3204,7 +3304,7 @@ mod tests {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             source: "builtin:question".into(),
-            outcome: Some("responded".into()),
+            outcome: Some(ElicitationResponseOutcome::Responded),
         });
         replay_session(
             &mut app,
@@ -3218,9 +3318,13 @@ mod tests {
             }],
         );
         assert!(app.chat.elicitation.is_none());
-        assert!(
-            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { outcome: Some(outcome), .. }] if outcome == "responded")
-        );
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation {
+                outcome: Some(ElicitationResponseOutcome::Responded),
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -3293,7 +3397,7 @@ mod tests {
         );
         assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }] if elicitation_id == "elic-1" && outcome == "unsupported schema - cannot answer in TUI")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(ElicitationResponseOutcome::UnsupportedSchema), .. }] if elicitation_id == "elic-1")
         );
     }
 

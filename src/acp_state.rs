@@ -1371,7 +1371,7 @@ mod tests {
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, DelegationState,
         PendingDelegateToolCall, SessionOp,
     };
-    use crate::domain::chat::ChatEntry;
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::ElicitationState;
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
@@ -4047,7 +4047,7 @@ mod tests {
         }
         app.apply_chat_elicitation_action(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-1".into(),
-            outcome: "staging".into(),
+            outcome: ElicitationResponseOutcome::Text("staging".into()),
         });
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
@@ -4058,7 +4058,8 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "staging"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Text("staging".into())
         ));
     }
 
@@ -4121,7 +4122,7 @@ mod tests {
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
                 if elicitation_id == "elic-unsupported"
-                    && outcome == "unsupported schema - cannot answer in TUI"
+                    && outcome == &ElicitationResponseOutcome::UnsupportedSchema
         ));
     }
 

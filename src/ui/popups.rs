@@ -11,7 +11,7 @@ use crate::app::App;
 use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::DelegateStats;
-use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
+use crate::domain::auth::{AuthMethod, AuthStatus, OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::ProfileInfo;
 use crate::models_state::ModelPopupItem;
@@ -2533,6 +2533,23 @@ pub(super) fn draw_help_popup(f: &mut Frame, app: &App) {
 const AUTH_POPUP_MAX_W: u16 = 68;
 const AUTH_POPUP_MIN_W: u16 = 44;
 
+fn auth_method_label(method: AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::OAuth => "OAuth",
+        AuthMethod::ApiKey => "API Key",
+        AuthMethod::EnvVar => "Env",
+    }
+}
+
+fn auth_status_label(status: AuthStatus) -> &'static str {
+    match status {
+        AuthStatus::Unconfigurable => "OAuth required",
+        AuthStatus::Expired => "Expired",
+        AuthStatus::Active(method) => auth_method_label(method),
+        AuthStatus::NotConfigured => "Not configured",
+    }
+}
+
 pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
     let area = f.area();
     let popup_width = area
@@ -2620,7 +2637,8 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, (_, provider))| {
             let selected = i == app.auth.cursor;
-            let badge = provider.auth_badge_label();
+            let status = provider.auth_status();
+            let badge = auth_status_label(status);
             let badge_active = provider.is_auth_active();
             let is_expired = provider.oauth_status == Some(OAuthStatus::Expired);
 
@@ -2756,7 +2774,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             // Show selected provider status summary
             let mut lines: Vec<Line<'static>> = Vec::new();
 
-            let status_label = provider.auth_badge_label();
+            let status_label = auth_status_label(provider.auth_status());
             let is_active = provider.is_auth_active();
             let status_style = if is_active {
                 ratatui::style::Style::default()
@@ -3051,7 +3069,40 @@ fn draw_auth_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::auth::AuthProviderEntry;
     use crate::domain::profile::ProfileInfo;
+
+    fn auth_provider(display_name: &str, status: AuthStatus) -> AuthProviderEntry {
+        let (supports_oauth, env_var_name) = match status {
+            AuthStatus::Unconfigurable => (false, None),
+            AuthStatus::Active(AuthMethod::OAuth) | AuthStatus::Expired => (true, None),
+            AuthStatus::Active(AuthMethod::ApiKey) | AuthStatus::Active(AuthMethod::EnvVar) => (
+                false,
+                Some(format!("{}_API_KEY", display_name.to_uppercase())),
+            ),
+            AuthStatus::NotConfigured => (
+                true,
+                Some(format!("{}_API_KEY", display_name.to_uppercase())),
+            ),
+        };
+        AuthProviderEntry {
+            provider: display_name.to_lowercase().replace(' ', "-"),
+            display_name: display_name.into(),
+            oauth_status: match status {
+                AuthStatus::Expired => Some(OAuthStatus::Expired),
+                AuthStatus::Active(AuthMethod::OAuth) => Some(OAuthStatus::Connected),
+                AuthStatus::Unconfigurable
+                | AuthStatus::Active(AuthMethod::ApiKey)
+                | AuthStatus::Active(AuthMethod::EnvVar) => None,
+                AuthStatus::NotConfigured => Some(OAuthStatus::NotAuthenticated),
+            },
+            has_stored_api_key: status == AuthStatus::Active(AuthMethod::ApiKey),
+            has_env_api_key: status == AuthStatus::Active(AuthMethod::EnvVar),
+            env_var_name,
+            supports_oauth,
+            preferred_method: None,
+        }
+    }
 
     fn profile(id: &str, name: &str) -> ProfileInfo {
         ProfileInfo {
@@ -3075,6 +3126,108 @@ mod tests {
             }
         }
         None
+    }
+
+    fn find_last_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in (0..buffer.area.height).rev() {
+            let line = buffer_line(buffer, y);
+            if let Some(byte_idx) = line.find(needle) {
+                return Some((line[..byte_idx].chars().count() as u16, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn auth_labels_map_semantic_methods_and_statuses() {
+        assert_eq!(auth_method_label(AuthMethod::OAuth), "OAuth");
+        assert_eq!(auth_method_label(AuthMethod::ApiKey), "API Key");
+        assert_eq!(auth_method_label(AuthMethod::EnvVar), "Env");
+        assert_eq!(
+            auth_status_label(AuthStatus::Unconfigurable),
+            "OAuth required"
+        );
+        assert_eq!(auth_status_label(AuthStatus::Expired), "Expired");
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::OAuth)),
+            "OAuth"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::ApiKey)),
+            "API Key"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::EnvVar)),
+            "Env"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::NotConfigured),
+            "Not configured"
+        );
+    }
+
+    #[test]
+    fn auth_popup_renders_exact_badges_and_styles_in_list_and_detail() {
+        let mut app = App::new();
+        app.auth.providers = vec![
+            auth_provider("OAuth Active", AuthStatus::Active(AuthMethod::OAuth)),
+            auth_provider("API Active", AuthStatus::Active(AuthMethod::ApiKey)),
+            auth_provider("Env Active", AuthStatus::Active(AuthMethod::EnvVar)),
+            auth_provider("Expired Auth", AuthStatus::Expired),
+            auth_provider("OAuth Missing", AuthStatus::Unconfigurable),
+            auth_provider("No Auth", AuthStatus::NotConfigured),
+        ];
+        app.auth.cursor = app.auth.providers.len();
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_auth_popup(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for (name, label, foreground) in [
+            ("OAuth Active", "[OAuth]", Theme::ok()),
+            ("API Active", "[API Key]", Theme::ok()),
+            ("Env Active", "[Env]", Theme::ok()),
+            ("Expired Auth", "[Expired]", Theme::warn()),
+        ] {
+            let row = find_buffer_text(buffer, name).expect("provider row").1;
+            let badge = find_buffer_text(buffer, label).expect("provider badge");
+            assert_eq!(badge.1, row);
+            assert_eq!(buffer[badge].fg, foreground);
+        }
+        for (name, label) in [
+            ("OAuth Missing", "[OAuth required]"),
+            ("No Auth", "[Not configured]"),
+        ] {
+            let row = find_buffer_text(buffer, name).expect("provider row").1;
+            let badge = find_buffer_text(buffer, label).expect("provider badge");
+            assert_eq!(badge.1, row);
+            assert_eq!(buffer[badge].fg, Theme::status().fg.unwrap());
+            assert_eq!(buffer[badge].bg, Theme::status().bg.unwrap());
+        }
+
+        for (index, label, active) in [
+            (0, "[OAuth]", true),
+            (1, "[API Key]", true),
+            (2, "[Env]", true),
+            (3, "[Expired]", false),
+            (4, "[OAuth required]", false),
+            (5, "[Not configured]", false),
+        ] {
+            app.auth.selected = Some(index);
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw_auth_popup(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let badge = find_last_buffer_text(buffer, label).expect("detail badge");
+            let (expected_fg, expected_bg) = if active {
+                (Theme::ok(), Theme::bg_dim())
+            } else {
+                (Theme::status().fg.unwrap(), Theme::status().bg.unwrap())
+            };
+            assert_eq!(buffer[badge].fg, expected_fg);
+            assert_eq!(buffer[badge].bg, expected_bg);
+        }
     }
 
     #[test]

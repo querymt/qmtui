@@ -806,7 +806,7 @@ mod tests {
     use super::*;
     use crate::connection_state::ServerState;
     use crate::domain::activity::{ActivityState, SessionOp};
-    use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::session::{
         ForkBoundaryKind, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState, UndoableTurn,
     };
@@ -1264,7 +1264,7 @@ mod tests {
             elicitation_id: "e1".into(),
             message: "Pick one".into(),
             source: "builtin:question".into(),
-            outcome: Some("responded".into()),
+            outcome: Some(ElicitationResponseOutcome::Responded),
         }];
         let result = r#"{"answers":[{"question":"Pick one","answers":["Beta"]}]}"#;
         let mut chat = ChatState::new();
@@ -1272,7 +1272,8 @@ mod tests {
         chat.backfill_elicitation_outcomes(result);
         messages = chat.messages;
         assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["Beta".into()])
         ));
     }
 
@@ -1282,7 +1283,7 @@ mod tests {
             elicitation_id: "e1".into(),
             message: "Pick many".into(),
             source: "builtin:question".into(),
-            outcome: Some("responded".into()),
+            outcome: Some(ElicitationResponseOutcome::Responded),
         }];
         let result = r#"{"answers":[{"question":"Pick many","answers":["X","Z"]}]}"#;
         let mut chat = ChatState::new();
@@ -1290,7 +1291,8 @@ mod tests {
         chat.backfill_elicitation_outcomes(result);
         messages = chat.messages;
         assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}X\n{OUTCOME_BULLET}Z")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["X".into(), "Z".into()])
         ));
     }
 
@@ -1301,13 +1303,13 @@ mod tests {
                 elicitation_id: "e1".into(),
                 message: "Q1".into(),
                 source: "builtin:question".into(),
-                outcome: Some("responded".into()),
+                outcome: Some(ElicitationResponseOutcome::Responded),
             },
             ChatEntry::Elicitation {
                 elicitation_id: "e2".into(),
                 message: "Q2".into(),
                 source: "builtin:question".into(),
-                outcome: Some("responded".into()),
+                outcome: Some(ElicitationResponseOutcome::Responded),
             },
         ];
         let result = r#"{"answers":[{"question":"Q1","answers":["Alpha"]},{"question":"Q2","answers":["Yes"]}]}"#;
@@ -1316,10 +1318,12 @@ mod tests {
         chat.backfill_elicitation_outcomes(result);
         messages = chat.messages;
         assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Alpha")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["Alpha".into()])
         ));
         assert!(matches!(&messages[1],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Yes")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["Yes".into()])
         ));
     }
 
@@ -1330,13 +1334,15 @@ mod tests {
                 elicitation_id: "e1".into(),
                 message: "Q1".into(),
                 source: "builtin:question".into(),
-                outcome: Some(format!("{OUTCOME_BULLET}AlreadySet")),
+                outcome: Some(ElicitationResponseOutcome::Selected(vec![
+                    "AlreadySet".into(),
+                ])),
             },
             ChatEntry::Elicitation {
                 elicitation_id: "e2".into(),
                 message: "Q2".into(),
                 source: "builtin:question".into(),
-                outcome: Some("responded".into()),
+                outcome: Some(ElicitationResponseOutcome::Responded),
             },
         ];
         let result = r#"{"answers":[{"question":"Q2","answers":["Beta"]}]}"#;
@@ -1346,11 +1352,13 @@ mod tests {
         messages = chat.messages;
         // First card unchanged
         assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}AlreadySet")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["AlreadySet".into()])
         ));
         // Second card updated
         assert!(matches!(&messages[1],
-            ChatEntry::Elicitation { outcome: Some(o), .. } if *o == format!("{OUTCOME_BULLET}Beta")
+            ChatEntry::Elicitation { outcome: Some(o), .. }
+                if o == &ElicitationResponseOutcome::Selected(vec!["Beta".into()])
         ));
     }
 }

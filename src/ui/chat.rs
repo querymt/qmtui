@@ -14,7 +14,7 @@ use ratatui::{
 use crate::app::App;
 use crate::composer_state::{InputVisualLayout, build_input_visual_layout};
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
-use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
 use crate::domain::tool::{
     MultiEditSection, ShellOutput, SymbolDiffSection, SymbolReplacement, ToolDetail,
 };
@@ -54,6 +54,7 @@ pub(crate) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
 }
 
 // ── Elicitation symbols ───────────────────────────────────────────────────────
+const OUTCOME_BULLET: &str = "\u{25B8} ";
 const RADIO_SELECTED: &str = "\u{25CF} "; // ● filled circle  – single-select active
 const RADIO_UNSELECTED: &str = "\u{25CB} "; // ○ empty circle   – single-select inactive
 pub(crate) const CHECK_CHECKED: &str = "\u{2611} "; // ☑ ballot box checked   – success/done
@@ -734,24 +735,16 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                     Span::styled(message.clone(), Theme::status_accent()),
                 ]));
                 let mut card_blocks = vec![header];
-                match outcome.as_deref() {
+                match outcome {
                     None => {
                         card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
                             Span::styled("  waiting for response\u{2026}", Theme::thinking()),
                         )));
                     }
-                    Some("declined") | Some("cancelled") => {
-                        card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
-                            Span::styled(
-                                format!("  {}", outcome.as_deref().unwrap()),
-                                Theme::status(),
-                            ),
-                        )));
-                    }
-                    Some(text) => {
-                        for part in text.lines() {
+                    Some(outcome) => {
+                        for (text, style) in elicitation_outcome_lines(outcome) {
                             card_blocks.push(crate::markdown::CardBlock::Text(Line::from(
-                                Span::styled(format!("  {part}"), Theme::info_text()),
+                                Span::styled(format!("  {text}"), style),
                             )));
                         }
                     }
@@ -771,6 +764,36 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 }
 
 // ── Shared header builder ─────────────────────────────────────────────────────
+
+fn elicitation_outcome_lines(outcome: &ElicitationResponseOutcome) -> Vec<(String, Style)> {
+    let (texts, style) = match outcome {
+        ElicitationResponseOutcome::Selected(labels) => (
+            labels
+                .iter()
+                .map(|label| format!("{OUTCOME_BULLET}{label}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Theme::info_text(),
+        ),
+        ElicitationResponseOutcome::Text(text) => (
+            text.lines().map(str::to_string).collect(),
+            Theme::info_text(),
+        ),
+        ElicitationResponseOutcome::Boolean(true) => (vec!["Yes".into()], Theme::info_text()),
+        ElicitationResponseOutcome::Boolean(false) => (vec!["No".into()], Theme::info_text()),
+        ElicitationResponseOutcome::Declined => (vec!["declined".into()], Theme::status()),
+        ElicitationResponseOutcome::Cancelled => (vec!["cancelled".into()], Theme::status()),
+        ElicitationResponseOutcome::UnsupportedSchema => (
+            vec!["unsupported schema - cannot answer in TUI".into()],
+            Theme::info_text(),
+        ),
+        ElicitationResponseOutcome::Responded => (vec!["responded".into()], Theme::info_text()),
+    };
+    texts.into_iter().map(|text| (text, style)).collect()
+}
 
 fn format_status_duration(duration: std::time::Duration) -> String {
     let secs = duration.as_secs();

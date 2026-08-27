@@ -4,7 +4,7 @@ use crate::application::Effect;
 use crate::composer_state::build_input_visual_layout;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp, SessionStatsLite};
-use crate::domain::chat::{ChatEntry, format_outcome_labels};
+use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::session::{
     ForkBoundaryKind, ForkResult, ForkTurnItem, RedoResult, UndoFrame, UndoFrameStatus, UndoResult,
@@ -130,7 +130,7 @@ pub(crate) enum ElicitationAction {
     },
     ResponseAcknowledged {
         elicitation_id: String,
-        outcome: String,
+        outcome: ElicitationResponseOutcome,
     },
 }
 
@@ -933,8 +933,7 @@ impl ChatState {
                     elicitation_id,
                     message,
                     source,
-                    outcome: (!supported)
-                        .then(|| "unsupported schema - cannot answer in TUI".into()),
+                    outcome: (!supported).then_some(ElicitationResponseOutcome::UnsupportedSchema),
                 });
                 self.scroll_offset = 0;
 
@@ -1917,7 +1916,7 @@ impl ChatState {
             let ChatEntry::Elicitation { outcome, .. } = entry else {
                 continue;
             };
-            if outcome.as_deref() != Some("responded") {
+            if outcome.as_ref() != Some(&ElicitationResponseOutcome::Responded) {
                 continue;
             }
             let Some(answer_entry) = answer_iter.next() else {
@@ -1926,10 +1925,14 @@ impl ChatState {
             let labels = answer_entry
                 .get("answers")
                 .and_then(|answers| answers.as_array())
-                .map(|answers| answers.iter().filter_map(|answer| answer.as_str()))
-                .into_iter()
-                .flatten();
-            *outcome = Some(format_outcome_labels(labels));
+                .map(|answers| {
+                    answers
+                        .iter()
+                        .filter_map(|answer| answer.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            *outcome = Some(ElicitationResponseOutcome::Selected(labels));
         }
     }
 }
@@ -1961,7 +1964,6 @@ fn move_wrapping_cursor(cursor: usize, len: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::chat::OUTCOME_BULLET;
     use crate::domain::tool::ToolDetail;
 
     fn user(text: &str, message_id: Option<&str>) -> ChatEntry {
@@ -2688,7 +2690,7 @@ mod tests {
 
         let outcome = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-1".into(),
-            outcome: "responded".into(),
+            outcome: ElicitationResponseOutcome::Responded,
         });
         assert_eq!(outcome.transition, ElicitationTransition::ResolvedActive);
         assert!(chat.elicitation.is_none());
@@ -2698,7 +2700,38 @@ mod tests {
         assert!(matches!(
             &chat.messages[0],
             ChatEntry::Elicitation { outcome: Some(outcome), .. }
-                if outcome == &format!("{OUTCOME_BULLET}Alpha\n{OUTCOME_BULLET}Beta")
+                if outcome == &ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into()])
+        ));
+    }
+
+    #[test]
+    fn elicitation_backfill_ignores_malformed_results_and_preserves_missing_answers_behavior() {
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Pick".into(),
+            source: "question".into(),
+            outcome: Some(ElicitationResponseOutcome::Responded),
+        });
+
+        for result in ["not json", r#"{"answers":"invalid"}"#] {
+            chat.backfill_elicitation_outcomes(result);
+            assert!(matches!(
+                chat.messages.as_slice(),
+                [ChatEntry::Elicitation {
+                    outcome: Some(ElicitationResponseOutcome::Responded),
+                    ..
+                }]
+            ));
+        }
+
+        chat.backfill_elicitation_outcomes(r#"{"answers":[{"question":"Pick"}]}"#);
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::Elicitation {
+                outcome: Some(ElicitationResponseOutcome::Selected(labels)),
+                ..
+            }] if labels.is_empty()
         ));
     }
 
@@ -2839,8 +2872,10 @@ mod tests {
             assert!(chat.elicitation_ui.is_none());
             assert!(matches!(
                 chat.messages.as_slice(),
-                [ChatEntry::Elicitation { outcome: Some(outcome), .. }]
-                    if outcome == "unsupported schema - cannot answer in TUI"
+                [ChatEntry::Elicitation {
+                    outcome: Some(ElicitationResponseOutcome::UnsupportedSchema),
+                    ..
+                }]
             ));
         }
     }
@@ -2955,7 +2990,7 @@ mod tests {
 
         let unknown = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "missing".into(),
-            outcome: "accepted".into(),
+            outcome: ElicitationResponseOutcome::Text("accepted".into()),
         });
         assert_eq!(
             unknown,
@@ -2974,7 +3009,7 @@ mod tests {
 
         let stale = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-old".into(),
-            outcome: "declined".into(),
+            outcome: ElicitationResponseOutcome::Declined,
         });
         assert_eq!(stale.transition, ElicitationTransition::ResolvedStale);
         assert_eq!(
@@ -2992,7 +3027,7 @@ mod tests {
 
         let active = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-new".into(),
-            outcome: "accepted".into(),
+            outcome: ElicitationResponseOutcome::Text("accepted".into()),
         });
         assert_eq!(active.transition, ElicitationTransition::ResolvedActive);
         assert_eq!(
@@ -3008,7 +3043,7 @@ mod tests {
 
         let duplicate = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-new".into(),
-            outcome: "accepted".into(),
+            outcome: ElicitationResponseOutcome::Text("accepted".into()),
         });
         assert_eq!(duplicate.transition, ElicitationTransition::ResolvedStale);
         assert_eq!(
@@ -3022,9 +3057,9 @@ mod tests {
                 ChatEntry::Elicitation { elicitation_id: old, outcome: Some(old_outcome), .. },
                 ChatEntry::Elicitation { elicitation_id: new, outcome: Some(new_outcome), .. },
             ] if old == "elic-old"
-                && old_outcome == "declined"
+                && old_outcome == &ElicitationResponseOutcome::Declined
                 && new == "elic-new"
-                && new_outcome == "accepted"
+                && new_outcome == &ElicitationResponseOutcome::Text("accepted".into())
         ));
     }
 

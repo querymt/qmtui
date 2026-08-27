@@ -4,7 +4,7 @@ use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::chat::format_outcome_labels;
+use crate::domain::chat::ElicitationResponseOutcome;
 use crate::domain::model::ModelEntry;
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -44,7 +44,7 @@ fn elicitation_response_effect(
     elicitation_id: String,
     action: &str,
     content: Option<serde_json::Value>,
-    outcome: String,
+    outcome: ElicitationResponseOutcome,
 ) -> Effect {
     Effect::ElicitationResponse {
         elicitation_id,
@@ -72,43 +72,46 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
         return effects;
     };
 
-    let selected_display = |state: &crate::domain::elicitation::ElicitationState,
+    let selected_outcome = |state: &crate::domain::elicitation::ElicitationState,
                             custom_active: bool| {
         let field = &state.fields[field_index];
         if custom_active {
-            return format_outcome_labels([state.custom_input.trim()]);
+            return ElicitationResponseOutcome::Selected(vec![
+                state.custom_input.trim().to_string(),
+            ]);
         }
         match &field.kind {
-            ElicitationFieldKind::SingleSelect { options } => options
-                .iter()
-                .find(|option| state.selected.get(&field.name) == Some(&option.value))
-                .map(|option| format_outcome_labels([option.label.as_str()]))
-                .unwrap_or_default(),
-            ElicitationFieldKind::MultiSelect { options } => state
-                .selected
-                .get(&field.name)
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    format_outcome_labels(
+            ElicitationFieldKind::SingleSelect { options } => ElicitationResponseOutcome::Selected(
+                options
+                    .iter()
+                    .find(|option| state.selected.get(&field.name) == Some(&option.value))
+                    .map(|option| vec![option.label.clone()])
+                    .unwrap_or_default(),
+            ),
+            ElicitationFieldKind::MultiSelect { options } => {
+                let labels = state
+                    .selected
+                    .get(&field.name)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
                         options
                             .iter()
                             .filter(|option| values.contains(&option.value))
-                            .map(|option| option.label.as_str()),
-                    )
-                })
-                .unwrap_or_default(),
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                state.text_input.clone()
+                            .map(|option| option.label.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ElicitationResponseOutcome::Selected(labels)
             }
-            ElicitationFieldKind::BooleanToggle => match state
+            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
+                ElicitationResponseOutcome::Text(state.text_input.clone())
+            }
+            ElicitationFieldKind::BooleanToggle => state
                 .selected
                 .get(&field.name)
                 .and_then(serde_json::Value::as_bool)
-            {
-                Some(true) => "Yes".into(),
-                Some(false) => "No".into(),
-                None => String::new(),
-            },
+                .map(ElicitationResponseOutcome::Boolean)
+                .unwrap_or_else(|| ElicitationResponseOutcome::Text(String::new())),
         }
     };
 
@@ -124,12 +127,12 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             KeyCode::Enter if state.is_valid(Some(&state.custom_input)) => {
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(Some(&state.custom_input));
-                let display = selected_display(state, true);
+                let outcome = selected_outcome(state, true);
                 effects.push(elicitation_response_effect(
                     elicitation_id,
                     "accept",
                     Some(content),
-                    display,
+                    outcome,
                 ));
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -164,7 +167,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
                 elicitation_id,
                 "decline",
                 None,
-                "declined".into(),
+                ElicitationResponseOutcome::Declined,
             ));
         }
         KeyCode::Down => {
@@ -206,12 +209,12 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             if state.is_valid(None) {
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(None);
-                let display = selected_display(state, false);
+                let outcome = selected_outcome(state, false);
                 effects.push(elicitation_response_effect(
                     elicitation_id,
                     "accept",
                     Some(content),
-                    display,
+                    outcome,
                 ));
             }
         }

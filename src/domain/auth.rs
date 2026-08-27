@@ -1,5 +1,3 @@
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,22 +9,20 @@ pub enum AuthMethod {
     EnvVar,
 }
 
-impl fmt::Display for AuthMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OAuth => write!(f, "OAuth"),
-            Self::ApiKey => write!(f, "API Key"),
-            Self::EnvVar => write!(f, "Env"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthStatus {
     Connected,
     Expired,
     NotAuthenticated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStatus {
+    Unconfigurable,
+    Expired,
+    Active(AuthMethod),
+    NotConfigured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -100,19 +96,16 @@ impl AuthProviderEntry {
         None
     }
 
-    /// Badge label for current auth state.
-    pub fn auth_badge_label(&self) -> &'static str {
+    /// Classify the provider's current authentication state.
+    pub fn auth_status(&self) -> AuthStatus {
         if self.is_unconfigurable() {
-            return "OAuth required";
-        }
-        if self.oauth_status == Some(OAuthStatus::Expired) {
-            return "Expired";
-        }
-        match self.effective_auth() {
-            Some(AuthMethod::OAuth) => "OAuth",
-            Some(AuthMethod::ApiKey) => "API Key",
-            Some(AuthMethod::EnvVar) => "Env",
-            None => "Not configured",
+            AuthStatus::Unconfigurable
+        } else if self.oauth_status == Some(OAuthStatus::Expired) {
+            AuthStatus::Expired
+        } else if let Some(method) = self.effective_auth() {
+            AuthStatus::Active(method)
+        } else {
+            AuthStatus::NotConfigured
         }
     }
 
@@ -205,7 +198,7 @@ mod tests {
         let mut p = make_provider("OpenAI");
         p.oauth_status = Some(OAuthStatus::Connected);
         assert_eq!(p.effective_auth(), Some(AuthMethod::OAuth));
-        assert_eq!(p.auth_badge_label(), "OAuth");
+        assert_eq!(p.auth_status(), AuthStatus::Active(AuthMethod::OAuth));
         assert!(p.is_auth_active());
     }
 
@@ -214,7 +207,7 @@ mod tests {
         let mut p = make_api_key_only("Groq");
         p.has_stored_api_key = true;
         assert_eq!(p.effective_auth(), Some(AuthMethod::ApiKey));
-        assert_eq!(p.auth_badge_label(), "API Key");
+        assert_eq!(p.auth_status(), AuthStatus::Active(AuthMethod::ApiKey));
         assert!(p.is_auth_active());
     }
 
@@ -223,22 +216,22 @@ mod tests {
         let mut p = make_api_key_only("DeepSeek");
         p.has_env_api_key = true;
         assert_eq!(p.effective_auth(), Some(AuthMethod::EnvVar));
-        assert_eq!(p.auth_badge_label(), "Env");
+        assert_eq!(p.auth_status(), AuthStatus::Active(AuthMethod::EnvVar));
     }
 
     #[test]
     fn auth_provider_entry_not_configured() {
         let p = make_provider("OpenAI");
         assert_eq!(p.effective_auth(), None);
-        assert_eq!(p.auth_badge_label(), "Not configured");
+        assert_eq!(p.auth_status(), AuthStatus::NotConfigured);
         assert!(!p.is_auth_active());
     }
 
     #[test]
-    fn auth_provider_entry_expired_badge() {
+    fn auth_provider_entry_expired_status() {
         let mut p = make_oauth_only("Codex");
         p.oauth_status = Some(OAuthStatus::Expired);
-        assert_eq!(p.auth_badge_label(), "Expired");
+        assert_eq!(p.auth_status(), AuthStatus::Expired);
     }
 
     #[test]
@@ -254,17 +247,21 @@ mod tests {
             preferred_method: None,
         };
         assert!(p.is_unconfigurable());
-        assert_eq!(p.auth_badge_label(), "OAuth required");
+        assert_eq!(p.auth_status(), AuthStatus::Unconfigurable);
     }
 
     #[test]
-    fn auth_provider_entry_preferred_method_overrides_default_order() {
-        let mut p = make_provider("OpenAI");
-        p.oauth_status = Some(OAuthStatus::Connected);
-        p.has_stored_api_key = true;
-        p.preferred_method = Some(AuthMethod::ApiKey);
-        // With preference ApiKey, should pick that over OAuth even though both are available
-        assert_eq!(p.effective_auth(), Some(AuthMethod::ApiKey));
+    fn auth_provider_entry_preferred_method_controls_effective_auth_order() {
+        for preferred in [AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar] {
+            let mut provider = make_provider("OpenAI");
+            provider.oauth_status = Some(OAuthStatus::Connected);
+            provider.has_stored_api_key = true;
+            provider.has_env_api_key = true;
+            provider.preferred_method = Some(preferred);
+
+            assert_eq!(provider.effective_auth(), Some(preferred));
+            assert_eq!(provider.auth_status(), AuthStatus::Active(preferred));
+        }
     }
 
     #[test]
@@ -338,13 +335,6 @@ mod tests {
 
         result.status = OAuthResultStatus::Failure;
         assert!(!result.is_success());
-    }
-
-    #[test]
-    fn auth_method_display_labels_match_ui_contract() {
-        assert_eq!(AuthMethod::OAuth.to_string(), "OAuth");
-        assert_eq!(AuthMethod::ApiKey.to_string(), "API Key");
-        assert_eq!(AuthMethod::EnvVar.to_string(), "Env");
     }
 
     #[test]

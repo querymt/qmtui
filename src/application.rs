@@ -8,6 +8,7 @@ use crate::{
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
+    domain::chat::ElicitationResponseOutcome,
     handlers,
     server_manager::ServerEvent,
 };
@@ -33,7 +34,7 @@ pub(crate) enum RuntimeEvent {
     },
     ElicitationResponseSent {
         elicitation_id: String,
-        outcome: String,
+        outcome: ElicitationResponseOutcome,
     },
     CommandFailed {
         command: Command,
@@ -61,7 +62,7 @@ pub(crate) enum Effect {
         elicitation_id: String,
         action: String,
         content: Option<serde_json::Value>,
-        outcome: String,
+        outcome: ElicitationResponseOutcome,
     },
     PersistConfig,
     CopyToClipboard {
@@ -263,7 +264,7 @@ mod tests {
                 DelegationUpdate, SessionOp,
             },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
-            chat::ChatEntry,
+            chat::{ChatEntry, ElicitationResponseOutcome},
             elicitation::ElicitationState,
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             model::DelegateModelPreference,
@@ -1041,7 +1042,7 @@ mod tests {
                 ChatEntry::Elicitation { elicitation_id: unsupported, outcome: Some(outcome), .. },
             ] if replay == "elic-replay"
                 && unsupported == "elic-unsupported"
-                && outcome == "unsupported schema - cannot answer in TUI"
+                && outcome == &ElicitationResponseOutcome::UnsupportedSchema
         ));
         assert_eq!(app.render.card_cache.processed_messages, 7);
         assert_eq!(
@@ -3161,7 +3162,7 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
@@ -3171,7 +3172,8 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "accepted"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Text("accepted".into())
         ));
         assert!(app.render.streaming_cache.get(3).is_some());
         assert!(app.render.streaming_thinking_cache.get(4).is_some());
@@ -3245,7 +3247,7 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-old".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
@@ -3268,7 +3270,9 @@ mod tests {
             [
                 ChatEntry::Elicitation { elicitation_id: old_id, outcome: Some(outcome), .. },
                 ChatEntry::Elicitation { elicitation_id: new_id, outcome: None, .. },
-            ] if old_id == "elic-old" && outcome == "accepted" && new_id == "elic-new"
+            ] if old_id == "elic-old"
+                && outcome == &ElicitationResponseOutcome::Text("accepted".into())
+                && new_id == "elic-new"
         ));
     }
 
@@ -3286,7 +3290,7 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "missing".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
@@ -3323,7 +3327,7 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
         assert!(first_effects.is_empty());
@@ -3334,14 +3338,15 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }),
         );
         assert!(duplicate_effects.is_empty());
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "declined"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Declined
         ));
         assert_eq!(app.render.card_cache.processed_messages, 0);
         assert_eq!(app.diagnostics.status, "preserved status");

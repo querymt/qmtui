@@ -204,7 +204,7 @@ impl TestEffects {
 mod tests {
     use super::*;
     use crate::command::PromptBlock;
-    use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::{
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
@@ -295,7 +295,7 @@ mod tests {
                         elicitation_id: "test-id".into(),
                         action: "accept".into(),
                         content: Some(serde_json::json!({ "choice": "a" })),
-                        outcome: format!("{OUTCOME_BULLET}Alpha"),
+                        outcome: ElicitationResponseOutcome::Selected(vec!["Alpha".into()]),
                     },
                     Effect::Command(Command::Init),
                 ],
@@ -309,7 +309,7 @@ mod tests {
         assert!(app.chat.messages.iter().any(|entry| matches!(
             entry,
             ChatEntry::Elicitation { outcome: Some(outcome), .. }
-                if outcome == &format!("{OUTCOME_BULLET}Alpha")
+                if outcome == &ElicitationResponseOutcome::Selected(vec!["Alpha".into()])
         )));
     }
 
@@ -328,7 +328,7 @@ mod tests {
                     elicitation_id: "test-id".into(),
                     action: "decline".into(),
                     content: None,
-                    outcome: "declined".into(),
+                    outcome: ElicitationResponseOutcome::Declined,
                 }],
             )
             .unwrap();
@@ -461,6 +461,29 @@ mod tests {
         }])
     }
 
+    fn make_multi_select_elicitation() -> ElicitationState {
+        ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choices".into(),
+            title: "Pick several".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::MultiSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: serde_json::json!("a"),
+                        label: "Alpha".into(),
+                        description: None,
+                    },
+                    ElicitationOption {
+                        value: serde_json::json!("b"),
+                        label: "Beta".into(),
+                        description: None,
+                    },
+                ],
+            },
+        }])
+    }
+
     // ── Elicitation key handling ──────────────────────────────────────────────
 
     #[test]
@@ -492,7 +515,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "choice": "b" })),
-                outcome: format!("{OUTCOME_BULLET}Beta"),
+                outcome: ElicitationResponseOutcome::Selected(vec!["Beta".into()]),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -500,6 +523,28 @@ mod tests {
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { outcome: None, .. }]
         ));
+    }
+
+    #[test]
+    fn elicitation_multi_select_preserves_wire_and_label_order() {
+        let mut app = make_app_with_elicitation(make_multi_select_elicitation());
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Up)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "choices": ["b", "a"] })),
+                outcome: ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into(),]),
+            }]
+        );
     }
 
     #[test]
@@ -536,7 +581,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "choice": "custom\nanswer" })),
-                outcome: format!("{OUTCOME_BULLET}custom\nanswer"),
+                outcome: ElicitationResponseOutcome::Selected(vec!["custom\nanswer".into()]),
             }]
         );
     }
@@ -567,7 +612,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "decline".into(),
                 content: None,
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }]
         );
     }
@@ -599,7 +644,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "decline".into(),
                 content: None,
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -628,7 +673,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "name": "Alice" })),
-                outcome: "Alice".into(),
+                outcome: ElicitationResponseOutcome::Text("Alice".into()),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -636,6 +681,31 @@ mod tests {
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { outcome: None, .. }]
         ));
+    }
+
+    #[test]
+    fn elicitation_enter_on_number_field_preserves_text_outcome_and_numeric_wire_value() {
+        let mut app =
+            make_app_with_elicitation(ElicitationState::new_for_test(vec![ElicitationField {
+                name: "count".into(),
+                title: "Count".into(),
+                description: None,
+                required: true,
+                kind: ElicitationFieldKind::NumberInput { integer: true },
+            }]));
+        app.chat.elicitation.as_mut().unwrap().text_input = "42".into();
+
+        let effects = handle_elicitation_key(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(
+            effects,
+            vec![Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "count": 42 })),
+                outcome: ElicitationResponseOutcome::Text("42".into()),
+            }]
+        );
     }
 
     #[test]
@@ -714,7 +784,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "confirm": true })),
-                outcome: "Yes".into(),
+                outcome: ElicitationResponseOutcome::Boolean(true),
             }]
         );
     }
@@ -743,7 +813,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "confirm": false })),
-                outcome: "No".into(),
+                outcome: ElicitationResponseOutcome::Boolean(false),
             }]
         );
     }
