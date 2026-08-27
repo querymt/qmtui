@@ -94,6 +94,7 @@ pub(crate) enum SessionAction {
         session_id: String,
         profile_id: Option<String>,
     },
+    InitializeAgentId(String),
     ReplaceAgentMode(String),
 }
 
@@ -280,6 +281,10 @@ impl SessionsState {
                         mode: self.agent_mode.clone(),
                     })],
                 }
+            }
+            SessionAction::InitializeAgentId(agent_id) => {
+                self.agent_id = Some(agent_id);
+                SessionOutcome::default()
             }
             SessionAction::ReplaceAgentMode(mode) => {
                 self.replace_agent_mode(mode);
@@ -1428,6 +1433,41 @@ mod tests {
                 remove_if_missing: false,
             }) if session_id == "local"
         ));
+    }
+
+    #[test]
+    fn reducer_agent_initialization_changes_only_identity_with_empty_outcome() {
+        let mut state = SessionsState::new();
+        state.session_id = Some("session-1".into());
+        state.agent_id = Some("old-agent".into());
+        state.agent_mode = "review".into();
+        state.mode_before_review = Some("plan".into());
+        state.session_filter = "keep".into();
+        state.session_cursor = 4;
+        state.new_session_path = "/keep".into();
+        state.note_session_activity("session-1");
+        state.remember_remote_session_location("remote-1", "node-1", Some("/remote/repo".into()));
+        let activity_at = state.session_activity["session-1"].last_event_at;
+
+        let outcome = state.reduce(SessionAction::InitializeAgentId("agent-1".into()));
+
+        assert_eq!(outcome, SessionOutcome::default());
+        assert_eq!(state.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(state.session_id.as_deref(), Some("session-1"));
+        assert_eq!(state.agent_mode, "review");
+        assert_eq!(state.mode_before_review.as_deref(), Some("plan"));
+        assert_eq!(state.session_filter, "keep");
+        assert_eq!(state.session_cursor, 4);
+        assert_eq!(state.new_session_path, "/keep");
+        assert_eq!(
+            state.session_activity["session-1"].last_event_at,
+            activity_at
+        );
+        assert_eq!(state.session_remote_node_id("remote-1"), Some("node-1"));
+        assert_eq!(
+            state.session_remote_cwd("remote-1"),
+            Some("/remote/repo".into())
+        );
     }
 
     #[test]

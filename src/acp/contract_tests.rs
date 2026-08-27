@@ -17,7 +17,10 @@ use super::inbound;
 use super::runtime::RuntimeState;
 use super::transport::jsonrpc::Peer;
 use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
+use crate::app::App;
+use crate::application::{self, AppEvent};
 use crate::command::{Command, SessionListRequest};
+use crate::domain::chat::ChatEntry;
 use crate::runtime_events::ServerChannelMsg;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +358,58 @@ async fn load_emits_loaded_replay_delegation_provider_and_stack_in_order() {
             .collect::<Vec<_>>(),
         ["session/load", "_querymt/session/undoStack"]
     );
+}
+
+#[tokio::test]
+async fn session_notification_reaches_application_reducer_coordination() {
+    let connection = RecordingConnection::default();
+    let (state, events, mut rx) = harness(&connection);
+    let mut app = App::new();
+    app.sessions.session_id = Some("session".into());
+    let local_id = app.push_pending_prompt("hello".into());
+    app.render.card_cache.processed_messages = 7;
+    let original_logs = app.diagnostics.logs.clone();
+    let original_log_cursor = app.diagnostics.log_cursor;
+    let original_log_filter = app.diagnostics.log_filter.clone();
+    let original_log_level_filter = app.diagnostics.log_level_filter;
+    let original_status = app.diagnostics.status.clone();
+
+    inbound::session_notification(
+        &state,
+        &events,
+        acp::SessionNotification::new(
+            "session",
+            acp::SessionUpdate::UserMessageChunk(
+                acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new("hello")))
+                    .message_id(Some(acp::MessageId::from("u1"))),
+            ),
+        ),
+    )
+    .await;
+
+    let event = match rx.try_recv().expect("session notification event") {
+        ServerChannelMsg::Acp(event) => AppEvent::Acp(event),
+    };
+    let effects = application::update(&mut app, event);
+
+    assert!(app.sessions.session_activity.contains_key("session"));
+    assert!(matches!(
+        app.chat.messages.as_slice(),
+        [ChatEntry::User {
+            text,
+            message_id: Some(message_id),
+        }] if text == "hello" && message_id == "u1" && message_id != &local_id
+    ));
+    assert_eq!(app.chat.undoable_turns.len(), 1);
+    assert_eq!(app.chat.undoable_turns[0].message_id, "u1");
+    assert_eq!(app.render.card_cache.processed_messages, 0);
+    assert_eq!(app.diagnostics.logs, original_logs);
+    assert_eq!(app.diagnostics.log_cursor, original_log_cursor);
+    assert_eq!(app.diagnostics.log_filter, original_log_filter);
+    assert_eq!(app.diagnostics.log_level_filter, original_log_level_filter);
+    assert_eq!(app.diagnostics.status, original_status);
+    assert_eq!(effects, Vec::new());
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]

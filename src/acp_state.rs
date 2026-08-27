@@ -209,7 +209,9 @@ impl crate::app::App {
                         !matches!(effect, Effect::Command(Command::ListProfileAgents { .. }))
                     }));
                 }
-                self.sessions.agent_id = Some(agent_id.clone());
+                let effects =
+                    self.apply_session_action(SessionAction::InitializeAgentId(agent_id.clone()));
+                debug_assert!(effects.is_empty());
                 let effects = self.apply_model_action(
                     ModelAction::InitializePrimaryAgent(AgentInfo {
                         id: agent_id,
@@ -231,7 +233,8 @@ impl crate::app::App {
                     );
                     debug_assert!(effects.is_empty());
                 }
-                self.auth.ui_notice = None;
+                let effects = self.apply_auth_action(AuthAction::ClearUiNotice);
+                debug_assert!(effects.is_empty());
                 self.set_status(LogLevel::Info, "connection", "connected");
                 vec![]
             }
@@ -717,7 +720,6 @@ impl crate::app::App {
     fn reset_active_session_view(&mut self) {
         self.chat.reset_for_session_switch();
         self.render.invalidate_content_cache();
-        self.chat.clear_streaming_thinking();
         self.render.invalidate_thinking_cache();
         self.render.invalidate_card_cache();
         let effects = self.apply_delegate_action(DelegateAction::ClearRootSessionState);
@@ -922,10 +924,6 @@ impl crate::app::App {
                 })
             }
         }
-    }
-
-    fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
-        self.chat.push_undoable_user_turn(message_id, text);
     }
 
     fn apply_acp_control_capabilities_log(&mut self, data: Value) {

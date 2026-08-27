@@ -16,6 +16,7 @@ pub(crate) enum AuthAction {
     OAuthFlowStarted(OAuthFlow),
     OAuthResult(OAuthResult),
     ClipboardFinished { provider: String, success: bool },
+    ClearUiNotice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +114,10 @@ impl AuthState {
                         .as_ref()
                         .map(|flow| flow.authorization_url.clone());
                 }
+                AuthOutcome::default()
+            }
+            AuthAction::ClearUiNotice => {
+                self.ui_notice = None;
                 AuthOutcome::default()
             }
         }
@@ -391,6 +396,61 @@ mod tests {
                     && notice.message == "Copied to clipboard"
         ));
         assert!(auth.clipboard_fallback.is_none());
+    }
+
+    #[test]
+    fn reducer_notice_clear_preserves_all_other_auth_state_with_empty_outcome() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("openai", "OpenAI")];
+        auth.cursor = 4;
+        auth.filter = "keep".into();
+        auth.selected = Some(0);
+        auth.panel = AuthPanel::OAuthFlow;
+        auth.api_key_input = "secret".into();
+        auth.api_key_cursor = 3;
+        auth.api_key_masked = false;
+        auth.oauth_flow = Some(oauth_flow("openai"));
+        auth.oauth_response = "response".into();
+        auth.oauth_response_cursor = 5;
+        auth.last_result = Some(oauth_result(
+            "openai",
+            OAuthResultStatus::Failure,
+            "old result",
+        ));
+        auth.ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: false,
+            message: "old notice".into(),
+        });
+        auth.clipboard_fallback = Some("https://example.com/fallback".into());
+
+        let outcome = auth.reduce(AuthAction::ClearUiNotice);
+
+        assert_eq!(outcome, AuthOutcome::default());
+        assert!(auth.ui_notice.is_none());
+        assert_eq!(auth.providers, vec![provider("openai", "OpenAI")]);
+        assert_eq!(auth.cursor, 4);
+        assert_eq!(auth.filter, "keep");
+        assert_eq!(auth.selected, Some(0));
+        assert_eq!(auth.panel, AuthPanel::OAuthFlow);
+        assert_eq!(auth.api_key_input, "secret");
+        assert_eq!(auth.api_key_cursor, 3);
+        assert!(!auth.api_key_masked);
+        assert_eq!(auth.oauth_flow, Some(oauth_flow("openai")));
+        assert_eq!(auth.oauth_response, "response");
+        assert_eq!(auth.oauth_response_cursor, 5);
+        assert_eq!(
+            auth.last_result,
+            Some(oauth_result(
+                "openai",
+                OAuthResultStatus::Failure,
+                "old result",
+            ))
+        );
+        assert_eq!(
+            auth.clipboard_fallback.as_deref(),
+            Some("https://example.com/fallback")
+        );
     }
 
     #[test]
