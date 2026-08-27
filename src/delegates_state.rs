@@ -2,12 +2,75 @@ use std::collections::{HashMap, HashSet};
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
+use serde_json::Value;
 
+use crate::application::Effect;
 use crate::domain::activity::{
-    DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, PendingDelegateToolCall,
+    DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, DelegationState,
+    DelegationUpdate, PendingDelegateToolCall,
 };
 
-pub(crate) struct DelegateLifecycleUpdate {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DelegateChildActivity {
+    ToolCallStarted,
+    AssistantMessage {
+        message_id: Option<String>,
+    },
+    AssistantContent {
+        message_id: Option<String>,
+    },
+    Progress,
+    UserMessage,
+    Usage {
+        used: u64,
+        size: u64,
+        cost_usd: Option<f64>,
+    },
+    PendingElicitation {
+        elicitation_id: String,
+        message: String,
+        requested_schema: Value,
+        source: String,
+    },
+    QuestionToolFinished,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DelegateAction {
+    LifecycleUpdate(DelegationUpdate),
+    ProvisionalToolDelegate {
+        tool_call_id: Option<String>,
+        arguments: Option<Value>,
+    },
+    InactiveChildActivity {
+        session_id: String,
+        activity: DelegateChildActivity,
+    },
+    ResolveLoadedSessionParent(Option<String>),
+    ClearNewRootParent,
+    ClearRootSessionState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DelegateContext {
+    pub(crate) active_session_id: Option<String>,
+    pub(crate) inactive_activity_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DelegateCoordination {
+    InvalidateCardCache,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DelegateOutcome {
+    pub(crate) changed: bool,
+    pub(crate) coordination: Vec<DelegateCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
+struct DelegateLifecycleUpdate {
     pub(crate) delegation_id: String,
     pub(crate) tool_call_id: Option<String>,
     pub(crate) target_agent_id: String,
@@ -22,6 +85,7 @@ pub(crate) struct DelegateLifecycleUpdate {
     pub(crate) error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DelegatesState {
     pub(crate) delegate_popup_visible_rows: usize,
     pub(crate) delegate_entries: Vec<DelegateEntry>,
@@ -40,6 +104,181 @@ pub(crate) struct DelegatesState {
 }
 
 impl DelegatesState {
+    pub(crate) fn reduce(
+        &mut self,
+        action: DelegateAction,
+        context: DelegateContext,
+    ) -> DelegateOutcome {
+        match action {
+            DelegateAction::LifecycleUpdate(update) => {
+                if context.active_session_id.as_deref() != Some(update.session_id.as_str()) {
+                    return DelegateOutcome::default();
+                }
+                let status = match update.state {
+                    DelegationState::Requested | DelegationState::Forked => {
+                        DelegateStatus::InProgress
+                    }
+                    DelegationState::Completed => DelegateStatus::Completed,
+                    DelegationState::Failed => DelegateStatus::Failed,
+                    DelegationState::Cancelled => DelegateStatus::Cancelled,
+                };
+                let lifecycle_rank = delegation_state_rank(update.state);
+                let before = self.clone();
+                let accepted = self.apply_lifecycle_update(DelegateLifecycleUpdate {
+                    delegation_id: update.delegation_id,
+                    tool_call_id: update.tool_call_id,
+                    target_agent_id: update.target_agent_id,
+                    objective: update.objective,
+                    child_session_id: update.child_session_id,
+                    status,
+                    lifecycle_rank,
+                    requested_at: update.requested_at,
+                    finished_at: update.finished_at,
+                    updated_at: update.updated_at,
+                    result_summary: update.result_summary,
+                    error: update.error,
+                });
+                Self::outcome_with_card_invalidation(accepted && *self != before)
+            }
+            DelegateAction::ProvisionalToolDelegate {
+                tool_call_id,
+                arguments,
+            } => {
+                let Some(tool_call_id) = tool_call_id else {
+                    return DelegateOutcome::default();
+                };
+                let target_agent_id = arguments
+                    .as_ref()
+                    .and_then(|value| value.get("target_agent_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let objective = arguments
+                    .as_ref()
+                    .and_then(|value| value.get("objective"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let changed =
+                    self.upsert_provisional_delegate(&tool_call_id, target_agent_id, objective);
+                Self::outcome_with_card_invalidation(changed)
+            }
+            DelegateAction::InactiveChildActivity {
+                session_id,
+                activity,
+            } => {
+                if context.inactive_activity_session_id.as_deref() != Some(session_id.as_str()) {
+                    return DelegateOutcome::default();
+                }
+                let changed = self.apply_child_activity(&session_id, activity);
+                DelegateOutcome {
+                    changed,
+                    coordination: changed
+                        .then_some(DelegateCoordination::InvalidateCardCache)
+                        .into_iter()
+                        .collect(),
+                    effects: Vec::new(),
+                }
+            }
+            DelegateAction::ResolveLoadedSessionParent(discovered_parent) => {
+                let parent_before = self.parent_session_id.clone();
+                let pending_before = self.pending_parent_session_id.clone();
+                self.resolve_parent_session_id(discovered_parent);
+                DelegateOutcome {
+                    changed: self.parent_session_id != parent_before
+                        || self.pending_parent_session_id != pending_before,
+                    ..DelegateOutcome::default()
+                }
+            }
+            DelegateAction::ClearNewRootParent => {
+                let changed = self.parent_session_id.take().is_some()
+                    | self.pending_parent_session_id.take().is_some();
+                DelegateOutcome {
+                    changed,
+                    ..DelegateOutcome::default()
+                }
+            }
+            DelegateAction::ClearRootSessionState => {
+                if self.parent_session_id.is_some() {
+                    return DelegateOutcome::default();
+                }
+                let before = self.clone();
+                self.clear_for_root_session();
+                DelegateOutcome {
+                    changed: *self != before,
+                    ..DelegateOutcome::default()
+                }
+            }
+        }
+    }
+
+    fn outcome_with_card_invalidation(changed: bool) -> DelegateOutcome {
+        DelegateOutcome {
+            changed,
+            coordination: changed
+                .then_some(DelegateCoordination::InvalidateCardCache)
+                .into_iter()
+                .collect(),
+            effects: Vec::new(),
+        }
+    }
+
+    fn apply_child_activity(&mut self, session_id: &str, activity: DelegateChildActivity) -> bool {
+        let (mut state, mut stats) = self.child_snapshot(session_id);
+        match activity {
+            DelegateChildActivity::ToolCallStarted => {
+                stats.tool_calls = stats.tool_calls.saturating_add(1);
+                state = DelegateChildState::OtherProgress;
+            }
+            DelegateChildActivity::AssistantMessage { message_id } => {
+                if self.record_child_message_id(session_id, message_id.as_deref(), true) {
+                    stats.messages = stats.messages.saturating_add(1);
+                }
+                state = DelegateChildState::AssistantMessage;
+            }
+            DelegateChildActivity::AssistantContent { message_id } => {
+                if self.record_child_message_id(session_id, message_id.as_deref(), false) {
+                    stats.messages = stats.messages.saturating_add(1);
+                }
+                state = DelegateChildState::AssistantMessage;
+            }
+            DelegateChildActivity::Progress => state = DelegateChildState::OtherProgress,
+            DelegateChildActivity::UserMessage => state = DelegateChildState::UserMessage,
+            DelegateChildActivity::Usage {
+                used,
+                size,
+                cost_usd,
+            } => {
+                if used > 0 {
+                    stats.context_tokens = used;
+                }
+                if size > 0 {
+                    stats.context_limit = size;
+                }
+                if let Some(cost) = cost_usd {
+                    stats.cost_usd = cost;
+                }
+            }
+            DelegateChildActivity::PendingElicitation {
+                elicitation_id,
+                message,
+                requested_schema,
+                source,
+            } => {
+                state = DelegateChildState::PendingElicitation {
+                    elicitation_id,
+                    message,
+                    requested_schema,
+                    source,
+                };
+            }
+            DelegateChildActivity::QuestionToolFinished => {
+                state = DelegateChildState::QuestionToolFinished;
+            }
+            DelegateChildActivity::Unchanged => {}
+        }
+        self.apply_child_snapshot(session_id, state, stats)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             delegate_popup_visible_rows: 0,
@@ -156,7 +395,7 @@ impl DelegatesState {
         true
     }
 
-    pub(crate) fn apply_lifecycle_update(&mut self, update: DelegateLifecycleUpdate) -> bool {
+    fn apply_lifecycle_update(&mut self, update: DelegateLifecycleUpdate) -> bool {
         let DelegateLifecycleUpdate {
             delegation_id,
             mut tool_call_id,
@@ -376,6 +615,14 @@ fn lifecycle_rank(status: DelegateStatus, child_session_id: Option<&str>) -> u8 
 
 fn entry_lifecycle_rank(entry: &DelegateEntry) -> u8 {
     lifecycle_rank(entry.status, entry.child_session_id.as_deref())
+}
+
+fn delegation_state_rank(state: DelegationState) -> u8 {
+    match state {
+        DelegationState::Requested => 1,
+        DelegationState::Forked => 2,
+        DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled => 3,
+    }
 }
 
 #[cfg(test)]
@@ -719,6 +966,296 @@ mod tests {
         assert_eq!(state.delegate_filter, "stale");
         assert_eq!(state.delegate_cursor, 3);
         assert_eq!(state.delegate_popup_visible_rows, 5);
+    }
+
+    #[test]
+    fn reducer_lifecycle_filters_and_preserves_timestamp_rank_and_tie_semantics() {
+        let mut state = DelegatesState::new();
+        let update = |session_id: &str, lifecycle, updated_at| DelegationUpdate {
+            session_id: session_id.into(),
+            delegation_id: "d1".into(),
+            tool_call_id: Some("tool-1".into()),
+            state: lifecycle,
+            target_agent_id: "coder".into(),
+            objective: "build feature".into(),
+            child_session_id: (lifecycle != DelegationState::Requested).then(|| "child".into()),
+            requested_at: 10,
+            forked_at: (lifecycle != DelegationState::Requested).then_some(15),
+            finished_at: matches!(
+                lifecycle,
+                DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled
+            )
+            .then_some(20),
+            updated_at,
+            result_summary: (lifecycle == DelegationState::Completed).then(|| "done".into()),
+            error: (lifecycle == DelegationState::Failed).then(|| "boom".into()),
+        };
+        let context = DelegateContext {
+            active_session_id: Some("parent".into()),
+            inactive_activity_session_id: None,
+        };
+
+        let filtered = state.reduce(
+            DelegateAction::LifecycleUpdate(update("other-parent", DelegationState::Requested, 10)),
+            context.clone(),
+        );
+        assert_eq!(filtered, DelegateOutcome::default());
+        assert!(state.delegate_entries.is_empty());
+
+        let accepted = state.reduce(
+            DelegateAction::LifecycleUpdate(update("parent", DelegationState::Completed, 20)),
+            context.clone(),
+        );
+        assert!(accepted.changed);
+        assert_eq!(
+            accepted.coordination,
+            vec![DelegateCoordination::InvalidateCardCache]
+        );
+        assert!(accepted.effects.is_empty());
+
+        let stale = state.reduce(
+            DelegateAction::LifecycleUpdate(update("parent", DelegationState::Forked, 19)),
+            context.clone(),
+        );
+        assert_eq!(stale, DelegateOutcome::default());
+        let equal_lower_rank = state.reduce(
+            DelegateAction::LifecycleUpdate(update("parent", DelegationState::Forked, 20)),
+            context.clone(),
+        );
+        assert_eq!(equal_lower_rank, DelegateOutcome::default());
+
+        let equal_rank_tie = state.reduce(
+            DelegateAction::LifecycleUpdate(update("parent", DelegationState::Failed, 20)),
+            context.clone(),
+        );
+        assert!(equal_rank_tie.changed);
+        assert_eq!(state.delegate_entries[0].status, DelegateStatus::Failed);
+        assert_eq!(state.delegation_errors["d1"], "boom");
+        assert!(!state.delegation_result_summaries.contains_key("d1"));
+
+        let repeated = state.reduce(
+            DelegateAction::LifecycleUpdate(update("parent", DelegationState::Failed, 20)),
+            context,
+        );
+        assert_eq!(repeated, DelegateOutcome::default());
+    }
+
+    #[test]
+    fn reducer_provisional_action_reconciles_authoritative_metadata_without_duplicates() {
+        let mut state = DelegatesState::new();
+        let action = DelegateAction::ProvisionalToolDelegate {
+            tool_call_id: Some("tool-1".into()),
+            arguments: Some(serde_json::json!({
+                "target_agent_id": "coder",
+                "objective": "build feature"
+            })),
+        };
+
+        let inserted = state.reduce(action.clone(), DelegateContext::default());
+        assert!(inserted.changed);
+        assert_eq!(
+            inserted.coordination,
+            vec![DelegateCoordination::InvalidateCardCache]
+        );
+        assert!(inserted.effects.is_empty());
+        assert_eq!(
+            state.reduce(action, DelegateContext::default()),
+            DelegateOutcome::default()
+        );
+        assert_eq!(
+            state.reduce(
+                DelegateAction::ProvisionalToolDelegate {
+                    tool_call_id: None,
+                    arguments: None,
+                },
+                DelegateContext::default(),
+            ),
+            DelegateOutcome::default()
+        );
+
+        let authoritative = state.reduce(
+            DelegateAction::LifecycleUpdate(DelegationUpdate {
+                session_id: "parent".into(),
+                delegation_id: "d1".into(),
+                tool_call_id: Some("tool-1".into()),
+                state: DelegationState::Forked,
+                target_agent_id: "reviewer".into(),
+                objective: "review feature".into(),
+                child_session_id: Some("child".into()),
+                requested_at: 10,
+                forked_at: Some(11),
+                finished_at: None,
+                updated_at: 11,
+                result_summary: None,
+                error: None,
+            }),
+            DelegateContext {
+                active_session_id: Some("parent".into()),
+                inactive_activity_session_id: None,
+            },
+        );
+        assert!(authoritative.changed);
+        assert_eq!(state.delegate_entries.len(), 1);
+        let entry = &state.delegate_entries[0];
+        assert_eq!(entry.delegation_id, "d1");
+        assert_eq!(entry.delegate_tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(entry.target_agent_id.as_deref(), Some("reviewer"));
+        assert_eq!(entry.objective, "review feature");
+        assert_eq!(entry.child_session_id.as_deref(), Some("child"));
+        assert!(state.pending_delegate_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reducer_inactive_activity_stages_then_attaches_and_orders_coordination() {
+        let mut state = DelegatesState::new();
+        let context = DelegateContext {
+            active_session_id: Some("parent".into()),
+            inactive_activity_session_id: Some("child".into()),
+        };
+        let rejected = state.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: "child".into(),
+                activity: DelegateChildActivity::AssistantContent {
+                    message_id: Some("m1".into()),
+                },
+            },
+            DelegateContext {
+                active_session_id: Some("parent".into()),
+                inactive_activity_session_id: None,
+            },
+        );
+        assert!(!rejected.changed);
+        assert!(rejected.coordination.is_empty());
+        assert!(state.pending_delegate_child_states.is_empty());
+        assert!(state.pending_delegate_child_stats.is_empty());
+
+        let staged = state.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: "child".into(),
+                activity: DelegateChildActivity::AssistantContent {
+                    message_id: Some("m1".into()),
+                },
+            },
+            context.clone(),
+        );
+        assert!(!staged.changed);
+        assert!(staged.coordination.is_empty());
+        assert!(staged.effects.is_empty());
+        assert_eq!(
+            state.pending_delegate_child_states["child"],
+            DelegateChildState::AssistantMessage
+        );
+        assert_eq!(state.pending_delegate_child_stats["child"].messages, 1);
+
+        let linked = state.reduce(
+            DelegateAction::LifecycleUpdate(DelegationUpdate {
+                session_id: "parent".into(),
+                delegation_id: "d1".into(),
+                tool_call_id: None,
+                state: DelegationState::Forked,
+                target_agent_id: "coder".into(),
+                objective: "build feature".into(),
+                child_session_id: Some("child".into()),
+                requested_at: 10,
+                forked_at: Some(11),
+                finished_at: None,
+                updated_at: 11,
+                result_summary: None,
+                error: None,
+            }),
+            context.clone(),
+        );
+        assert!(linked.changed);
+        assert_eq!(state.delegate_entries[0].stats.messages, 1);
+        assert_eq!(
+            state.delegate_entries[0].child_state,
+            DelegateChildState::AssistantMessage
+        );
+        assert!(!state.pending_delegate_child_states.contains_key("child"));
+        assert!(!state.pending_delegate_child_stats.contains_key("child"));
+
+        let changed = state.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: "child".into(),
+                activity: DelegateChildActivity::ToolCallStarted,
+            },
+            context.clone(),
+        );
+        assert!(changed.changed);
+        assert_eq!(
+            changed.coordination,
+            vec![DelegateCoordination::InvalidateCardCache]
+        );
+        assert_eq!(state.delegate_entries[0].stats.tool_calls, 1);
+
+        let unchanged = state.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: "child".into(),
+                activity: DelegateChildActivity::Unchanged,
+            },
+            context,
+        );
+        assert!(!unchanged.changed);
+        assert!(unchanged.coordination.is_empty());
+    }
+
+    #[test]
+    fn reducer_resolve_and_clear_actions_report_exact_changes() {
+        let mut state = DelegatesState::new();
+        state.pending_parent_session_id = Some("staged-parent".into());
+        state
+            .delegate_entries
+            .push(entry("d1", "task", None, DelegateStatus::InProgress));
+
+        let resolved = state.reduce(
+            DelegateAction::ResolveLoadedSessionParent(Some("catalog-parent".into())),
+            DelegateContext::default(),
+        );
+        assert!(resolved.changed);
+        assert!(resolved.coordination.is_empty());
+        assert!(resolved.effects.is_empty());
+        assert_eq!(state.parent_session_id.as_deref(), Some("staged-parent"));
+        assert_eq!(state.pending_parent_session_id, None);
+        assert_eq!(
+            state.reduce(
+                DelegateAction::ResolveLoadedSessionParent(Some("staged-parent".into())),
+                DelegateContext::default(),
+            ),
+            DelegateOutcome::default()
+        );
+
+        let protected = state.reduce(
+            DelegateAction::ClearRootSessionState,
+            DelegateContext::default(),
+        );
+        assert_eq!(protected, DelegateOutcome::default());
+        assert_eq!(state.delegate_entries.len(), 1);
+
+        let cleared_parent = state.reduce(
+            DelegateAction::ClearNewRootParent,
+            DelegateContext::default(),
+        );
+        assert!(cleared_parent.changed);
+        assert_eq!(
+            state.reduce(
+                DelegateAction::ClearNewRootParent,
+                DelegateContext::default(),
+            ),
+            DelegateOutcome::default()
+        );
+        let cleared_root = state.reduce(
+            DelegateAction::ClearRootSessionState,
+            DelegateContext::default(),
+        );
+        assert!(cleared_root.changed);
+        assert!(state.delegate_entries.is_empty());
+        assert_eq!(
+            state.reduce(
+                DelegateAction::ClearRootSessionState,
+                DelegateContext::default(),
+            ),
+            DelegateOutcome::default()
+        );
     }
 
     #[test]

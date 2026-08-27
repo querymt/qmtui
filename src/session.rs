@@ -8,15 +8,6 @@ use crate::composer_state::FileIndexEntryLite;
 use crate::navigation_state::Popup;
 
 impl App {
-    pub fn apply_session_profile_binding(&mut self, session_id: &str, profile_id: Option<String>) {
-        if let Some(profile_id) = profile_id {
-            self.profiles
-                .bind_session_profile(session_id.to_string(), profile_id);
-        } else if self.sessions.is_remote_session_id(session_id) {
-            self.profiles.remove_session_profile(session_id);
-        }
-    }
-
     pub fn resolve_new_session_default_cwd(&self) -> Option<String> {
         if let Some(active_session_id) = self.sessions.session_id.as_deref() {
             for group in &self.sessions.session_groups {
@@ -287,41 +278,6 @@ mod tests {
         app.sessions
             .remember_remote_session_node("remote", "node-1");
         assert_eq!(app.current_profile_label(), "remote");
-    }
-
-    #[test]
-    fn profile_binding_some_inserts_and_overwrites() {
-        let mut app = App::new();
-
-        app.apply_session_profile_binding("session", Some("fast".into()));
-        assert_eq!(app.profiles.session_profile_id("session"), Some("fast"));
-
-        app.apply_session_profile_binding("session", Some("deep".into()));
-        assert_eq!(app.profiles.session_profile_id("session"), Some("deep"));
-    }
-
-    #[test]
-    fn missing_local_profile_preserves_existing_binding() {
-        let mut app = App::new();
-        app.profiles
-            .bind_session_profile("local".into(), "fast".into());
-
-        app.apply_session_profile_binding("local", None);
-
-        assert_eq!(app.profiles.session_profile_id("local"), Some("fast"));
-    }
-
-    #[test]
-    fn missing_remote_profile_removes_existing_binding() {
-        let mut app = App::new();
-        app.sessions
-            .remember_remote_session_node("remote", "node-1");
-        app.profiles
-            .bind_session_profile("remote".into(), "fast".into());
-
-        app.apply_session_profile_binding("remote", None);
-
-        assert!(app.profiles.session_profile_id("remote").is_none());
     }
 
     #[test]

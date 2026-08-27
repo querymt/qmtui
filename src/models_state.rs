@@ -1,10 +1,70 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
+use crate::application::Effect;
+use crate::command::Command;
+use crate::diagnostics::LogLevel;
 use crate::domain::model::{DelegateModelPreference, ModelEntry};
 use crate::domain::profile::AgentInfo;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ModelAction {
+    InitializePrimaryAgent(AgentInfo),
+    InitializeReasoningEffort(Option<String>),
+    ReasoningEffort(Option<String>),
+    ReplaceCatalog {
+        models: Vec<ModelEntry>,
+        remote_node_count: u32,
+        remote_timeout_count: u32,
+    },
+    SynchronizeProfileCatalog {
+        active_profile_changed: bool,
+    },
+    ReplaceProfileAgents {
+        profile_id: String,
+        agents: Vec<AgentInfo>,
+    },
+    ProviderChanged {
+        provider: String,
+        model: String,
+        node_id: Option<String>,
+        context_limit: Option<u64>,
+    },
+    DelegateModelSet {
+        session_id: String,
+        agent_id: String,
+        model_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelContext {
+    pub(crate) desired_profile_id: Option<String>,
+    pub(crate) root_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelCoordination {
+    Log {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
+    Status {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
+    SetContextLimit(u64),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelOutcome {
+    pub(crate) coordination: Vec<ModelCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelPopupItem {
@@ -49,6 +109,118 @@ pub(crate) fn validate_reasoning_effort(s: Option<&str>) -> Option<Option<String
 }
 
 impl ModelsState {
+    pub(crate) fn reduce(&mut self, action: ModelAction, context: ModelContext) -> ModelOutcome {
+        match action {
+            ModelAction::InitializePrimaryAgent(agent) => {
+                self.initialize_primary_agent(agent);
+                ModelOutcome::default()
+            }
+            ModelAction::InitializeReasoningEffort(reasoning_effort) => {
+                self.reasoning_effort = reasoning_effort;
+                ModelOutcome::default()
+            }
+            ModelAction::ReasoningEffort(reasoning_effort) => {
+                if let Some(validated) = validate_reasoning_effort(reasoning_effort.as_deref()) {
+                    self.reasoning_effort = validated;
+                }
+                ModelOutcome::default()
+            }
+            ModelAction::ReplaceCatalog {
+                models,
+                remote_node_count,
+                remote_timeout_count,
+            } => {
+                let (total_models, remote_models) = self.replace_catalog(models);
+                let mut message = format!("models: {total_models} total, {remote_models} remote");
+                if remote_node_count > 0 || remote_timeout_count > 0 {
+                    message.push_str(&format!(
+                        " (inventory nodes={remote_node_count}, timeouts={remote_timeout_count})"
+                    ));
+                }
+                ModelOutcome {
+                    coordination: vec![ModelCoordination::Log {
+                        level: LogLevel::Info,
+                        target: "models",
+                        message,
+                    }],
+                    effects: Vec::new(),
+                }
+            }
+            ModelAction::SynchronizeProfileCatalog {
+                active_profile_changed,
+            } => {
+                let desired_profile_id = context.desired_profile_id;
+                if active_profile_changed
+                    || self.agents_profile_id.as_deref() != desired_profile_id.as_deref()
+                    || self.agents.len() <= 1
+                {
+                    self.clear_profile_agents();
+                    ModelOutcome {
+                        coordination: Vec::new(),
+                        effects: desired_profile_id
+                            .map(|profile_id| {
+                                Effect::Command(Command::ListProfileAgents { profile_id })
+                            })
+                            .into_iter()
+                            .collect(),
+                    }
+                } else {
+                    ModelOutcome::default()
+                }
+            }
+            ModelAction::ReplaceProfileAgents { profile_id, agents } => {
+                if context.desired_profile_id.as_deref() != Some(profile_id.as_str()) {
+                    return ModelOutcome::default();
+                }
+                self.replace_profile_agents(profile_id.clone(), agents);
+                ModelOutcome {
+                    coordination: Vec::new(),
+                    effects: context
+                        .root_session_id
+                        .map(|session_id| {
+                            self.delegate_model_commands_for_session(&session_id, &profile_id)
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(Effect::Command)
+                        .collect(),
+                }
+            }
+            ModelAction::ProviderChanged {
+                provider,
+                model,
+                node_id,
+                context_limit,
+            } => {
+                self.replace_live_selection(provider, model, node_id);
+                ModelOutcome {
+                    coordination: context_limit
+                        .map(ModelCoordination::SetContextLimit)
+                        .into_iter()
+                        .collect(),
+                    effects: Vec::new(),
+                }
+            }
+            ModelAction::DelegateModelSet {
+                session_id,
+                agent_id,
+                model_id,
+            } => ModelOutcome {
+                coordination: vec![ModelCoordination::Status {
+                    level: LogLevel::Info,
+                    target: "model",
+                    message: match model_id {
+                        Some(model_id) => {
+                            format!("delegate model set for {agent_id} in {session_id}: {model_id}")
+                        }
+                        None => format!("delegate model reset for {agent_id} in {session_id}"),
+                    },
+                }],
+                effects: Vec::new(),
+            },
+        }
+    }
+
     /// Valid explicit reasoning levels; automatic effort is represented by `None`.
     pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 
@@ -373,6 +545,31 @@ impl ModelsState {
             .and_then(|preferences| preferences.get(agent_id))
     }
 
+    pub(crate) fn delegate_model_commands_for_session(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+    ) -> Vec<Command> {
+        let known_agents: HashSet<&str> = self
+            .agents
+            .iter()
+            .skip(1)
+            .map(|agent| agent.id.as_str())
+            .collect();
+        self.delegate_model_preferences
+            .get(profile_id)
+            .into_iter()
+            .flat_map(|preferences| preferences.iter())
+            .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
+            .map(|(agent_id, preference)| Command::SetDelegateModel {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.clone(),
+                model_id: Some(preference.model_id.clone()),
+                node_id: preference.node_id.clone(),
+            })
+            .collect()
+    }
+
     pub(crate) fn delegate_model_cursor(&self, profile_id: Option<&str>, agent_id: &str) -> usize {
         let items = self.visible_model_popup_items();
         let Some(profile_id) = profile_id else {
@@ -451,6 +648,217 @@ mod tests {
             description: None,
             capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reducer_initialization_and_reasoning_effort_preserve_validation_contracts() {
+        let mut state = ModelsState::new();
+        state.model_popup_agent_tab = 3;
+        state.reasoning_effort = Some("low".into());
+
+        assert_eq!(
+            state.reduce(
+                ModelAction::InitializePrimaryAgent(agent("primary", "Primary")),
+                ModelContext::default(),
+            ),
+            ModelOutcome::default()
+        );
+        assert_eq!(state.agents[0].id, "primary");
+        assert_eq!(state.agents_profile_id, None);
+        assert_eq!(state.model_popup_agent_tab, 3);
+
+        state.reduce(
+            ModelAction::InitializeReasoningEffort(Some("backend-level".into())),
+            ModelContext::default(),
+        );
+        assert_eq!(state.reasoning_effort.as_deref(), Some("backend-level"));
+        state.reduce(
+            ModelAction::ReasoningEffort(Some("med".into())),
+            ModelContext::default(),
+        );
+        assert_eq!(state.reasoning_effort.as_deref(), Some("medium"));
+        state.reduce(
+            ModelAction::ReasoningEffort(Some("invalid".into())),
+            ModelContext::default(),
+        );
+        assert_eq!(state.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn reducer_catalog_preserves_model_ui_state_and_reports_exact_diagnostics() {
+        let mut state = ModelsState::new();
+        state.current_model = Some("old-model".into());
+        state.current_provider = Some("old-provider".into());
+        state.current_model_node_id = Some("old-node".into());
+        state.model_cursor = 9;
+        state.model_filter = "old-filter".into();
+        state.model_popup_agent_tab = 3;
+        state.reasoning_effort = Some("high".into());
+
+        let outcome = state.reduce(
+            ModelAction::ReplaceCatalog {
+                models: vec![
+                    model("local", "local", "p", "m", None, None),
+                    model("remote", "remote", "p", "m", Some("node"), None),
+                ],
+                remote_node_count: 2,
+                remote_timeout_count: 1,
+            },
+            ModelContext::default(),
+        );
+
+        assert_eq!(state.models.len(), 2);
+        assert_eq!(state.current_model.as_deref(), Some("old-model"));
+        assert_eq!(state.current_provider.as_deref(), Some("old-provider"));
+        assert_eq!(state.current_model_node_id.as_deref(), Some("old-node"));
+        assert_eq!(state.model_cursor, 9);
+        assert_eq!(state.model_filter, "old-filter");
+        assert_eq!(state.model_popup_agent_tab, 3);
+        assert_eq!(state.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            outcome,
+            ModelOutcome {
+                coordination: vec![ModelCoordination::Log {
+                    level: LogLevel::Info,
+                    target: "models",
+                    message: "models: 2 total, 1 remote (inventory nodes=2, timeouts=1)".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_profile_synchronization_preserves_refresh_and_stale_response_contracts() {
+        let mut state = ModelsState::new();
+        state.agents_profile_id = Some("quorum".into());
+        state.agents = vec![agent("primary", "Primary"), agent("coder", "Coder")];
+        state.model_popup_agent_tab = 1;
+
+        let outcome = state.reduce(
+            ModelAction::SynchronizeProfileCatalog {
+                active_profile_changed: false,
+            },
+            ModelContext {
+                desired_profile_id: Some("quorum".into()),
+                root_session_id: None,
+            },
+        );
+        assert_eq!(outcome, ModelOutcome::default());
+        assert_eq!(state.agents.len(), 2);
+
+        let outcome = state.reduce(
+            ModelAction::SynchronizeProfileCatalog {
+                active_profile_changed: true,
+            },
+            ModelContext {
+                desired_profile_id: Some("fast".into()),
+                root_session_id: None,
+            },
+        );
+        assert!(state.agents.is_empty());
+        assert_eq!(state.agents_profile_id, None);
+        assert_eq!(state.model_popup_agent_tab, 0);
+        assert_eq!(
+            outcome.effects,
+            vec![Effect::Command(Command::ListProfileAgents {
+                profile_id: "fast".into(),
+            })]
+        );
+
+        state.agents = vec![agent("sentinel", "Sentinel")];
+        let outcome = state.reduce(
+            ModelAction::ReplaceProfileAgents {
+                profile_id: "stale".into(),
+                agents: vec![agent("stale", "Stale")],
+            },
+            ModelContext {
+                desired_profile_id: Some("fast".into()),
+                root_session_id: Some("session".into()),
+            },
+        );
+        assert_eq!(outcome, ModelOutcome::default());
+        assert_eq!(state.agents[0].id, "sentinel");
+    }
+
+    #[test]
+    fn reducer_current_profile_agents_update_tabs_before_reapplying_root_preferences() {
+        let mut state = ModelsState::new();
+        state.delegate_model_preferences.insert(
+            "quorum".into(),
+            [(
+                "coder".into(),
+                DelegateModelPreference {
+                    model_id: "openai/gpt-5".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    node_id: Some("node-1".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let outcome = state.reduce(
+            ModelAction::ReplaceProfileAgents {
+                profile_id: "quorum".into(),
+                agents: vec![agent("primary", "Primary"), agent("coder", "Coder")],
+            },
+            ModelContext {
+                desired_profile_id: Some("quorum".into()),
+                root_session_id: Some("parent".into()),
+            },
+        );
+
+        assert_eq!(state.agents_profile_id.as_deref(), Some("quorum"));
+        assert_eq!(state.model_popup_tab_agent_id(1), Some("coder"));
+        assert_eq!(
+            outcome.effects,
+            vec![Effect::Command(Command::SetDelegateModel {
+                session_id: "parent".into(),
+                agent_id: "coder".into(),
+                model_id: Some("openai/gpt-5".into()),
+                node_id: Some("node-1".into()),
+            })]
+        );
+    }
+
+    #[test]
+    fn reducer_provider_and_delegate_events_return_ordered_coordination() {
+        let mut state = ModelsState::new();
+        let outcome = state.reduce(
+            ModelAction::ProviderChanged {
+                provider: "provider".into(),
+                model: "model".into(),
+                node_id: Some("node".into()),
+                context_limit: Some(128_000),
+            },
+            ModelContext::default(),
+        );
+        assert_eq!(state.current_provider.as_deref(), Some("provider"));
+        assert_eq!(state.current_model.as_deref(), Some("model"));
+        assert_eq!(state.current_model_node_id.as_deref(), Some("node"));
+        assert_eq!(
+            outcome.coordination,
+            vec![ModelCoordination::SetContextLimit(128_000)]
+        );
+
+        let outcome = state.reduce(
+            ModelAction::DelegateModelSet {
+                session_id: "session".into(),
+                agent_id: "coder".into(),
+                model_id: Some("openai/gpt-5".into()),
+            },
+            ModelContext::default(),
+        );
+        assert_eq!(
+            outcome.coordination,
+            vec![ModelCoordination::Status {
+                level: LogLevel::Info,
+                target: "model",
+                message: "delegate model set for coder in session: openai/gpt-5".into(),
+            }]
+        );
     }
 
     #[test]
