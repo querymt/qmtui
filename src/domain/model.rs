@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DelegateModelOverrideInfo {
+    pub model_id: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegateModelPreference {
     pub model_id: String,
