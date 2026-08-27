@@ -278,7 +278,8 @@ mod tests {
             chat::ChatEntry,
             elicitation::ElicitationState,
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
-            profile::ProfileInfo,
+            model::DelegateModelPreference,
+            profile::{AgentInfo, ProfileInfo},
             session::{SessionGroup, SessionSummary},
         },
         navigation_state::Screen,
@@ -297,6 +298,23 @@ mod tests {
             state.message = format!("Question {elicitation_id}");
             app.chat.elicitation = Some(state);
             app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        }
+    }
+
+    fn profile(id: &str) -> ProfileInfo {
+        ProfileInfo {
+            id: id.into(),
+            name: id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn agent(id: &str) -> AgentInfo {
+        AgentInfo {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -360,6 +378,380 @@ mod tests {
                 profile_id: "fast".into(),
             })]
         );
+    }
+
+    #[test]
+    fn profile_acp_route_preserves_selection_and_applies_refresh_conditions() {
+        let mut app = App::new();
+        app.profiles.active_profile_id = Some("deep".into());
+        app.models.agents_profile_id = Some("deep".into());
+        app.models.agents = vec![agent("primary"), agent("coder")];
+        app.auth.filter = "preserved auth".into();
+        app.mesh.mesh_invite_name = "preserved mesh".into();
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved chat".into()));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Profiles {
+                profiles: vec![profile("fast"), profile("deep")],
+                active_profile_id: Some("fast".into()),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.models.agents_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.models.agents.len(), 2);
+
+        app.sessions.session_id = Some("session-1".into());
+        app.profiles
+            .bind_session_profile("session-1".into(), "fast".into());
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Profiles {
+                profiles: vec![profile("fast"), profile("deep")],
+                active_profile_id: Some("deep".into()),
+            }),
+        );
+        assert!(app.models.agents.is_empty());
+        assert_eq!(app.models.agents_profile_id, None);
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::ListProfileAgents {
+                profile_id: "fast".into(),
+            })]
+        );
+
+        app.sessions.session_id = None;
+        app.profiles.active_profile_id = Some("removed".into());
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Profiles {
+                profiles: vec![profile("fast"), profile("deep")],
+                active_profile_id: Some("fast".into()),
+            }),
+        );
+
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert!(app.models.agents.is_empty());
+        assert_eq!(app.models.agents_profile_id, None);
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::ListProfileAgents {
+                profile_id: "fast".into(),
+            })]
+        );
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Profiles {
+                profiles: Vec::new(),
+                active_profile_id: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.profiles.active_profile_id.is_none());
+        assert!(app.profiles.profiles.is_empty());
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert_eq!(app.mesh.mesh_invite_name, "preserved mesh");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved chat"
+        ));
+    }
+
+    #[test]
+    fn profile_agents_acp_route_ignores_stale_and_reapplies_root_preferences() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("parent".into());
+        app.profiles
+            .bind_session_profile("parent".into(), "quorum".into());
+        app.models.agents_profile_id = Some("quorum".into());
+        app.models.agents = vec![agent("sentinel"), agent("old")];
+        app.models.delegate_model_preferences.insert(
+            "quorum".into(),
+            [(
+                "coder".into(),
+                DelegateModelPreference {
+                    model_id: "openai/gpt-5".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    node_id: Some("node-1".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        app.auth.filter = "preserved auth".into();
+        app.chat.context_limit = 4_096;
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ProfileAgents {
+                profile_id: "stale".into(),
+                agents: vec![agent("stale")],
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.models.agents[0].id, "sentinel");
+        assert_eq!(app.models.agents_profile_id.as_deref(), Some("quorum"));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ProfileAgents {
+                profile_id: "quorum".into(),
+                agents: vec![agent("primary"), agent("coder")],
+            }),
+        );
+        assert_eq!(app.models.agents[1].id, "coder");
+        assert_eq!(app.models.agents_profile_id.as_deref(), Some("quorum"));
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::SetDelegateModel {
+                session_id: "parent".into(),
+                agent_id: "coder".into(),
+                model_id: Some("openai/gpt-5".into()),
+                node_id: Some("node-1".into()),
+            })]
+        );
+
+        app.delegates.parent_session_id = Some("root".into());
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ProfileAgents {
+                profile_id: "quorum".into(),
+                agents: vec![agent("primary"), agent("reviewer")],
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.models.agents[1].id, "reviewer");
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert_eq!(app.chat.context_limit, 4_096);
+    }
+
+    #[test]
+    fn model_acp_route_preserves_ui_state_and_logs_exact_inventory_diagnostics() {
+        let mut app = App::new();
+        app.models.current_provider = Some("old-provider".into());
+        app.models.current_model = Some("old-model".into());
+        app.models.current_model_node_id = Some("old-node".into());
+        app.models.model_filter = "keep".into();
+        app.models.model_cursor = 7;
+        app.models.model_popup_agent_tab = 2;
+        app.models.reasoning_effort = Some("high".into());
+        app.auth.filter = "preserved auth".into();
+        app.sessions.session_id = Some("preserved session".into());
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved chat".into()));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Models {
+                models: vec![
+                    crate::models_state::ModelsState::test_model_entry(
+                        "local", "provider", "local", None, None,
+                    ),
+                    crate::models_state::ModelsState::test_model_entry(
+                        "remote",
+                        "provider",
+                        "remote",
+                        Some("node-1"),
+                        Some("peer"),
+                    ),
+                ],
+                meta: Some(crate::acp_state::AcpModelsMetaInfo {
+                    remote_node_count: 2,
+                    remote_timeout_count: 1,
+                }),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.models.models.len(), 2);
+        assert_eq!(app.models.current_provider.as_deref(), Some("old-provider"));
+        assert_eq!(app.models.current_model.as_deref(), Some("old-model"));
+        assert_eq!(
+            app.models.current_model_node_id.as_deref(),
+            Some("old-node")
+        );
+        assert_eq!(app.models.model_filter, "keep");
+        assert_eq!(app.models.model_cursor, 7);
+        assert_eq!(app.models.model_popup_agent_tab, 2);
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+        let diagnostic = app.diagnostics.logs.last().expect("model diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Info);
+        assert_eq!(diagnostic.target, "models");
+        assert_eq!(
+            diagnostic.message,
+            "models: 2 total, 1 remote (inventory nodes=2, timeouts=1)"
+        );
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert_eq!(
+            app.sessions.session_id.as_deref(),
+            Some("preserved session")
+        );
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved chat"
+        ));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegateModelSet {
+                session_id: "preserved session".into(),
+                agent_id: "coder".into(),
+                model: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.diagnostics.status,
+            "delegate model reset for coder in preserved session"
+        );
+        let diagnostic = app.diagnostics.logs.last().expect("delegate diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Info);
+        assert_eq!(diagnostic.target, "model");
+        assert_eq!(
+            diagnostic.message,
+            "delegate model reset for coder in preserved session"
+        );
+    }
+
+    #[test]
+    fn provider_and_effort_acp_routes_apply_release_sensitive_coordination() {
+        let mut app = App::new();
+        app.chat.context_limit = 4_096;
+        app.auth.filter = "preserved auth".into();
+        app.mesh.mesh_invite_name = "preserved mesh".into();
+        app.sessions.session_id = Some("preserved session".into());
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ProviderChanged {
+                provider: "remote-provider".into(),
+                model: "model-1".into(),
+                context_limit: Some(128_000),
+                provider_node_id: Some("node-1".into()),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.models.current_provider.as_deref(),
+            Some("remote-provider")
+        );
+        assert_eq!(app.models.current_model.as_deref(), Some("model-1"));
+        assert_eq!(app.models.current_model_node_id.as_deref(), Some("node-1"));
+        assert_eq!(app.chat.context_limit, 128_000);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::ProviderChanged {
+                provider: "local-provider".into(),
+                model: "model-2".into(),
+                context_limit: None,
+                provider_node_id: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.models.current_provider.as_deref(),
+            Some("local-provider")
+        );
+        assert_eq!(app.models.current_model.as_deref(), Some("model-2"));
+        assert_eq!(app.models.current_model_node_id, None);
+        assert_eq!(app.chat.context_limit, 128_000);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Acp(AcpAppEvent::ReasoningEffort {
+                    reasoning_effort: Some("med".into()),
+                }),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("medium"));
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Acp(AcpAppEvent::ReasoningEffort {
+                    reasoning_effort: Some("invalid".into()),
+                }),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert_eq!(app.mesh.mesh_invite_name, "preserved mesh");
+        assert_eq!(
+            app.sessions.session_id.as_deref(),
+            Some("preserved session")
+        );
+    }
+
+    #[test]
+    fn initialized_acp_route_preserves_placeholder_and_discards_profile_effects() {
+        let mut app = App::new();
+        app.profiles.profiles = vec![profile("deep")];
+        app.profiles.active_profile_id = Some("deep".into());
+        app.models.model_popup_agent_tab = 3;
+        app.models.model_filter = "keep".into();
+        app.auth.ui_notice = Some(AuthUiNotice {
+            provider: Some("openai".into()),
+            success: false,
+            message: "stale".into(),
+        });
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Initialized {
+                agent_id: "agent-1".into(),
+                agent_name: "Agent".into(),
+                profiles: Vec::new(),
+                active_profile_id: None,
+                agent_mode: Some("plan".into()),
+                reasoning_effort: Some(Some("high".into())),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.profiles.profiles[0].id, "deep");
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
+        assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(app.sessions.agent_mode, "plan");
+        assert_eq!(app.models.agents[0].id, "agent-1");
+        assert_eq!(app.models.agents_profile_id, None);
+        assert_eq!(app.models.model_popup_agent_tab, 3);
+        assert_eq!(app.models.model_filter, "keep");
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+        assert!(app.auth.ui_notice.is_none());
+        assert_eq!(app.diagnostics.status, "connected");
+        let diagnostic = app.diagnostics.logs.last().expect("connection diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Info);
+        assert_eq!(diagnostic.target, "connection");
+        assert_eq!(diagnostic.message, "connected");
+
+        let mut app = App::new();
+        app.models.model_popup_agent_tab = 3;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Initialized {
+                agent_id: "agent-2".into(),
+                agent_name: "Agent Two".into(),
+                profiles: vec![profile("fast")],
+                active_profile_id: Some("fast".into()),
+                agent_mode: None,
+                reasoning_effort: None,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("fast"));
+        assert_eq!(app.models.agents[0].id, "agent-2");
+        assert_eq!(app.models.agents_profile_id, None);
+        assert_eq!(app.models.model_popup_agent_tab, 0);
     }
 
     #[test]

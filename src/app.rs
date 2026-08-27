@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::auth_state::AuthState;
 use crate::chat_state::ChatState;
 use crate::command::Command;
@@ -409,26 +407,8 @@ impl App {
         session_id: &str,
         profile_id: &str,
     ) -> Vec<Command> {
-        let known_agents: HashSet<&str> = self
-            .models
-            .agents
-            .iter()
-            .skip(1)
-            .map(|agent| agent.id.as_str())
-            .collect();
         self.models
-            .delegate_model_preferences
-            .get(profile_id)
-            .into_iter()
-            .flat_map(|preferences| preferences.iter())
-            .filter(|(agent_id, _)| known_agents.contains(agent_id.as_str()))
-            .map(|(agent_id, preference)| Command::SetDelegateModel {
-                session_id: session_id.to_string(),
-                agent_id: agent_id.clone(),
-                model_id: Some(preference.model_id.clone()),
-                node_id: preference.node_id.clone(),
-            })
-            .collect()
+            .delegate_model_commands_for_session(session_id, profile_id)
     }
 
     /// Cursor position for a delegate agent's preferred model in the popup list.

@@ -22,7 +22,9 @@ use crate::domain::session::{
     ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot,
 };
 use crate::domain::tool::ToolDetail;
+use crate::models_state::{ModelAction, ModelContext, ModelCoordination, ModelOutcome};
 use crate::navigation_state::{Popup, Screen};
+use crate::profiles_state::{ProfileAction, ProfileOutcome};
 use crate::tool_detail;
 
 #[derive(Debug, Clone, Default)]
@@ -198,20 +200,31 @@ impl crate::app::App {
                 // ACP initialization sends a placeholder empty catalog before
                 // capability-gated profile discovery completes.
                 if !profiles.is_empty() {
-                    self.apply_profile_catalog(profiles, active_profile_id);
+                    let discarded_effects = self.apply_profile_catalog(profiles, active_profile_id);
+                    debug_assert!(!discarded_effects.iter().any(|effect| {
+                        !matches!(effect, Effect::Command(Command::ListProfileAgents { .. }))
+                    }));
                 }
                 self.sessions.agent_id = Some(agent_id.clone());
-                self.models.initialize_primary_agent(AgentInfo {
-                    id: agent_id,
-                    name: agent_name,
-                    description: None,
-                    capabilities: Vec::new(),
-                });
+                let effects = self.apply_model_action(
+                    ModelAction::InitializePrimaryAgent(AgentInfo {
+                        id: agent_id,
+                        name: agent_name,
+                        description: None,
+                        capabilities: Vec::new(),
+                    }),
+                    ModelContext::default(),
+                );
+                debug_assert!(effects.is_empty());
                 if let Some(mode) = agent_mode {
                     self.sessions.replace_agent_mode(mode);
                 }
                 if let Some(effort) = reasoning_effort {
-                    self.models.reasoning_effort = effort;
+                    let effects = self.apply_model_action(
+                        ModelAction::InitializeReasoningEffort(effort),
+                        ModelContext::default(),
+                    );
+                    debug_assert!(effects.is_empty());
                 }
                 self.auth.ui_notice = None;
                 self.set_status(LogLevel::Info, "connection", "connected");
@@ -221,65 +234,55 @@ impl crate::app::App {
                 self.sessions.replace_agent_mode(mode);
                 vec![]
             }
-            AcpAppEvent::ReasoningEffort { reasoning_effort } => {
-                if let Some(validated) =
-                    crate::models_state::validate_reasoning_effort(reasoning_effort.as_deref())
-                {
-                    self.models.reasoning_effort = validated;
-                }
-                vec![]
-            }
+            AcpAppEvent::ReasoningEffort { reasoning_effort } => self.apply_model_action(
+                ModelAction::ReasoningEffort(reasoning_effort),
+                ModelContext::default(),
+            ),
             AcpAppEvent::Profiles {
                 profiles,
                 active_profile_id,
-            } => effects(self.apply_profile_catalog(profiles, active_profile_id)),
+            } => self.apply_profile_catalog(profiles, active_profile_id),
             AcpAppEvent::ProfileAgents { profile_id, agents } => {
-                if self.desired_agents_profile_id() == Some(profile_id.as_str()) {
-                    self.models.replace_profile_agents(profile_id, agents);
-                    if self.delegates.parent_session_id.is_none()
-                        && let (Some(session_id), Some(profile_id)) = (
-                            self.sessions.session_id.as_deref(),
-                            self.models.agents_profile_id.as_deref(),
-                        )
-                    {
-                        return effects(
-                            self.delegate_model_commands_for_session(session_id, profile_id),
-                        );
-                    }
-                }
-                vec![]
+                let context = ModelContext {
+                    desired_profile_id: self.desired_agents_profile_id().map(str::to_string),
+                    root_session_id: self
+                        .delegates
+                        .parent_session_id
+                        .is_none()
+                        .then(|| self.sessions.session_id.clone())
+                        .flatten(),
+                };
+                self.apply_model_action(
+                    ModelAction::ReplaceProfileAgents { profile_id, agents },
+                    context,
+                )
             }
             AcpAppEvent::DelegateModelSet {
                 session_id,
                 agent_id,
                 model,
-            } => {
-                self.set_status(
-                    LogLevel::Info,
-                    "model",
-                    match model {
-                        Some(model) => format!(
-                            "delegate model set for {agent_id} in {session_id}: {}",
-                            model.model_id
-                        ),
-                        None => format!("delegate model reset for {agent_id} in {session_id}"),
-                    },
-                );
-                vec![]
-            }
+            } => self.apply_model_action(
+                ModelAction::DelegateModelSet {
+                    session_id,
+                    agent_id,
+                    model_id: model.map(|model| model.model_id),
+                },
+                ModelContext::default(),
+            ),
             AcpAppEvent::ProviderChanged {
                 provider,
                 model,
                 context_limit,
                 provider_node_id,
-            } => {
-                self.models
-                    .replace_live_selection(provider, model, provider_node_id);
-                if let Some(limit) = context_limit {
-                    self.chat.context_limit = limit;
-                }
-                vec![]
-            }
+            } => self.apply_model_action(
+                ModelAction::ProviderChanged {
+                    provider,
+                    model,
+                    node_id: provider_node_id,
+                    context_limit,
+                },
+                ModelContext::default(),
+            ),
             AcpAppEvent::ControlCapabilities(data) => {
                 self.apply_acp_control_capabilities_log(data);
                 vec![]
@@ -496,17 +499,15 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::Models { models, meta } => {
-                let (total_models, remote_models) = self.models.replace_catalog(models);
-                let remote_nodes = meta.as_ref().map(|m| m.remote_node_count).unwrap_or(0);
-                let timeouts = meta.as_ref().map(|m| m.remote_timeout_count).unwrap_or(0);
-                let mut line = format!("models: {total_models} total, {remote_models} remote");
-                if remote_nodes > 0 || timeouts > 0 {
-                    line.push_str(&format!(
-                        " (inventory nodes={remote_nodes}, timeouts={timeouts})"
-                    ));
-                }
-                self.push_log(LogLevel::Info, "models", line);
-                vec![]
+                let meta = meta.unwrap_or_default();
+                self.apply_model_action(
+                    ModelAction::ReplaceCatalog {
+                        models,
+                        remote_node_count: meta.remote_node_count,
+                        remote_timeout_count: meta.remote_timeout_count,
+                    },
+                    ModelContext::default(),
+                )
             }
             AcpAppEvent::AuthProviders(providers) => {
                 self.apply_auth_action(AuthAction::Providers(providers))
@@ -549,25 +550,50 @@ impl crate::app::App {
         effects
     }
 
+    fn apply_model_action(&mut self, action: ModelAction, context: ModelContext) -> Vec<Effect> {
+        let ModelOutcome {
+            coordination,
+            effects,
+        } = self.models.reduce(action, context);
+        for coordination in coordination {
+            match coordination {
+                ModelCoordination::Log {
+                    level,
+                    target,
+                    message,
+                } => self.push_log(level, target, message),
+                ModelCoordination::Status {
+                    level,
+                    target,
+                    message,
+                } => self.set_status(level, target, message),
+                ModelCoordination::SetContextLimit(limit) => self.chat.context_limit = limit,
+            }
+        }
+        effects
+    }
+
     fn apply_profile_catalog(
         &mut self,
         profiles: Vec<ProfileInfo>,
         backend_active_profile_id: Option<String>,
-    ) -> Vec<Command> {
-        let active_profile_changed = self
-            .profiles
-            .apply_catalog(profiles, backend_active_profile_id);
-        let desired_profile_id = self.desired_agents_profile_id().map(str::to_string);
-        if active_profile_changed
-            || self.models.agents_profile_id.as_deref() != desired_profile_id.as_deref()
-            || self.models.agents.len() <= 1
-        {
-            self.models.clear_profile_agents();
-            return desired_profile_id
-                .map(|profile_id| vec![Command::ListProfileAgents { profile_id }])
-                .unwrap_or_default();
-        }
-        vec![]
+    ) -> Vec<Effect> {
+        let ProfileOutcome {
+            active_profile_changed,
+        } = self.profiles.reduce(ProfileAction::ReplaceCatalog {
+            profiles,
+            backend_active_profile_id,
+        });
+        let context = ModelContext {
+            desired_profile_id: self.desired_agents_profile_id().map(str::to_string),
+            root_session_id: None,
+        };
+        self.apply_model_action(
+            ModelAction::SynchronizeProfileCatalog {
+                active_profile_changed,
+            },
+            context,
+        )
     }
 
     fn apply_acp_session_list(
