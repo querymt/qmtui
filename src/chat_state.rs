@@ -118,10 +118,36 @@ pub(crate) struct StreamingDeltaTransition {
     pub(crate) ignored_duplicate: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ElicitationTransition {
-    pub(crate) inserted: bool,
-    pub(crate) finalized_streaming: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ElicitationAction {
+    Requested {
+        elicitation_id: String,
+        message: String,
+        source: String,
+        requested_schema: serde_json::Value,
+        allow_custom: bool,
+        is_replay: bool,
+    },
+    ResponseAcknowledged {
+        elicitation_id: String,
+        outcome: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ElicitationTransition {
+    InsertedSupported {
+        is_replay: bool,
+        finalized_streaming: bool,
+    },
+    InsertedUnsupported {
+        is_replay: bool,
+        finalized_streaming: bool,
+    },
+    Duplicate,
+    ResolvedActive,
+    ResolvedStale,
+    UnknownAcknowledgement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +313,7 @@ pub(crate) enum ChatCoordination {
         target: &'static str,
         message: String,
     },
+    RefreshTransientStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +333,13 @@ pub(crate) struct ChatToolOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatUsageOutcome {
     pub(crate) transition: ChatUsageTransition,
+    pub(crate) coordination: Vec<ChatCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElicitationOutcome {
+    pub(crate) transition: ElicitationTransition,
     pub(crate) coordination: Vec<ChatCoordination>,
     pub(crate) effects: Vec<Effect>,
 }
@@ -654,6 +688,143 @@ impl ChatState {
             ChatUsageAction::TimingUpdated { .. } => (ChatUsageTransition::NoOp, Vec::new()),
         };
         ChatUsageOutcome {
+            transition,
+            coordination,
+            effects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reduce_elicitation(&mut self, action: ElicitationAction) -> ElicitationOutcome {
+        let (transition, coordination) = match action {
+            ElicitationAction::Requested {
+                elicitation_id,
+                message,
+                source,
+                requested_schema,
+                allow_custom,
+                is_replay,
+            } => {
+                if self.messages.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        ChatEntry::Elicitation {
+                            elicitation_id: existing_id,
+                            ..
+                        } if existing_id == &elicitation_id
+                    )
+                }) {
+                    return ElicitationOutcome {
+                        transition: ElicitationTransition::Duplicate,
+                        coordination: Vec::new(),
+                        effects: Vec::new(),
+                    };
+                }
+
+                let fields = ElicitationState::parse_schema(&requested_schema);
+                let supported = !fields.is_empty();
+                let finalized_streaming = self.finalize_streaming_segment();
+                if supported && !is_replay {
+                    self.elicitation = Some(ElicitationState {
+                        elicitation_id: elicitation_id.clone(),
+                        message: message.clone(),
+                        source: source.clone(),
+                        fields,
+                        selected: std::collections::HashMap::new(),
+                        text_input: String::new(),
+                        custom_input: String::new(),
+                        allow_custom,
+                    });
+                    self.elicitation_ui = Some(ElicitationUiState::default());
+                }
+                self.messages.push(ChatEntry::Elicitation {
+                    elicitation_id,
+                    message,
+                    source,
+                    outcome: (!supported)
+                        .then(|| "unsupported schema - cannot answer in TUI".into()),
+                });
+                self.scroll_offset = 0;
+
+                let mut coordination = if finalized_streaming {
+                    vec![
+                        ChatCoordination::InvalidateContentCache,
+                        ChatCoordination::InvalidateThinkingCache,
+                        ChatCoordination::InvalidateCardCache,
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let (transition, status) = if supported {
+                    (
+                        ElicitationTransition::InsertedSupported {
+                            is_replay,
+                            finalized_streaming,
+                        },
+                        ChatCoordination::Status {
+                            level: LogLevel::Info,
+                            target: "elicitation",
+                            message: "question - answer in the panel above input".into(),
+                        },
+                    )
+                } else {
+                    (
+                        ElicitationTransition::InsertedUnsupported {
+                            is_replay,
+                            finalized_streaming,
+                        },
+                        ChatCoordination::Status {
+                            level: LogLevel::Warn,
+                            target: "elicitation",
+                            message: "question skipped - unsupported schema".into(),
+                        },
+                    )
+                };
+                coordination.push(status);
+                (transition, coordination)
+            }
+            ElicitationAction::ResponseAcknowledged {
+                elicitation_id,
+                outcome,
+            } => {
+                let is_active = self
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|state| state.elicitation_id == elicitation_id);
+                let Some(card_outcome) = self.messages.iter_mut().find_map(|entry| match entry {
+                    ChatEntry::Elicitation {
+                        elicitation_id: existing_id,
+                        outcome,
+                        ..
+                    } if existing_id == &elicitation_id => Some(outcome),
+                    _ => None,
+                }) else {
+                    return ElicitationOutcome {
+                        transition: ElicitationTransition::UnknownAcknowledgement,
+                        coordination: Vec::new(),
+                        effects: Vec::new(),
+                    };
+                };
+                *card_outcome = Some(outcome);
+
+                if is_active {
+                    self.elicitation = None;
+                    self.elicitation_ui = None;
+                    (
+                        ElicitationTransition::ResolvedActive,
+                        vec![
+                            ChatCoordination::InvalidateCardCache,
+                            ChatCoordination::RefreshTransientStatus,
+                        ],
+                    )
+                } else {
+                    (
+                        ElicitationTransition::ResolvedStale,
+                        vec![ChatCoordination::InvalidateCardCache],
+                    )
+                }
+            }
+        };
+        ElicitationOutcome {
             transition,
             coordination,
             effects: Vec::new(),
@@ -1540,64 +1711,6 @@ impl ChatState {
         }
     }
 
-    pub(crate) fn push_elicitation(
-        &mut self,
-        active: Option<ElicitationState>,
-        elicitation_id: String,
-        message: String,
-        source: String,
-        outcome: Option<String>,
-    ) -> ElicitationTransition {
-        if self.messages.iter().any(|entry| {
-            matches!(
-                entry,
-                ChatEntry::Elicitation {
-                    elicitation_id: existing_id,
-                    ..
-                } if existing_id == &elicitation_id
-            )
-        }) {
-            return ElicitationTransition::default();
-        }
-
-        let finalized_streaming = self.finalize_streaming_segment();
-        if let Some(active) = active {
-            self.elicitation = Some(active);
-            self.elicitation_ui = Some(ElicitationUiState::default());
-        }
-        self.messages.push(ChatEntry::Elicitation {
-            elicitation_id,
-            message,
-            source,
-            outcome,
-        });
-        self.scroll_offset = 0;
-        ElicitationTransition {
-            inserted: true,
-            finalized_streaming,
-        }
-    }
-
-    pub(crate) fn resolve_elicitation(&mut self, elicitation_id: &str, outcome: &str) -> bool {
-        let mut resolved = false;
-        for entry in &mut self.messages {
-            if let ChatEntry::Elicitation {
-                elicitation_id: existing_id,
-                outcome: existing_outcome,
-                ..
-            } = entry
-                && existing_id == elicitation_id
-            {
-                *existing_outcome = Some(outcome.to_string());
-                resolved = true;
-                break;
-            }
-        }
-        self.elicitation = None;
-        self.elicitation_ui = None;
-        resolved
-    }
-
     pub(crate) fn backfill_elicitation_outcomes(&mut self, result_str: &str) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(result_str) else {
             return;
@@ -1984,17 +2097,22 @@ mod tests {
     #[test]
     fn elicitation_resolution_and_backfill_update_durable_cards() {
         let mut chat = ChatState::new();
-        let state = ElicitationState::new_for_test(Vec::new());
-        let transition = chat.push_elicitation(
-            Some(state),
-            "elic-1".into(),
-            "Pick".into(),
-            "question".into(),
-            None,
-        );
-        assert!(transition.inserted);
-        assert!(chat.elicitation.is_some());
-        assert!(chat.resolve_elicitation("elic-1", "responded"));
+        chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Pick".into(),
+            source: "question".into(),
+            outcome: None,
+        });
+        let mut active = ElicitationState::new_for_test(Vec::new());
+        active.elicitation_id = "elic-1".into();
+        chat.elicitation = Some(active);
+        chat.elicitation_ui = Some(ElicitationUiState::default());
+
+        let outcome = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "elic-1".into(),
+            outcome: "responded".into(),
+        });
+        assert_eq!(outcome.transition, ElicitationTransition::ResolvedActive);
         assert!(chat.elicitation.is_none());
         chat.backfill_elicitation_outcomes(
             r#"{"answers":[{"question":"Pick","answers":["Alpha","Beta"]}]}"#,
@@ -2009,25 +2127,327 @@ mod tests {
     #[test]
     fn elicitation_live_replay_duplicate_identity_is_idempotent() {
         let mut chat = ChatState::new();
-        let replay = chat.push_elicitation(
-            None,
-            "elic-1".into(),
-            "Question".into(),
-            "source".into(),
-            None,
+        let request = |is_replay| ElicitationAction::Requested {
+            elicitation_id: "elic-1".into(),
+            message: "Question".into(),
+            source: "source".into(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } }
+            }),
+            allow_custom: false,
+            is_replay,
+        };
+        let replay = chat.reduce_elicitation(request(true));
+        assert_eq!(
+            replay.transition,
+            ElicitationTransition::InsertedSupported {
+                is_replay: true,
+                finalized_streaming: false,
+            }
         );
-        assert!(replay.inserted);
         assert!(chat.elicitation.is_none());
-        let duplicate = chat.push_elicitation(
-            Some(ElicitationState::new_for_test(Vec::new())),
-            "elic-1".into(),
-            "Question".into(),
-            "source".into(),
-            None,
-        );
-        assert_eq!(duplicate, ElicitationTransition::default());
+        let duplicate = chat.reduce_elicitation(request(false));
+        assert_eq!(duplicate.transition, ElicitationTransition::Duplicate);
+        assert!(duplicate.coordination.is_empty());
         assert_eq!(chat.messages.len(), 1);
         assert!(chat.elicitation.is_none());
+    }
+
+    #[test]
+    fn elicitation_supported_live_and_replay_have_exact_state_and_coordination() {
+        let request = |is_replay| ElicitationAction::Requested {
+            elicitation_id: "elic-1".into(),
+            message: "Choose a target".into(),
+            source: "builtin:question".into(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "target": { "type": "string", "enum": ["staging"] } },
+                "required": ["target"]
+            }),
+            allow_custom: true,
+            is_replay,
+        };
+
+        let mut live = ChatState::new();
+        live.scroll_offset = 9;
+        let live_outcome = live.reduce_elicitation(request(false));
+        assert_eq!(
+            live_outcome,
+            ElicitationOutcome {
+                transition: ElicitationTransition::InsertedSupported {
+                    is_replay: false,
+                    finalized_streaming: false,
+                },
+                coordination: vec![ChatCoordination::Status {
+                    level: LogLevel::Info,
+                    target: "elicitation",
+                    message: "question - answer in the panel above input".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+        let active = live.elicitation.as_ref().expect("live active elicitation");
+        assert_eq!(active.elicitation_id, "elic-1");
+        assert_eq!(active.message, "Choose a target");
+        assert_eq!(active.source, "builtin:question");
+        assert_eq!(active.fields.len(), 1);
+        assert!(active.allow_custom);
+        assert!(live.elicitation_ui.is_some());
+        assert_eq!(live.scroll_offset, 0);
+        assert!(matches!(
+            live.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, message, source, outcome: None }]
+                if elicitation_id == "elic-1"
+                    && message == "Choose a target"
+                    && source == "builtin:question"
+        ));
+
+        let mut replay = ChatState::new();
+        let replay_outcome = replay.reduce_elicitation(request(true));
+        assert_eq!(
+            replay_outcome,
+            ElicitationOutcome {
+                transition: ElicitationTransition::InsertedSupported {
+                    is_replay: true,
+                    finalized_streaming: false,
+                },
+                coordination: vec![ChatCoordination::Status {
+                    level: LogLevel::Info,
+                    target: "elicitation",
+                    message: "question - answer in the panel above input".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+        assert!(replay.elicitation.is_none());
+        assert!(replay.elicitation_ui.is_none());
+        assert!(matches!(
+            replay.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
+                if elicitation_id == "elic-1"
+        ));
+    }
+
+    #[test]
+    fn elicitation_unsupported_live_and_replay_insert_outcome_without_active_state() {
+        for is_replay in [false, true] {
+            let mut chat = ChatState::new();
+            let outcome = chat.reduce_elicitation(ElicitationAction::Requested {
+                elicitation_id: format!("unsupported-{is_replay}"),
+                message: "Upload a file".into(),
+                source: "extension:file-picker".into(),
+                requested_schema: serde_json::json!({ "type": "array" }),
+                allow_custom: false,
+                is_replay,
+            });
+
+            assert_eq!(
+                outcome,
+                ElicitationOutcome {
+                    transition: ElicitationTransition::InsertedUnsupported {
+                        is_replay,
+                        finalized_streaming: false,
+                    },
+                    coordination: vec![ChatCoordination::Status {
+                        level: LogLevel::Warn,
+                        target: "elicitation",
+                        message: "question skipped - unsupported schema".into(),
+                    }],
+                    effects: Vec::new(),
+                }
+            );
+            assert!(chat.elicitation.is_none());
+            assert!(chat.elicitation_ui.is_none());
+            assert!(matches!(
+                chat.messages.as_slice(),
+                [ChatEntry::Elicitation { outcome: Some(outcome), .. }]
+                    if outcome == "unsupported schema - cannot answer in TUI"
+            ));
+        }
+    }
+
+    #[test]
+    fn elicitation_request_finalizes_stream_before_card_and_distinct_live_replaces_active() {
+        let request = |id: &str| ElicitationAction::Requested {
+            elicitation_id: id.into(),
+            message: format!("Question {id}"),
+            source: "builtin:question".into(),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } }
+            }),
+            allow_custom: false,
+            is_replay: false,
+        };
+        let mut chat = ChatState::new();
+        chat.streaming_thinking = "plan".into();
+        chat.streaming_thinking_message_id = Some("assistant-1".into());
+        chat.streaming_content = "answer".into();
+        chat.streaming_content_message_id = Some("assistant-1".into());
+
+        let first = chat.reduce_elicitation(request("elic-1"));
+        assert_eq!(
+            first.transition,
+            ElicitationTransition::InsertedSupported {
+                is_replay: false,
+                finalized_streaming: true,
+            }
+        );
+        assert_eq!(
+            first.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::InvalidateCardCache,
+                ChatCoordination::Status {
+                    level: LogLevel::Info,
+                    target: "elicitation",
+                    message: "question - answer in the panel above input".into(),
+                },
+            ]
+        );
+        assert!(first.effects.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) },
+                ChatEntry::Elicitation { elicitation_id, outcome: None, .. },
+            ] if content == "answer"
+                && thinking == "plan"
+                && message_id == "assistant-1"
+                && elicitation_id == "elic-1"
+        ));
+
+        chat.streaming_content = "must remain pending".into();
+        let duplicate = chat.reduce_elicitation(request("elic-1"));
+        assert_eq!(duplicate.transition, ElicitationTransition::Duplicate);
+        assert!(duplicate.coordination.is_empty());
+        assert!(duplicate.effects.is_empty());
+        assert_eq!(chat.streaming_content, "must remain pending");
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(
+            chat.elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-1")
+        );
+
+        chat.streaming_content.clear();
+        let second = chat.reduce_elicitation(request("elic-2"));
+        assert_eq!(
+            second.transition,
+            ElicitationTransition::InsertedSupported {
+                is_replay: false,
+                finalized_streaming: false,
+            }
+        );
+        assert_eq!(
+            chat.elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-2")
+        );
+        assert!(chat.elicitation_ui.is_some());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [
+                ChatEntry::Assistant { .. },
+                ChatEntry::Elicitation { elicitation_id: first, outcome: None, .. },
+                ChatEntry::Elicitation { elicitation_id: second, outcome: None, .. },
+            ] if first == "elic-1" && second == "elic-2"
+        ));
+    }
+
+    #[test]
+    fn elicitation_acknowledgements_type_unknown_stale_active_and_duplicate_behavior() {
+        let mut chat = ChatState::new();
+        for id in ["elic-old", "elic-new"] {
+            chat.messages.push(ChatEntry::Elicitation {
+                elicitation_id: id.into(),
+                message: format!("Question {id}"),
+                source: "builtin:question".into(),
+                outcome: None,
+            });
+        }
+        let mut active = ElicitationState::new_for_test(Vec::new());
+        active.elicitation_id = "elic-new".into();
+        chat.elicitation = Some(active);
+        chat.elicitation_ui = Some(ElicitationUiState::default());
+
+        let unknown = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "missing".into(),
+            outcome: "accepted".into(),
+        });
+        assert_eq!(
+            unknown,
+            ElicitationOutcome {
+                transition: ElicitationTransition::UnknownAcknowledgement,
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(
+            chat.elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-new")
+        );
+
+        let stale = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "elic-old".into(),
+            outcome: "declined".into(),
+        });
+        assert_eq!(stale.transition, ElicitationTransition::ResolvedStale);
+        assert_eq!(
+            stale.coordination,
+            vec![ChatCoordination::InvalidateCardCache]
+        );
+        assert!(stale.effects.is_empty());
+        assert_eq!(
+            chat.elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-new")
+        );
+        assert!(chat.elicitation_ui.is_some());
+
+        let active = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "elic-new".into(),
+            outcome: "accepted".into(),
+        });
+        assert_eq!(active.transition, ElicitationTransition::ResolvedActive);
+        assert_eq!(
+            active.coordination,
+            vec![
+                ChatCoordination::InvalidateCardCache,
+                ChatCoordination::RefreshTransientStatus,
+            ]
+        );
+        assert!(active.effects.is_empty());
+        assert!(chat.elicitation.is_none());
+        assert!(chat.elicitation_ui.is_none());
+
+        let duplicate = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "elic-new".into(),
+            outcome: "accepted".into(),
+        });
+        assert_eq!(duplicate.transition, ElicitationTransition::ResolvedStale);
+        assert_eq!(
+            duplicate.coordination,
+            vec![ChatCoordination::InvalidateCardCache]
+        );
+        assert!(duplicate.effects.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [
+                ChatEntry::Elicitation { elicitation_id: old, outcome: Some(old_outcome), .. },
+                ChatEntry::Elicitation { elicitation_id: new, outcome: Some(new_outcome), .. },
+            ] if old == "elic-old"
+                && old_outcome == "declined"
+                && new == "elic-new"
+                && new_outcome == "accepted"
+        ));
     }
 
     #[test]

@@ -6,7 +6,8 @@ use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::chat_state::{
     ChatAction, ChatCoordination, ChatOutcome, ChatToolAction, ChatToolOutcome, ChatToolTransition,
-    ChatUsageAction, ChatUsageOutcome, ToolStartPreparationTransition,
+    ChatUsageAction, ChatUsageOutcome, ElicitationAction, ElicitationOutcome,
+    ToolStartPreparationTransition,
 };
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
@@ -15,7 +16,6 @@ use crate::delegates_state::{
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, DelegationUpdate};
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
-use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
     RemoteSessionListInfo,
@@ -746,6 +746,19 @@ impl crate::app::App {
         effects
     }
 
+    pub(crate) fn apply_chat_elicitation_action(
+        &mut self,
+        action: ElicitationAction,
+    ) -> Vec<Effect> {
+        let ElicitationOutcome {
+            transition: _,
+            coordination,
+            effects,
+        } = self.chat.reduce_elicitation(action);
+        self.apply_chat_coordination(coordination);
+        effects
+    }
+
     fn apply_chat_coordination(&mut self, coordination: Vec<ChatCoordination>) {
         for coordination in coordination {
             match coordination {
@@ -768,6 +781,7 @@ impl crate::app::App {
                     target,
                     message,
                 } => self.set_status(level, target, message),
+                ChatCoordination::RefreshTransientStatus => self.refresh_transient_status(),
             }
         }
     }
@@ -853,48 +867,40 @@ impl crate::app::App {
 
         match update {
             AcpSessionUpdate::TurnStarted => {
-                return self.apply_chat_action(ChatAction::TurnStarted { is_replay });
+                self.apply_chat_action(ChatAction::TurnStarted { is_replay })
             }
             AcpSessionUpdate::UserMessage {
                 content,
                 message_id,
-            } => {
-                return self.apply_chat_action(ChatAction::UserMessage {
-                    text: acp_content_to_string(&content),
-                    message_id,
-                    is_replay,
-                });
-            }
+            } => self.apply_chat_action(ChatAction::UserMessage {
+                text: acp_content_to_string(&content),
+                message_id,
+                is_replay,
+            }),
             AcpSessionUpdate::AssistantContentDelta {
                 content,
                 message_id,
-            } => {
-                return self.apply_chat_action(ChatAction::AssistantContentDelta {
-                    content,
-                    message_id,
-                });
-            }
+            } => self.apply_chat_action(ChatAction::AssistantContentDelta {
+                content,
+                message_id,
+            }),
             AcpSessionUpdate::AssistantThinkingDelta {
                 content,
                 message_id,
-            } => {
-                return self.apply_chat_action(ChatAction::AssistantThinkingDelta {
-                    content,
-                    message_id,
-                    is_replay,
-                });
-            }
+            } => self.apply_chat_action(ChatAction::AssistantThinkingDelta {
+                content,
+                message_id,
+                is_replay,
+            }),
             AcpSessionUpdate::AssistantMessage {
                 content,
                 thinking,
                 message_id,
-            } => {
-                return self.apply_chat_action(ChatAction::AssistantMessage {
-                    content,
-                    thinking,
-                    message_id,
-                });
-            }
+            } => self.apply_chat_action(ChatAction::AssistantMessage {
+                content,
+                thinking,
+                message_id,
+            }),
             AcpSessionUpdate::ToolCallStart {
                 tool_call_id,
                 name,
@@ -936,7 +942,7 @@ impl crate::app::App {
                         detail,
                     });
                 effects.extend(insertion_effects);
-                return effects;
+                effects
             }
             AcpSessionUpdate::ToolCallEnd {
                 tool_call_id,
@@ -950,22 +956,19 @@ impl crate::app::App {
                     is_error,
                     result,
                 });
-                return effects;
+                effects
             }
             AcpSessionUpdate::UsageUpdate {
                 used,
                 size,
                 cost_usd,
-            } => {
-                return self.apply_chat_usage_action(ChatUsageAction::UsageUpdated {
-                    used,
-                    size,
-                    cost_usd,
-                });
-            }
+            } => self.apply_chat_usage_action(ChatUsageAction::UsageUpdated {
+                used,
+                size,
+                cost_usd,
+            }),
             AcpSessionUpdate::TimingUpdate { duration_secs } => {
-                return self
-                    .apply_chat_usage_action(ChatUsageAction::TimingUpdated { duration_secs });
+                self.apply_chat_usage_action(ChatUsageAction::TimingUpdated { duration_secs })
             }
             AcpSessionUpdate::ElicitationRequested {
                 elicitation_id,
@@ -973,83 +976,28 @@ impl crate::app::App {
                 requested_schema,
                 source,
                 allow_custom,
-            } => {
-                self.handle_acp_elicitation_requested(
-                    &elicitation_id,
-                    &message,
-                    &source,
-                    &requested_schema,
-                    allow_custom,
-                    is_replay,
-                );
-            }
+            } => self.apply_chat_elicitation_action(ElicitationAction::Requested {
+                elicitation_id,
+                message,
+                source,
+                requested_schema,
+                allow_custom,
+                is_replay,
+            }),
             AcpSessionUpdate::Cancelled => {
-                return self.apply_chat_action(ChatAction::Cancelled { is_replay });
+                self.apply_chat_action(ChatAction::Cancelled { is_replay })
             }
             AcpSessionUpdate::Finished { finish_reason } => {
-                return self.apply_chat_action(ChatAction::Finished {
+                self.apply_chat_action(ChatAction::Finished {
                     finish_reason,
                     is_replay,
-                });
+                })
             }
         }
-        Vec::new()
     }
 
     fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
         self.chat.push_undoable_user_turn(message_id, text);
-    }
-
-    fn handle_acp_elicitation_requested(
-        &mut self,
-        elicitation_id: &str,
-        message: &str,
-        source: &str,
-        requested_schema: &Value,
-        allow_custom: bool,
-        is_replay: bool,
-    ) {
-        let fields = ElicitationState::parse_schema(requested_schema);
-        let supported = !fields.is_empty();
-        let active = (supported && !is_replay).then(|| ElicitationState {
-            elicitation_id: elicitation_id.to_string(),
-            message: message.to_string(),
-            source: source.to_string(),
-            fields,
-            selected: std::collections::HashMap::new(),
-            text_input: String::new(),
-            custom_input: String::new(),
-            allow_custom,
-        });
-        let outcome = (!supported).then(|| "unsupported schema - cannot answer in TUI".into());
-        let transition = self.chat.push_elicitation(
-            active,
-            elicitation_id.to_string(),
-            message.to_string(),
-            source.to_string(),
-            outcome,
-        );
-        if !transition.inserted {
-            return;
-        }
-        if transition.finalized_streaming {
-            self.render.invalidate_content_cache();
-            self.render.invalidate_thinking_cache();
-            self.render.invalidate_card_cache();
-        }
-        if supported {
-            self.set_status(
-                LogLevel::Info,
-                "elicitation",
-                "question - answer in the panel above input",
-            );
-        } else {
-            self.set_status(
-                LogLevel::Warn,
-                "elicitation",
-                "question skipped - unsupported schema",
-            );
-        }
     }
 
     fn apply_acp_control_capabilities_log(&mut self, data: Value) {
@@ -1500,6 +1448,7 @@ mod tests {
         PendingDelegateToolCall, SessionOp,
     };
     use crate::domain::chat::ChatEntry;
+    use crate::domain::elicitation::ElicitationState;
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
     use crate::domain::session::{
@@ -4172,7 +4121,10 @@ mod tests {
                 updates: updates.clone(),
             });
         }
-        app.resolve_elicitation("elic-1", "staging");
+        app.apply_chat_elicitation_action(ElicitationAction::ResponseAcknowledged {
+            elicitation_id: "elic-1".into(),
+            outcome: "staging".into(),
+        });
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
             updates,

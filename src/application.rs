@@ -4,11 +4,10 @@ use crate::{
     acp_state::AcpAppEvent,
     app::{App, ConnectionEvent},
     auth_state::AuthAction,
-    chat_state::ChatAction,
+    chat_state::{ChatAction, ElicitationAction},
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
-    domain::chat::ChatEntry,
     handlers,
     server_manager::ServerEvent,
 };
@@ -227,31 +226,10 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
         RuntimeEvent::ElicitationResponseSent {
             elicitation_id,
             outcome,
-        } => {
-            let is_active = app
-                .chat
-                .elicitation
-                .as_ref()
-                .is_some_and(|state| state.elicitation_id == elicitation_id);
-            if is_active {
-                app.resolve_elicitation(&elicitation_id, &outcome);
-            } else if let Some(ChatEntry::Elicitation {
-                outcome: card_outcome,
-                ..
-            }) = app.chat.messages.iter_mut().find(|entry| {
-                matches!(
-                    entry,
-                    ChatEntry::Elicitation {
-                        elicitation_id: existing_id,
-                        ..
-                    } if existing_id == &elicitation_id
-                )
-            }) {
-                *card_outcome = Some(outcome);
-                app.render.invalidate_card_cache();
-            }
-            Vec::new()
-        }
+        } => app.apply_chat_elicitation_action(ElicitationAction::ResponseAcknowledged {
+            elicitation_id,
+            outcome,
+        }),
         RuntimeEvent::CommandFailed { command, message } => {
             let effects = if let Command::Prompt { local_id, .. } = command {
                 app.apply_chat_action(ChatAction::RuntimePromptDispatchFailed { local_id })
@@ -337,6 +315,30 @@ mod tests {
                 is_replay: false,
             }),
         )
+    }
+
+    fn supported_elicitation(elicitation_id: &str) -> AcpSessionUpdate {
+        AcpSessionUpdate::ElicitationRequested {
+            elicitation_id: elicitation_id.into(),
+            message: format!("Question {elicitation_id}"),
+            requested_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "target": { "type": "string", "enum": ["staging"] } },
+                "required": ["target"]
+            }),
+            source: "builtin:question".into(),
+            allow_custom: true,
+        }
+    }
+
+    fn unsupported_elicitation(elicitation_id: &str) -> AcpSessionUpdate {
+        AcpSessionUpdate::ElicitationRequested {
+            elicitation_id: elicitation_id.into(),
+            message: format!("Question {elicitation_id}"),
+            requested_schema: serde_json::json!({ "type": "array" }),
+            source: "extension:file-picker".into(),
+            allow_custom: false,
+        }
     }
 
     fn delegation_update(
@@ -909,6 +911,188 @@ mod tests {
         ));
         assert_eq!(app.chat.streaming_content, "active stream");
         assert_eq!(app.chat.activity, ActivityState::Streaming);
+    }
+
+    #[test]
+    fn chat_elicitation_acp_route_is_owner_bounded_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.chat.streaming_thinking = "plan".into();
+        app.chat.streaming_thinking_message_id = Some("assistant-1".into());
+        app.chat.streaming_content = "answer".into();
+        app.chat.streaming_content_message_id = Some("assistant-1".into());
+        app.chat.scroll_offset = 8;
+        app.render.streaming_cache.store(6, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-live")
+        );
+        assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.chat.scroll_offset, 0);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.render.streaming_cache.get(6).is_none());
+        assert!(app.render.streaming_thinking_cache.get(4).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) },
+                ChatEntry::Elicitation { elicitation_id, outcome: None, .. },
+            ] if content == "answer"
+                && thinking == "plan"
+                && message_id == "assistant-1"
+                && elicitation_id == "elic-live"
+        ));
+        assert_eq!(
+            app.diagnostics.status,
+            "question - answer in the panel above input"
+        );
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Info);
+        assert_eq!(diagnostics[0].target, "elicitation");
+        assert_eq!(
+            diagnostics[0].message,
+            "question - answer in the panel above input"
+        );
+
+        app.render.streaming_cache.store(9, Vec::new());
+        app.render.streaming_thinking_cache.store(10, Vec::new());
+        app.render.card_cache.processed_messages = 2;
+        let log_count_before_duplicate = app.diagnostics.logs.len();
+        let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(app.render.streaming_cache.get(9).is_some());
+        assert!(app.render.streaming_thinking_cache.get(10).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert_eq!(app.diagnostics.logs.len(), log_count_before_duplicate);
+    }
+
+    #[test]
+    fn chat_elicitation_replay_and_unsupported_routes_preserve_exact_behavior() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.render.streaming_cache.store(5, Vec::new());
+        app.render.streaming_thinking_cache.store(6, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        let log_count_before_replay = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionReplay {
+                session_id: "active".into(),
+                updates: vec![supported_elicitation("elic-replay")],
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.chat.elicitation.is_none());
+        assert!(app.chat.elicitation_ui.is_none());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
+                if elicitation_id == "elic-replay"
+        ));
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(6).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(
+            app.diagnostics.status,
+            "question - answer in the panel above input"
+        );
+        let replay_diagnostics = &app.diagnostics.logs[log_count_before_replay..];
+        assert_eq!(replay_diagnostics.len(), 2);
+        assert_eq!(replay_diagnostics[0].level, LogLevel::Info);
+        assert_eq!(replay_diagnostics[0].target, "session");
+        assert_eq!(replay_diagnostics[0].message, "session replay: 1 update(s)");
+        assert_eq!(replay_diagnostics[1].level, LogLevel::Info);
+        assert_eq!(replay_diagnostics[1].target, "elicitation");
+        assert_eq!(
+            replay_diagnostics[1].message,
+            "question - answer in the panel above input"
+        );
+
+        let log_count_before_unsupported = app.diagnostics.logs.len();
+        let effects = apply_session_update(&mut app, unsupported_elicitation("elic-unsupported"));
+        assert!(effects.is_empty());
+        assert!(app.chat.elicitation.is_none());
+        assert!(app.chat.elicitation_ui.is_none());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::Elicitation { elicitation_id: replay, outcome: None, .. },
+                ChatEntry::Elicitation { elicitation_id: unsupported, outcome: Some(outcome), .. },
+            ] if replay == "elic-replay"
+                && unsupported == "elic-unsupported"
+                && outcome == "unsupported schema - cannot answer in TUI"
+        ));
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(
+            app.diagnostics.status,
+            "question skipped - unsupported schema"
+        );
+        let unsupported_diagnostic = app
+            .diagnostics
+            .logs
+            .get(log_count_before_unsupported)
+            .expect("unsupported diagnostic");
+        assert_eq!(unsupported_diagnostic.level, LogLevel::Warn);
+        assert_eq!(unsupported_diagnostic.target, "elicitation");
+        assert_eq!(
+            unsupported_diagnostic.message,
+            "question skipped - unsupported schema"
+        );
+    }
+
+    #[test]
+    fn inactive_child_elicitation_stays_in_delegate_state_without_chat_mutation() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("parent".into());
+        add_elicitation(&mut app, "active-elicitation", true);
+        app.chat.streaming_content = "active stream".into();
+        app.render.card_cache.processed_messages = 6;
+        app.diagnostics.status = "preserved status".into();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "child-1".into(),
+                update: supported_elicitation("child-elicitation"),
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("active-elicitation")
+        );
+        assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.chat.streaming_content, "active stream");
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.render.card_cache.processed_messages, 6);
+        assert_eq!(app.diagnostics.status, "preserved status");
+        assert_eq!(app.diagnostics.logs.len(), log_count_before);
+        assert!(matches!(
+            &app.delegates.pending_delegate_child_states["child-1"],
+            DelegateChildState::PendingElicitation { elicitation_id, message, source, .. }
+                if elicitation_id == "child-elicitation"
+                    && message == "Question child-elicitation"
+                    && source == "builtin:question"
+        ));
     }
 
     #[test]
@@ -2518,6 +2702,12 @@ mod tests {
     fn elicitation_response_ack_resolves_the_matching_active_card() {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", true);
+        app.connection.conn = ConnState::Connected;
+        app.render.streaming_cache.store(3, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
+        app.render.card_cache.processed_messages = 5;
+        app.diagnostics.status = "question pending".into();
+        let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
             &mut app,
@@ -2535,12 +2725,25 @@ mod tests {
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
                 if elicitation_id == "elic-1" && outcome == "accepted"
         ));
+        assert!(app.render.streaming_cache.get(3).is_some());
+        assert!(app.render.streaming_thinking_cache.get(4).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "ready");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Debug);
+        assert_eq!(diagnostics[0].target, "activity");
+        assert_eq!(diagnostics[0].message, "ready");
     }
 
     #[test]
     fn elicitation_command_failure_leaves_active_card_pending() {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", true);
+        app.render.streaming_cache.store(3, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
+        app.render.card_cache.processed_messages = 5;
+        let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
             &mut app,
@@ -2568,7 +2771,15 @@ mod tests {
             [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
                 if elicitation_id == "elic-1"
         ));
+        assert!(app.render.streaming_cache.get(3).is_some());
+        assert!(app.render.streaming_thinking_cache.get(4).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 5);
         assert_eq!(app.diagnostics.status, "channel closed");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "command");
+        assert_eq!(diagnostics[0].message, "channel closed");
     }
 
     #[test]
@@ -2576,7 +2787,11 @@ mod tests {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-old", false);
         add_elicitation(&mut app, "elic-new", true);
+        app.render.streaming_cache.store(3, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
         app.render.card_cache.processed_messages = 2;
+        app.diagnostics.status = "newer question pending".into();
+        let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
             &mut app,
@@ -2595,7 +2810,11 @@ mod tests {
             Some("elic-new")
         );
         assert!(app.chat.elicitation_ui.is_some());
+        assert!(app.render.streaming_cache.get(3).is_some());
+        assert!(app.render.streaming_thinking_cache.get(4).is_some());
         assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "newer question pending");
+        assert_eq!(app.diagnostics.logs.len(), log_count_before);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [
@@ -2603,6 +2822,82 @@ mod tests {
                 ChatEntry::Elicitation { elicitation_id: new_id, outcome: None, .. },
             ] if old_id == "elic-old" && outcome == "accepted" && new_id == "elic-new"
         ));
+    }
+
+    #[test]
+    fn unknown_elicitation_ack_is_a_complete_noop() {
+        let mut app = App::new();
+        add_elicitation(&mut app, "elic-active", true);
+        app.render.streaming_cache.store(3, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
+        app.render.card_cache.processed_messages = 5;
+        app.diagnostics.status = "question pending".into();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
+                elicitation_id: "missing".into(),
+                outcome: "accepted".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.elicitation_id.as_str()),
+            Some("elic-active")
+        );
+        assert!(app.chat.elicitation_ui.is_some());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
+                if elicitation_id == "elic-active"
+        ));
+        assert!(app.render.streaming_cache.get(3).is_some());
+        assert!(app.render.streaming_thinking_cache.get(4).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 5);
+        assert_eq!(app.diagnostics.status, "question pending");
+        assert_eq!(app.diagnostics.logs.len(), log_count_before);
+    }
+
+    #[test]
+    fn duplicate_elicitation_ack_rewrites_and_invalidates_again_without_status_refresh() {
+        let mut app = App::new();
+        add_elicitation(&mut app, "elic-1", false);
+        app.render.card_cache.processed_messages = 5;
+        app.diagnostics.status = "preserved status".into();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let first_effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
+                elicitation_id: "elic-1".into(),
+                outcome: "accepted".into(),
+            }),
+        );
+        assert!(first_effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        app.render.card_cache.processed_messages = 6;
+
+        let duplicate_effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
+                elicitation_id: "elic-1".into(),
+                outcome: "declined".into(),
+            }),
+        );
+        assert!(duplicate_effects.is_empty());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
+                if elicitation_id == "elic-1" && outcome == "declined"
+        ));
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "preserved status");
+        assert_eq!(app.diagnostics.logs.len(), log_count_before);
     }
 
     #[test]

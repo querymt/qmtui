@@ -384,13 +384,6 @@ impl App {
         }
     }
 
-    /// Mark the pending elicitation chat card with an outcome and clear the active state.
-    pub fn resolve_elicitation(&mut self, elicitation_id: &str, outcome: &str) {
-        self.chat.resolve_elicitation(elicitation_id, outcome);
-        self.render.invalidate_card_cache();
-        self.refresh_transient_status();
-    }
-
     // ── delegate model preference coordination ───────────────────────────────
 
     pub fn delegate_preference_profile_id(&self) -> Option<&str> {
