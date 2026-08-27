@@ -272,15 +272,18 @@ mod tests {
     use crate::auth_state::AuthUiNotice;
     use crate::{
         chat_state::ElicitationUiState,
+        command::SessionListRequest,
+        composer_state::FileIndexEntryLite,
         connection_state::ServerState,
         domain::{
+            activity::{ActivityState, DelegateChildState},
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::ChatEntry,
             elicitation::ElicitationState,
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             model::DelegateModelPreference,
             profile::{AgentInfo, ProfileInfo},
-            session::{SessionGroup, SessionSummary},
+            session::{SessionGroup, SessionListPage, SessionSummary},
         },
         navigation_state::Screen,
     };
@@ -690,6 +693,339 @@ mod tests {
             app.sessions.session_id.as_deref(),
             Some("preserved session")
         );
+    }
+
+    #[test]
+    fn session_catalog_acp_route_preserves_order_and_remote_location() {
+        let mut app = App::new();
+        app.sessions.session_discovery_in_progress = true;
+        app.sessions.remember_remote_session_location(
+            "remote-1",
+            "node-1",
+            Some("/remote/repo".into()),
+        );
+        app.auth.filter = "preserved auth".into();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionList {
+                request: SessionListRequest::Discovery,
+                page: SessionListPage {
+                    groups: vec![
+                        SessionGroup {
+                            cwd: Some("/first".into()),
+                            sessions: vec![SessionSummary {
+                                session_id: "remote-1".into(),
+                                cwd: Some("/catalog/repo".into()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        SessionGroup {
+                            cwd: Some("/second".into()),
+                            sessions: vec![SessionSummary {
+                                session_id: "local-1".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ],
+                    next_cursor: Some("discovery-2".into()),
+                    total_count: Some(2),
+                },
+            }),
+        );
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::list_sessions_workspace("/first".into())),
+                Effect::Command(Command::list_sessions_workspace("/second".into())),
+                Effect::Command(Command::list_sessions_discovery(Some("discovery-2".into()))),
+            ]
+        );
+        let location = &app.sessions.remote_session_locations["remote-1"];
+        assert_eq!(location.node_id, "node-1");
+        assert_eq!(location.cwd.as_deref(), Some("/remote/repo"));
+        assert_eq!(app.auth.filter, "preserved auth");
+    }
+
+    #[test]
+    fn session_catalog_failure_acp_route_applies_ordered_release_coordination() {
+        let mut app = App::new();
+        app.sessions
+            .pending_session_group_loads
+            .insert(Some("/repo".into()));
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved first".into()));
+        app.models.reasoning_effort = Some("high".into());
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionListFailed {
+                request: SessionListRequest::WorkspaceContinuation {
+                    cwd: "/repo".into(),
+                },
+                message: "catalog unavailable".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(app.sessions.pending_session_group_loads.is_empty());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(first), ChatEntry::Error(second)]
+                if first == "preserved first" && second == "catalog unavailable"
+        ));
+        assert_eq!(app.diagnostics.status, "error: catalog unavailable");
+        let diagnostic = app.diagnostics.logs.last().expect("failure diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Error);
+        assert_eq!(diagnostic.target, "acp");
+        assert_eq!(diagnostic.message, "error: catalog unavailable");
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn session_created_acp_route_applies_resets_diagnostic_and_effect_order() {
+        let mut app = App::new();
+        app.delegates.parent_session_id = Some("old-parent".into());
+        app.delegates.pending_parent_session_id = Some("staged-parent".into());
+        app.delegates
+            .pending_delegate_child_states
+            .insert("old-child".into(), DelegateChildState::OtherProgress);
+        app.chat
+            .messages
+            .push(ChatEntry::Error("stale chat".into()));
+        app.chat.streaming_content = "stale stream".into();
+        app.composer.input = "preserved draft".into();
+        app.composer.input_cursor = 4;
+        app.composer.file_index = vec![FileIndexEntryLite {
+            path: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        app.render.streaming_cache.store(7, Vec::new());
+        app.render.streaming_thinking_cache.store(8, Vec::new());
+        app.render.card_cache.processed_messages = 2;
+        app.sessions.mode_before_review = Some("plan".into());
+        app.models.agents_profile_id = Some("code".into());
+        app.models.agents = vec![agent("primary"), agent("coder")];
+        app.models.delegate_model_preferences.insert(
+            "code".into(),
+            [(
+                "coder".into(),
+                DelegateModelPreference {
+                    model_id: "openai/gpt-5".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    node_id: Some("node-1".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionCreated {
+                agent_id: "agent-1".into(),
+                session_id: "session-1".into(),
+                profile_id: Some("code".into()),
+            }),
+        );
+
+        assert_eq!(app.sessions.session_id.as_deref(), Some("session-1"));
+        assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(app.sessions.mode_before_review, None);
+        assert_eq!(app.navigation.screen, Screen::Chat);
+        assert_eq!(app.delegates.parent_session_id, None);
+        assert_eq!(app.delegates.pending_parent_session_id, None);
+        assert!(app.delegates.pending_delegate_child_states.is_empty());
+        assert_eq!(app.profiles.session_profile_id("session-1"), Some("code"));
+        assert!(app.chat.messages.is_empty());
+        assert!(app.chat.streaming_content.is_empty());
+        assert_eq!(app.composer.input, "preserved draft");
+        assert_eq!(app.composer.input_cursor, 4);
+        assert!(app.composer.file_index.is_empty());
+        assert!(app.render.streaming_cache.get(7).is_none());
+        assert!(app.render.streaming_thinking_cache.get(8).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "session created");
+        let diagnostic = app.diagnostics.logs.last().expect("creation diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Info);
+        assert_eq!(diagnostic.target, "session");
+        assert_eq!(diagnostic.message, "session created");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "session-1".into(),
+                    agent_id: Some("agent-1".into()),
+                }),
+                Effect::Command(Command::SetDelegateModel {
+                    session_id: "session-1".into(),
+                    agent_id: "coder".into(),
+                    model_id: Some("openai/gpt-5".into()),
+                    node_id: Some("node-1".into()),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_loaded_acp_route_preserves_local_and_removes_remote_profile_binding() {
+        let mut app = App::new();
+        app.sessions.agent_mode = "plan".into();
+        app.profiles
+            .bind_session_profile("local".into(), "code".into());
+        app.models.agents_profile_id = Some("code".into());
+        app.models.agents = vec![agent("primary"), agent("coder")];
+        app.models.delegate_model_preferences.insert(
+            "code".into(),
+            [(
+                "coder".into(),
+                DelegateModelPreference {
+                    model_id: "openai/gpt-5".into(),
+                    provider: "openai".into(),
+                    model: "gpt-5".into(),
+                    node_id: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        app.delegates.parent_session_id = Some("old-parent".into());
+        app.delegates
+            .pending_delegate_child_states
+            .insert("old-child".into(), DelegateChildState::OtherProgress);
+        app.chat.activity = ActivityState::Streaming;
+        app.chat
+            .messages
+            .push(ChatEntry::Error("stale chat".into()));
+        app.composer.file_index = vec![FileIndexEntryLite {
+            path: "src/lib.rs".into(),
+            is_dir: false,
+        }];
+        app.sessions.mode_before_review = Some("build".into());
+
+        let local_effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionLoaded {
+                agent_id: "agent-local".into(),
+                session_id: "local".into(),
+                profile_id: None,
+            }),
+        );
+
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(app.delegates.parent_session_id, None);
+        assert!(app.delegates.pending_delegate_child_states.is_empty());
+        assert_eq!(app.navigation.screen, Screen::Chat);
+        assert_eq!(app.profiles.session_profile_id("local"), Some("code"));
+        assert_eq!(app.sessions.session_id.as_deref(), Some("local"));
+        assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-local"));
+        assert_eq!(app.sessions.mode_before_review, None);
+        assert!(app.chat.messages.is_empty());
+        assert!(app.composer.file_index.is_empty());
+        assert_eq!(app.diagnostics.status, "ready");
+        let diagnostic = app.diagnostics.logs.last().expect("load diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "activity");
+        assert_eq!(diagnostic.message, "ready");
+        assert_eq!(
+            local_effects,
+            vec![
+                Effect::Command(Command::SetAgentMode {
+                    mode: "plan".into(),
+                }),
+                Effect::Command(Command::SetDelegateModel {
+                    session_id: "local".into(),
+                    agent_id: "coder".into(),
+                    model_id: Some("openai/gpt-5".into()),
+                    node_id: None,
+                }),
+            ]
+        );
+
+        let mut app = App::new();
+        app.sessions.remember_remote_session_location(
+            "remote-child",
+            "node-1",
+            Some("/remote".into()),
+        );
+        app.profiles
+            .bind_session_profile("remote-child".into(), "stale".into());
+        app.sessions.session_groups = vec![SessionGroup {
+            sessions: vec![SessionSummary {
+                session_id: "remote-child".into(),
+                parent_session_id: Some("catalog-parent".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.delegates.pending_parent_session_id = Some("staged-parent".into());
+        app.delegates
+            .pending_delegate_child_states
+            .insert("keep-child".into(), DelegateChildState::OtherProgress);
+        app.chat.activity = ActivityState::Thinking;
+
+        let remote_effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionLoaded {
+                agent_id: "agent-remote".into(),
+                session_id: "remote-child".into(),
+                profile_id: None,
+            }),
+        );
+
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert_eq!(
+            app.delegates.parent_session_id.as_deref(),
+            Some("staged-parent")
+        );
+        assert_eq!(app.delegates.pending_parent_session_id, None);
+        assert!(
+            app.delegates
+                .pending_delegate_child_states
+                .contains_key("keep-child")
+        );
+        assert_eq!(app.navigation.screen, Screen::Delegate);
+        assert!(app.profiles.session_profile_id("remote-child").is_none());
+        assert_eq!(
+            remote_effects,
+            vec![Effect::Command(Command::SetAgentMode {
+                mode: "build".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn session_agent_mode_acp_route_is_owner_bounded_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.agent_mode = "review".into();
+        app.sessions.mode_before_review = Some("plan".into());
+        app.auth.filter = "preserved auth".into();
+        app.mesh.mesh_invite_name = "preserved mesh".into();
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved chat".into()));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::AgentMode {
+                mode: "build".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.mode_before_review, None);
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert_eq!(app.mesh.mesh_invite_name, "preserved mesh");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved chat"
+        ));
     }
 
     #[test]

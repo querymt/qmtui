@@ -25,6 +25,7 @@ use crate::domain::tool::ToolDetail;
 use crate::models_state::{ModelAction, ModelContext, ModelCoordination, ModelOutcome};
 use crate::navigation_state::{Popup, Screen};
 use crate::profiles_state::{ProfileAction, ProfileOutcome};
+use crate::session_state::{SessionAction, SessionCoordination, SessionOutcome};
 use crate::tool_detail;
 
 #[derive(Debug, Clone, Default)]
@@ -217,7 +218,8 @@ impl crate::app::App {
                 );
                 debug_assert!(effects.is_empty());
                 if let Some(mode) = agent_mode {
-                    self.sessions.replace_agent_mode(mode);
+                    let effects = self.apply_session_action(SessionAction::ReplaceAgentMode(mode));
+                    debug_assert!(effects.is_empty());
                 }
                 if let Some(effort) = reasoning_effort {
                     let effects = self.apply_model_action(
@@ -231,8 +233,7 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::AgentMode { mode } => {
-                self.sessions.replace_agent_mode(mode);
-                vec![]
+                self.apply_session_action(SessionAction::ReplaceAgentMode(mode))
             }
             AcpAppEvent::ReasoningEffort { reasoning_effort } => self.apply_model_action(
                 ModelAction::ReasoningEffort(reasoning_effort),
@@ -312,24 +313,29 @@ impl crate::app::App {
                 effects(self.apply_remote_session_attached(attached))
             }
             AcpAppEvent::SessionList { request, page } => {
-                effects(self.apply_acp_session_list(request, page))
+                self.apply_session_action(SessionAction::CatalogPage { request, page })
             }
             AcpAppEvent::SessionListFailed { request, message } => {
-                self.apply_acp_session_list_failure(&request);
-                self.push_acp_error(&message);
-                self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
-                vec![]
+                self.apply_session_action(SessionAction::CatalogFailed { request, message })
             }
             AcpAppEvent::SessionCreated {
                 agent_id,
                 session_id,
                 profile_id,
-            } => effects(self.apply_acp_session_created(agent_id, session_id, profile_id)),
+            } => self.apply_session_action(SessionAction::Created {
+                agent_id,
+                session_id,
+                profile_id,
+            }),
             AcpAppEvent::SessionLoaded {
                 agent_id,
                 session_id,
                 profile_id,
-            } => effects(self.apply_acp_session_loaded(agent_id, session_id, profile_id)),
+            } => self.apply_session_action(SessionAction::Loaded {
+                agent_id,
+                session_id,
+                profile_id,
+            }),
             AcpAppEvent::SessionUpdate {
                 session_id,
                 update,
@@ -596,113 +602,70 @@ impl crate::app::App {
         )
     }
 
-    fn apply_acp_session_list(
-        &mut self,
-        request: SessionListRequest,
-        page: SessionListPage,
-    ) -> Vec<Command> {
-        let SessionListPage {
-            groups,
-            next_cursor,
-            total_count: _,
-        } = page;
-        match request {
-            SessionListRequest::Discovery => {
-                let (workspaces, next_discovery_cursor) =
-                    self.sessions.apply_discovery_page(groups, next_cursor);
-                let mut commands = workspaces
-                    .into_iter()
-                    .map(Command::list_sessions_workspace)
-                    .collect::<Vec<_>>();
-                if let Some(cursor) = next_discovery_cursor {
-                    commands.push(Command::list_sessions_discovery(Some(cursor)));
+    fn apply_session_action(&mut self, action: SessionAction) -> Vec<Effect> {
+        let SessionOutcome {
+            coordination,
+            mut effects,
+        } = self.sessions.reduce(action);
+        for coordination in coordination {
+            match coordination {
+                SessionCoordination::PushChatError(message) => self.push_acp_error(&message),
+                SessionCoordination::ClearDelegateParent => {
+                    self.delegates.parent_session_id = None;
+                    self.delegates.pending_parent_session_id = None;
                 }
-                commands
-            }
-            SessionListRequest::WorkspaceFirstPage { cwd } => {
-                self.sessions.apply_workspace_first_page(cwd, groups);
-                Vec::new()
-            }
-            SessionListRequest::WorkspaceContinuation { cwd } => {
-                self.sessions.apply_workspace_continuation(cwd, groups);
-                Vec::new()
-            }
-        }
-    }
-
-    fn apply_acp_session_list_failure(&mut self, request: &SessionListRequest) {
-        match request {
-            SessionListRequest::Discovery => self.sessions.fail_discovery(),
-            SessionListRequest::WorkspaceFirstPage { cwd }
-            | SessionListRequest::WorkspaceContinuation { cwd } => {
-                self.sessions.fail_workspace_request(cwd);
-            }
-        }
-    }
-
-    fn apply_acp_session_created(
-        &mut self,
-        agent_id: String,
-        session_id: String,
-        profile_id: Option<String>,
-    ) -> Vec<Command> {
-        self.delegates.parent_session_id = None;
-        self.delegates.pending_parent_session_id = None;
-        self.sessions.session_id = Some(session_id.clone());
-        self.apply_session_profile_binding(&session_id, profile_id);
-        self.sessions.agent_id = Some(agent_id);
-        self.reset_active_session_view();
-        self.navigation.screen = Screen::Chat;
-        self.set_status(LogLevel::Info, "session", "session created");
-        let mut commands = vec![Command::SubscribeSession {
-            session_id: session_id.clone(),
-            agent_id: self.sessions.agent_id.clone(),
-        }];
-        if let Some(profile_id) = self.current_session_profile_id().map(str::to_string) {
-            if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
-                commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
-            } else {
-                commands.push(Command::ListProfileAgents { profile_id });
-            }
-        }
-        commands
-    }
-
-    fn apply_acp_session_loaded(
-        &mut self,
-        agent_id: String,
-        session_id: String,
-        profile_id: Option<String>,
-    ) -> Vec<Command> {
-        self.chat.activity = ActivityState::Idle;
-        let discovered_parent = self
-            .sessions
-            .session_parent_id(&session_id)
-            .map(str::to_owned);
-        self.delegates.resolve_parent_session_id(discovered_parent);
-        self.apply_session_profile_binding(&session_id, profile_id);
-        self.sessions.session_id = Some(session_id.clone());
-        self.sessions.agent_id = Some(agent_id);
-        self.reset_active_session_view();
-        self.navigation.screen = if self.delegates.parent_session_id.is_some() {
-            Screen::Delegate
-        } else {
-            Screen::Chat
-        };
-        self.set_status(LogLevel::Debug, "activity", "ready");
-        let mut commands = vec![Command::SetAgentMode {
-            mode: self.sessions.agent_mode.clone(),
-        }];
-        if self.delegates.parent_session_id.is_none()
-            && let Some(profile_id) = self.current_session_profile_id().map(str::to_string)
-        {
-            if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
-                commands.extend(self.delegate_model_commands_for_session(&session_id, &profile_id));
-            } else {
-                commands.push(Command::ListProfileAgents { profile_id });
+                SessionCoordination::SetChatIdle => self.chat.activity = ActivityState::Idle,
+                SessionCoordination::ResolveDelegateParent(discovered_parent) => {
+                    self.delegates.resolve_parent_session_id(discovered_parent);
+                }
+                SessionCoordination::ApplyProfileBinding {
+                    session_id,
+                    profile_id,
+                    remove_if_missing,
+                } => {
+                    if let Some(profile_id) = profile_id {
+                        self.profiles.bind_session_profile(session_id, profile_id);
+                    } else if remove_if_missing {
+                        self.profiles.remove_session_profile(&session_id);
+                    }
+                }
+                SessionCoordination::ResetActiveSessionView => self.reset_active_session_view(),
+                SessionCoordination::SelectChat => self.navigation.screen = Screen::Chat,
+                SessionCoordination::SelectLoadedSessionScreen => {
+                    self.navigation.screen = if self.delegates.parent_session_id.is_some() {
+                        Screen::Delegate
+                    } else {
+                        Screen::Chat
+                    };
+                }
+                SessionCoordination::Status {
+                    level,
+                    target,
+                    message,
+                } => self.set_status(level, target, message),
+                SessionCoordination::SynchronizeProfileCommands {
+                    session_id,
+                    root_only,
+                } => {
+                    if (!root_only || self.delegates.parent_session_id.is_none())
+                        && let Some(profile_id) =
+                            self.current_session_profile_id().map(str::to_string)
+                    {
+                        if self.models.agents_profile_id.as_deref() == Some(profile_id.as_str()) {
+                            effects.extend(
+                                self.delegate_model_commands_for_session(&session_id, &profile_id)
+                                    .into_iter()
+                                    .map(Effect::Command),
+                            );
+                        } else {
+                            effects
+                                .push(Effect::Command(Command::ListProfileAgents { profile_id }));
+                        }
+                    }
+                }
             }
         }
-        commands
+        effects
     }
 
     fn reset_active_session_view(&mut self) {
@@ -715,7 +678,6 @@ impl crate::app::App {
             self.delegates.clear_for_root_session();
         }
         self.composer.reset_for_session_switch();
-        self.sessions.mode_before_review = None;
     }
 
     fn upsert_provisional_delegate(
@@ -2485,21 +2447,15 @@ mod tests {
                 .contains(&Some("/repo".into()))
         );
         assert_eq!(app.sessions.session_groups[0].next_cursor, None);
-        assert!(replies.iter().any(|reply| matches!(
-            reply,
-            Effect::Command(Command::ListSessions {
-                request: SessionListRequest::WorkspaceFirstPage { cwd },
-                cursor: None,
-                ..
-            }) if cwd == "/repo"
-        )));
-        assert!(replies.iter().any(|reply| matches!(
-            reply,
-            Effect::Command(Command::ListSessions {
-                request: SessionListRequest::Discovery,
-                cursor: Some(cursor),
-            }) if cursor == "opaque-root-2"
-        )));
+        assert_eq!(
+            replies,
+            vec![
+                Effect::Command(Command::list_sessions_workspace("/repo".into())),
+                Effect::Command(Command::list_sessions_discovery(Some(
+                    "opaque-root-2".into()
+                ))),
+            ]
+        );
     }
 
     #[test]
@@ -2616,7 +2572,7 @@ mod tests {
             .pending_session_group_loads
             .insert(Some("/repo".into()));
 
-        app.handle_acp_event(AcpAppEvent::SessionListFailed {
+        let replies = app.handle_acp_event(AcpAppEvent::SessionListFailed {
             request: SessionListRequest::WorkspaceContinuation {
                 cwd: "/repo".into(),
             },
@@ -2624,6 +2580,16 @@ mod tests {
         });
 
         assert!(app.sessions.pending_session_group_loads.is_empty());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "failed"
+        ));
+        assert_eq!(app.diagnostics.status, "error: failed");
+        let diagnostic = app.diagnostics.logs.last().expect("failure diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Error);
+        assert_eq!(diagnostic.target, "acp");
+        assert_eq!(diagnostic.message, "error: failed");
+        assert!(replies.is_empty());
     }
 
     fn seed_model_state(app: &mut App) {
@@ -2715,6 +2681,7 @@ mod tests {
 
         assert_eq!(app.sessions.session_id.as_deref(), Some("session-1"));
         assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(app.profiles.session_profile_id("session-1"), Some("code"));
         assert_eq!(app.navigation.screen, Screen::Chat);
         assert_eq!(app.delegates.parent_session_id, None);
         assert_eq!(app.delegates.pending_parent_session_id, None);
@@ -2740,6 +2707,11 @@ mod tests {
         assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
         assert_eq!(app.mesh.mesh_invite_name, "preserved");
         assert_seeded_model_state(&app);
+        assert_eq!(app.diagnostics.status, "session created");
+        let diagnostic = app.diagnostics.logs.last().expect("creation diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Info);
+        assert_eq!(diagnostic.target, "session");
+        assert_eq!(diagnostic.message, "session created");
         assert!(matches!(
             command_refs(&replies).as_slice(),
             [
@@ -2809,6 +2781,9 @@ mod tests {
             profile_id: None,
         });
 
+        assert_eq!(app.sessions.session_id.as_deref(), Some("child"));
+        assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(app.chat.activity, ActivityState::Idle);
         assert_eq!(app.delegates.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(app.navigation.screen, Screen::Delegate);
         assert!(app.chat.messages.is_empty());
@@ -2824,6 +2799,11 @@ mod tests {
         assert_eq!(app.chat.session_stats.total_tool_calls, 0);
         assert_eq!(app.delegates.delegate_entries.len(), 1);
         assert_seeded_model_state(&app);
+        assert_eq!(app.diagnostics.status, "ready");
+        let diagnostic = app.diagnostics.logs.last().expect("load diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "activity");
+        assert_eq!(diagnostic.message, "ready");
         assert!(matches!(
             command_refs(&replies).as_slice(),
             [Command::SetAgentMode { mode }] if mode == "plan"
@@ -2979,9 +2959,10 @@ mod tests {
         app.sessions.agent_mode = "review".into();
         app.sessions.mode_before_review = Some("plan".into());
 
-        app.handle_acp_event(AcpAppEvent::AgentMode {
+        let replies = app.handle_acp_event(AcpAppEvent::AgentMode {
             mode: "build".into(),
         });
+        assert!(replies.is_empty());
         assert_eq!(app.sessions.agent_mode, "build");
         assert_eq!(app.sessions.mode_before_review, None);
 
