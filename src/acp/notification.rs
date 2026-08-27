@@ -70,8 +70,8 @@ pub(super) async fn apply(
     match translation {
         Translation::Update(update) => emit_or_buffer(state, events, &session_id, update).await,
         Translation::ToolStart(update) => match state.replay.route(&session_id, update).await {
-            Ok(()) => {}
-            Err(update) => {
+            None => {}
+            Some(update) => {
                 flush_assistant(state, events, &session_id).await;
                 events.session_update(&session_id, update);
             }
@@ -93,7 +93,12 @@ pub(super) async fn apply(
                     message_id: message_id.clone(),
                 }
             };
-            if state.replay.route(&session_id, replay_update).await.is_ok() {
+            if state
+                .replay
+                .route(&session_id, replay_update)
+                .await
+                .is_none()
+            {
                 return;
             }
             if let Some(update) = state
@@ -136,7 +141,7 @@ async fn emit_or_buffer(
     session_id: &str,
     update: AcpSessionUpdate,
 ) {
-    if let Err(update) = state.replay.route(session_id, update).await {
+    if let Some(update) = state.replay.route(session_id, update).await {
         events.session_update(session_id, update);
     }
 }

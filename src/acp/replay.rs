@@ -34,13 +34,13 @@ impl ReplayBuffer {
         &self,
         session_id: &str,
         update: AcpSessionUpdate,
-    ) -> Result<(), AcpSessionUpdate> {
+    ) -> Option<AcpSessionUpdate> {
         let mut sessions = self.sessions.lock().await;
         let Some(load) = sessions.get_mut(session_id) else {
-            return Err(update);
+            return Some(update);
         };
         load.updates.push(update);
-        Ok(())
+        None
     }
 
     pub(super) async fn start_completion(&self, session_id: &str) -> Vec<AcpSessionUpdate> {
@@ -330,9 +330,9 @@ mod tests {
         let buffer = ReplayBuffer::default();
         buffer.begin("one").await;
         buffer.begin("two").await;
-        assert!(buffer.route("one", user("a")).await.is_ok());
-        assert!(buffer.route("two", user("x")).await.is_ok());
-        assert!(buffer.route("one", user("b")).await.is_ok());
+        assert!(buffer.route("one", user("a")).await.is_none());
+        assert!(buffer.route("two", user("x")).await.is_none());
+        assert!(buffer.route("one", user("b")).await.is_none());
 
         let one = buffer.start_completion("one").await;
         let two = buffer.start_completion("two").await;
@@ -348,15 +348,12 @@ mod tests {
     async fn completion_race_neither_loses_nor_strands_an_update() {
         let buffer = Arc::new(ReplayBuffer::default());
         buffer.begin("session").await;
-        buffer
-            .route("session", user("before"))
-            .await
-            .expect("queued");
+        assert!(buffer.route("session", user("before")).await.is_none());
         let initial = buffer.start_completion("session").await;
 
         let racing = buffer.clone();
         let task = tokio::spawn(async move { racing.route("session", user("racing")).await });
-        task.await.expect("task").expect("queued while completing");
+        assert!(task.await.expect("task").is_none());
         let tail = buffer
             .drain_completion("session")
             .await
@@ -364,7 +361,7 @@ mod tests {
         assert_eq!(initial.len() + tail.len(), 2);
         assert!(buffer.drain_completion("session").await.is_none());
         assert!(!buffer.contains("session").await);
-        assert!(buffer.route("session", user("live")).await.is_err());
+        assert!(buffer.route("session", user("live")).await.is_some());
     }
 
     #[test]
