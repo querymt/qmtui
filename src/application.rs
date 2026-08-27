@@ -3,7 +3,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::{
     acp_state::AcpAppEvent,
     app::{App, ConnectionEvent},
-    auth_state::AuthUiNotice,
+    auth_state::AuthAction,
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
@@ -192,35 +192,12 @@ fn handle_supervisor_event(app: &mut App, event: ServerEvent) -> Vec<Effect> {
 
 fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
     match event {
-        RuntimeEvent::ClipboardFinished { target, success } => {
-            match target {
-                ClipboardTarget::Auth { provider } => {
-                    if success {
-                        app.auth.ui_notice = Some(AuthUiNotice {
-                            provider: Some(provider),
-                            success: true,
-                            message: "Copied to clipboard".into(),
-                        });
-                        app.auth.clipboard_fallback = None;
-                    } else {
-                        app.auth.ui_notice = None;
-                        app.auth.clipboard_fallback = app
-                            .auth
-                            .oauth_flow
-                            .as_ref()
-                            .map(|flow| flow.authorization_url.clone());
-                    }
-                }
-                ClipboardTarget::MeshInvite => {
-                    if success {
-                        app.set_status(LogLevel::Info, "mesh", "invite URL copied");
-                    } else if let Some(url) = app.mesh.invite_url().map(str::to_string) {
-                        app.mesh.set_clipboard_fallback(url);
-                    }
-                }
+        RuntimeEvent::ClipboardFinished { target, success } => match target {
+            ClipboardTarget::Auth { provider } => {
+                app.apply_auth_action(AuthAction::ClipboardFinished { provider, success })
             }
-            Vec::new()
-        }
+            ClipboardTarget::MeshInvite => app.apply_mesh_clipboard_result(success),
+        },
         RuntimeEvent::ExternalEditorFinished { outcome } => {
             app.render.invalidate_card_cache();
             app.render.invalidate_content_cache();
@@ -292,14 +269,15 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
     use super::*;
+    use crate::auth_state::AuthUiNotice;
     use crate::{
         chat_state::ElicitationUiState,
         connection_state::ServerState,
         domain::{
-            auth::{OAuthFlow, OAuthFlowKind},
+            auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::ChatEntry,
             elicitation::ElicitationState,
-            mesh::MeshInviteCreatedInfo,
+            mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             profile::ProfileInfo,
             session::{SessionGroup, SessionSummary},
         },
@@ -381,6 +359,88 @@ mod tests {
             vec![Effect::Command(Command::ListProfileAgents {
                 profile_id: "fast".into(),
             })]
+        );
+    }
+
+    #[test]
+    fn mesh_acp_route_mutates_only_mesh_and_explicit_coordination_targets() {
+        let mut app = App::new();
+        app.auth.filter = "preserved auth".into();
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved chat".into()));
+        app.models.reasoning_effort = Some("high".into());
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::MeshNodes(MeshNodesInfo {
+                nodes: vec![RemoteNodeInfo {
+                    id: "node-1".into(),
+                    label: "Remote".into(),
+                    ..Default::default()
+                }],
+            })),
+        );
+
+        assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::ListRemoteSessions {
+                node_id: "node-1".into(),
+                offset: 0,
+                limit: 50,
+            })]
+        );
+        assert_eq!(app.auth.filter, "preserved auth");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved chat"
+        ));
+        assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn auth_acp_route_mutates_only_auth_and_explicit_diagnostic_effect_targets() {
+        let mut app = App::new();
+        app.mesh.mesh_nodes = vec![RemoteNodeInfo {
+            id: "node-1".into(),
+            label: "Remote".into(),
+            ..Default::default()
+        }];
+        app.chat
+            .messages
+            .push(ChatEntry::Error("preserved chat".into()));
+        app.sessions.session_id = Some("session-1".into());
+        app.auth.oauth_flow = Some(OAuthFlow {
+            flow_id: "flow-1".into(),
+            provider: "openai".into(),
+            authorization_url: "https://example.com/authorize".into(),
+            flow_kind: OAuthFlowKind::RedirectCode,
+        });
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::OAuthResult(OAuthResult {
+                provider: "openai".into(),
+                status: OAuthResultStatus::Success,
+                message: "connected".into(),
+            })),
+        );
+
+        assert!(app.auth.oauth_flow.is_none());
+        assert_eq!(effects, vec![Effect::Command(Command::ListAuthProviders)]);
+        assert_eq!(app.mesh.selected_mesh_node_id(), Some("node-1"));
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved chat"
+        ));
+        assert_eq!(app.sessions.session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            app.diagnostics
+                .logs
+                .last()
+                .map(|entry| entry.message.as_str()),
+            Some("connected")
         );
     }
 

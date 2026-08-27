@@ -1,3 +1,6 @@
+use crate::application::Effect;
+use crate::command::Command;
+use crate::diagnostics::LogLevel;
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5,6 +8,26 @@ pub(crate) struct AuthUiNotice {
     pub(crate) provider: Option<String>,
     pub(crate) success: bool,
     pub(crate) message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum AuthAction {
+    Providers(Vec<AuthProviderEntry>),
+    OAuthFlowStarted(OAuthFlow),
+    OAuthResult(OAuthResult),
+    ClipboardFinished { provider: String, success: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthCoordination {
+    pub(crate) level: LogLevel,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AuthOutcome {
+    pub(crate) diagnostics: Vec<AuthCoordination>,
+    pub(crate) effects: Vec<Effect>,
 }
 
 /// Which sub-panel is active in the provider auth popup.
@@ -37,6 +60,64 @@ pub(crate) struct AuthState {
 }
 
 impl AuthState {
+    pub(crate) fn reduce(&mut self, action: AuthAction) -> AuthOutcome {
+        match action {
+            AuthAction::Providers(providers) => {
+                self.providers = providers;
+                AuthOutcome {
+                    diagnostics: vec![AuthCoordination {
+                        level: LogLevel::Debug,
+                        message: format!("{} auth provider(s)", self.providers.len()),
+                    }],
+                    effects: Vec::new(),
+                }
+            }
+            AuthAction::OAuthFlowStarted(flow) => {
+                let provider = flow.provider.clone();
+                self.begin_oauth_flow(flow);
+                AuthOutcome {
+                    diagnostics: vec![AuthCoordination {
+                        level: LogLevel::Info,
+                        message: format!("OAuth flow started for {provider}"),
+                    }],
+                    effects: Vec::new(),
+                }
+            }
+            AuthAction::OAuthResult(result) => {
+                let is_success = result.is_success();
+                let level = if is_success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                };
+                let message = result.message.clone();
+                let applied_success = self.apply_oauth_result(result);
+                debug_assert_eq!(applied_success, is_success);
+                AuthOutcome {
+                    diagnostics: vec![AuthCoordination { level, message }],
+                    effects: vec![Effect::Command(Command::ListAuthProviders)],
+                }
+            }
+            AuthAction::ClipboardFinished { provider, success } => {
+                if success {
+                    self.ui_notice = Some(AuthUiNotice {
+                        provider: Some(provider),
+                        success: true,
+                        message: "Copied to clipboard".into(),
+                    });
+                    self.clipboard_fallback = None;
+                } else {
+                    self.ui_notice = None;
+                    self.clipboard_fallback = self
+                        .oauth_flow
+                        .as_ref()
+                        .map(|flow| flow.authorization_url.clone());
+                }
+                AuthOutcome::default()
+            }
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             providers: Vec::new(),
@@ -171,6 +252,145 @@ mod tests {
             status,
             message: message.into(),
         }
+    }
+
+    #[test]
+    fn reducer_replaces_provider_catalog_and_reports_exact_count() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("stale", "Stale")];
+
+        let outcome = auth.reduce(AuthAction::Providers(vec![
+            provider("openai", "OpenAI"),
+            provider("anthropic", "Anthropic"),
+        ]));
+
+        assert_eq!(auth.providers.len(), 2);
+        assert_eq!(auth.providers[0].provider, "openai");
+        assert_eq!(
+            outcome,
+            AuthOutcome {
+                diagnostics: vec![AuthCoordination {
+                    level: LogLevel::Debug,
+                    message: "2 auth provider(s)".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_begins_oauth_flow_with_exact_state_and_diagnostic() {
+        let mut auth = AuthState::new();
+        auth.oauth_response = "stale response".into();
+        auth.oauth_response_cursor = auth.oauth_response.len();
+        auth.last_result = Some(oauth_result(
+            "openai",
+            OAuthResultStatus::Failure,
+            "old result",
+        ));
+        let flow = oauth_flow("openai");
+
+        let outcome = auth.reduce(AuthAction::OAuthFlowStarted(flow.clone()));
+
+        assert_eq!(auth.oauth_flow, Some(flow));
+        assert_eq!(auth.panel, AuthPanel::OAuthFlow);
+        assert!(auth.oauth_response.is_empty());
+        assert_eq!(auth.oauth_response_cursor, 0);
+        assert!(auth.last_result.is_none());
+        assert_eq!(
+            outcome,
+            AuthOutcome {
+                diagnostics: vec![AuthCoordination {
+                    level: LogLevel::Info,
+                    message: "OAuth flow started for openai".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_oauth_results_always_refresh_providers_and_preserve_failure_flow() {
+        let mut auth = AuthState::new();
+        let flow = oauth_flow("openai");
+        auth.oauth_flow = Some(flow.clone());
+        auth.panel = AuthPanel::OAuthFlow;
+
+        let failed = auth.reduce(AuthAction::OAuthResult(oauth_result(
+            "openai",
+            OAuthResultStatus::Failure,
+            "authorization denied",
+        )));
+
+        assert_eq!(auth.oauth_flow, Some(flow));
+        assert_eq!(auth.panel, AuthPanel::OAuthFlow);
+        assert_eq!(
+            failed,
+            AuthOutcome {
+                diagnostics: vec![AuthCoordination {
+                    level: LogLevel::Warn,
+                    message: "authorization denied".into(),
+                }],
+                effects: vec![Effect::Command(Command::ListAuthProviders)],
+            }
+        );
+
+        let succeeded = auth.reduce(AuthAction::OAuthResult(oauth_result(
+            "openai",
+            OAuthResultStatus::Success,
+            "connected",
+        )));
+
+        assert!(auth.oauth_flow.is_none());
+        assert_eq!(auth.panel, AuthPanel::List);
+        assert_eq!(
+            succeeded,
+            AuthOutcome {
+                diagnostics: vec![AuthCoordination {
+                    level: LogLevel::Info,
+                    message: "connected".into(),
+                }],
+                effects: vec![Effect::Command(Command::ListAuthProviders)],
+            }
+        );
+    }
+
+    #[test]
+    fn reducer_clipboard_results_preserve_exact_feedback_and_fallback() {
+        let mut auth = AuthState::new();
+        auth.oauth_flow = Some(oauth_flow("openai"));
+        auth.ui_notice = Some(AuthUiNotice {
+            provider: None,
+            success: false,
+            message: "old notice".into(),
+        });
+
+        let failed = auth.reduce(AuthAction::ClipboardFinished {
+            provider: "openai".into(),
+            success: false,
+        });
+
+        assert_eq!(failed, AuthOutcome::default());
+        assert!(auth.ui_notice.is_none());
+        assert_eq!(
+            auth.clipboard_fallback.as_deref(),
+            Some("https://example.com/authorize")
+        );
+
+        let succeeded = auth.reduce(AuthAction::ClipboardFinished {
+            provider: "openai".into(),
+            success: true,
+        });
+
+        assert_eq!(succeeded, AuthOutcome::default());
+        assert!(matches!(
+            auth.ui_notice.as_ref(),
+            Some(notice)
+                if notice.provider.as_deref() == Some("openai")
+                    && notice.success
+                    && notice.message == "Copied to clipboard"
+        ));
+        assert!(auth.clipboard_fallback.is_none());
     }
 
     #[test]

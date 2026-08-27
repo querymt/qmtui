@@ -1,10 +1,12 @@
 use crate::app::App;
+use crate::application::Effect;
 use crate::command::Command;
 use crate::diagnostics::LogLevel;
 use crate::domain::mesh::{
     MeshInviteCreatedInfo, MeshNodesInfo, MeshStatusInfo, RemoteSessionAttachInfo,
     RemoteSessionListInfo,
 };
+use crate::mesh_state::{MeshAction, MeshContext, MeshCoordination, MeshOutcome};
 use crate::navigation_state::Popup;
 
 impl App {
@@ -20,10 +22,10 @@ impl App {
     }
 
     pub fn apply_mesh_invite_created(&mut self, invite: MeshInviteCreatedInfo) {
-        let url = self.mesh.store_invite(invite);
-        self.navigation.popup = Popup::MeshInviteQr;
-        self.set_status(LogLevel::Info, "mesh", "mesh invite created");
-        self.push_log(LogLevel::Info, "mesh", format!("mesh invite: {url}"));
+        let outcome = self
+            .mesh
+            .reduce(MeshAction::InviteCreated(invite), MeshContext::default());
+        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
     }
 
     pub fn mesh_invite_form_command(&mut self) -> Option<Command> {
@@ -36,69 +38,78 @@ impl App {
     }
 
     pub fn apply_mesh_status(&mut self, status: MeshStatusInfo) {
-        let (enabled, peer_count) = self.mesh.replace_status(status);
-        self.push_log(
-            LogLevel::Debug,
-            "mesh",
-            format!("mesh status: enabled={enabled}, peers={peer_count}"),
-        );
+        let outcome = self
+            .mesh
+            .reduce(MeshAction::Status(status), MeshContext::default());
+        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
     }
 
     pub fn apply_mesh_nodes(&mut self, nodes: MeshNodesInfo) -> Vec<Command> {
-        let (count, selected_node_id) = self.mesh.replace_nodes(nodes.nodes);
-        self.push_log(LogLevel::Info, "mesh", format!("mesh nodes: {count}"));
-        selected_node_id
-            .map(|node_id| Command::ListRemoteSessions {
-                node_id,
-                offset: 0,
-                limit: 50,
-            })
-            .into_iter()
-            .collect()
+        let outcome = self
+            .mesh
+            .reduce(MeshAction::Nodes(nodes), MeshContext::default());
+        self.apply_mesh_outcome(outcome)
     }
 
     pub fn apply_remote_sessions(&mut self, list: RemoteSessionListInfo) {
-        for session in &list.sessions {
-            self.sessions.remember_remote_session_location(
-                &session.id,
-                &session.node_id,
-                session.cwd.clone(),
-            );
-        }
-        let count = self
+        let outcome = self
             .mesh
-            .replace_remote_sessions(&list.node_id, list.sessions);
-        self.push_log(
-            LogLevel::Info,
-            "mesh",
-            format!("remote sessions: {count} for {}", list.node_id),
-        );
+            .reduce(MeshAction::RemoteSessions(list), MeshContext::default());
+        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
     }
 
     pub fn apply_remote_session_attached(
         &mut self,
         attached: RemoteSessionAttachInfo,
     ) -> Vec<Command> {
-        // ACP session/load is authoritative for history and typed config; applying this
-        // extension snapshot/config directly would duplicate replay or configuration.
-        self.sessions
-            .remember_remote_session_node(&attached.session_id, &attached.node_id);
-        if attached.attached {
-            self.navigation.popup = Popup::None;
-            self.set_status(LogLevel::Info, "mesh", "remote session attached");
-            Command::load_session_commands(
-                attached.session_id.clone(),
-                self.sessions.session_remote_cwd(&attached.session_id),
-                self.sessions.agent_id.clone(),
-            )
-            .into()
-        } else {
-            self.set_status(LogLevel::Info, "mesh", "remote session created");
-            vec![Command::ListRemoteSessions {
-                node_id: attached.node_id,
-                offset: 0,
-                limit: 50,
-            }]
+        // ACP session/load remains authoritative for history and typed config.
+        let context = MeshContext {
+            agent_id: self.sessions.agent_id.clone(),
+            remote_session_cwd: self.sessions.session_remote_cwd(&attached.session_id),
+        };
+        let outcome = self
+            .mesh
+            .reduce(MeshAction::RemoteSessionAttached(attached), context);
+        self.apply_mesh_outcome(outcome)
+    }
+
+    pub(crate) fn apply_mesh_clipboard_result(&mut self, success: bool) -> Vec<Effect> {
+        let outcome = self.mesh.reduce(
+            MeshAction::ClipboardFinished { success },
+            MeshContext::default(),
+        );
+        self.apply_mesh_outcome(outcome)
+            .into_iter()
+            .map(Effect::Command)
+            .collect()
+    }
+
+    fn apply_mesh_outcome(&mut self, outcome: MeshOutcome) -> Vec<Command> {
+        for coordination in outcome.coordination {
+            match coordination {
+                MeshCoordination::Log { level, message } => {
+                    self.push_log(level, "mesh", message);
+                }
+                MeshCoordination::Status { level, message } => {
+                    self.set_status(level, "mesh", message);
+                }
+                MeshCoordination::SetPopup(popup) => self.navigation.popup = popup,
+                MeshCoordination::RememberRemoteSession {
+                    session_id,
+                    node_id,
+                    cwd,
+                } => self
+                    .sessions
+                    .remember_remote_session_location(&session_id, &node_id, cwd),
+            }
         }
+        outcome
+            .effects
+            .into_iter()
+            .map(|effect| match effect {
+                Effect::Command(command) => command,
+                _ => unreachable!("mesh reducers only emit command effects"),
+            })
+            .collect()
     }
 }

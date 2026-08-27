@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::application::Effect;
+use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::DelegateLifecycleUpdate;
 use crate::diagnostics::LogLevel;
@@ -508,34 +509,13 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::AuthProviders(providers) => {
-                self.auth.providers = providers;
-                self.push_log(
-                    LogLevel::Debug,
-                    "auth",
-                    format!("{} auth provider(s)", self.auth.providers.len()),
-                );
-                vec![]
+                self.apply_auth_action(AuthAction::Providers(providers))
             }
             AcpAppEvent::OAuthFlowStarted(flow) => {
-                self.push_log(
-                    LogLevel::Info,
-                    "auth",
-                    format!("OAuth flow started for {}", flow.provider),
-                );
-                self.auth.begin_oauth_flow(flow);
-                vec![]
+                self.apply_auth_action(AuthAction::OAuthFlowStarted(flow))
             }
             AcpAppEvent::OAuthResult(result) => {
-                let is_success = result.is_success();
-                let level = if is_success {
-                    LogLevel::Info
-                } else {
-                    LogLevel::Warn
-                };
-                self.push_log(level, "auth", &result.message);
-                let applied_success = self.auth.apply_oauth_result(result);
-                debug_assert_eq!(applied_success, is_success);
-                vec![Effect::Command(Command::ListAuthProviders)]
+                self.apply_auth_action(AuthAction::OAuthResult(result))
             }
             AcpAppEvent::InfoLog { target, message } => {
                 self.push_log(LogLevel::Info, target, message);
@@ -556,6 +536,17 @@ impl crate::app::App {
                 vec![]
             }
         }
+    }
+
+    pub(crate) fn apply_auth_action(&mut self, action: AuthAction) -> Vec<Effect> {
+        let AuthOutcome {
+            diagnostics,
+            effects,
+        } = self.auth.reduce(action);
+        for diagnostic in diagnostics {
+            self.push_log(diagnostic.level, "auth", diagnostic.message);
+        }
+        effects
     }
 
     fn apply_profile_catalog(
