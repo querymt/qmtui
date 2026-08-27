@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
+use crate::chat_state::{ChatAction, ChatCoordination, ChatOutcome};
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
     DelegateAction, DelegateChildActivity, DelegateContext, DelegateCoordination, DelegateOutcome,
@@ -340,10 +341,7 @@ impl crate::app::App {
                 session_id,
                 update,
                 is_replay,
-            } => {
-                self.apply_acp_session_update(&session_id, update, is_replay);
-                vec![]
-            }
+            } => self.apply_acp_session_update(&session_id, update, is_replay),
             AcpAppEvent::SessionReplay {
                 session_id,
                 updates,
@@ -354,10 +352,11 @@ impl crate::app::App {
                     "session",
                     format!("session replay: {} update(s)", updates.len()),
                 );
+                let mut effects = Vec::new();
                 for update in updates {
-                    self.apply_acp_session_update(&session_id, update, true);
+                    effects.extend(self.apply_acp_session_update(&session_id, update, true));
                 }
-                vec![]
+                effects
             }
             AcpAppEvent::UndoStack(undo_stack) => {
                 self.chat.undo_state =
@@ -668,22 +667,78 @@ impl crate::app::App {
     }
 
     fn apply_delegate_action(&mut self, action: DelegateAction) -> Vec<Effect> {
-        let context = DelegateContext {
-            active_session_id: self.sessions.session_id.clone(),
-        };
+        let outcome = self.delegates.reduce(
+            action,
+            DelegateContext {
+                active_session_id: self.sessions.session_id.clone(),
+                inactive_activity_session_id: None,
+            },
+        );
+        self.apply_delegate_outcome(outcome)
+    }
+
+    fn apply_inactive_delegate_action(
+        &mut self,
+        session_id: &str,
+        activity: DelegateChildActivity,
+    ) -> Vec<Effect> {
+        self.sessions.note_session_activity(session_id);
+        let inactive_activity_session_id = self
+            .sessions
+            .session_activity
+            .contains_key(session_id)
+            .then(|| session_id.to_string());
+        let outcome = self.delegates.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: session_id.to_string(),
+                activity,
+            },
+            DelegateContext {
+                active_session_id: self.sessions.session_id.clone(),
+                inactive_activity_session_id,
+            },
+        );
+        self.apply_delegate_outcome(outcome)
+    }
+
+    fn apply_delegate_outcome(&mut self, outcome: DelegateOutcome) -> Vec<Effect> {
         let DelegateOutcome {
             changed: _,
             coordination,
             effects,
-        } = self.delegates.reduce(action, context);
+        } = outcome;
         for coordination in coordination {
             match coordination {
-                DelegateCoordination::NoteSessionActivity(session_id) => {
-                    self.sessions.note_session_activity(&session_id);
-                }
                 DelegateCoordination::InvalidateCardCache => {
                     self.render.invalidate_card_cache();
                 }
+            }
+        }
+        effects
+    }
+
+    fn apply_chat_action(&mut self, action: ChatAction) -> Vec<Effect> {
+        let ChatOutcome {
+            transition: _,
+            coordination,
+            effects,
+        } = self.chat.reduce(action);
+        for coordination in coordination {
+            match coordination {
+                ChatCoordination::InvalidateContentCache => {
+                    self.render.invalidate_content_cache();
+                }
+                ChatCoordination::InvalidateThinkingCache => {
+                    self.render.invalidate_thinking_cache();
+                }
+                ChatCoordination::InvalidateCardCache => {
+                    self.render.invalidate_card_cache();
+                }
+                ChatCoordination::Status {
+                    level,
+                    target,
+                    message,
+                } => self.set_status(level, target, message),
             }
         }
         effects
@@ -754,10 +809,7 @@ impl crate::app::App {
             | AcpSessionUpdate::Cancelled
             | AcpSessionUpdate::Finished { .. } => DelegateChildActivity::Unchanged,
         };
-        self.apply_delegate_action(DelegateAction::InactiveChildActivity {
-            session_id: session_id.to_string(),
-            activity,
-        })
+        self.apply_inactive_delegate_action(session_id, activity)
     }
 
     fn apply_acp_session_update(
@@ -765,64 +817,63 @@ impl crate::app::App {
         session_id: &str,
         update: AcpSessionUpdate,
         is_replay: bool,
-    ) {
+    ) -> Vec<Effect> {
         if self.sessions.session_id.as_deref() != Some(session_id) {
-            let effects = self.apply_acp_delegate_child_update(session_id, &update);
-            debug_assert!(effects.is_empty());
-            return;
+            return self.apply_acp_delegate_child_update(session_id, &update);
         }
         self.sessions.note_session_activity(session_id);
 
         match update {
             AcpSessionUpdate::TurnStarted => {
-                self.chat.begin_turn(is_replay);
-                self.render.invalidate_content_cache();
-                self.render.invalidate_thinking_cache();
-                self.set_status(LogLevel::Debug, "activity", "thinking...");
+                return self.apply_chat_action(ChatAction::TurnStarted { is_replay });
             }
             AcpSessionUpdate::UserMessage {
                 content,
                 message_id,
-            } => self.push_acp_user_message(content, message_id, is_replay),
+            } => {
+                return self.apply_chat_action(ChatAction::UserMessage {
+                    text: acp_content_to_string(&content),
+                    message_id,
+                    is_replay,
+                });
+            }
             AcpSessionUpdate::AssistantContentDelta {
                 content,
                 message_id,
             } => {
-                let transition = self.chat.append_streaming_content(&content, message_id);
-                if transition.finalized_previous {
-                    self.render.invalidate_content_cache();
-                    self.render.invalidate_thinking_cache();
-                    self.render.invalidate_card_cache();
-                }
+                return self.apply_chat_action(ChatAction::AssistantContentDelta {
+                    content,
+                    message_id,
+                });
             }
             AcpSessionUpdate::AssistantThinkingDelta {
                 content,
                 message_id,
             } => {
-                let transition = self
-                    .chat
-                    .append_streaming_thinking(&content, message_id, is_replay);
-                if transition.ignored_duplicate {
-                    return;
-                }
-                if transition.finalized_previous {
-                    self.render.invalidate_content_cache();
-                    self.render.invalidate_thinking_cache();
-                    self.render.invalidate_card_cache();
-                }
+                return self.apply_chat_action(ChatAction::AssistantThinkingDelta {
+                    content,
+                    message_id,
+                    is_replay,
+                });
             }
             AcpSessionUpdate::AssistantMessage {
                 content,
                 thinking,
                 message_id,
-            } => self.push_acp_assistant_message(content, thinking, message_id),
+            } => {
+                return self.apply_chat_action(ChatAction::AssistantMessage {
+                    content,
+                    thinking,
+                    message_id,
+                });
+            }
             AcpSessionUpdate::ToolCallStart {
                 tool_call_id,
                 name,
                 arguments,
             } => {
                 if self.chat.suppress_turn_output {
-                    return;
+                    return Vec::new();
                 }
                 self.chat.activity = ActivityState::RunningTool { name: name.clone() };
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
@@ -847,7 +898,7 @@ impl crate::app::App {
                         self.chat.clear_streaming_thinking();
                         self.render.invalidate_thinking_cache();
                         self.render.invalidate_card_cache();
-                        return;
+                        return Vec::new();
                     }
                     self.chat.record_tool_call();
                     if self.chat.push_streaming_thinking_entry() {
@@ -938,38 +989,16 @@ impl crate::app::App {
                 );
             }
             AcpSessionUpdate::Cancelled => {
-                self.chat.cancel_turn(is_replay);
-                self.render.invalidate_content_cache();
-                self.render.invalidate_thinking_cache();
-                self.set_status(LogLevel::Warn, "activity", "cancelled");
+                return self.apply_chat_action(ChatAction::Cancelled { is_replay });
             }
             AcpSessionUpdate::Finished { finish_reason } => {
-                self.chat.finish_turn(is_replay);
-                self.render.invalidate_content_cache();
-                self.render.invalidate_thinking_cache();
-                self.set_status(
-                    LogLevel::Debug,
-                    "activity",
-                    format!("finished: {finish_reason}"),
-                );
+                return self.apply_chat_action(ChatAction::Finished {
+                    finish_reason,
+                    is_replay,
+                });
             }
         }
-    }
-
-    fn push_acp_user_message(
-        &mut self,
-        content: Value,
-        message_id: Option<String>,
-        is_replay: bool,
-    ) {
-        let text = acp_content_to_string(&content);
-        let transition = self.chat.push_user_message(text, message_id, is_replay);
-        if matches!(
-            transition,
-            crate::chat_state::UserMessageTransition::Reconciled
-        ) {
-            self.render.invalidate_card_cache();
-        }
+        Vec::new()
     }
 
     fn finalize_streaming_segment(&mut self) {
@@ -983,22 +1012,6 @@ impl crate::app::App {
 
     fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
         self.chat.push_undoable_user_turn(message_id, text);
-    }
-
-    fn push_acp_assistant_message(
-        &mut self,
-        content: String,
-        thinking: Option<String>,
-        message_id: Option<String>,
-    ) {
-        self.render.invalidate_content_cache();
-        let replaced = self
-            .chat
-            .push_assistant_message(content, thinking, message_id);
-        self.render.invalidate_thinking_cache();
-        if replaced {
-            self.render.invalidate_card_cache();
-        }
     }
 
     fn push_acp_error(&mut self, message: &str) {

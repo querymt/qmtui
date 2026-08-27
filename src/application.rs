@@ -605,6 +605,231 @@ mod tests {
     }
 
     #[test]
+    fn chat_turn_and_user_routes_apply_release_sensitive_coordination() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.chat.streaming_content = "discarded".into();
+        app.chat.streaming_thinking = "discarded thinking".into();
+        app.render.streaming_cache.store(9, Vec::new());
+        app.render.streaming_thinking_cache.store(8, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::TurnStarted,
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.activity, ActivityState::Thinking);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.chat.session_stats.open_llm_request_instant.is_some());
+        assert!(app.render.streaming_cache.get(9).is_none());
+        assert!(app.render.streaming_thinking_cache.get(8).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(app.diagnostics.status, "thinking...");
+        let diagnostic = app.diagnostics.logs.last().expect("turn diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "activity");
+        assert_eq!(diagnostic.message, "thinking...");
+
+        let local_id = app.chat.push_pending_prompt("  repeat\n".into());
+        app.render.card_cache.processed_messages = 8;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "repeat" }),
+                    message_id: Some("server-user".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(id) }]
+                if text == "repeat" && id == "server-user" && id != &local_id
+        ));
+        assert_eq!(app.chat.undoable_turns[0].message_id, "server-user");
+
+        app.sessions.session_activity.remove("active");
+        app.render.card_cache.processed_messages = 9;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::UserMessage {
+                    content: serde_json::json!({ "text": "repeat" }),
+                    message_id: Some("server-user".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(app.chat.messages.len(), 1);
+    }
+
+    #[test]
+    fn chat_stream_and_final_routes_preserve_boundaries_and_invalidation_scope() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.chat.activity = ActivityState::Thinking;
+        app.render.streaming_cache.store(5, Vec::new());
+        app.render.streaming_thinking_cache.store(6, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+
+        for update_value in [
+            crate::acp_state::AcpSessionUpdate::AssistantThinkingDelta {
+                content: "plan".into(),
+                message_id: Some("assistant-1".into()),
+            },
+            crate::acp_state::AcpSessionUpdate::AssistantContentDelta {
+                content: "first".into(),
+                message_id: Some("assistant-1".into()),
+            },
+        ] {
+            let effects = update(
+                &mut app,
+                AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                    session_id: "active".into(),
+                    update: update_value,
+                    is_replay: false,
+                }),
+            );
+            assert!(effects.is_empty());
+        }
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(6).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::AssistantThinkingDelta {
+                    content: "second plan".into(),
+                    message_id: Some("assistant-2".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.render.streaming_cache.get(5).is_none());
+        assert!(app.render.streaming_thinking_cache.get(6).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
+                if content == "first" && thinking == "plan" && id == "assistant-1"
+        ));
+        assert_eq!(app.chat.streaming_thinking, "second plan");
+
+        app.render.streaming_cache.store(10, Vec::new());
+        app.render.streaming_thinking_cache.store(11, Vec::new());
+        app.render.card_cache.processed_messages = 12;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::AssistantMessage {
+                    content: "final".into(),
+                    thinking: None,
+                    message_id: Some("assistant-2".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.render.streaming_cache.get(10).is_none());
+        assert!(app.render.streaming_thinking_cache.get(11).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 12);
+        assert!(matches!(
+            &app.chat.messages[1],
+            ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }
+                if content == "final" && thinking == "second plan" && id == "assistant-2"
+        ));
+    }
+
+    #[test]
+    fn chat_cancel_and_finish_routes_discard_streams_and_emit_exact_diagnostics() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::TurnStarted,
+                is_replay: false,
+            }),
+        );
+        app.chat.streaming_content = "discarded".into();
+        app.chat.streaming_thinking = "discarded thinking".into();
+        app.render.streaming_cache.store(9, Vec::new());
+        app.render.streaming_thinking_cache.store(8, Vec::new());
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::Cancelled,
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.chat.messages.is_empty());
+        assert!(app.render.streaming_cache.get(9).is_none());
+        assert!(app.render.streaming_thinking_cache.get(8).is_none());
+        assert_eq!(app.diagnostics.status, "cancelled");
+        let diagnostic = app.diagnostics.logs.last().expect("cancel diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Warn);
+        assert_eq!(diagnostic.target, "activity");
+        assert_eq!(diagnostic.message, "cancelled");
+
+        update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::TurnStarted,
+                is_replay: false,
+            }),
+        );
+        app.chat.streaming_content = "discarded final".into();
+        app.chat.streaming_thinking = "discarded final thinking".into();
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::Finished {
+                    finish_reason: "EndTurn".into(),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.chat.messages.is_empty());
+        assert_eq!(app.diagnostics.status, "finished: EndTurn");
+        let diagnostic = app.diagnostics.logs.last().expect("finish diagnostic");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "activity");
+        assert_eq!(diagnostic.message, "finished: EndTurn");
+    }
+
+    #[test]
     fn profile_acp_route_preserves_selection_and_applies_refresh_conditions() {
         let mut app = App::new();
         app.profiles.active_profile_id = Some("deep".into());

@@ -55,11 +55,11 @@ pub(crate) enum DelegateAction {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DelegateContext {
     pub(crate) active_session_id: Option<String>,
+    pub(crate) inactive_activity_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DelegateCoordination {
-    NoteSessionActivity(String),
     InvalidateCardCache,
 }
 
@@ -166,14 +166,16 @@ impl DelegatesState {
                 session_id,
                 activity,
             } => {
-                let changed = self.apply_child_activity(&session_id, activity);
-                let mut coordination = vec![DelegateCoordination::NoteSessionActivity(session_id)];
-                if changed {
-                    coordination.push(DelegateCoordination::InvalidateCardCache);
+                if context.inactive_activity_session_id.as_deref() != Some(session_id.as_str()) {
+                    return DelegateOutcome::default();
                 }
+                let changed = self.apply_child_activity(&session_id, activity);
                 DelegateOutcome {
                     changed,
-                    coordination,
+                    coordination: changed
+                        .then_some(DelegateCoordination::InvalidateCardCache)
+                        .into_iter()
+                        .collect(),
                     effects: Vec::new(),
                 }
             }
@@ -990,6 +992,7 @@ mod tests {
         };
         let context = DelegateContext {
             active_session_id: Some("parent".into()),
+            inactive_activity_session_id: None,
         };
 
         let filtered = state.reduce(
@@ -1088,6 +1091,7 @@ mod tests {
             }),
             DelegateContext {
                 active_session_id: Some("parent".into()),
+                inactive_activity_session_id: None,
             },
         );
         assert!(authoritative.changed);
@@ -1106,7 +1110,25 @@ mod tests {
         let mut state = DelegatesState::new();
         let context = DelegateContext {
             active_session_id: Some("parent".into()),
+            inactive_activity_session_id: Some("child".into()),
         };
+        let rejected = state.reduce(
+            DelegateAction::InactiveChildActivity {
+                session_id: "child".into(),
+                activity: DelegateChildActivity::AssistantContent {
+                    message_id: Some("m1".into()),
+                },
+            },
+            DelegateContext {
+                active_session_id: Some("parent".into()),
+                inactive_activity_session_id: None,
+            },
+        );
+        assert!(!rejected.changed);
+        assert!(rejected.coordination.is_empty());
+        assert!(state.pending_delegate_child_states.is_empty());
+        assert!(state.pending_delegate_child_stats.is_empty());
+
         let staged = state.reduce(
             DelegateAction::InactiveChildActivity {
                 session_id: "child".into(),
@@ -1117,10 +1139,7 @@ mod tests {
             context.clone(),
         );
         assert!(!staged.changed);
-        assert_eq!(
-            staged.coordination,
-            vec![DelegateCoordination::NoteSessionActivity("child".into())]
-        );
+        assert!(staged.coordination.is_empty());
         assert!(staged.effects.is_empty());
         assert_eq!(
             state.pending_delegate_child_states["child"],
@@ -1165,10 +1184,7 @@ mod tests {
         assert!(changed.changed);
         assert_eq!(
             changed.coordination,
-            vec![
-                DelegateCoordination::NoteSessionActivity("child".into()),
-                DelegateCoordination::InvalidateCardCache,
-            ]
+            vec![DelegateCoordination::InvalidateCardCache]
         );
         assert_eq!(state.delegate_entries[0].stats.tool_calls, 1);
 
@@ -1180,10 +1196,7 @@ mod tests {
             context,
         );
         assert!(!unchanged.changed);
-        assert_eq!(
-            unchanged.coordination,
-            vec![DelegateCoordination::NoteSessionActivity("child".into())]
-        );
+        assert!(unchanged.coordination.is_empty());
     }
 
     #[test]

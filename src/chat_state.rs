@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
+use crate::application::Effect;
 use crate::composer_state::build_input_visual_layout;
+use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp, SessionStatsLite};
 use crate::domain::chat::{ChatEntry, format_outcome_labels};
 use crate::domain::elicitation::ElicitationState;
@@ -121,6 +123,77 @@ pub(crate) struct ElicitationTransition {
     pub(crate) finalized_streaming: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssistantMessageTransition {
+    Ignored,
+    Duplicate,
+    ReplacedThinking,
+    Appended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatAction {
+    TurnStarted {
+        is_replay: bool,
+    },
+    UserMessage {
+        text: String,
+        message_id: Option<String>,
+        is_replay: bool,
+    },
+    AssistantContentDelta {
+        content: String,
+        message_id: Option<String>,
+    },
+    AssistantThinkingDelta {
+        content: String,
+        message_id: Option<String>,
+        is_replay: bool,
+    },
+    AssistantMessage {
+        content: String,
+        thinking: Option<String>,
+        message_id: Option<String>,
+    },
+    Cancelled {
+        is_replay: bool,
+    },
+    Finished {
+        finish_reason: String,
+        is_replay: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatTransition {
+    TurnStarted,
+    UserMessage(UserMessageTransition),
+    AssistantContentDelta(StreamingDeltaTransition),
+    AssistantThinkingDelta(StreamingDeltaTransition),
+    AssistantMessage(AssistantMessageTransition),
+    Cancelled,
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatCoordination {
+    InvalidateContentCache,
+    InvalidateThinkingCache,
+    InvalidateCardCache,
+    Status {
+        level: LogLevel,
+        target: &'static str,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatOutcome {
+    pub(crate) transition: ChatTransition,
+    pub(crate) coordination: Vec<ChatCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
 pub(crate) struct ChatState {
     pub(crate) messages: Vec<ChatEntry>,
     pub(crate) pending_prompt_seq: u64,
@@ -148,6 +221,126 @@ pub(crate) struct ChatState {
 }
 
 impl ChatState {
+    pub(crate) fn reduce(&mut self, action: ChatAction) -> ChatOutcome {
+        let (transition, coordination) = match action {
+            ChatAction::TurnStarted { is_replay } => {
+                self.begin_turn(is_replay);
+                (
+                    ChatTransition::TurnStarted,
+                    vec![
+                        ChatCoordination::InvalidateContentCache,
+                        ChatCoordination::InvalidateThinkingCache,
+                        ChatCoordination::Status {
+                            level: LogLevel::Debug,
+                            target: "activity",
+                            message: "thinking...".into(),
+                        },
+                    ],
+                )
+            }
+            ChatAction::UserMessage {
+                text,
+                message_id,
+                is_replay,
+            } => {
+                let transition = self.push_user_message(text, message_id, is_replay);
+                let coordination = matches!(transition, UserMessageTransition::Reconciled)
+                    .then_some(ChatCoordination::InvalidateCardCache)
+                    .into_iter()
+                    .collect();
+                (ChatTransition::UserMessage(transition), coordination)
+            }
+            ChatAction::AssistantContentDelta {
+                content,
+                message_id,
+            } => {
+                let transition = self.append_streaming_content(&content, message_id);
+                let coordination = Self::stream_boundary_coordination(transition);
+                (
+                    ChatTransition::AssistantContentDelta(transition),
+                    coordination,
+                )
+            }
+            ChatAction::AssistantThinkingDelta {
+                content,
+                message_id,
+                is_replay,
+            } => {
+                let transition = self.append_streaming_thinking(&content, message_id, is_replay);
+                let coordination = Self::stream_boundary_coordination(transition);
+                (
+                    ChatTransition::AssistantThinkingDelta(transition),
+                    coordination,
+                )
+            }
+            ChatAction::AssistantMessage {
+                content,
+                thinking,
+                message_id,
+            } => {
+                let transition = self.push_assistant_message(content, thinking, message_id);
+                let mut coordination = vec![
+                    ChatCoordination::InvalidateContentCache,
+                    ChatCoordination::InvalidateThinkingCache,
+                ];
+                if transition == AssistantMessageTransition::ReplacedThinking {
+                    coordination.push(ChatCoordination::InvalidateCardCache);
+                }
+                (ChatTransition::AssistantMessage(transition), coordination)
+            }
+            ChatAction::Cancelled { is_replay } => {
+                self.cancel_turn(is_replay);
+                (
+                    ChatTransition::Cancelled,
+                    vec![
+                        ChatCoordination::InvalidateContentCache,
+                        ChatCoordination::InvalidateThinkingCache,
+                        ChatCoordination::Status {
+                            level: LogLevel::Warn,
+                            target: "activity",
+                            message: "cancelled".into(),
+                        },
+                    ],
+                )
+            }
+            ChatAction::Finished {
+                finish_reason,
+                is_replay,
+            } => {
+                self.finish_turn(is_replay);
+                (
+                    ChatTransition::Finished,
+                    vec![
+                        ChatCoordination::InvalidateContentCache,
+                        ChatCoordination::InvalidateThinkingCache,
+                        ChatCoordination::Status {
+                            level: LogLevel::Debug,
+                            target: "activity",
+                            message: format!("finished: {finish_reason}"),
+                        },
+                    ],
+                )
+            }
+        };
+        ChatOutcome {
+            transition,
+            coordination,
+            effects: Vec::new(),
+        }
+    }
+
+    fn stream_boundary_coordination(transition: StreamingDeltaTransition) -> Vec<ChatCoordination> {
+        if transition.finalized_previous {
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::InvalidateCardCache,
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             messages: Vec::new(),
@@ -420,7 +613,9 @@ impl ChatState {
     }
 
     pub(crate) fn begin_llm_request_span(&mut self, timestamp: Option<i64>) {
-        if self.session_stats.open_llm_request_ts.is_none() {
+        if self.session_stats.open_llm_request_ts.is_none()
+            && self.session_stats.open_llm_request_instant.is_none()
+        {
             self.session_stats.open_llm_request_ts = timestamp;
             self.session_stats.open_llm_request_instant = Some(Instant::now());
         }
@@ -821,7 +1016,7 @@ impl ChatState {
         content: String,
         thinking: Option<String>,
         message_id: Option<String>,
-    ) -> bool {
+    ) -> AssistantMessageTransition {
         let explicit_thinking = thinking.filter(|text| !text.is_empty());
         let thinking_message_id = message_id
             .clone()
@@ -833,12 +1028,12 @@ impl ChatState {
         }
         if content.is_empty() && explicit_thinking.is_none() && self.streaming_thinking.is_empty() {
             self.streaming_thinking_message_id = None;
-            return false;
+            return AssistantMessageTransition::Ignored;
         }
         self.recent_prompt_text = None;
         if self.suppress_turn_output {
             self.clear_streaming_thinking();
-            return false;
+            return AssistantMessageTransition::Ignored;
         }
 
         if let Some(message_id) = message_id.as_deref() {
@@ -846,7 +1041,7 @@ impl ChatState {
                 matches!(entry, ChatEntry::Assistant { message_id: Some(mid), .. } if mid == message_id)
             }) {
                 self.clear_streaming_thinking();
-                return false;
+                return AssistantMessageTransition::Duplicate;
             }
 
             if let Some(index) = self.messages.iter().position(|entry| {
@@ -854,7 +1049,7 @@ impl ChatState {
             }) {
                 if content.is_empty() {
                     self.clear_streaming_thinking();
-                    return false;
+                    return AssistantMessageTransition::Duplicate;
                 }
                 let existing_thinking = match &self.messages[index] {
                     ChatEntry::Thinking { content, .. } => content.clone(),
@@ -871,7 +1066,7 @@ impl ChatState {
                     thinking: thinking_text,
                     message_id: Some(message_id.to_string()),
                 };
-                return true;
+                return AssistantMessageTransition::ReplacedThinking;
             }
         }
 
@@ -893,7 +1088,7 @@ impl ChatState {
                 message_id,
             });
         }
-        false
+        AssistantMessageTransition::Appended
     }
 
     pub(crate) fn reconcile_tool_call_start(
@@ -1429,6 +1624,314 @@ mod tests {
             ChatEntry::User { message_id: Some(id), .. } if id == &second
         ));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reducer_turn_start_preserves_live_replay_timing_and_exact_coordination() {
+        let mut live = ChatState::new();
+        live.streaming_content = "discarded".into();
+        live.streaming_thinking = "discarded thinking".into();
+        live.arm_cancel_confirm();
+        let outcome = live.reduce(ChatAction::TurnStarted { is_replay: false });
+        assert_eq!(outcome.transition, ChatTransition::TurnStarted);
+        assert_eq!(
+            outcome.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::Status {
+                    level: LogLevel::Debug,
+                    target: "activity",
+                    message: "thinking...".into(),
+                },
+            ]
+        );
+        assert!(outcome.effects.is_empty());
+        assert_eq!(live.activity, ActivityState::Thinking);
+        assert!(live.streaming_content.is_empty());
+        assert!(live.streaming_thinking.is_empty());
+        assert!(live.pending_cancel_confirm_until.is_none());
+        let opened = live.session_stats.open_llm_request_instant;
+        assert!(opened.is_some());
+        live.reduce(ChatAction::TurnStarted { is_replay: false });
+        assert_eq!(live.session_stats.open_llm_request_instant, opened);
+
+        let mut replay = ChatState::new();
+        replay.reduce(ChatAction::TurnStarted { is_replay: true });
+        assert_eq!(replay.activity, ActivityState::Thinking);
+        assert!(replay.session_stats.open_llm_request_instant.is_none());
+    }
+
+    #[test]
+    fn reducer_user_message_reports_noops_and_reconciles_in_submission_order() {
+        let mut chat = ChatState::new();
+        let ignored = chat.reduce(ChatAction::UserMessage {
+            text: String::new(),
+            message_id: Some("empty".into()),
+            is_replay: false,
+        });
+        assert_eq!(
+            ignored,
+            ChatOutcome {
+                transition: ChatTransition::UserMessage(UserMessageTransition::Ignored),
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+
+        let first = chat.push_pending_prompt("  repeat\n".into());
+        let second = chat.push_pending_prompt("repeat".into());
+        let reconciled = chat.reduce(ChatAction::UserMessage {
+            text: "repeat".into(),
+            message_id: Some("server-1".into()),
+            is_replay: false,
+        });
+        assert_eq!(
+            reconciled.transition,
+            ChatTransition::UserMessage(UserMessageTransition::Reconciled)
+        );
+        assert_eq!(
+            reconciled.coordination,
+            vec![ChatCoordination::InvalidateCardCache]
+        );
+        assert!(matches!(
+            &chat.messages[0],
+            ChatEntry::User { message_id: Some(id), .. } if id == "server-1"
+        ));
+        assert!(matches!(
+            &chat.messages[1],
+            ChatEntry::User { message_id: Some(id), .. } if id == &second
+        ));
+        assert_ne!(first, second);
+        assert_eq!(chat.undoable_turns[0].message_id, "server-1");
+
+        let duplicate = chat.reduce(ChatAction::UserMessage {
+            text: "repeat".into(),
+            message_id: Some("server-1".into()),
+            is_replay: false,
+        });
+        assert_eq!(
+            duplicate.transition,
+            ChatTransition::UserMessage(UserMessageTransition::Duplicate)
+        );
+        assert!(duplicate.coordination.is_empty());
+
+        chat.undo_state = Some(UndoState {
+            stack: Vec::new(),
+            frontier_message_id: None,
+        });
+        chat.suppress_turn_output = true;
+        let replay = chat.reduce(ChatAction::UserMessage {
+            text: "replayed".into(),
+            message_id: Some("server-2".into()),
+            is_replay: true,
+        });
+        assert_eq!(
+            replay.transition,
+            ChatTransition::UserMessage(UserMessageTransition::Appended)
+        );
+        assert!(replay.coordination.is_empty());
+    }
+
+    #[test]
+    fn reducer_stream_deltas_preserve_boundaries_and_replay_suppression() {
+        let mut chat = ChatState::new();
+        chat.activity = ActivityState::Thinking;
+        let thinking = chat.reduce(ChatAction::AssistantThinkingDelta {
+            content: "plan".into(),
+            message_id: Some("one".into()),
+            is_replay: true,
+        });
+        assert_eq!(
+            thinking.transition,
+            ChatTransition::AssistantThinkingDelta(StreamingDeltaTransition::default())
+        );
+        assert!(thinking.coordination.is_empty());
+
+        let duplicate = chat.reduce(ChatAction::AssistantThinkingDelta {
+            content: "plan".into(),
+            message_id: Some("one".into()),
+            is_replay: true,
+        });
+        assert_eq!(
+            duplicate.transition,
+            ChatTransition::AssistantThinkingDelta(StreamingDeltaTransition {
+                finalized_previous: false,
+                ignored_duplicate: true,
+            })
+        );
+        assert!(duplicate.coordination.is_empty());
+        assert_eq!(chat.streaming_thinking, "plan");
+
+        let content = chat.reduce(ChatAction::AssistantContentDelta {
+            content: "answer".into(),
+            message_id: Some("one".into()),
+        });
+        assert_eq!(
+            content.transition,
+            ChatTransition::AssistantContentDelta(StreamingDeltaTransition::default())
+        );
+        assert_eq!(chat.activity, ActivityState::Streaming);
+
+        let boundary = chat.reduce(ChatAction::AssistantContentDelta {
+            content: "second".into(),
+            message_id: Some("two".into()),
+        });
+        assert_eq!(
+            boundary.transition,
+            ChatTransition::AssistantContentDelta(StreamingDeltaTransition {
+                finalized_previous: true,
+                ignored_duplicate: false,
+            })
+        );
+        assert_eq!(
+            boundary.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::InvalidateCardCache,
+            ]
+        );
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
+                if content == "answer" && thinking == "plan" && id == "one"
+        ));
+        assert_eq!(chat.streaming_content, "second");
+        assert_eq!(chat.streaming_content_message_id.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn reducer_final_assistant_merges_replaces_and_deduplicates_exactly() {
+        let expected_base_coordination = vec![
+            ChatCoordination::InvalidateContentCache,
+            ChatCoordination::InvalidateThinkingCache,
+        ];
+        let mut chat = ChatState::new();
+        chat.streaming_content = "partial".into();
+        chat.streaming_content_message_id = Some("assistant-1".into());
+        chat.streaming_thinking = "streamed thinking".into();
+        chat.streaming_thinking_message_id = Some("assistant-1".into());
+        let appended = chat.reduce(ChatAction::AssistantMessage {
+            content: "final".into(),
+            thinking: None,
+            message_id: Some("assistant-1".into()),
+        });
+        assert_eq!(
+            appended.transition,
+            ChatTransition::AssistantMessage(AssistantMessageTransition::Appended)
+        );
+        assert_eq!(appended.coordination, expected_base_coordination);
+        assert!(chat.streaming_content.is_empty());
+        assert!(chat.streaming_thinking.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
+                if content == "final" && thinking == "streamed thinking" && id == "assistant-1"
+        ));
+
+        let duplicate = chat.reduce(ChatAction::AssistantMessage {
+            content: "duplicate".into(),
+            thinking: Some("duplicate thinking".into()),
+            message_id: Some("assistant-1".into()),
+        });
+        assert_eq!(
+            duplicate.transition,
+            ChatTransition::AssistantMessage(AssistantMessageTransition::Duplicate)
+        );
+        assert_eq!(duplicate.coordination, expected_base_coordination);
+        assert_eq!(chat.messages.len(), 1);
+
+        chat.messages.push(ChatEntry::Thinking {
+            content: "old thinking".into(),
+            message_id: Some("assistant-2".into()),
+        });
+        let replaced = chat.reduce(ChatAction::AssistantMessage {
+            content: "replacement".into(),
+            thinking: Some("explicit thinking".into()),
+            message_id: Some("assistant-2".into()),
+        });
+        assert_eq!(
+            replaced.transition,
+            ChatTransition::AssistantMessage(AssistantMessageTransition::ReplacedThinking)
+        );
+        assert_eq!(
+            replaced.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::InvalidateCardCache,
+            ]
+        );
+        assert!(matches!(
+            &chat.messages[1],
+            ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }
+                if content == "replacement" && thinking == "explicit thinking" && id == "assistant-2"
+        ));
+    }
+
+    #[test]
+    fn reducer_cancel_and_finish_discard_streams_close_live_timing_and_report_status() {
+        let mut cancelled = ChatState::new();
+        cancelled.begin_llm_request_span(None);
+        cancelled.activity = ActivityState::Streaming;
+        cancelled.streaming_content = "discard content".into();
+        cancelled.streaming_thinking = "discard thinking".into();
+        let outcome = cancelled.reduce(ChatAction::Cancelled { is_replay: false });
+        assert_eq!(outcome.transition, ChatTransition::Cancelled);
+        assert_eq!(
+            outcome.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::Status {
+                    level: LogLevel::Warn,
+                    target: "activity",
+                    message: "cancelled".into(),
+                },
+            ]
+        );
+        assert_eq!(cancelled.activity, ActivityState::Idle);
+        assert!(cancelled.session_stats.open_llm_request_instant.is_none());
+        assert!(cancelled.streaming_content.is_empty());
+        assert!(cancelled.streaming_thinking.is_empty());
+        assert!(cancelled.messages.is_empty());
+
+        let mut finished = ChatState::new();
+        finished.begin_llm_request_span(None);
+        finished.streaming_content = "discard content".into();
+        finished.streaming_thinking = "discard thinking".into();
+        let outcome = finished.reduce(ChatAction::Finished {
+            finish_reason: "EndTurn".into(),
+            is_replay: false,
+        });
+        assert_eq!(outcome.transition, ChatTransition::Finished);
+        assert_eq!(
+            outcome.coordination,
+            vec![
+                ChatCoordination::InvalidateContentCache,
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::Status {
+                    level: LogLevel::Debug,
+                    target: "activity",
+                    message: "finished: EndTurn".into(),
+                },
+            ]
+        );
+        assert_eq!(finished.activity, ActivityState::Idle);
+        assert!(finished.session_stats.open_llm_request_instant.is_none());
+        assert!(finished.streaming_content.is_empty());
+        assert!(finished.streaming_thinking.is_empty());
+        assert!(finished.messages.is_empty());
+
+        let mut replay = ChatState::new();
+        replay.begin_llm_request_span(None);
+        let opened = replay.session_stats.open_llm_request_instant;
+        replay.reduce(ChatAction::Finished {
+            finish_reason: "Replay".into(),
+            is_replay: true,
+        });
+        assert_eq!(replay.session_stats.open_llm_request_instant, opened);
     }
 
     #[test]
