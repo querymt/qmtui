@@ -245,7 +245,10 @@ mod tests {
     };
     use crate::domain::model::ModelEntry;
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
+    use crate::domain::tool::{
+        IndexMetadata, MultiEditSection, SearchResultCounts, ShellOutput, SymbolDiffSection,
+        SymbolReplacement, TodoItem, ToolDetail,
+    };
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -283,7 +286,10 @@ mod tests {
             tool_call_id: Some(id.into()),
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary(format!("({agent}) {objective}")),
+            detail: ToolDetail::Delegate {
+                target_agent_id: agent.into(),
+                objective: objective.into(),
+            },
         }
     }
 
@@ -1167,7 +1173,10 @@ mod tests {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+            detail: ToolDetail::Delegate {
+                target_agent_id: "coder".into(),
+                objective: "Fix the bug".into(),
+            },
         });
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -1207,9 +1216,14 @@ mod tests {
             tool_call_id: None,
             name: "index".into(),
             is_error: false,
-            detail: ToolDetail::Summary(
-                "src/(generated)/main.rs (rust, 2 imports, 1 functions)".into(),
-            ),
+            detail: ToolDetail::Index {
+                path: "src/(generated)/main.rs".into(),
+                metadata: Some(IndexMetadata {
+                    language: "rust".into(),
+                    imports: 2,
+                    functions: 1,
+                }),
+            },
         });
 
         let cards = build_message_cards(&mut app);
@@ -1235,7 +1249,15 @@ mod tests {
             tool_call_id: None,
             name: "search_text".into(),
             is_error: false,
-            detail: ToolDetail::Summary("\"needle\" *.rs (5 files, 28 matches)".into()),
+            detail: ToolDetail::SearchText {
+                pattern: "needle".into(),
+                path: String::new(),
+                include: "*.rs".into(),
+                counts: Some(SearchResultCounts {
+                    files: 5,
+                    matches: 28,
+                }),
+            },
         });
 
         let cards = build_message_cards(&mut app);
@@ -1307,21 +1329,34 @@ mod tests {
                 tool_call_id: None,
                 name: "browse".into(),
                 is_error: false,
-                detail: ToolDetail::Summary("https://例.test/文档…".into()),
+                detail: ToolDetail::Browse {
+                    url: "https://例.test/文档…".into(),
+                },
             },
             ChatEntry::ToolCall {
                 tool_call_id: None,
                 name: "todowrite".into(),
                 is_error: false,
-                detail: ToolDetail::Summary("[x] done\n[ ] next".into()),
+                detail: ToolDetail::Todo {
+                    items: vec![
+                        TodoItem {
+                            content: "done".into(),
+                            status: "completed".into(),
+                        },
+                        TodoItem {
+                            content: "next".into(),
+                            status: "pending".into(),
+                        },
+                    ],
+                },
             },
             ChatEntry::ToolCall {
                 tool_call_id: None,
                 name: "inspect".into(),
                 is_error: false,
-                detail: ToolDetail::SummaryWithOutput {
-                    header: "src/lib.rs".into(),
-                    output: "language: rust\nsymbols: 3".into(),
+                detail: ToolDetail::Generic {
+                    input: Some("src/lib.rs".into()),
+                    result: Some("language: rust\nsymbols: 3".into()),
                 },
             },
             ChatEntry::ToolCall {
@@ -1372,6 +1407,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_summary_utf8_truncation_is_render_owned_and_char_safe() {
+        let browse_url = format!("https://example.test/{}tail", "界".repeat(50));
+        let objective = format!("{}tail", "界".repeat(50));
+        let expected_url = format!("{}…", browse_url.chars().take(59).collect::<String>());
+        let expected_objective = format!("{}…", objective.chars().take(49).collect::<String>());
+        let mut app = App::new();
+        app.chat.messages.extend([
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "browse".into(),
+                is_error: false,
+                detail: ToolDetail::Browse { url: browse_url },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "delegate".into(),
+                is_error: false,
+                detail: ToolDetail::Delegate {
+                    target_agent_id: String::new(),
+                    objective,
+                },
+            },
+        ]);
+
+        assert_eq!(
+            rendered_card_lines(&mut app),
+            [
+                format!("> browse {expected_url}"),
+                format!("> delegate {expected_objective}"),
+            ]
+        );
+    }
+
+    #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
@@ -1380,7 +1449,10 @@ mod tests {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+            detail: ToolDetail::Delegate {
+                target_agent_id: "coder".into(),
+                objective: "Fix the bug".into(),
+            },
         });
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -3015,10 +3087,12 @@ mod tests {
             is_error: false,
             detail: ToolDetail::Shell {
                 command: "printf '界界界 wide output'".into(),
+                arguments: Vec::new(),
                 workdir: Some("/repo/工作".into()),
-                output_tail: Some(ShellOutputTail {
-                    lines: vec!["第一行".into(), "last line".into()],
-                    hidden_line_count: 3,
+                output: Some(ShellOutput {
+                    stdout: "第一行\nlast line".into(),
+                    stderr: String::new(),
+                    preceding_line_count: 3,
                 }),
             },
         });
@@ -3032,6 +3106,7 @@ mod tests {
                 file: "src/lib.rs".into(),
                 old: "before 界\n".into(),
                 new: "after 界\n".into(),
+                replace_all: false,
                 start_line: Some(99),
             },
         });
@@ -3324,6 +3399,7 @@ mod tests {
                 file: "f.rs".into(),
                 old: old.into(),
                 new: new.into(),
+                replace_all: false,
                 start_line: Some(41),
             },
         });
@@ -3369,12 +3445,9 @@ mod tests {
     fn message_cards_multiedit_tool_includes_sectioned_diff_lines() {
         let mut app = App::new();
         let sections = (1..=8)
-            .map(|index| DiffPreviewSection {
-                header: if index == 1 {
-                    "edit 1 (all)".into()
-                } else {
-                    format!("edit {index}")
-                },
+            .map(|index| MultiEditSection {
+                edit_index: index,
+                replace_all: index == 1,
                 old: format!("old {index}\n"),
                 new: format!("new {index}\n"),
                 start_line: Some(index * 10),
@@ -3441,8 +3514,9 @@ mod tests {
     fn message_cards_replace_symbol_tool_includes_symbol_diff_lines() {
         let mut app = App::new();
         let sections = (1..=6)
-            .map(|index| DiffPreviewSection {
-                header: if index == 1 {
+            .map(|index| SymbolDiffSection {
+                path: "src/ui/chat.rs".into(),
+                symbol: if index == 1 {
                     "build_message_cards".into()
                 } else {
                     format!("symbol_{index}")
@@ -3456,8 +3530,8 @@ mod tests {
             tool_call_id: None,
             name: "replace_symbol".into(),
             is_error: false,
-            detail: ToolDetail::ReplaceSymbol {
-                title: "src/ui/chat.rs build_message_cards".into(),
+            detail: ToolDetail::ReplaceSymbolDiff {
+                replacements: Vec::new(),
                 sections,
             },
         });
@@ -3513,16 +3587,95 @@ mod tests {
     }
 
     #[test]
+    fn replace_symbol_titles_are_derived_from_semantic_paths() {
+        let cases = [
+            (Vec::new(), "symbols"),
+            (
+                vec![SymbolReplacement {
+                    path: String::new(),
+                    symbol: "missing".into(),
+                    new_text: "fn missing() {}".into(),
+                }],
+                "symbols",
+            ),
+            (
+                vec![SymbolReplacement {
+                    path: "/workspace/project/src/nested/lib.rs".into(),
+                    symbol: "run".into(),
+                    new_text: "fn run() {}".into(),
+                }],
+                "nested/lib.rs",
+            ),
+            (
+                vec![
+                    SymbolReplacement {
+                        path: "/workspace/project/src/nested/lib.rs".into(),
+                        symbol: "run".into(),
+                        new_text: "fn run() {}".into(),
+                    },
+                    SymbolReplacement {
+                        path: "/workspace/project/src/nested/lib.rs".into(),
+                        symbol: "stop".into(),
+                        new_text: "fn stop() {}".into(),
+                    },
+                ],
+                "nested/lib.rs",
+            ),
+            (
+                vec![
+                    SymbolReplacement {
+                        path: "/workspace/project/src/one.rs".into(),
+                        symbol: "one".into(),
+                        new_text: "fn one() {}".into(),
+                    },
+                    SymbolReplacement {
+                        path: "/workspace/project/src/two.rs".into(),
+                        symbol: "two".into(),
+                        new_text: "fn two() {}".into(),
+                    },
+                ],
+                "src/one.rs (+1)",
+            ),
+        ];
+
+        for (replacements, expected_title) in cases {
+            let mut app = App::new();
+            app.sessions.session_id = Some("session-1".into());
+            app.sessions.session_groups = vec![SessionGroup {
+                cwd: Some("/workspace/project".into()),
+                sessions: vec![SessionSummary {
+                    session_id: "session-1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.chat.messages.push(ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "replace_symbol".into(),
+                is_error: false,
+                detail: ToolDetail::ReplaceSymbolInput { replacements },
+            });
+
+            assert_eq!(
+                rendered_card_lines(&mut app),
+                [format!("> replace_symbol {expected_title}")]
+            );
+        }
+    }
+
+    #[test]
     fn message_cards_shell_tool_shows_command_and_last_output_lines() {
         let mut app = App::new();
         let command = "cargo \\\ntest \\\n--lib";
-        let output_tail = ShellOutputTail {
-            lines: vec![
-                "running 1 test".into(),
-                "test ui::tests::shell ... ok".into(),
-                "test result: ok".into(),
-            ],
-            hidden_line_count: 12,
+        let output = ShellOutput {
+            stdout: [
+                "running 1 test",
+                "test ui::tests::shell ... ok",
+                "test result: ok",
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            preceding_line_count: 12,
         };
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
@@ -3530,8 +3683,9 @@ mod tests {
             is_error: false,
             detail: ToolDetail::Shell {
                 command: command.into(),
+                arguments: Vec::new(),
                 workdir: Some("/repo".into()),
-                output_tail: Some(output_tail),
+                output: Some(output),
             },
         });
 

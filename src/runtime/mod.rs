@@ -786,6 +786,7 @@ mod tests {
                 file: "f.rs".into(),
                 old: "aaa".into(),
                 new: "bbb".into(),
+                replace_all: false,
                 start_line: None,
             },
         });

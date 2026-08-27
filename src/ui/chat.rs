@@ -1,4 +1,7 @@
-use std::cell::{Cell, Ref, RefCell};
+use std::{
+    cell::{Cell, Ref, RefCell},
+    path::Path,
+};
 
 use ratatui::{
     Frame,
@@ -12,7 +15,9 @@ use crate::app::App;
 use crate::composer_state::{InputVisualLayout, build_input_visual_layout};
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
 use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
-use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
+use crate::domain::tool::{
+    MultiEditSection, ShellOutput, SymbolDiffSection, SymbolReplacement, ToolDetail,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
@@ -286,6 +291,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
 
     // Process new messages from start_idx
     let mut pending_tools: Vec<Line<'static>> = Vec::new();
+    let current_cwd = app.current_session_cwd();
 
     let flush_tools = |tools: &mut Vec<Line<'static>>, cards: &mut Vec<Card>| {
         if !tools.is_empty() {
@@ -423,6 +429,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         old,
                         new,
                         start_line,
+                        ..
                     } => {
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
@@ -440,19 +447,32 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             Span::styled(short_path(file).to_string(), Theme::diff_file()),
                             Span::styled(format!(" ({edit_count} edits)"), Theme::status_accent()),
                         ]));
-                        pending_tools.extend(build_sectioned_diff_lines(sections, 6));
+                        pending_tools.extend(build_multiedit_lines(sections, 6));
                     }
-                    ToolDetail::ReplaceSymbol { title, sections } => {
+                    ToolDetail::ReplaceSymbolInput { replacements } => {
+                        let title = replace_symbol_title(replacements, &[], current_cwd.as_deref());
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
-                            Span::styled(title.clone(), Theme::diff_file()),
+                            Span::styled(title, Theme::diff_file()),
                         ]));
-                        pending_tools.extend(build_sectioned_diff_lines(sections, 4));
+                    }
+                    ToolDetail::ReplaceSymbolDiff {
+                        replacements,
+                        sections,
+                    } => {
+                        let title =
+                            replace_symbol_title(replacements, sections, current_cwd.as_deref());
+                        pending_tools.push(Line::from(vec![
+                            Span::styled(format!("{sym} {name} "), style),
+                            Span::styled(title, Theme::diff_file()),
+                        ]));
+                        pending_tools.extend(build_symbol_diff_lines(sections, 4));
                     }
                     ToolDetail::Shell {
                         command,
+                        arguments,
                         workdir,
-                        output_tail,
+                        output,
                     } => {
                         let mut spans = vec![Span::styled(format!("{sym} {name}"), style)];
                         if let Some(workdir) = workdir.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -460,11 +480,8 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                             spans.push(Span::styled(workdir.to_string(), Theme::diff_file()));
                         }
                         pending_tools.push(Line::from(spans));
-                        pending_tools.extend(build_shell_lines(
-                            command,
-                            workdir.as_deref(),
-                            output_tail.as_ref(),
-                        ));
+                        let command = shell_command_display(command, arguments);
+                        pending_tools.extend(build_shell_lines(&command, output.as_ref()));
                     }
                     ToolDetail::ReadTool {
                         path,
@@ -492,29 +509,110 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         ]));
                         pending_tools.extend(build_write_lines(content));
                     }
-                    ToolDetail::SummaryWithOutput { header, output } => {
-                        pending_tools.push(Line::from(vec![
-                            Span::styled(format!("{sym} {name} "), style),
-                            Span::styled(header.clone(), Theme::diff_file()),
-                        ]));
-                        for line in output.lines() {
+                    ToolDetail::Generic { input, result } => {
+                        let (summary, output) = match (input.as_deref(), result.as_deref()) {
+                            (Some(input), result) => (input, result),
+                            (None, Some(result)) => (result, None),
+                            (None, None) => ("", None),
+                        };
+                        push_summary_lines(&mut pending_tools, sym, name, style, summary, output);
+                    }
+                    ToolDetail::SearchText {
+                        pattern,
+                        path,
+                        include,
+                        counts,
+                    } => {
+                        let location = if !include.is_empty() {
+                            include.as_str()
+                        } else if !path.is_empty() {
+                            short_path(path)
+                        } else {
+                            "."
+                        };
+                        let mut summary = format!("\"{pattern}\" {location}");
+                        if let Some(counts) = counts {
+                            summary.push_str(&format!(
+                                " ({} files, {} matches)",
+                                counts.files, counts.matches
+                            ));
+                        }
+                        push_summary_lines(&mut pending_tools, sym, name, style, &summary, None);
+                    }
+                    ToolDetail::Glob { pattern, path } => {
+                        let summary = if path.is_empty() {
+                            pattern.clone()
+                        } else {
+                            format!("{pattern} in {}", short_path(path))
+                        };
+                        push_summary_lines(&mut pending_tools, sym, name, style, &summary, None);
+                    }
+                    ToolDetail::List { path } => {
+                        let summary = if path.is_empty() {
+                            "."
+                        } else {
+                            short_path(path)
+                        };
+                        push_summary_lines(&mut pending_tools, sym, name, style, summary, None);
+                    }
+                    ToolDetail::Index { path, metadata } => {
+                        let mut summary = if path.is_empty() {
+                            ".".to_string()
+                        } else if metadata.is_some() {
+                            path.clone()
+                        } else {
+                            short_path(path).to_string()
+                        };
+                        if let Some(metadata) = metadata {
+                            summary.push_str(&format!(
+                                " ({}, {} imports, {} functions)",
+                                metadata.language, metadata.imports, metadata.functions
+                            ));
+                        }
+                        push_summary_lines(&mut pending_tools, sym, name, style, &summary, None);
+                    }
+                    ToolDetail::DeleteFile { path } => push_summary_lines(
+                        &mut pending_tools,
+                        sym,
+                        name,
+                        style,
+                        short_path(path),
+                        None,
+                    ),
+                    ToolDetail::Browse { url } => {
+                        let summary = truncate_summary(url, 60);
+                        push_summary_lines(&mut pending_tools, sym, name, style, &summary, None);
+                    }
+                    ToolDetail::Todo { items } => {
+                        pending_tools
+                            .push(Line::from(Span::styled(format!("{sym} {name}"), style)));
+                        for item in items {
+                            let check = if item.status == "completed" { "x" } else { " " };
                             pending_tools.push(Line::from(Span::styled(
-                                format!("  {line}"),
-                                Theme::tool_output(),
+                                format!("  [{check}] {}", item.content),
+                                Theme::diff_file(),
                             )));
                         }
                     }
-                    ToolDetail::Summary(info) => {
-                        // Delegate tool calls: split "(agent:dur) objective" into
-                        // accent-colored label + normal objective.
-                        if name == "delegate" && info.starts_with('(') {
-                            let close = info.find(')').unwrap_or(0);
-                            let label_inner = &info[1..close]; // "coder"
-                            let objective = info[close + 1..].trim_start();
+                    ToolDetail::Delegate {
+                        target_agent_id,
+                        objective,
+                    } => {
+                        let objective = truncate_summary(objective, 50);
+                        if target_agent_id.is_empty() {
+                            push_summary_lines(
+                                &mut pending_tools,
+                                sym,
+                                name,
+                                style,
+                                &objective,
+                                None,
+                            );
+                        } else {
                             let label = if delegate_duration.is_empty() {
-                                format!("({label_inner})")
+                                format!("({target_agent_id})")
                             } else {
-                                format!("({label_inner}{delegate_duration})")
+                                format!("({target_agent_id}{delegate_duration})")
                             };
                             let (delegate_status, delegate_status_style) = match delegate_entry {
                                 Some(entry) if entry.awaiting_input() => {
@@ -537,39 +635,20 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                                 delegate_status_style,
                             ));
                             if !objective.is_empty() {
-                                spans.push(Span::styled(objective.to_string(), Theme::diff_file()));
+                                spans.push(Span::styled(objective, Theme::diff_file()));
                             }
                             pending_tools.push(Line::from(spans));
-                        } else if info.contains('\n') {
-                            pending_tools
-                                .push(Line::from(Span::styled(format!("{sym} {name}"), style)));
-                            for line in info.lines() {
-                                pending_tools.push(Line::from(Span::styled(
-                                    format!("  {line}"),
-                                    Theme::diff_file(),
-                                )));
-                            }
-                        } else if matches!(name.as_str(), "index" | "search_text")
-                            && info.ends_with(')')
-                        {
-                            if let Some((summary, metadata)) = info.rsplit_once(" (") {
-                                pending_tools.push(Line::from(vec![
-                                    Span::styled(format!("{sym} {name} "), style),
-                                    Span::styled(summary.to_string(), Theme::diff_file()),
-                                    Span::styled(format!(" ({metadata}"), Theme::status_accent()),
-                                ]));
-                            } else {
-                                pending_tools.push(Line::from(vec![
-                                    Span::styled(format!("{sym} {name} "), style),
-                                    Span::styled(info.clone(), Theme::diff_file()),
-                                ]));
-                            }
-                        } else {
-                            pending_tools.push(Line::from(vec![
-                                Span::styled(format!("{sym} {name} "), style),
-                                Span::styled(info.clone(), Theme::diff_file()),
-                            ]));
                         }
+                    }
+                    ToolDetail::LanguageQuery { action, uri } => {
+                        let summary = format!("{action} {}", short_path(uri));
+                        push_summary_lines(&mut pending_tools, sym, name, style, &summary, None);
+                    }
+                    ToolDetail::Question { .. } => {
+                        push_summary_lines(&mut pending_tools, sym, name, style, "asking...", None)
+                    }
+                    ToolDetail::ApplyPatch { .. } => {
+                        push_summary_lines(&mut pending_tools, sym, name, style, "patch", None)
                     }
                     ToolDetail::None => {
                         pending_tools
@@ -1712,28 +1791,161 @@ fn short_path(path: &str) -> &str {
     path
 }
 
-pub(crate) fn build_sectioned_diff_lines(
-    sections: &[DiffPreviewSection],
+fn strip_cwd(path: &str, cwd: Option<&str>) -> String {
+    cwd.and_then(|cwd| Path::new(path).strip_prefix(cwd).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn truncate_summary(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('\u{2026}');
+    out
+}
+
+fn push_summary_lines(
+    pending_tools: &mut Vec<Line<'static>>,
+    sym: &str,
+    name: &str,
+    style: Style,
+    summary: &str,
+    output: Option<&str>,
+) {
+    if let Some(output) = output {
+        pending_tools.push(Line::from(vec![
+            Span::styled(format!("{sym} {name} "), style),
+            Span::styled(summary.to_string(), Theme::diff_file()),
+        ]));
+        for line in output.lines() {
+            pending_tools.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Theme::tool_output(),
+            )));
+        }
+    } else if summary.contains('\n') {
+        pending_tools.push(Line::from(Span::styled(format!("{sym} {name}"), style)));
+        for line in summary.lines() {
+            pending_tools.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Theme::diff_file(),
+            )));
+        }
+    } else if matches!(name, "index" | "search_text") && summary.ends_with(')') {
+        if let Some((summary, metadata)) = summary.rsplit_once(" (") {
+            pending_tools.push(Line::from(vec![
+                Span::styled(format!("{sym} {name} "), style),
+                Span::styled(summary.to_string(), Theme::diff_file()),
+                Span::styled(format!(" ({metadata}"), Theme::status_accent()),
+            ]));
+        } else {
+            pending_tools.push(Line::from(vec![
+                Span::styled(format!("{sym} {name} "), style),
+                Span::styled(summary.to_string(), Theme::diff_file()),
+            ]));
+        }
+    } else {
+        pending_tools.push(Line::from(vec![
+            Span::styled(format!("{sym} {name} "), style),
+            Span::styled(summary.to_string(), Theme::diff_file()),
+        ]));
+    }
+}
+
+fn replace_symbol_title(
+    replacements: &[SymbolReplacement],
+    sections: &[SymbolDiffSection],
+    cwd: Option<&str>,
+) -> String {
+    if replacements.is_empty() && !sections.is_empty() {
+        let first = &sections[0];
+        return if first.symbol.is_empty() {
+            first.path.clone()
+        } else {
+            format!("{} {}", first.path, first.symbol)
+        };
+    }
+
+    let mut files = replacements
+        .iter()
+        .filter(|replacement| !replacement.path.is_empty())
+        .map(|replacement| strip_cwd(&replacement.path, cwd))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    match files.as_slice() {
+        [] => "symbols".into(),
+        [one] => short_path(one).to_string(),
+        [first, ..] => format!("{} (+{})", short_path(first), files.len() - 1),
+    }
+}
+
+fn build_multiedit_lines(sections: &[MultiEditSection], max_sections: usize) -> Vec<Line<'static>> {
+    build_sectioned_diff_lines(
+        sections
+            .iter()
+            .map(|section| {
+                let header = if section.replace_all {
+                    format!("edit {} (all)", section.edit_index)
+                } else {
+                    format!("edit {}", section.edit_index)
+                };
+                (
+                    header,
+                    &section.old,
+                    &section.new,
+                    section.start_line,
+                    Theme::status_accent(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        max_sections,
+    )
+}
+
+fn build_symbol_diff_lines(
+    sections: &[SymbolDiffSection],
+    max_sections: usize,
+) -> Vec<Line<'static>> {
+    build_sectioned_diff_lines(
+        sections
+            .iter()
+            .map(|section| {
+                (
+                    section.symbol.clone(),
+                    &section.old,
+                    &section.new,
+                    section.start_line,
+                    Theme::diff_file(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        max_sections,
+    )
+}
+
+fn build_sectioned_diff_lines(
+    sections: Vec<(String, &String, &String, Option<usize>, Style)>,
     max_sections: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let preview_count = sections.len().min(max_sections.max(1));
 
-    for (idx, section) in sections.iter().take(preview_count).enumerate() {
-        if !section.header.is_empty() {
-            let mut spans = vec![Span::styled("  @@ ", Theme::diff_context())];
-            if section.header.starts_with("edit ") {
-                spans.push(Span::styled(section.header.clone(), Theme::status_accent()));
-            } else {
-                spans.push(Span::styled(section.header.clone(), Theme::diff_file()));
-            }
-            lines.push(Line::from(spans));
+    for (idx, (header, old, new, start_line, header_style)) in
+        sections.iter().take(preview_count).enumerate()
+    {
+        if !header.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  @@ ", Theme::diff_context()),
+                Span::styled(header.clone(), *header_style),
+            ]));
         }
-        lines.extend(build_diff_lines(
-            &section.old,
-            &section.new,
-            section.start_line,
-        ));
+        lines.extend(build_diff_lines(old, new, *start_line));
         if idx + 1 < preview_count {
             lines.push(Line::default());
         }
@@ -1752,11 +1964,31 @@ pub(crate) fn build_sectioned_diff_lines(
     lines
 }
 
-pub(crate) fn build_shell_lines(
-    command: &str,
-    _workdir: Option<&str>,
-    output_tail: Option<&ShellOutputTail>,
-) -> Vec<Line<'static>> {
+fn shell_command_display(command: &str, arguments: &[String]) -> String {
+    if arguments.is_empty() {
+        return command.to_string();
+    }
+    std::iter::once(command)
+        .chain(arguments.iter().map(String::as_str))
+        .map(shell_quote_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+pub(crate) fn build_shell_lines(command: &str, output: Option<&ShellOutput>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let mut command_lines = command.lines();
@@ -1779,26 +2011,33 @@ pub(crate) fn build_shell_lines(
         ]));
     }
 
-    if let Some(tail) = output_tail
-        && !tail.lines.is_empty()
-    {
+    let output_lines = output
+        .into_iter()
+        .flat_map(|output| output.stdout.lines().chain(output.stderr.lines()))
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !output_lines.is_empty() {
+        let keep = 5;
+        let display_hidden_count = output_lines.len().saturating_sub(keep);
+        let hidden_line_count = output
+            .map(|output| output.preceding_line_count)
+            .unwrap_or_default()
+            .saturating_add(display_hidden_count);
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "  output tail:",
             Theme::diff_file(),
         )));
-        for line in &tail.lines {
+        for line in output_lines.into_iter().skip(display_hidden_count) {
             lines.push(Line::from(Span::styled(
                 format!("    {line}"),
                 Theme::tool_output(),
             )));
         }
-        if tail.hidden_line_count > 0 {
+        if hidden_line_count > 0 {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  ... {} earlier output lines hidden",
-                    tail.hidden_line_count
-                ),
+                format!("  ... {hidden_line_count} earlier output lines hidden"),
                 Theme::diff_context(),
             )));
         }

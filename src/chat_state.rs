@@ -220,7 +220,7 @@ pub(crate) enum ToolEndTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolResultDetailState {
-    Shell(Option<(Vec<String>, usize)>),
+    Shell(Option<crate::domain::tool::ShellOutput>),
     ReadTool(Option<u64>, Option<u64>),
     Edit(Option<usize>),
     MultiEdit(Vec<Option<usize>>),
@@ -808,7 +808,12 @@ impl ChatState {
                         tool_call_id,
                         format!("{name} (failed)"),
                         true,
-                        result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
+                        result
+                            .map(|result| ToolDetail::Generic {
+                                input: None,
+                                result: Some(result),
+                            })
+                            .unwrap_or(ToolDetail::None),
                     );
                     (
                         ChatToolTransition::Ended(ToolEndTransition::FallbackInserted),
@@ -1931,11 +1936,7 @@ impl ChatState {
 
 fn tool_result_detail_state(detail: &ToolDetail) -> ToolResultDetailState {
     match detail {
-        ToolDetail::Shell { output_tail, .. } => ToolResultDetailState::Shell(
-            output_tail
-                .as_ref()
-                .map(|tail| (tail.lines.clone(), tail.hidden_line_count)),
-        ),
+        ToolDetail::Shell { output, .. } => ToolResultDetailState::Shell(output.clone()),
         ToolDetail::ReadTool {
             start_line,
             end_line,
@@ -3255,7 +3256,10 @@ mod tests {
             Some("tool-1".into()),
             "shell (failed)".into(),
             true,
-            ToolDetail::Summary("failed".into()),
+            ToolDetail::Generic {
+                input: None,
+                result: Some("failed".into()),
+            },
         );
 
         let outcome = chat.reduce_tool(ChatToolAction::InsertOrReconcileToolStart {
@@ -3263,8 +3267,9 @@ mod tests {
             name: "shell".into(),
             detail: ToolDetail::Shell {
                 command: "echo late".into(),
+                arguments: Vec::new(),
                 workdir: None,
-                output_tail: None,
+                output: None,
             },
         });
 
@@ -3325,8 +3330,9 @@ mod tests {
             name: "shell".into(),
             detail: ToolDetail::Shell {
                 command: "echo late".into(),
+                arguments: Vec::new(),
                 workdir: None,
-                output_tail: None,
+                output: None,
             },
         });
         assert_eq!(
@@ -3373,8 +3379,9 @@ mod tests {
             false,
             ToolDetail::Shell {
                 command: "cargo check".into(),
+                arguments: Vec::new(),
                 workdir: Some("/repo".into()),
-                output_tail: None,
+                output: None,
             },
         );
         let end = ChatToolAction::ToolCallEnd {
@@ -3399,8 +3406,8 @@ mod tests {
         assert!(updated.effects.is_empty());
         assert!(matches!(
             chat.messages.as_slice(),
-            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output_tail: Some(tail), .. }, .. }]
-                if tail.lines == ["line one", "line two"]
+            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output: Some(output), .. }, .. }]
+                if output.stdout == "line one\nline two" && output.stderr.is_empty()
         ));
 
         let repeated = chat.reduce_tool(end);

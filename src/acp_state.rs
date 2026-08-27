@@ -862,9 +862,7 @@ impl crate::app::App {
                     ));
                 }
 
-                let cwd = self.current_session_cwd();
-                let detail =
-                    tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
+                let detail = tool_detail::parse_tool_detail(&name, arguments.as_ref());
                 let (_, insertion_effects) =
                     self.apply_chat_tool_action(ChatToolAction::InsertOrReconcileToolStart {
                         tool_call_id,
@@ -3418,9 +3416,9 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::ToolCall {
-                detail: ToolDetail::Shell { output_tail: Some(tail), .. },
+                detail: ToolDetail::Shell { output: Some(output), .. },
                 ..
-            }] if tail.lines.iter().any(|line| line.contains("Finished dev profile"))
+            }] if output.stdout.contains("Finished dev profile")
         ));
     }
 

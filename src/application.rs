@@ -548,14 +548,18 @@ mod tests {
                     tool_call_id: Some(tool_call_id),
                     name,
                     is_error: false,
-                    detail: ToolDetail::Summary(summary),
+                    detail: ToolDetail::Delegate {
+                        target_agent_id,
+                        objective,
+                    },
                 },
             ] if content == "before delegate"
                 && thinking == "delegate plan"
                 && message_id == "assistant-1"
                 && tool_call_id == "delegate-call"
                 && name == "delegate"
-                && summary == "(coder) Implement the feature"
+                && target_agent_id == "coder"
+                && objective == "Implement the feature"
         ));
 
         let effects = update(
@@ -745,8 +749,8 @@ mod tests {
         assert_eq!(app.render.card_cache.processed_messages, 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Summary(detail) }]
-                if id == "tool-1" && name == "shell (failed)" && detail == "failed before start"
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Generic { input: None, result: Some(result) } }]
+                if id == "tool-1" && name == "shell (failed)" && result == "failed before start"
         ));
 
         app.render.card_cache.processed_messages = 8;
@@ -779,7 +783,7 @@ mod tests {
         assert_eq!(diagnostic.message, "tool: shell");
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, output_tail: None, .. } }]
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, output: None, .. } }]
                 if id == "tool-1" && name == "shell" && command == "echo late"
         ));
 
@@ -801,8 +805,8 @@ mod tests {
         assert_eq!(app.render.card_cache.processed_messages, 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output_tail: Some(tail), .. }, .. }]
-                if tail.lines == ["line one", "line two"]
+            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output: Some(output), .. }, .. }]
+                if output.stdout == "line one\nline two" && output.stderr.is_empty()
         ));
 
         app.render.card_cache.processed_messages = 11;
