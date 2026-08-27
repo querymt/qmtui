@@ -304,6 +304,25 @@ mod tests {
             .collect()
     }
 
+    fn rendered_card_snapshot(app: &mut App, width: u16) -> Vec<(CardKind, Vec<String>, u16)> {
+        build_message_cards(app)
+            .iter()
+            .map(|card| {
+                let lines = card
+                    .lines_for(width.saturating_sub(4))
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect();
+                (card.kind.clone(), lines, card.height(width))
+            })
+            .collect()
+    }
+
     fn render_chat_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1275,6 +1294,84 @@ mod tests {
     }
 
     #[test]
+    fn summary_tool_detail_families_preserve_exact_visible_lines_and_styles() {
+        let mut app = App::new();
+        app.chat.messages.extend([
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "mystery".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "browse".into(),
+                is_error: false,
+                detail: ToolDetail::Summary("https://例.test/文档…".into()),
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "todowrite".into(),
+                is_error: false,
+                detail: ToolDetail::Summary("[x] done\n[ ] next".into()),
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "inspect".into(),
+                is_error: false,
+                detail: ToolDetail::SummaryWithOutput {
+                    header: "src/lib.rs".into(),
+                    output: "language: rust\nsymbols: 3".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "read_tool".into(),
+                is_error: false,
+                detail: ToolDetail::ReadTool {
+                    path: "/workspace/project/src/lib.rs".into(),
+                    start_line: Some(7),
+                    end_line: Some(9),
+                },
+            },
+        ]);
+
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        let lines = cards[0].lines_for(120);
+        let visible_lines = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_lines,
+            [
+                "> mystery",
+                "> browse https://例.test/文档…",
+                "> todowrite",
+                "  [x] done",
+                "  [ ] next",
+                "> inspect src/lib.rs",
+                "  language: rust",
+                "  symbols: 3",
+                "> read_tool src/lib.rs:7-9",
+            ]
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[3].spans[0].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[5].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[6].spans[0].style.fg, Theme::tool_output().fg);
+        assert_eq!(lines[8].spans[3].style.fg, Theme::status_accent().fg);
+        drop(lines);
+        assert_eq!(cards[0].height(20), 13, "narrow Unicode rows must wrap");
+    }
+
+    #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
@@ -1302,6 +1399,9 @@ mod tests {
                 source: "builtin:question".into(),
             },
         });
+
+        let lines = rendered_card_lines(&mut app);
+        assert_eq!(lines, ["> delegate (coder:45s) awaiting input Fix the bug"]);
 
         let buffer = render_chat_buffer(&mut app, 90, 10);
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
@@ -2651,7 +2751,14 @@ mod tests {
             app.render.card_cache.processed_messages, 0,
             "cache must invalidate"
         );
-        let lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render.card_cache.invalidate();
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let lines = rebuilt_from_warm_update
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .collect::<Vec<_>>();
         assert!(lines.iter().any(|line| line.contains("x shell")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
         assert!(matches!(app.chat.messages[1], ChatEntry::Assistant { .. }));
@@ -2699,7 +2806,11 @@ mod tests {
             app.render.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
         );
-        let rebuilt_lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render.card_cache.invalidate();
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let rebuilt_lines = &rebuilt_from_warm_update[0].1;
         assert!(
             rebuilt_lines
                 .iter()
@@ -2762,12 +2873,78 @@ mod tests {
             app.render.card_cache.processed_messages, 0,
             "semantic update should invalidate the warm card"
         );
-        let rebuilt_lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render.card_cache.invalidate();
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let rebuilt_lines = &rebuilt_from_warm_update[0].1;
         assert!(
             rebuilt_lines
                 .iter()
                 .any(|line| line.contains("  42 ") && line.contains("- before")),
             "rebuilt card returned stale edit detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
+    fn warm_tool_detail_update_matches_cold_full_rebuild() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-parity".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "printf",
+                    "args": ["界 output"],
+                    "workdir": "/repo/工作",
+                })),
+            },
+        );
+        let warm_start = rendered_card_snapshot(&mut app, 34);
+        assert!(
+            warm_start[0]
+                .1
+                .iter()
+                .any(|line| line.contains("$ printf '界 output'"))
+        );
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("shell-parity".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some(
+                    serde_json::json!({
+                        "stdout": "one\ntwo\nthree\nfour\nfive\nsix\n",
+                        "stderr": "错误\n",
+                    })
+                    .to_string(),
+                ),
+            },
+        );
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 34);
+        app.render.card_cache.invalidate();
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 34);
+
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        assert!(
+            rebuilt_from_warm_update[0]
+                .1
+                .iter()
+                .any(|line| line == "  ... 2 earlier output lines hidden")
+        );
+        assert!(
+            rebuilt_from_warm_update[0]
+                .1
+                .iter()
+                .any(|line| line == "    错误")
         );
     }
 
@@ -2799,7 +2976,16 @@ mod tests {
             failed_tool_end("tool-out-of-order", "shell"),
         );
 
-        let lines = rendered_card_lines(&mut app);
+        let warm_reconciled = rendered_card_snapshot(&mut app, 42);
+        app.render.card_cache.invalidate();
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
+        assert_eq!(warm_reconciled, cold_full_rebuild);
+
+        let lines = warm_reconciled
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .cloned()
+            .collect::<Vec<_>>();
         assert!(lines.iter().any(|line| line.contains("x shell")));
         assert!(lines.iter().any(|line| line.contains("$ echo replay")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
@@ -2810,40 +2996,73 @@ mod tests {
     fn message_cards_incremental_matches_full_rebuild() {
         let mut app = App::new();
 
-        // Build incrementally
         app.chat.messages.push(ChatEntry::User {
             text: "q1".into(),
             message_id: None,
         });
-        build_message_cards(&mut app);
+        rendered_card_snapshot(&mut app, 42);
 
         app.chat.messages.push(ChatEntry::Assistant {
             content: "a1".into(),
             thinking: None,
             message_id: None,
         });
-        build_message_cards(&mut app);
+        rendered_card_snapshot(&mut app, 42);
 
-        app.chat.messages.push(tool_call("edit"));
-        build_message_cards(&mut app);
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("shell-1".into()),
+            name: "shell".into(),
+            is_error: false,
+            detail: ToolDetail::Shell {
+                command: "printf '界界界 wide output'".into(),
+                workdir: Some("/repo/工作".into()),
+                output_tail: Some(ShellOutputTail {
+                    lines: vec!["第一行".into(), "last line".into()],
+                    hidden_line_count: 3,
+                }),
+            },
+        });
+        rendered_card_snapshot(&mut app, 42);
+
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("edit-1".into()),
+            name: "edit".into(),
+            is_error: false,
+            detail: ToolDetail::Edit {
+                file: "src/lib.rs".into(),
+                old: "before 界\n".into(),
+                new: "after 界\n".into(),
+                start_line: Some(99),
+            },
+        });
+        rendered_card_snapshot(&mut app, 42);
 
         app.chat.messages.push(ChatEntry::User {
             text: "q2".into(),
             message_id: None,
         });
-        let incremental_kinds: Vec<_> = {
-            let cards = build_message_cards(&mut app);
-            cards.iter().map(|c| c.kind.clone()).collect()
-        };
+        let incremental = rendered_card_snapshot(&mut app, 42);
 
-        // Full rebuild from scratch
         app.render.card_cache.invalidate();
-        let full_kinds: Vec<_> = {
-            let cards = build_message_cards(&mut app);
-            cards.iter().map(|c| c.kind.clone()).collect()
-        };
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
 
-        assert_eq!(incremental_kinds, full_kinds);
+        assert_eq!(incremental, cold_full_rebuild);
+        let all_visible_lines = incremental
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            all_visible_lines
+                .iter()
+                .any(|line| line == "> shell@/repo/工作")
+        );
+        assert!(all_visible_lines.iter().any(|line| line.contains("第一行")));
+        assert!(
+            all_visible_lines
+                .iter()
+                .any(|line| line.contains("99 - before 界"))
+        );
     }
 
     #[test]
@@ -3105,57 +3324,62 @@ mod tests {
                 file: "f.rs".into(),
                 old: old.into(),
                 new: new.into(),
-                start_line: Some(1),
+                start_line: Some(41),
             },
         });
 
-        let cards = build_message_cards(&mut app);
-        assert_eq!(cards.len(), 1);
-        // header line + diff lines (at least equal + changed = 2 original lines)
-        assert!(
-            cards[0].lines_for(80).len() > 1,
-            "tool card should include header + diff lines, got {} lines",
-            cards[0].lines_for(80).len()
+        let snapshot = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, CardKind::Tool { compact: false });
+        assert_eq!(
+            snapshot[0].1,
+            ["> edit f.rs", "  41   aaa", "  42 - bbb", "  42 + ccc",]
         );
+        assert_eq!(snapshot[0].2, 5);
     }
 
     #[test]
     fn message_cards_write_tool_includes_content_lines() {
         let mut app = App::new();
-        let content = "fn main() {}\n";
+        let content = (1..=22)
+            .map(|line| format!("line {line} 界"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "write_file".into(),
             is_error: false,
             detail: ToolDetail::WriteFile {
-                path: "out.rs".into(),
-                content: content.into(),
+                path: "/workspace/src/out.rs".into(),
+                content,
             },
         });
 
-        let cards = build_message_cards(&mut app);
-        assert_eq!(cards.len(), 1);
-        // header line + 1 content line
-        assert_eq!(cards[0].lines_for(80).len(), 2);
+        let snapshot = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].1.len(), 22);
+        assert_eq!(snapshot[0].1[0], "> write_file src/out.rs");
+        assert_eq!(snapshot[0].1[1], "   1 + line 1 界");
+        assert_eq!(snapshot[0].1[20], "  20 + line 20 界");
+        assert_eq!(snapshot[0].1[21], "       ... (2 more lines)");
+        assert_eq!(snapshot[0].2, 23);
     }
 
     #[test]
     fn message_cards_multiedit_tool_includes_sectioned_diff_lines() {
         let mut app = App::new();
-        let sections = vec![
-            DiffPreviewSection {
-                header: "edit 1".into(),
-                old: "aaa\n".into(),
-                new: "bbb\n".into(),
-                start_line: Some(10),
-            },
-            DiffPreviewSection {
-                header: "edit 2".into(),
-                old: "ccc\n".into(),
-                new: "ddd\n".into(),
-                start_line: Some(20),
-            },
-        ];
+        let sections = (1..=8)
+            .map(|index| DiffPreviewSection {
+                header: if index == 1 {
+                    "edit 1 (all)".into()
+                } else {
+                    format!("edit {index}")
+                },
+                old: format!("old {index}\n"),
+                new: format!("new {index}\n"),
+                start_line: Some(index * 10),
+            })
+            .collect::<Vec<_>>();
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "multiedit".into(),
@@ -3185,11 +3409,17 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("> multiedit src/lib.rs (2 edits)"))
+                .any(|line| line.contains("> multiedit src/lib.rs (8 edits)"))
         );
-        assert!(lines.iter().any(|line| line.contains("@@ edit 1")));
-        assert!(lines.iter().any(|line| line.contains("- aaa")));
-        assert!(lines.iter().any(|line| line.contains("+ bbb")));
+        assert!(lines.iter().any(|line| line.contains("@@ edit 1 (all)")));
+        assert!(lines.iter().any(|line| line.contains("  10 - old 1")));
+        assert!(lines.iter().any(|line| line.contains("  10 + new 1")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  ... 2 more sections collapsed")
+        );
+        assert!(!lines.iter().any(|line| line.contains("@@ edit 7")));
 
         let section_line = card_lines
             .iter()
@@ -3198,24 +3428,30 @@ mod tests {
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
-                    .contains("@@ edit 1")
+                    .contains("@@ edit 1 (all)")
             })
             .expect("missing multiedit section header");
         assert_eq!(section_line.spans[0].content, "  @@ ");
         assert_eq!(section_line.spans[0].style.fg, Theme::diff_context().fg);
-        assert_eq!(section_line.spans[1].content, "edit 1");
+        assert_eq!(section_line.spans[1].content, "edit 1 (all)");
         assert_eq!(section_line.spans[1].style.fg, Theme::status_accent().fg);
     }
 
     #[test]
     fn message_cards_replace_symbol_tool_includes_symbol_diff_lines() {
         let mut app = App::new();
-        let sections = vec![DiffPreviewSection {
-            header: "build_message_cards".into(),
-            old: "fn build_message_cards() {\n    old();\n}\n".into(),
-            new: "fn build_message_cards() {\n    new();\n}\n".into(),
-            start_line: Some(211),
-        }];
+        let sections = (1..=6)
+            .map(|index| DiffPreviewSection {
+                header: if index == 1 {
+                    "build_message_cards".into()
+                } else {
+                    format!("symbol_{index}")
+                },
+                old: format!("fn symbol_{index}() {{\n    old();\n}}\n"),
+                new: format!("fn symbol_{index}() {{\n    new();\n}}\n"),
+                start_line: Some(210 + index),
+            })
+            .collect::<Vec<_>>();
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "replace_symbol".into(),
@@ -3253,6 +3489,12 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("-     old();")));
         assert!(lines.iter().any(|line| line.contains("+     new();")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  ... 2 more sections collapsed")
+        );
+        assert!(!lines.iter().any(|line| line.contains("@@ symbol_5")));
 
         let section_line = card_lines
             .iter()
@@ -3308,16 +3550,20 @@ mod tests {
             })
             .collect();
 
-        assert!(lines.iter().any(|line| line == "> shell@/repo"));
-        assert!(!lines.iter().any(|line| line.contains("cwd:")));
-        assert!(lines.iter().any(|line| line.contains("$ cargo \\")));
-        assert!(lines.iter().any(|line| line.contains("test \\")));
-        assert!(lines.iter().any(|line| line.contains("output tail:")));
-        assert!(lines.iter().any(|line| line.contains("test result: ok")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("12 earlier output lines hidden"))
+        assert_eq!(
+            lines,
+            [
+                "> shell@/repo",
+                "  $ cargo \\",
+                "    test \\",
+                "    --lib",
+                "",
+                "  output tail:",
+                "    running 1 test",
+                "    test ui::tests::shell ... ok",
+                "    test result: ok",
+                "  ... 12 earlier output lines hidden",
+            ]
         );
 
         let command_line = card_lines

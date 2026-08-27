@@ -504,47 +504,44 @@ mod tests {
 
     #[test]
     fn delegate_tool_shows_agent_and_objective() {
-        let args = serde_json::json!({
+        let semantic_inputs = serde_json::json!({
             "target_agent_id": "coder",
             "objective": "List the contents of /tmp"
         });
-        let detail = parse_tool_detail("delegate", Some(&args), None);
-        match detail {
-            ToolDetail::Summary(s) => {
-                assert!(s.contains("coder"), "must contain agent name, got: {s}");
-                assert!(
-                    s.contains("List the contents"),
-                    "must contain objective, got: {s}"
-                );
-            }
-            other => panic!("expected Summary, got: {other:?}"),
-        }
+
+        let visible_detail = parse_tool_detail("delegate", Some(&semantic_inputs), None);
+
+        assert!(matches!(
+            visible_detail,
+            ToolDetail::Summary(summary) if summary == "(coder) List the contents of /tmp"
+        ));
     }
 
     #[test]
     fn delegate_tool_without_agent_shows_objective_only() {
-        let args = serde_json::json!({
+        let semantic_inputs = serde_json::json!({
             "objective": "Do something"
         });
-        let detail = parse_tool_detail("delegate", Some(&args), None);
-        match detail {
-            ToolDetail::Summary(s) => {
-                assert!(
-                    s.contains("Do something"),
-                    "must contain objective, got: {s}"
-                );
-            }
-            other => panic!("expected Summary, got: {other:?}"),
-        }
+
+        let visible_detail = parse_tool_detail("delegate", Some(&semantic_inputs), None);
+
+        assert!(matches!(
+            visible_detail,
+            ToolDetail::Summary(summary) if summary == "Do something"
+        ));
     }
 
-    fn assert_summary_truncates_with_ellipsis(tool_name: &str, args: serde_json::Value) {
+    fn assert_summary_truncates_with_ellipsis(
+        tool_name: &str,
+        args: serde_json::Value,
+        expected: &str,
+    ) {
         let detail = parse_tool_detail(tool_name, Some(&args), None);
 
         match detail {
-            ToolDetail::Summary(s) => {
-                assert!(s.ends_with(crate::ui::ELLIPSIS), "got: {s}");
-                assert!(s.is_char_boundary(s.len()), "got: {s}");
+            ToolDetail::Summary(summary) => {
+                assert_eq!(summary, expected);
+                assert!(summary.is_char_boundary(summary.len()));
             }
             other => panic!("expected Summary, got: {other:?}"),
         }
@@ -633,42 +630,40 @@ mod tests {
 
     #[test]
     fn read_tool_defaults_missing_offset_and_limit_for_display_range() {
-        let detail = parse_tool_detail(
-            "read_tool",
-            Some(&serde_json::json!({
-                "path": "apps/portal/priv/static/assets/css/app.css",
-                "limit": 300,
-            })),
-            None,
-        );
+        let cases = [
+            (
+                serde_json::json!({
+                    "path": "apps/portal/priv/static/assets/css/app.css",
+                    "limit": 300,
+                }),
+                "apps/portal/priv/static/assets/css/app.css",
+                300,
+            ),
+            (
+                serde_json::json!({ "path": "README.md" }),
+                "README.md",
+                DEFAULT_READ_TOOL_LIMIT,
+            ),
+            (
+                serde_json::json!({ "path": "README.md", "limit": 0 }),
+                "README.md",
+                DEFAULT_READ_TOOL_LIMIT,
+            ),
+        ];
 
-        match detail {
-            ToolDetail::ReadTool {
-                start_line,
-                end_line,
-                ..
-            } => {
-                assert_eq!(start_line, Some(1));
-                assert_eq!(end_line, Some(300));
+        for (semantic_inputs, expected_path, expected_end_line) in cases {
+            match parse_tool_detail("read_tool", Some(&semantic_inputs), None) {
+                ToolDetail::ReadTool {
+                    path,
+                    start_line,
+                    end_line,
+                } => {
+                    assert_eq!(path, expected_path);
+                    assert_eq!(start_line, Some(1));
+                    assert_eq!(end_line, Some(expected_end_line));
+                }
+                other => panic!("expected ReadTool, got: {other:?}"),
             }
-            other => panic!("expected ReadTool, got: {other:?}"),
-        }
-
-        let default_limit = parse_tool_detail(
-            "read_tool",
-            Some(&serde_json::json!({ "path": "README.md" })),
-            None,
-        );
-        match default_limit {
-            ToolDetail::ReadTool {
-                start_line,
-                end_line,
-                ..
-            } => {
-                assert_eq!(start_line, Some(1));
-                assert_eq!(end_line, Some(DEFAULT_READ_TOOL_LIMIT));
-            }
-            other => panic!("expected ReadTool, got: {other:?}"),
         }
     }
 
@@ -712,8 +707,8 @@ mod tests {
         }];
         let result = serde_json::json!({
             "exit_code": 0,
-            "stdout": "out1\nout2\nout3\nout4\nout5\nout6\n",
-            "stderr": "err1\nerr2\n",
+            "stdout": "out1  \n\n out2\nout3\nout4\nout5\nout6\n",
+            "stderr": "\nerr1  \n错误\n",
         })
         .to_string();
 
@@ -726,13 +721,16 @@ mod tests {
             ChatEntry::ToolCall {
                 detail:
                     ToolDetail::Shell {
+                        command,
+                        workdir,
                         output_tail: Some(tail),
-                        ..
                     },
                 ..
             } => {
+                assert_eq!(command, "cargo test");
+                assert_eq!(workdir, &None);
                 assert_eq!(tail.hidden_line_count, 3);
-                assert_eq!(tail.lines, ["out4", "out5", "out6", "err1", "err2"]);
+                assert_eq!(tail.lines, ["out4", "out5", "out6", "err1", "错误"]);
             }
             other => panic!("expected shell tail, got: {other:?}"),
         }
@@ -848,9 +846,20 @@ mod tests {
         ));
         match &messages[0] {
             ChatEntry::ToolCall {
-                detail: ToolDetail::Edit { start_line, .. },
+                detail:
+                    ToolDetail::Edit {
+                        file,
+                        old,
+                        new,
+                        start_line,
+                    },
                 ..
-            } => assert_eq!(*start_line, Some(42)),
+            } => {
+                assert_eq!(file, "src/lib.rs");
+                assert_eq!(old, "before\n");
+                assert_eq!(new, "after\n");
+                assert_eq!(*start_line, Some(42));
+            }
             other => panic!("expected Edit detail, got: {other:?}"),
         }
     }
@@ -883,10 +892,23 @@ mod tests {
         ));
         match &messages[0] {
             ChatEntry::ToolCall {
-                detail: ToolDetail::MultiEdit { sections, .. },
+                detail:
+                    ToolDetail::MultiEdit {
+                        file,
+                        edit_count,
+                        sections,
+                    },
                 ..
             } => {
+                assert_eq!(file, "src/lib.rs");
+                assert_eq!(*edit_count, 2);
+                assert_eq!(sections[0].header, "edit 1");
+                assert_eq!(sections[0].old, "aaa\n");
+                assert_eq!(sections[0].new, "bbb\n");
                 assert_eq!(sections[0].start_line, Some(10));
+                assert_eq!(sections[1].header, "edit 2");
+                assert_eq!(sections[1].old, "ccc\n");
+                assert_eq!(sections[1].new, "ddd\n");
                 assert_eq!(sections[1].start_line, Some(20));
             }
             other => panic!("expected multiedit detail, got: {other:?}"),
@@ -948,30 +970,43 @@ mod tests {
             Some(&serde_json::json!({"todos": [
                 {"content": "done", "status": "completed"},
                 {"content": "next", "status": "pending"},
+                {"content": "working", "status": "in_progress"},
             ]})),
             None,
         );
         assert!(matches!(
             detail,
-            ToolDetail::Summary(summary) if summary == "[x] done\n[ ] next"
+            ToolDetail::Summary(summary) if summary == "[x] done\n[ ] next\n[ ] working"
         ));
+
+        let missing = parse_tool_detail("todowrite", Some(&serde_json::json!({})), None);
+        let empty = parse_tool_detail("todowrite", Some(&serde_json::json!({ "todos": [] })), None);
+        assert!(matches!(missing, ToolDetail::None));
+        assert!(matches!(empty, ToolDetail::None));
     }
 
     #[test]
     fn browse_tool_truncates_utf8_url_on_char_boundary() {
-        let url = "https://example.com/docs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa🔴/page";
+        let url = format!("https://example.test/{}tail", "界".repeat(50));
+        let expected = format!("{}…", url.chars().take(59).collect::<String>());
         let args = serde_json::json!({ "url": url });
 
-        assert_summary_truncates_with_ellipsis("browse", args);
+        assert_eq!(expected.chars().count(), 60);
+        assert_summary_truncates_with_ellipsis("browse", args, &expected);
     }
 
     #[test]
     fn delegate_tool_truncates_utf8_objective_on_char_boundary() {
-        let objective = "Review this objective with multibyte marker aaaaa🔴 done";
-        assert!(!objective.is_char_boundary(50));
-        let args = serde_json::json!({ "objective": objective });
+        let objective = format!("{}tail", "界".repeat(50));
+        let expected_objective = format!("{}…", objective.chars().take(49).collect::<String>());
+        let expected = format!("(coder) {expected_objective}");
+        let args = serde_json::json!({
+            "target_agent_id": "coder",
+            "objective": objective,
+        });
 
-        assert_summary_truncates_with_ellipsis("delegate", args);
+        assert_eq!(expected_objective.chars().count(), 50);
+        assert_summary_truncates_with_ellipsis("delegate", args, &expected);
     }
 
     #[test]
@@ -984,6 +1019,214 @@ mod tests {
             }
             other => panic!("expected Summary, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn structured_tool_inputs_preserve_raw_values_and_visible_diff_headers() {
+        let shell_inputs = serde_json::json!({
+            "command": "printf",
+            "args": ["hello world", "it's", "界", "", 7],
+            "workdir": "/tmp/工作",
+        });
+        match parse_tool_detail("shell", Some(&shell_inputs), Some("/ignored/session")) {
+            ToolDetail::Shell {
+                command,
+                workdir,
+                output_tail,
+            } => {
+                assert_eq!(command, "printf 'hello world' 'it'\\''s' '界' ''");
+                assert_eq!(workdir.as_deref(), Some("/tmp/工作"));
+                assert!(output_tail.is_none());
+            }
+            other => panic!("expected Shell, got: {other:?}"),
+        }
+
+        let write_inputs = serde_json::json!({
+            "path": "/workspace/src/界.rs",
+            "content": "fn 界() {\n    println!(\"ok\");\n}\n",
+        });
+        match parse_tool_detail("write_file", Some(&write_inputs), None) {
+            ToolDetail::WriteFile { path, content } => {
+                assert_eq!(path, "/workspace/src/界.rs");
+                assert_eq!(content, "fn 界() {\n    println!(\"ok\");\n}\n");
+            }
+            other => panic!("expected WriteFile, got: {other:?}"),
+        }
+
+        let edit_inputs = serde_json::json!({
+            "file_path": "/workspace/src/lib.rs",
+            "old_string": "before\n",
+            "new_string": "after\n",
+        });
+        match parse_tool_detail("edit", Some(&edit_inputs), None) {
+            ToolDetail::Edit {
+                file,
+                old,
+                new,
+                start_line,
+            } => {
+                assert_eq!(file, "/workspace/src/lib.rs");
+                assert_eq!(old, "before\n");
+                assert_eq!(new, "after\n");
+                assert_eq!(start_line, None);
+            }
+            other => panic!("expected Edit, got: {other:?}"),
+        }
+
+        let multiedit_inputs = serde_json::json!({
+            "filePath": "/workspace/src/lib.rs",
+            "edits": [
+                { "oldString": "one\n", "newString": "ONE\n", "replaceAll": true },
+                { "old_string": "two\n", "new_string": "TWO\n", "replace_all": false },
+                { "oldString": "missing new value" },
+            ],
+        });
+        match parse_tool_detail("multiedit", Some(&multiedit_inputs), None) {
+            ToolDetail::MultiEdit {
+                file,
+                edit_count,
+                sections,
+            } => {
+                assert_eq!(file, "/workspace/src/lib.rs");
+                assert_eq!(edit_count, 2);
+                assert_eq!(sections.len(), 2);
+                assert_eq!(sections[0].header, "edit 1 (all)");
+                assert_eq!(sections[0].old, "one\n");
+                assert_eq!(sections[0].new, "ONE\n");
+                assert_eq!(sections[0].start_line, None);
+                assert_eq!(sections[1].header, "edit 2");
+                assert_eq!(sections[1].old, "two\n");
+                assert_eq!(sections[1].new, "TWO\n");
+                assert_eq!(sections[1].start_line, None);
+            }
+            other => panic!("expected MultiEdit, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_tool_matrix_pins_current_visible_formatting() {
+        let cases = [
+            (
+                "search_text",
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": "/workspace/project/src",
+                    "include": "*.rs",
+                }),
+                "\"needle\" *.rs",
+            ),
+            (
+                "search_text",
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": "/workspace/project/src/lib.rs",
+                }),
+                "\"needle\" src/lib.rs",
+            ),
+            (
+                "search_text",
+                serde_json::json!({ "pattern": "needle" }),
+                "\"needle\" .",
+            ),
+            (
+                "glob",
+                serde_json::json!({
+                    "pattern": "*.rs",
+                    "path": "/workspace/project/src",
+                }),
+                "*.rs in project/src",
+            ),
+            ("glob", serde_json::json!({ "pattern": "*.md" }), "*.md"),
+            ("ls", serde_json::json!({}), "."),
+            (
+                "index",
+                serde_json::json!({ "path": "/workspace/project/src/main.rs" }),
+                "src/main.rs",
+            ),
+            (
+                "delete_file",
+                serde_json::json!({ "path": "/workspace/project/tmp/out.txt" }),
+                "tmp/out.txt",
+            ),
+            (
+                "browse",
+                serde_json::json!({ "url": "https://example.test/docs" }),
+                "https://example.test/docs",
+            ),
+            (
+                "web_fetch",
+                serde_json::json!({ "url": "https://example.test/api" }),
+                "https://example.test/api",
+            ),
+            (
+                "language_query",
+                serde_json::json!({
+                    "action": "definition",
+                    "uri": "file:///workspace/project/src/lib.rs",
+                }),
+                "definition src/lib.rs",
+            ),
+            (
+                "question",
+                serde_json::json!({ "prompt": "Continue?" }),
+                "asking...",
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({ "patch": "raw patch" }),
+                "patch",
+            ),
+        ];
+
+        for (tool_name, semantic_inputs, expected_visible_summary) in cases {
+            let detail = parse_tool_detail(tool_name, Some(&semantic_inputs), None);
+            assert!(
+                matches!(detail, ToolDetail::Summary(ref summary) if summary == expected_visible_summary),
+                "unexpected summary for {tool_name}: {detail:?}"
+            );
+        }
+
+        assert!(matches!(
+            parse_tool_detail(
+                "unknown_tool",
+                Some(&serde_json::json!({ "raw": true })),
+                None
+            ),
+            ToolDetail::None
+        ));
+        assert!(matches!(
+            parse_tool_detail("shell", None, None),
+            ToolDetail::None
+        ));
+    }
+
+    #[test]
+    fn replace_symbol_single_path_strips_cwd_and_shortens_visible_title() {
+        let semantic_inputs = serde_json::json!({
+            "replacements": [
+                {
+                    "path": "/workspace/project/src/nested/lib.rs",
+                    "symbol": "run",
+                    "newText": "fn run() {}",
+                },
+                {
+                    "path": "/workspace/project/src/nested/lib.rs",
+                    "symbol": "stop",
+                    "newText": "fn stop() {}",
+                },
+            ],
+        });
+
+        let visible_detail = parse_tool_detail(
+            "replace_symbol",
+            Some(&semantic_inputs),
+            Some("/workspace/project"),
+        );
+
+        assert!(matches!(
+            visible_detail,
+            ToolDetail::Summary(summary) if summary == "nested/lib.rs"
+        ));
     }
 
     #[test]
