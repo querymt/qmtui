@@ -11,9 +11,8 @@ use std::{
 };
 
 use crate::{
-    acp_client,
-    acp_state::AcpAppEvent,
-    app::{self, App},
+    acp,
+    app::App,
     application::{self, AppEvent, Effect, RuntimeEvent, TerminalAction},
     command::Command,
     config,
@@ -21,6 +20,7 @@ use crate::{
     diagnostics::LogLevel,
     domain::model::DelegateModelPreference,
     navigation_state::Screen,
+    runtime_events::{ConnectionManagerEvent, ServerChannelMsg},
     server_manager, theme,
 };
 use clap::Parser;
@@ -34,17 +34,7 @@ use terminal::AppTerminal;
 use tokio::sync::mpsc;
 
 #[cfg(test)]
-use crate::{connection_state::ConnState, navigation_state::Popup};
-
-#[derive(Debug)]
-pub(crate) enum ConnectionManagerEvent {
-    State(app::ConnectionEvent),
-}
-
-#[derive(Debug)]
-pub(crate) enum ServerChannelMsg {
-    Acp(AcpAppEvent),
-}
+use crate::{acp_state::AcpAppEvent, connection_state::ConnState, navigation_state::Popup};
 
 pub(super) struct EffectExecutor<'a> {
     cmd_tx: &'a mpsc::UnboundedSender<Command>,
@@ -1827,7 +1817,7 @@ pub async fn run() -> anyhow::Result<()> {
         && cfg.acp.websocket_url.is_none()
         && cfg.acp.transport.unwrap_or_default() != config::AcpTransportMode::WebSocket
         && cfg.acp.auto_start.unwrap_or(true)
-        && acp_client::probe_websocket(&default_acp_ws_url(), Duration::from_millis(250)).await;
+        && acp::probe_websocket(&default_acp_ws_url(), Duration::from_millis(250)).await;
 
     let selection = select_acp_endpoint(&cli, &cfg, default_ws_available);
     if let EndpointSelection::Endpoint {
@@ -1848,7 +1838,7 @@ pub async fn run() -> anyhow::Result<()> {
         if matches!(
             selection,
             EndpointSelection::Endpoint {
-                endpoint: acp_client::AcpEndpoint::Stdio { .. },
+                endpoint: acp::AcpEndpoint::Stdio { .. },
                 ..
             } | EndpointSelection::Endpoint {
                 missing_binary_fallback: true,
@@ -1860,7 +1850,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
     if let EndpointSelection::Endpoint {
         missing_binary_fallback: true,
-        endpoint: acp_client::AcpEndpoint::WebSocket { url },
+        endpoint: acp::AcpEndpoint::WebSocket { url },
         ..
     } = &selection
     {

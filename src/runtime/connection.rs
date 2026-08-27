@@ -1,20 +1,13 @@
-use std::time::Duration;
-
 use tokio::sync::mpsc;
 
 use crate::{
-    acp_client::{self, AcpEndpoint},
+    acp::{self, AcpEndpoint},
     app::ConnectionEvent,
     command::Command,
     server_manager::ServerEvent,
 };
 
 use super::{ConnectionManagerEvent, ServerChannelMsg};
-
-fn reconnect_delay_ms(attempt: u32) -> u64 {
-    let capped = attempt.min(5);
-    250 * (1u64 << capped)
-}
 
 pub(super) async fn connection_manager(
     endpoint: AcpEndpoint,
@@ -27,29 +20,19 @@ pub(super) async fn connection_manager(
     match endpoint {
         AcpEndpoint::Stdio { argv } => {
             let _ = sup_event_tx.send(ServerEvent::Starting);
-            let agent = match agent_client_protocol::AcpAgent::from_args(argv) {
-                Ok(agent) => agent,
-                Err(err) => {
-                    let message = format!("invalid ACP stdio command: {err:?}");
-                    let _ = sup_event_tx.send(ServerEvent::StartFailed {
-                        error: message.clone(),
-                    });
-                    let _ = conn_tx.send(ConnectionManagerEvent::State(
-                        ConnectionEvent::Disconnected { reason: message },
-                    ));
-                    return;
-                }
-            };
-
+            let endpoint = AcpEndpoint::Stdio { argv };
+            if let Err(err) = endpoint.validate() {
+                let message = format!("invalid ACP stdio command: {err:?}");
+                let _ = sup_event_tx.send(ServerEvent::StartFailed {
+                    error: message.clone(),
+                });
+                let _ = conn_tx.send(ConnectionManagerEvent::State(
+                    ConnectionEvent::Disconnected { reason: message },
+                ));
+                return;
+            }
             let _ = sup_event_tx.send(ServerEvent::Started);
-            let result = acp_client::run_stdio_agent(
-                agent,
-                &mut cmd_rx,
-                srv_tx,
-                conn_tx.clone(),
-                launch_cwd,
-            )
-            .await;
+            let result = acp::run(endpoint, &mut cmd_rx, srv_tx, conn_tx.clone(), launch_cwd).await;
 
             match result {
                 Ok(()) => {
@@ -76,18 +59,18 @@ pub(super) async fn connection_manager(
             let mut attempt = 0u32;
             loop {
                 if attempt > 0 {
-                    let delay_ms = reconnect_delay_ms(attempt - 1);
+                    let delay_ms = acp::websocket_retry_delay(attempt - 1).as_millis() as u64;
                     let _ =
                         conn_tx.send(ConnectionManagerEvent::State(ConnectionEvent::Connecting {
                             attempt,
                             delay_ms,
                         }));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(acp::websocket_retry_delay(attempt - 1)).await;
                 }
 
                 let _ = sup_event_tx.send(ServerEvent::Starting);
-                let result = acp_client::run_websocket_agent(
-                    url.clone(),
+                let result = acp::run(
+                    AcpEndpoint::WebSocket { url: url.clone() },
                     &mut cmd_rx,
                     srv_tx.clone(),
                     conn_tx.clone(),
@@ -124,16 +107,36 @@ pub(super) async fn connection_manager(
 
 #[cfg(test)]
 mod tests {
-    use super::reconnect_delay_ms;
+    use super::*;
 
-    #[test]
-    fn reconnect_delay_caps_after_five_steps() {
-        assert_eq!(reconnect_delay_ms(0), 250);
-        assert_eq!(reconnect_delay_ms(1), 500);
-        assert_eq!(reconnect_delay_ms(2), 1000);
-        assert_eq!(reconnect_delay_ms(3), 2000);
-        assert_eq!(reconnect_delay_ms(4), 4000);
-        assert_eq!(reconnect_delay_ms(5), 8000);
-        assert_eq!(reconnect_delay_ms(8), 8000);
+    #[tokio::test]
+    async fn invalid_stdio_command_fails_before_started() {
+        let (srv_tx, _srv_rx) = mpsc::unbounded_channel();
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (sup_tx, mut sup_rx) = mpsc::unbounded_channel();
+
+        connection_manager(
+            AcpEndpoint::Stdio { argv: Vec::new() },
+            srv_tx,
+            cmd_rx,
+            conn_tx,
+            sup_tx,
+            None,
+        )
+        .await;
+
+        assert_eq!(sup_rx.try_recv().expect("starting"), ServerEvent::Starting);
+        assert!(matches!(
+            sup_rx.try_recv().expect("start failed"),
+            ServerEvent::StartFailed { error }
+                if error.starts_with("invalid ACP stdio command: ")
+        ));
+        assert!(sup_rx.try_recv().is_err());
+        assert!(matches!(
+            conn_rx.try_recv().expect("disconnected"),
+            ConnectionManagerEvent::State(ConnectionEvent::Disconnected { reason })
+                if reason.starts_with("invalid ACP stdio command: ")
+        ));
     }
 }
