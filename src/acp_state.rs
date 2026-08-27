@@ -5,11 +5,11 @@ use serde_json::Value;
 use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::command::{Command, SessionListRequest};
-use crate::delegates_state::DelegateLifecycleUpdate;
-use crate::diagnostics::LogLevel;
-use crate::domain::activity::{
-    ActivityState, DelegateChildState, DelegateStatus, DelegationState, DelegationUpdate,
+use crate::delegates_state::{
+    DelegateAction, DelegateChildActivity, DelegateContext, DelegateCoordination, DelegateOutcome,
 };
+use crate::diagnostics::LogLevel;
+use crate::domain::activity::{ActivityState, DelegationUpdate};
 use crate::domain::auth::{AuthProviderEntry, OAuthFlow, OAuthResult};
 use crate::domain::elicitation::ElicitationState;
 use crate::domain::mesh::{
@@ -489,20 +489,18 @@ impl crate::app::App {
                 }
                 vec![]
             }
-            AcpAppEvent::DelegationUpdate(update) => {
-                self.apply_acp_delegation_update(update);
-                vec![]
-            }
+            AcpAppEvent::DelegationUpdate(update) => self.apply_acp_delegation_update(update),
             AcpAppEvent::DelegationReplay {
                 session_id,
                 updates,
             } => {
+                let mut effects = Vec::new();
                 if self.sessions.session_id.as_deref() == Some(session_id.as_str()) {
                     for update in updates {
-                        self.apply_acp_delegation_update(update);
+                        effects.extend(self.apply_acp_delegation_update(update));
                     }
                 }
-                vec![]
+                effects
             }
             AcpAppEvent::Models { models, meta } => {
                 let meta = meta.unwrap_or_default();
@@ -611,12 +609,13 @@ impl crate::app::App {
             match coordination {
                 SessionCoordination::PushChatError(message) => self.push_acp_error(&message),
                 SessionCoordination::ClearDelegateParent => {
-                    self.delegates.parent_session_id = None;
-                    self.delegates.pending_parent_session_id = None;
+                    effects.extend(self.apply_delegate_action(DelegateAction::ClearNewRootParent));
                 }
                 SessionCoordination::SetChatIdle => self.chat.activity = ActivityState::Idle,
                 SessionCoordination::ResolveDelegateParent(discovered_parent) => {
-                    self.delegates.resolve_parent_session_id(discovered_parent);
+                    effects.extend(self.apply_delegate_action(
+                        DelegateAction::ResolveLoadedSessionParent(discovered_parent),
+                    ));
                 }
                 SessionCoordination::ApplyProfileBinding {
                     session_id,
@@ -668,147 +667,97 @@ impl crate::app::App {
         effects
     }
 
+    fn apply_delegate_action(&mut self, action: DelegateAction) -> Vec<Effect> {
+        let context = DelegateContext {
+            active_session_id: self.sessions.session_id.clone(),
+        };
+        let DelegateOutcome {
+            changed: _,
+            coordination,
+            effects,
+        } = self.delegates.reduce(action, context);
+        for coordination in coordination {
+            match coordination {
+                DelegateCoordination::NoteSessionActivity(session_id) => {
+                    self.sessions.note_session_activity(&session_id);
+                }
+                DelegateCoordination::InvalidateCardCache => {
+                    self.render.invalidate_card_cache();
+                }
+            }
+        }
+        effects
+    }
+
     fn reset_active_session_view(&mut self) {
         self.chat.reset_for_session_switch();
         self.render.invalidate_content_cache();
         self.chat.clear_streaming_thinking();
         self.render.invalidate_thinking_cache();
         self.render.invalidate_card_cache();
-        if self.delegates.parent_session_id.is_none() {
-            self.delegates.clear_for_root_session();
-        }
+        let effects = self.apply_delegate_action(DelegateAction::ClearRootSessionState);
+        debug_assert!(effects.is_empty());
         self.composer.reset_for_session_switch();
     }
 
-    fn upsert_provisional_delegate(
+    fn apply_acp_delegation_update(&mut self, update: DelegationUpdate) -> Vec<Effect> {
+        self.apply_delegate_action(DelegateAction::LifecycleUpdate(update))
+    }
+
+    fn apply_acp_delegate_child_update(
         &mut self,
-        tool_call_id: Option<&str>,
-        arguments: Option<&Value>,
-    ) {
-        let Some(tool_call_id) = tool_call_id else {
-            return;
-        };
-        let target_agent_id = arguments
-            .and_then(|value| value.get("target_agent_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let objective = arguments
-            .and_then(|value| value.get("objective"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if self
-            .delegates
-            .upsert_provisional_delegate(tool_call_id, target_agent_id, objective)
-        {
-            self.render.invalidate_card_cache();
-        }
-    }
-
-    fn apply_acp_delegation_update(&mut self, update: DelegationUpdate) {
-        if self.sessions.session_id.as_deref() != Some(update.session_id.as_str()) {
-            return;
-        }
-        let status = match update.state {
-            DelegationState::Requested | DelegationState::Forked => DelegateStatus::InProgress,
-            DelegationState::Completed => DelegateStatus::Completed,
-            DelegationState::Failed => DelegateStatus::Failed,
-            DelegationState::Cancelled => DelegateStatus::Cancelled,
-        };
-        let lifecycle_rank = delegation_state_rank(update.state);
-        if self
-            .delegates
-            .apply_lifecycle_update(DelegateLifecycleUpdate {
-                delegation_id: update.delegation_id,
-                tool_call_id: update.tool_call_id,
-                target_agent_id: update.target_agent_id,
-                objective: update.objective,
-                child_session_id: update.child_session_id,
-                status,
-                lifecycle_rank,
-                requested_at: update.requested_at,
-                finished_at: update.finished_at,
-                updated_at: update.updated_at,
-                result_summary: update.result_summary,
-                error: update.error,
-            })
-        {
-            self.render.invalidate_card_cache();
-        }
-    }
-
-    fn apply_acp_delegate_child_update(&mut self, session_id: &str, update: &AcpSessionUpdate) {
-        let (mut state, mut stats) = self.delegates.child_snapshot(session_id);
-        match update {
-            AcpSessionUpdate::ToolCallStart { .. } => {
-                stats.tool_calls = stats.tool_calls.saturating_add(1);
-                state = DelegateChildState::OtherProgress;
-            }
+        session_id: &str,
+        update: &AcpSessionUpdate,
+    ) -> Vec<Effect> {
+        let activity = match update {
+            AcpSessionUpdate::ToolCallStart { .. } => DelegateChildActivity::ToolCallStarted,
             AcpSessionUpdate::AssistantMessage { message_id, .. } => {
-                if self
-                    .delegates
-                    .record_child_message_id(session_id, message_id.as_deref(), true)
-                {
-                    stats.messages = stats.messages.saturating_add(1);
+                DelegateChildActivity::AssistantMessage {
+                    message_id: message_id.clone(),
                 }
-                state = DelegateChildState::AssistantMessage;
             }
             AcpSessionUpdate::AssistantContentDelta { message_id, .. } => {
-                if self
-                    .delegates
-                    .record_child_message_id(session_id, message_id.as_deref(), false)
-                {
-                    stats.messages = stats.messages.saturating_add(1);
+                DelegateChildActivity::AssistantContent {
+                    message_id: message_id.clone(),
                 }
-                state = DelegateChildState::AssistantMessage;
             }
             AcpSessionUpdate::AssistantThinkingDelta { .. } | AcpSessionUpdate::TurnStarted => {
-                state = DelegateChildState::OtherProgress;
+                DelegateChildActivity::Progress
             }
-            AcpSessionUpdate::UserMessage { .. } => state = DelegateChildState::UserMessage,
+            AcpSessionUpdate::UserMessage { .. } => DelegateChildActivity::UserMessage,
             AcpSessionUpdate::UsageUpdate {
                 used,
                 size,
                 cost_usd,
-            } => {
-                if *used > 0 {
-                    stats.context_tokens = *used;
-                }
-                if *size > 0 {
-                    stats.context_limit = *size;
-                }
-                if let Some(cost) = cost_usd {
-                    stats.cost_usd = *cost;
-                }
-            }
+            } => DelegateChildActivity::Usage {
+                used: *used,
+                size: *size,
+                cost_usd: *cost_usd,
+            },
             AcpSessionUpdate::ElicitationRequested {
                 elicitation_id,
                 message,
                 requested_schema,
                 source,
                 ..
-            } => {
-                state = DelegateChildState::PendingElicitation {
-                    elicitation_id: elicitation_id.clone(),
-                    message: message.clone(),
-                    requested_schema: requested_schema.clone(),
-                    source: source.clone(),
-                };
-            }
+            } => DelegateChildActivity::PendingElicitation {
+                elicitation_id: elicitation_id.clone(),
+                message: message.clone(),
+                requested_schema: requested_schema.clone(),
+                source: source.clone(),
+            },
             AcpSessionUpdate::ToolCallEnd { name, .. } if name == "question" => {
-                state = DelegateChildState::QuestionToolFinished;
+                DelegateChildActivity::QuestionToolFinished
             }
             AcpSessionUpdate::ToolCallEnd { .. }
             | AcpSessionUpdate::TimingUpdate { .. }
             | AcpSessionUpdate::Cancelled
-            | AcpSessionUpdate::Finished { .. } => {}
-        }
-        if self
-            .delegates
-            .apply_child_snapshot(session_id, state, stats)
-        {
-            self.render.invalidate_card_cache();
-        }
+            | AcpSessionUpdate::Finished { .. } => DelegateChildActivity::Unchanged,
+        };
+        self.apply_delegate_action(DelegateAction::InactiveChildActivity {
+            session_id: session_id.to_string(),
+            activity,
+        })
     }
 
     fn apply_acp_session_update(
@@ -818,8 +767,8 @@ impl crate::app::App {
         is_replay: bool,
     ) {
         if self.sessions.session_id.as_deref() != Some(session_id) {
-            self.sessions.note_session_activity(session_id);
-            self.apply_acp_delegate_child_update(session_id, &update);
+            let effects = self.apply_acp_delegate_child_update(session_id, &update);
+            debug_assert!(effects.is_empty());
             return;
         }
         self.sessions.note_session_activity(session_id);
@@ -879,7 +828,12 @@ impl crate::app::App {
                 self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
                 self.finalize_streaming_segment();
                 if name == "delegate" {
-                    self.upsert_provisional_delegate(tool_call_id.as_deref(), arguments.as_ref());
+                    let effects =
+                        self.apply_delegate_action(DelegateAction::ProvisionalToolDelegate {
+                            tool_call_id: tool_call_id.clone(),
+                            arguments: arguments.clone(),
+                        });
+                    debug_assert!(effects.is_empty());
                 }
                 if name != "question" {
                     let cwd = self.current_session_cwd();
@@ -1518,14 +1472,6 @@ fn message_id_matches(left: Option<&String>, right: Option<&String>) -> bool {
     }
 }
 
-fn delegation_state_rank(state: DelegationState) -> u8 {
-    match state {
-        DelegationState::Requested => 1,
-        DelegationState::Forked => 2,
-        DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled => 3,
-    }
-}
-
 fn acp_content_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -1555,7 +1501,8 @@ mod tests {
     use crate::chat_state::ElicitationUiState;
     use crate::composer_state::{FileIndexEntryLite, MentionState};
     use crate::domain::activity::{
-        DelegateEntry, DelegateStats, PendingDelegateToolCall, SessionOp,
+        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, DelegationState,
+        PendingDelegateToolCall, SessionOp,
     };
     use crate::domain::chat::ChatEntry;
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
@@ -1889,13 +1836,14 @@ mod tests {
     #[test]
     fn delegation_snapshots_reconcile_by_tool_id_and_ignore_stale_updates() {
         let mut app = app_with_active_session();
-        app.upsert_provisional_delegate(
-            Some("call-1"),
-            Some(&serde_json::json!({
+        let effects = app.apply_delegate_action(DelegateAction::ProvisionalToolDelegate {
+            tool_call_id: Some("call-1".into()),
+            arguments: Some(serde_json::json!({
                 "target_agent_id": "coder",
                 "objective": "Implement the feature"
             })),
-        );
+        });
+        assert!(effects.is_empty());
 
         app.handle_acp_event(AcpAppEvent::DelegationUpdate(delegation_update(
             DelegationState::Completed,

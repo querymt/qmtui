@@ -275,8 +275,12 @@ mod tests {
         command::SessionListRequest,
         composer_state::FileIndexEntryLite,
         connection_state::ServerState,
+        domain::tool::ToolDetail,
         domain::{
-            activity::{ActivityState, DelegateChildState},
+            activity::{
+                ActivityState, DelegateChildState, DelegateStatus, DelegationState,
+                DelegationUpdate,
+            },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::ChatEntry,
             elicitation::ElicitationState,
@@ -318,6 +322,32 @@ mod tests {
             name: id.into(),
             description: None,
             capabilities: Vec::new(),
+        }
+    }
+
+    fn delegation_update(
+        session_id: &str,
+        state: DelegationState,
+        updated_at: i64,
+    ) -> DelegationUpdate {
+        DelegationUpdate {
+            session_id: session_id.into(),
+            delegation_id: "delegation-1".into(),
+            tool_call_id: Some("delegate-call".into()),
+            state,
+            target_agent_id: "coder".into(),
+            objective: "Implement the feature".into(),
+            child_session_id: (state != DelegationState::Requested).then(|| "child-1".into()),
+            requested_at: 100,
+            forked_at: (state != DelegationState::Requested).then_some(110),
+            finished_at: matches!(
+                state,
+                DelegationState::Completed | DelegationState::Failed | DelegationState::Cancelled
+            )
+            .then_some(120),
+            updated_at,
+            result_summary: (state == DelegationState::Completed).then(|| "done".into()),
+            error: (state == DelegationState::Failed).then(|| "boom".into()),
         }
     }
 
@@ -381,6 +411,197 @@ mod tests {
                 profile_id: "fast".into(),
             })]
         );
+    }
+
+    #[test]
+    fn delegation_lifecycle_acp_route_is_filtered_ranked_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("parent".into());
+        app.render.card_cache.processed_messages = 7;
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
+                "parent",
+                DelegationState::Completed,
+                120,
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.delegates.delegate_entries.len(), 1);
+        assert_eq!(
+            app.delegates.delegate_entries[0].status,
+            DelegateStatus::Completed
+        );
+        assert_eq!(
+            app.delegates.delegation_result_summaries["delegation-1"],
+            "done"
+        );
+
+        app.render.card_cache.processed_messages = 8;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
+                "parent",
+                DelegationState::Forked,
+                120,
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert_eq!(
+            app.delegates.delegate_entries[0].status,
+            DelegateStatus::Completed
+        );
+
+        app.render.card_cache.processed_messages = 9;
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
+                "other-parent",
+                DelegationState::Failed,
+                130,
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(app.delegates.delegate_entries.len(), 1);
+    }
+
+    #[test]
+    fn provisional_delegate_acp_route_reconciles_without_reordering_chat_tool_state() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("parent".into());
+        app.chat.messages.push(ChatEntry::Assistant {
+            content: "before delegate".into(),
+            thinking: None,
+            message_id: Some("assistant-1".into()),
+        });
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "parent".into(),
+                update: crate::acp_state::AcpSessionUpdate::ToolCallStart {
+                    tool_call_id: Some("delegate-call".into()),
+                    name: "delegate".into(),
+                    arguments: Some(serde_json::json!({
+                        "target_agent_id": "coder",
+                        "objective": "Implement the feature"
+                    })),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.delegates.delegate_entries.len(), 1);
+        assert_eq!(
+            app.delegates.delegate_entries[0].delegation_id,
+            "tool:delegate-call"
+        );
+        assert_eq!(app.delegates.pending_delegate_tool_calls.len(), 1);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, .. },
+                ChatEntry::ToolCall {
+                    tool_call_id: Some(tool_call_id),
+                    name,
+                    is_error: false,
+                    detail: ToolDetail::Summary(summary),
+                },
+            ] if content == "before delegate"
+                && tool_call_id == "delegate-call"
+                && name == "delegate"
+                && summary == "(coder) Implement the feature"
+        ));
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
+                "parent",
+                DelegationState::Forked,
+                110,
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.delegates.delegate_entries.len(), 1);
+        let entry = &app.delegates.delegate_entries[0];
+        assert_eq!(entry.delegation_id, "delegation-1");
+        assert_eq!(
+            entry.delegate_tool_call_id.as_deref(),
+            Some("delegate-call")
+        );
+        assert_eq!(entry.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(entry.target_agent_id.as_deref(), Some("coder"));
+        assert_eq!(entry.objective, "Implement the feature");
+        assert!(app.delegates.pending_delegate_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn inactive_child_acp_route_marks_activity_without_mutating_active_chat() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("parent".into());
+        app.chat.messages.push(ChatEntry::Error("preserved".into()));
+        app.chat.streaming_content = "active stream".into();
+        app.chat.activity = ActivityState::Streaming;
+        app.render.card_cache.processed_messages = 6;
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "child-1".into(),
+                update: crate::acp_state::AcpSessionUpdate::AssistantContentDelta {
+                    content: "child content".into(),
+                    message_id: Some("child-message".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("child-1"));
+        assert_eq!(app.render.card_cache.processed_messages, 6);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved"
+        ));
+        assert_eq!(app.chat.streaming_content, "active stream");
+        assert_eq!(app.chat.activity, ActivityState::Streaming);
+        assert_eq!(
+            app.delegates.pending_delegate_child_states["child-1"],
+            DelegateChildState::AssistantMessage
+        );
+        assert_eq!(
+            app.delegates.pending_delegate_child_stats["child-1"].messages,
+            1
+        );
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
+                "parent",
+                DelegationState::Forked,
+                110,
+            ))),
+        );
+        assert!(effects.is_empty());
+        let entry = &app.delegates.delegate_entries[0];
+        assert_eq!(entry.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(entry.stats.messages, 1);
+        assert_eq!(entry.child_state, DelegateChildState::AssistantMessage);
+        assert!(
+            !app.delegates
+                .pending_delegate_child_states
+                .contains_key("child-1")
+        );
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "preserved"
+        ));
+        assert_eq!(app.chat.streaming_content, "active stream");
+        assert_eq!(app.chat.activity, ActivityState::Streaming);
     }
 
     #[test]
