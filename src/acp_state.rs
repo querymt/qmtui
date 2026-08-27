@@ -2223,21 +2223,24 @@ mod tests {
         let mut app = App::new();
         let before = app.diagnostics.logs.len();
 
-        app.handle_acp_event(AcpAppEvent::MeshStatus(MeshStatusInfo {
+        let replies = app.handle_acp_event(AcpAppEvent::MeshStatus(MeshStatusInfo {
             enabled: true,
             known_peer_count: 2,
             ..Default::default()
         }));
 
+        assert!(replies.is_empty());
         assert!(
             app.mesh
                 .mesh_status
                 .as_ref()
                 .is_some_and(|status| { status.enabled && status.known_peer_count == 2 })
         );
-        let log = &app.diagnostics.logs[before];
-        assert_eq!(log.target, "mesh");
-        assert_eq!(log.message, "mesh status: enabled=true, peers=2");
+        let logs = &app.diagnostics.logs[before..];
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, LogLevel::Debug);
+        assert_eq!(logs[0].target, "mesh");
+        assert_eq!(logs[0].message, "mesh status: enabled=true, peers=2");
     }
 
     #[test]
@@ -2249,6 +2252,7 @@ mod tests {
             ..Default::default()
         }];
         app.mesh.remote_session_cursor = 4;
+        let before = app.diagnostics.logs.len();
 
         let replies = app.handle_acp_event(AcpAppEvent::RemoteSessions(RemoteSessionListInfo {
             node_id: "node-1".into(),
@@ -2278,13 +2282,22 @@ mod tests {
             app.sessions.session_remote_cwd("session-1"),
             Some("/remote/repo".into())
         );
+        let location = &app.sessions.remote_session_locations["session-1"];
+        assert_eq!(location.node_id, "node-1");
+        assert_eq!(location.cwd.as_deref(), Some("/remote/repo"));
+        let logs = &app.diagnostics.logs[before..];
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, LogLevel::Info);
+        assert_eq!(logs[0].target, "mesh");
+        assert_eq!(logs[0].message, "remote sessions: 1 for node-1");
     }
 
     #[test]
     fn native_mesh_invite_created_stores_invite_and_opens_invite_view() {
         let mut app = App::new();
+        let before = app.diagnostics.logs.len();
 
-        app.handle_acp_event(AcpAppEvent::MeshInviteCreated(MeshInviteCreatedInfo {
+        let replies = app.handle_acp_event(AcpAppEvent::MeshInviteCreated(MeshInviteCreatedInfo {
             invite_id: "invite-1".into(),
             url: "qmt://mesh/join/token".into(),
             qr_code: Some("QR".into()),
@@ -2293,8 +2306,18 @@ mod tests {
             mesh_name: Some("Team Mesh".into()),
         }));
 
+        assert!(replies.is_empty());
         assert!(matches!(app.navigation.popup, Popup::MeshInviteQr));
         assert_eq!(app.mesh.invite_url(), Some("qmt://mesh/join/token"));
+        assert_eq!(app.diagnostics.status, "mesh invite created");
+        let logs = &app.diagnostics.logs[before..];
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].level, LogLevel::Info);
+        assert_eq!(logs[0].target, "mesh");
+        assert_eq!(logs[0].message, "mesh invite created");
+        assert_eq!(logs[1].level, LogLevel::Info);
+        assert_eq!(logs[1].target, "mesh");
+        assert_eq!(logs[1].message, "mesh invite: qmt://mesh/join/token");
     }
 
     #[test]

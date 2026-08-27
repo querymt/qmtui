@@ -25,7 +25,8 @@ impl App {
         let outcome = self
             .mesh
             .reduce(MeshAction::InviteCreated(invite), MeshContext::default());
-        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
+        let effects = self.apply_mesh_outcome(outcome);
+        debug_assert!(effects.is_empty());
     }
 
     pub fn mesh_invite_form_command(&mut self) -> Option<Command> {
@@ -41,7 +42,8 @@ impl App {
         let outcome = self
             .mesh
             .reduce(MeshAction::Status(status), MeshContext::default());
-        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
+        let effects = self.apply_mesh_outcome(outcome);
+        debug_assert!(effects.is_empty());
     }
 
     pub fn apply_mesh_nodes(&mut self, nodes: MeshNodesInfo) -> Vec<Command> {
@@ -55,7 +57,8 @@ impl App {
         let outcome = self
             .mesh
             .reduce(MeshAction::RemoteSessions(list), MeshContext::default());
-        debug_assert!(self.apply_mesh_outcome(outcome).is_empty());
+        let effects = self.apply_mesh_outcome(outcome);
+        debug_assert!(effects.is_empty());
     }
 
     pub fn apply_remote_session_attached(
