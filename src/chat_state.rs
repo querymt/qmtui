@@ -232,6 +232,16 @@ pub(crate) enum ChatAction {
         thinking: Option<String>,
         message_id: Option<String>,
     },
+    AcpError {
+        message: String,
+    },
+    BackendPromptFailed {
+        local_id: String,
+        message: String,
+    },
+    RuntimePromptDispatchFailed {
+        local_id: String,
+    },
     Cancelled {
         is_replay: bool,
     },
@@ -248,6 +258,16 @@ pub(crate) enum ChatTransition {
     AssistantContentDelta(StreamingDeltaTransition),
     AssistantThinkingDelta(StreamingDeltaTransition),
     AssistantMessage(AssistantMessageTransition),
+    AcpError {
+        error_inserted: bool,
+    },
+    BackendPromptFailed {
+        prompt_rolled_back: bool,
+        error_inserted: bool,
+    },
+    RuntimePromptDispatchFailed {
+        prompt_rolled_back: bool,
+    },
     Cancelled,
     Finished,
 }
@@ -383,6 +403,47 @@ impl ChatState {
                     coordination.push(ChatCoordination::InvalidateCardCache);
                 }
                 (ChatTransition::AssistantMessage(transition), coordination)
+            }
+            ChatAction::AcpError { message } => {
+                self.end_llm_request_span(None);
+                let error_inserted = self.push_error(&message);
+                (
+                    ChatTransition::AcpError { error_inserted },
+                    vec![ChatCoordination::Status {
+                        level: LogLevel::Error,
+                        target: "acp",
+                        message: format!("error: {message}"),
+                    }],
+                )
+            }
+            ChatAction::BackendPromptFailed { local_id, message } => {
+                self.end_llm_request_span(None);
+                let prompt_rolled_back = self.rollback_pending_prompt(&local_id);
+                let error_inserted = self.push_error(&message);
+                (
+                    ChatTransition::BackendPromptFailed {
+                        prompt_rolled_back,
+                        error_inserted,
+                    },
+                    vec![
+                        ChatCoordination::InvalidateCardCache,
+                        ChatCoordination::Status {
+                            level: LogLevel::Error,
+                            target: "acp",
+                            message: format!("error: {message}"),
+                        },
+                    ],
+                )
+            }
+            ChatAction::RuntimePromptDispatchFailed { local_id } => {
+                let prompt_rolled_back = self.rollback_pending_prompt(&local_id);
+                (
+                    ChatTransition::RuntimePromptDispatchFailed { prompt_rolled_back },
+                    prompt_rolled_back
+                        .then_some(ChatCoordination::InvalidateCardCache)
+                        .into_iter()
+                        .collect(),
+                )
             }
             ChatAction::Cancelled { is_replay } => {
                 self.cancel_turn(is_replay);
@@ -2371,6 +2432,172 @@ mod tests {
             ChatEntry::User { message_id: Some(id), .. } if id == &second
         ));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn error_reducer_closes_live_timing_and_types_error_deduplication() {
+        let mut chat = ChatState::new();
+        chat.recent_prompt_text = Some("preserved prompt".into());
+        chat.session_stats.open_llm_request_instant = Some(Instant::now() - Duration::from_secs(2));
+
+        let inserted = chat.reduce(ChatAction::AcpError {
+            message: "connection lost".into(),
+        });
+
+        assert_eq!(
+            inserted,
+            ChatOutcome {
+                transition: ChatTransition::AcpError {
+                    error_inserted: true,
+                },
+                coordination: vec![ChatCoordination::Status {
+                    level: LogLevel::Error,
+                    target: "acp",
+                    message: "error: connection lost".into(),
+                }],
+                effects: Vec::new(),
+            }
+        );
+        assert!(chat.session_stats.open_llm_request_instant.is_none());
+        assert!(chat.session_stats.active_llm_duration >= Duration::from_secs(2));
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::Error(message)] if message == "connection lost"
+        ));
+
+        chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let duplicate = chat.reduce(ChatAction::AcpError {
+            message: "connection lost".into(),
+        });
+        assert_eq!(
+            duplicate.transition,
+            ChatTransition::AcpError {
+                error_inserted: false,
+            }
+        );
+        assert_eq!(duplicate.coordination, inserted.coordination);
+        assert!(duplicate.effects.is_empty());
+        assert!(chat.session_stats.open_llm_request_instant.is_none());
+        assert_eq!(chat.messages.len(), 1);
+    }
+
+    #[test]
+    fn backend_prompt_failure_reducer_preserves_matching_and_dedupe_semantics() {
+        let mut chat = ChatState::new();
+        let failed_id = chat.push_pending_prompt("failed".into());
+        let retained_id = chat.push_pending_prompt("retained".into());
+        chat.recent_prompt_text = Some("preserved prompt".into());
+        chat.session_stats.open_llm_request_instant = Some(Instant::now() - Duration::from_secs(2));
+
+        let failed = chat.reduce(ChatAction::BackendPromptFailed {
+            local_id: failed_id.clone(),
+            message: "backend rejected prompt".into(),
+        });
+
+        assert_eq!(
+            failed,
+            ChatOutcome {
+                transition: ChatTransition::BackendPromptFailed {
+                    prompt_rolled_back: true,
+                    error_inserted: true,
+                },
+                coordination: vec![
+                    ChatCoordination::InvalidateCardCache,
+                    ChatCoordination::Status {
+                        level: LogLevel::Error,
+                        target: "acp",
+                        message: "error: backend rejected prompt".into(),
+                    },
+                ],
+                effects: Vec::new(),
+            }
+        );
+        assert!(chat.session_stats.open_llm_request_instant.is_none());
+        assert!(chat.session_stats.active_llm_duration >= Duration::from_secs(2));
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [
+                ChatEntry::User { text, message_id: Some(message_id) },
+                ChatEntry::Error(message),
+            ] if text == "retained"
+                && message_id == &retained_id
+                && message == "backend rejected prompt"
+        ));
+
+        chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let nonmatching = chat.reduce(ChatAction::BackendPromptFailed {
+            local_id: "missing".into(),
+            message: "backend rejected prompt".into(),
+        });
+        assert_eq!(
+            nonmatching.transition,
+            ChatTransition::BackendPromptFailed {
+                prompt_rolled_back: false,
+                error_inserted: false,
+            }
+        );
+        assert_eq!(nonmatching.coordination, failed.coordination);
+        assert!(nonmatching.effects.is_empty());
+        assert!(chat.session_stats.open_llm_request_instant.is_none());
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
+    }
+
+    #[test]
+    fn runtime_prompt_dispatch_failure_reducer_only_coordinates_matching_rollback() {
+        let mut chat = ChatState::new();
+        let failed_id = chat.push_pending_prompt("failed".into());
+        let retained_id = chat.push_pending_prompt("retained".into());
+        chat.recent_prompt_text = Some("preserved prompt".into());
+        chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let open_timing = chat.session_stats.open_llm_request_instant;
+
+        let failed = chat.reduce(ChatAction::RuntimePromptDispatchFailed {
+            local_id: failed_id,
+        });
+
+        assert_eq!(
+            failed,
+            ChatOutcome {
+                transition: ChatTransition::RuntimePromptDispatchFailed {
+                    prompt_rolled_back: true,
+                },
+                coordination: vec![ChatCoordination::InvalidateCardCache],
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(chat.session_stats.active_llm_duration, Duration::ZERO);
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "retained" && message_id == &retained_id
+        ));
+
+        let nonmatching = chat.reduce(ChatAction::RuntimePromptDispatchFailed {
+            local_id: "missing".into(),
+        });
+        assert_eq!(
+            nonmatching,
+            ChatOutcome {
+                transition: ChatTransition::RuntimePromptDispatchFailed {
+                    prompt_rolled_back: false,
+                },
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(chat.session_stats.active_llm_duration, Duration::ZERO);
+        assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
+        assert!(
+            chat.messages
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::Error(_)))
+        );
     }
 
     #[test]

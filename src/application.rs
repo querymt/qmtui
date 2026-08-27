@@ -4,6 +4,7 @@ use crate::{
     acp_state::AcpAppEvent,
     app::{App, ConnectionEvent},
     auth_state::AuthAction,
+    chat_state::ChatAction,
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
@@ -252,12 +253,13 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             Vec::new()
         }
         RuntimeEvent::CommandFailed { command, message } => {
-            if let Command::Prompt { local_id, .. } = command {
-                app.chat.rollback_pending_prompt(&local_id);
-                app.render.invalidate_card_cache();
-            }
+            let effects = if let Command::Prompt { local_id, .. } = command {
+                app.apply_chat_action(ChatAction::RuntimePromptDispatchFailed { local_id })
+            } else {
+                Vec::new()
+            };
             app.set_status(LogLevel::Error, "command", message);
-            Vec::new()
+            effects
         }
     }
 }
@@ -1261,6 +1263,123 @@ mod tests {
         assert_eq!(diagnostic.level, LogLevel::Debug);
         assert_eq!(diagnostic.target, "activity");
         assert_eq!(diagnostic.message, "finished: EndTurn");
+    }
+
+    #[test]
+    fn chat_acp_error_route_is_unscoped_deduplicated_and_release_safe() {
+        let mut app = App::new();
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.recent_prompt_text = Some("preserved prompt".into());
+        app.chat.messages.push(ChatEntry::Error("preserved".into()));
+        app.chat.session_stats.open_llm_request_instant =
+            Some(Instant::now() - Duration::from_secs(2));
+        app.render.streaming_cache.store(5, Vec::new());
+        app.render.streaming_thinking_cache.store(6, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        app.composer.input = "preserved input".into();
+        app.mesh.mesh_invite_name = "preserved invite".into();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Error {
+                message: "connection lost".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_id.is_none());
+        assert_eq!(app.chat.activity, ActivityState::Streaming);
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.session_stats.active_llm_duration >= Duration::from_secs(2));
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserved prompt")
+        );
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Error(preserved), ChatEntry::Error(inserted)]
+                if preserved == "preserved" && inserted == "connection lost"
+        ));
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(6).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(app.diagnostics.status, "error: connection lost");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "acp");
+        assert_eq!(diagnostics[0].message, "error: connection lost");
+        assert_eq!(app.composer.input, "preserved input");
+        assert_eq!(app.mesh.mesh_invite_name, "preserved invite");
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::Error {
+                message: "connection lost".into(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.messages.len(), 2);
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(app.diagnostics.logs.len(), log_count_before + 1);
+    }
+
+    #[test]
+    fn chat_backend_prompt_failure_route_is_owner_bounded_and_release_safe() {
+        let mut app = App::new();
+        let failed_id = app.chat.push_pending_prompt("failed".into());
+        let retained_id = app.chat.push_pending_prompt("retained".into());
+        app.chat.activity = ActivityState::Thinking;
+        app.chat.recent_prompt_text = Some("preserved prompt".into());
+        app.chat.session_stats.open_llm_request_instant =
+            Some(Instant::now() - Duration::from_secs(2));
+        app.render.streaming_cache.store(8, Vec::new());
+        app.render.streaming_thinking_cache.store(9, Vec::new());
+        app.render.card_cache.processed_messages = 10;
+        app.composer.input = "preserved input".into();
+        app.mesh.mesh_invite_name = "preserved invite".into();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::PromptFailed {
+                local_id: failed_id.clone(),
+                message: "backend rejected prompt".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Thinking);
+        assert!(app.chat.session_stats.open_llm_request_instant.is_none());
+        assert!(app.chat.session_stats.active_llm_duration >= Duration::from_secs(2));
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserved prompt")
+        );
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::User { text, message_id: Some(message_id) },
+                ChatEntry::Error(message),
+            ] if text == "retained"
+                && message_id == &retained_id
+                && message == "backend rejected prompt"
+        ));
+        assert!(app.chat.messages.iter().all(|entry| {
+            !matches!(entry, ChatEntry::User { message_id: Some(id), .. } if id == &failed_id)
+        }));
+        assert!(app.render.streaming_cache.get(8).is_some());
+        assert!(app.render.streaming_thinking_cache.get(9).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "error: backend rejected prompt");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "acp");
+        assert_eq!(diagnostics[0].message, "error: backend rejected prompt");
+        assert_eq!(app.composer.input, "preserved input");
+        assert_eq!(app.mesh.mesh_invite_name, "preserved invite");
     }
 
     #[test]
@@ -2491,7 +2610,13 @@ mod tests {
         let mut app = App::new();
         let failed_id = app.chat.push_pending_prompt("failed".into());
         let retained_id = app.chat.push_pending_prompt("retained".into());
+        app.chat.recent_prompt_text = Some("preserved prompt".into());
+        app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let open_timing = app.chat.session_stats.open_llm_request_instant;
+        app.render.streaming_cache.store(3, Vec::new());
+        app.render.streaming_thinking_cache.store(4, Vec::new());
         app.render.card_cache.processed_messages = 2;
+        let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
             &mut app,
@@ -2511,7 +2636,115 @@ mod tests {
         assert!(app.chat.messages.iter().any(|entry| {
             matches!(entry, ChatEntry::User { message_id: Some(id), .. } if id == &retained_id)
         }));
+        assert!(
+            app.chat
+                .messages
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::Error(_)))
+        );
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserved prompt")
+        );
+        assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
+        assert!(app.render.streaming_cache.get(3).is_some());
+        assert!(app.render.streaming_thinking_cache.get(4).is_some());
         assert_eq!(app.render.card_cache.processed_messages, 0);
         assert_eq!(app.diagnostics.status, "channel closed");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "command");
+        assert_eq!(diagnostics[0].message, "channel closed");
+    }
+
+    #[test]
+    fn unmatched_prompt_command_failure_is_diagnostic_only_and_release_safe() {
+        let mut app = App::new();
+        let retained_id = app.chat.push_pending_prompt("retained".into());
+        app.chat.recent_prompt_text = Some("preserved prompt".into());
+        app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let open_timing = app.chat.session_stats.open_llm_request_instant;
+        app.render.streaming_cache.store(5, Vec::new());
+        app.render.streaming_thinking_cache.store(6, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::CommandFailed {
+                command: Command::Prompt {
+                    prompt: vec![],
+                    local_id: "missing".into(),
+                },
+                message: "unknown prompt failed".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "retained" && message_id == &retained_id
+        ));
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserved prompt")
+        );
+        assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
+        assert!(app.render.streaming_cache.get(5).is_some());
+        assert!(app.render.streaming_thinking_cache.get(6).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(app.diagnostics.status, "unknown prompt failed");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "command");
+        assert_eq!(diagnostics[0].message, "unknown prompt failed");
+    }
+
+    #[test]
+    fn non_prompt_command_failure_is_diagnostic_only_and_release_safe() {
+        let mut app = App::new();
+        let retained_id = app.chat.push_pending_prompt("retained".into());
+        app.chat.recent_prompt_text = Some("preserved prompt".into());
+        app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let open_timing = app.chat.session_stats.open_llm_request_instant;
+        app.render.streaming_cache.store(8, Vec::new());
+        app.render.streaming_thinking_cache.store(9, Vec::new());
+        app.render.card_cache.processed_messages = 10;
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = update(
+            &mut app,
+            AppEvent::Runtime(RuntimeEvent::CommandFailed {
+                command: Command::CancelSession,
+                message: "cancel channel closed".into(),
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "retained" && message_id == &retained_id
+        ));
+        assert_eq!(
+            app.chat.recent_prompt_text.as_deref(),
+            Some("preserved prompt")
+        );
+        assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
+        assert!(app.render.streaming_cache.get(8).is_some());
+        assert!(app.render.streaming_thinking_cache.get(9).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 10);
+        assert_eq!(app.diagnostics.status, "cancel channel closed");
+        let diagnostics = &app.diagnostics.logs[log_count_before..];
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, LogLevel::Error);
+        assert_eq!(diagnostics[0].target, "command");
+        assert_eq!(diagnostics[0].message, "cancel channel closed");
     }
 }

@@ -528,18 +528,10 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::Error { message } => {
-                self.chat.end_llm_request_span(None);
-                self.push_acp_error(&message);
-                self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
-                vec![]
+                self.apply_chat_action(ChatAction::AcpError { message })
             }
             AcpAppEvent::PromptFailed { local_id, message } => {
-                self.chat.end_llm_request_span(None);
-                self.chat.rollback_pending_prompt(&local_id);
-                self.render.invalidate_card_cache();
-                self.push_acp_error(&message);
-                self.set_status(LogLevel::Error, "acp", format!("error: {message}"));
-                vec![]
+                self.apply_chat_action(ChatAction::BackendPromptFailed { local_id, message })
             }
         }
     }
@@ -608,7 +600,9 @@ impl crate::app::App {
         } = self.sessions.reduce(action);
         for coordination in coordination {
             match coordination {
-                SessionCoordination::PushChatError(message) => self.push_acp_error(&message),
+                SessionCoordination::PushChatError(message) => {
+                    self.chat.push_error(&message);
+                }
                 SessionCoordination::ClearDelegateParent => {
                     effects.extend(self.apply_delegate_action(DelegateAction::ClearNewRootParent));
                 }
@@ -719,7 +713,7 @@ impl crate::app::App {
         effects
     }
 
-    fn apply_chat_action(&mut self, action: ChatAction) -> Vec<Effect> {
+    pub(crate) fn apply_chat_action(&mut self, action: ChatAction) -> Vec<Effect> {
         let ChatOutcome {
             transition: _,
             coordination,
@@ -1004,10 +998,6 @@ impl crate::app::App {
 
     fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
         self.chat.push_undoable_user_turn(message_id, text);
-    }
-
-    fn push_acp_error(&mut self, message: &str) {
-        self.chat.push_error(message);
     }
 
     fn handle_acp_elicitation_requested(
