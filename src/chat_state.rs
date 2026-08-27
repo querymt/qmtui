@@ -11,6 +11,7 @@ use crate::domain::session::{
     UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
+use crate::tool_detail;
 
 const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -131,6 +132,63 @@ pub(crate) enum AssistantMessageTransition {
     Appended,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum ChatToolAction {
+    PrepareToolStart {
+        name: String,
+    },
+    InsertOrReconcileToolStart {
+        tool_call_id: Option<String>,
+        name: String,
+        detail: ToolDetail,
+    },
+    ToolCallEnd {
+        tool_call_id: Option<String>,
+        name: String,
+        is_error: bool,
+        result: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolStartPreparationTransition {
+    Suppressed,
+    Prepared { finalized_streaming: bool },
+    QuestionOnly { finalized_streaming: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolStartInsertionTransition {
+    Reconciled,
+    Inserted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolEndTransition {
+    Updated {
+        detail_updated: bool,
+        marked_failed: bool,
+    },
+    FallbackInserted,
+    NoOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolResultDetailState {
+    Shell(Option<(Vec<String>, usize)>),
+    ReadTool(Option<u64>, Option<u64>),
+    Edit(Option<usize>),
+    MultiEdit(Vec<Option<usize>>),
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatToolTransition {
+    StartPrepared(ToolStartPreparationTransition),
+    StartInserted(ToolStartInsertionTransition),
+    Ended(ToolEndTransition),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChatAction {
     TurnStarted {
@@ -190,6 +248,13 @@ pub(crate) enum ChatCoordination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChatOutcome {
     pub(crate) transition: ChatTransition,
+    pub(crate) coordination: Vec<ChatCoordination>,
+    pub(crate) effects: Vec<Effect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatToolOutcome {
+    pub(crate) transition: ChatToolTransition,
     pub(crate) coordination: Vec<ChatCoordination>,
     pub(crate) effects: Vec<Effect>,
 }
@@ -323,6 +388,135 @@ impl ChatState {
             }
         };
         ChatOutcome {
+            transition,
+            coordination,
+            effects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn reduce_tool(&mut self, action: ChatToolAction) -> ChatToolOutcome {
+        let (transition, coordination) = match action {
+            ChatToolAction::PrepareToolStart { name } => {
+                if self.suppress_turn_output {
+                    return ChatToolOutcome {
+                        transition: ChatToolTransition::StartPrepared(
+                            ToolStartPreparationTransition::Suppressed,
+                        ),
+                        coordination: Vec::new(),
+                        effects: Vec::new(),
+                    };
+                }
+
+                self.activity = ActivityState::RunningTool { name: name.clone() };
+                let finalized_streaming = self.finalize_streaming_segment();
+                let mut coordination = vec![ChatCoordination::Status {
+                    level: LogLevel::Debug,
+                    target: "tool",
+                    message: format!("tool: {name}"),
+                }];
+                if finalized_streaming {
+                    coordination.extend([
+                        ChatCoordination::InvalidateContentCache,
+                        ChatCoordination::InvalidateThinkingCache,
+                        ChatCoordination::InvalidateCardCache,
+                    ]);
+                }
+                let preparation = if name == "question" {
+                    ToolStartPreparationTransition::QuestionOnly {
+                        finalized_streaming,
+                    }
+                } else {
+                    ToolStartPreparationTransition::Prepared {
+                        finalized_streaming,
+                    }
+                };
+                (ChatToolTransition::StartPrepared(preparation), coordination)
+            }
+            ChatToolAction::InsertOrReconcileToolStart {
+                tool_call_id,
+                name,
+                detail,
+            } => {
+                if self.reconcile_tool_call_start(tool_call_id.as_deref(), &name, detail.clone()) {
+                    self.clear_streaming_thinking();
+                    (
+                        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled),
+                        vec![
+                            ChatCoordination::InvalidateThinkingCache,
+                            ChatCoordination::InvalidateCardCache,
+                        ],
+                    )
+                } else {
+                    self.record_tool_call();
+                    let moved_thinking = self.push_streaming_thinking_entry();
+                    self.push_tool_call(tool_call_id, name, false, detail);
+                    (
+                        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted),
+                        moved_thinking
+                            .then_some(ChatCoordination::InvalidateThinkingCache)
+                            .into_iter()
+                            .collect(),
+                    )
+                }
+            }
+            ChatToolAction::ToolCallEnd {
+                tool_call_id,
+                name,
+                is_error,
+                result,
+            } => {
+                let detail_before = self
+                    .tool_call_detail(tool_call_id.as_deref())
+                    .map(tool_result_detail_state);
+                let detail_updated = result.as_deref().is_some_and(|result| {
+                    let found = tool_detail::update_tool_detail(
+                        &mut self.messages,
+                        tool_call_id.as_deref(),
+                        result,
+                    );
+                    found
+                        && detail_before.as_ref().is_some_and(|before| {
+                            self.tool_call_detail(tool_call_id.as_deref())
+                                .is_some_and(|after| before != &tool_result_detail_state(after))
+                        })
+                });
+                let failure_before = is_error
+                    .then(|| self.tool_call_error_state(tool_call_id.as_deref(), &name))
+                    .flatten();
+                let marked_failed = if failure_before.is_some() {
+                    self.mark_tool_call_failed(tool_call_id.as_deref(), &name);
+                    failure_before == Some(false)
+                } else {
+                    false
+                };
+                if is_error && failure_before.is_none() {
+                    self.push_tool_call(
+                        tool_call_id,
+                        format!("{name} (failed)"),
+                        true,
+                        result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
+                    );
+                    (
+                        ChatToolTransition::Ended(ToolEndTransition::FallbackInserted),
+                        vec![ChatCoordination::InvalidateCardCache],
+                    )
+                } else if detail_updated || marked_failed {
+                    (
+                        ChatToolTransition::Ended(ToolEndTransition::Updated {
+                            detail_updated,
+                            marked_failed,
+                        }),
+                        vec![ChatCoordination::InvalidateCardCache],
+                    )
+                } else {
+                    (
+                        ChatToolTransition::Ended(ToolEndTransition::NoOp),
+                        Vec::new(),
+                    )
+                }
+            }
+        };
+        ChatToolOutcome {
             transition,
             coordination,
             effects: Vec::new(),
@@ -1127,6 +1321,34 @@ impl ChatState {
         false
     }
 
+    fn tool_call_detail(&self, tool_call_id: Option<&str>) -> Option<&ToolDetail> {
+        let tool_call_id = tool_call_id?;
+        self.messages.iter().rev().find_map(|entry| match entry {
+            ChatEntry::ToolCall {
+                tool_call_id: Some(existing),
+                detail,
+                ..
+            } if existing == tool_call_id => Some(detail),
+            _ => None,
+        })
+    }
+
+    fn tool_call_error_state(&self, tool_call_id: Option<&str>, tool_name: &str) -> Option<bool> {
+        let tool_call_id = tool_call_id?;
+        let fallback_name = format!("{tool_name} (failed)");
+        self.messages.iter().rev().find_map(|entry| match entry {
+            ChatEntry::ToolCall {
+                tool_call_id: Some(existing),
+                name,
+                is_error,
+                ..
+            } if existing == tool_call_id && (name == tool_name || name == &fallback_name) => {
+                Some(*is_error)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn mark_tool_call_failed(
         &mut self,
         tool_call_id: Option<&str>,
@@ -1266,6 +1488,26 @@ impl ChatState {
                 .flatten();
             *outcome = Some(format_outcome_labels(labels));
         }
+    }
+}
+
+fn tool_result_detail_state(detail: &ToolDetail) -> ToolResultDetailState {
+    match detail {
+        ToolDetail::Shell { output_tail, .. } => ToolResultDetailState::Shell(
+            output_tail
+                .as_ref()
+                .map(|tail| (tail.lines.clone(), tail.hidden_line_count)),
+        ),
+        ToolDetail::ReadTool {
+            start_line,
+            end_line,
+            ..
+        } => ToolResultDetailState::ReadTool(*start_line, *end_line),
+        ToolDetail::Edit { start_line, .. } => ToolResultDetailState::Edit(*start_line),
+        ToolDetail::MultiEdit { sections, .. } => ToolResultDetailState::MultiEdit(
+            sections.iter().map(|section| section.start_line).collect(),
+        ),
+        _ => ToolResultDetailState::Unchanged,
     }
 }
 
@@ -1604,6 +1846,336 @@ mod tests {
                 if id == "assistant-1" && call_id == "call-1"
         ));
         assert_eq!(chat.session_stats.total_tool_calls, 1);
+    }
+
+    #[test]
+    fn tool_reducer_suppression_is_a_typed_noop() {
+        let mut chat = ChatState::new();
+        chat.suppress_turn_output = true;
+        chat.activity = ActivityState::Thinking;
+        chat.streaming_content = "preserved".into();
+        chat.streaming_content_message_id = Some("assistant-1".into());
+        chat.session_stats.total_tool_calls = 4;
+
+        let outcome = chat.reduce_tool(ChatToolAction::PrepareToolStart {
+            name: "shell".into(),
+        });
+
+        assert_eq!(
+            outcome,
+            ChatToolOutcome {
+                transition: ChatToolTransition::StartPrepared(
+                    ToolStartPreparationTransition::Suppressed,
+                ),
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(chat.activity, ActivityState::Thinking);
+        assert_eq!(chat.streaming_content, "preserved");
+        assert_eq!(
+            chat.streaming_content_message_id.as_deref(),
+            Some("assistant-1")
+        );
+        assert!(chat.messages.is_empty());
+        assert_eq!(chat.session_stats.total_tool_calls, 4);
+    }
+
+    #[test]
+    fn tool_reducer_prepare_sets_status_and_finalizes_stream_in_exact_order() {
+        let mut chat = ChatState::new();
+        chat.streaming_content = "answer".into();
+        chat.streaming_content_message_id = Some("assistant-1".into());
+        chat.streaming_thinking = "plan".into();
+        chat.streaming_thinking_message_id = Some("assistant-1".into());
+
+        let outcome = chat.reduce_tool(ChatToolAction::PrepareToolStart {
+            name: "shell".into(),
+        });
+
+        assert_eq!(
+            outcome,
+            ChatToolOutcome {
+                transition: ChatToolTransition::StartPrepared(
+                    ToolStartPreparationTransition::Prepared {
+                        finalized_streaming: true,
+                    },
+                ),
+                coordination: vec![
+                    ChatCoordination::Status {
+                        level: LogLevel::Debug,
+                        target: "tool",
+                        message: "tool: shell".into(),
+                    },
+                    ChatCoordination::InvalidateContentCache,
+                    ChatCoordination::InvalidateThinkingCache,
+                    ChatCoordination::InvalidateCardCache,
+                ],
+                effects: Vec::new(),
+            }
+        );
+        assert_eq!(
+            chat.activity,
+            ActivityState::RunningTool {
+                name: "shell".into()
+            }
+        );
+        assert!(chat.streaming_content.is_empty());
+        assert!(chat.streaming_thinking.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
+                if content == "answer" && thinking == "plan" && id == "assistant-1"
+        ));
+    }
+
+    #[test]
+    fn tool_reducer_question_prepare_excludes_card_and_count() {
+        let mut chat = ChatState::new();
+
+        let outcome = chat.reduce_tool(ChatToolAction::PrepareToolStart {
+            name: "question".into(),
+        });
+
+        assert_eq!(
+            outcome.transition,
+            ChatToolTransition::StartPrepared(ToolStartPreparationTransition::QuestionOnly {
+                finalized_streaming: false,
+            })
+        );
+        assert_eq!(
+            outcome.coordination,
+            vec![ChatCoordination::Status {
+                level: LogLevel::Debug,
+                target: "tool",
+                message: "tool: question".into(),
+            }]
+        );
+        assert!(outcome.effects.is_empty());
+        assert_eq!(
+            chat.activity,
+            ActivityState::RunningTool {
+                name: "question".into()
+            }
+        );
+        assert!(chat.messages.is_empty());
+        assert_eq!(chat.session_stats.total_tool_calls, 0);
+    }
+
+    #[test]
+    fn tool_reducer_inserts_after_pending_thinking_and_counts_once() {
+        let mut chat = ChatState::new();
+        chat.streaming_thinking = "inspect".into();
+        chat.streaming_thinking_message_id = Some("assistant-1".into());
+        chat.session_stats.total_tool_calls = 7;
+
+        let outcome = chat.reduce_tool(ChatToolAction::InsertOrReconcileToolStart {
+            tool_call_id: Some("tool-1".into()),
+            name: "read_tool".into(),
+            detail: ToolDetail::ReadTool {
+                path: "src/lib.rs".into(),
+                start_line: Some(1),
+                end_line: Some(5),
+            },
+        });
+
+        assert_eq!(
+            outcome.transition,
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted)
+        );
+        assert_eq!(
+            outcome.coordination,
+            vec![ChatCoordination::InvalidateThinkingCache]
+        );
+        assert!(outcome.effects.is_empty());
+        assert_eq!(chat.session_stats.total_tool_calls, 8);
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [
+                ChatEntry::Thinking { content, message_id: Some(message_id) },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), name, is_error: false, .. },
+            ] if content == "inspect"
+                && message_id == "assistant-1"
+                && tool_call_id == "tool-1"
+                && name == "read_tool"
+        ));
+
+        chat.session_stats.total_tool_calls = u32::MAX;
+        let saturated = chat.reduce_tool(ChatToolAction::InsertOrReconcileToolStart {
+            tool_call_id: None,
+            name: "shell".into(),
+            detail: ToolDetail::None,
+        });
+        assert_eq!(
+            saturated.transition,
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted)
+        );
+        assert_eq!(chat.session_stats.total_tool_calls, u32::MAX);
+    }
+
+    #[test]
+    fn tool_reducer_reconciles_failed_start_without_append_or_count() {
+        let mut chat = ChatState::new();
+        chat.session_stats.total_tool_calls = 7;
+        chat.streaming_thinking = "discard duplicate thinking".into();
+        chat.push_tool_call(
+            Some("tool-1".into()),
+            "shell (failed)".into(),
+            true,
+            ToolDetail::Summary("failed".into()),
+        );
+
+        let outcome = chat.reduce_tool(ChatToolAction::InsertOrReconcileToolStart {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell".into(),
+            detail: ToolDetail::Shell {
+                command: "echo late".into(),
+                workdir: None,
+                output_tail: None,
+            },
+        });
+
+        assert_eq!(
+            outcome.transition,
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled)
+        );
+        assert_eq!(
+            outcome.coordination,
+            vec![
+                ChatCoordination::InvalidateThinkingCache,
+                ChatCoordination::InvalidateCardCache,
+            ]
+        );
+        assert!(outcome.effects.is_empty());
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.session_stats.total_tool_calls, 7);
+        assert!(chat.streaming_thinking.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, .. } }]
+                if id == "tool-1" && name == "shell" && command == "echo late"
+        ));
+    }
+
+    #[test]
+    fn tool_reducer_failed_fallback_dedupes_and_late_start_restores() {
+        let mut chat = ChatState::new();
+        let failed = ChatToolAction::ToolCallEnd {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell".into(),
+            is_error: true,
+            result: Some("failed".into()),
+        };
+
+        let inserted = chat.reduce_tool(failed.clone());
+        assert_eq!(
+            inserted.transition,
+            ChatToolTransition::Ended(ToolEndTransition::FallbackInserted)
+        );
+        assert_eq!(
+            inserted.coordination,
+            vec![ChatCoordination::InvalidateCardCache]
+        );
+        assert!(inserted.effects.is_empty());
+
+        let repeated = chat.reduce_tool(failed);
+        assert_eq!(
+            repeated.transition,
+            ChatToolTransition::Ended(ToolEndTransition::NoOp)
+        );
+        assert!(repeated.coordination.is_empty());
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.session_stats.total_tool_calls, 0);
+
+        let reconciled = chat.reduce_tool(ChatToolAction::InsertOrReconcileToolStart {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell".into(),
+            detail: ToolDetail::Shell {
+                command: "echo late".into(),
+                workdir: None,
+                output_tail: None,
+            },
+        });
+        assert_eq!(
+            reconciled.transition,
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled)
+        );
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.session_stats.total_tool_calls, 0);
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::ToolCall { name, is_error: true, detail: ToolDetail::Shell { command, .. }, .. }]
+                if name == "shell" && command == "echo late"
+        ));
+    }
+
+    #[test]
+    fn tool_reducer_success_before_start_is_a_typed_noop() {
+        let mut chat = ChatState::new();
+
+        let outcome = chat.reduce_tool(ChatToolAction::ToolCallEnd {
+            tool_call_id: Some("missing".into()),
+            name: "shell".into(),
+            is_error: false,
+            result: Some("done".into()),
+        });
+
+        assert_eq!(
+            outcome,
+            ChatToolOutcome {
+                transition: ChatToolTransition::Ended(ToolEndTransition::NoOp),
+                coordination: Vec::new(),
+                effects: Vec::new(),
+            }
+        );
+        assert!(chat.messages.is_empty());
+    }
+
+    #[test]
+    fn tool_reducer_existing_end_updates_detail_then_failure_once() {
+        let mut chat = ChatState::new();
+        chat.push_tool_call(
+            Some("tool-1".into()),
+            "shell".into(),
+            false,
+            ToolDetail::Shell {
+                command: "cargo check".into(),
+                workdir: Some("/repo".into()),
+                output_tail: None,
+            },
+        );
+        let end = ChatToolAction::ToolCallEnd {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell".into(),
+            is_error: true,
+            result: Some("line one\nline two".into()),
+        };
+
+        let updated = chat.reduce_tool(end.clone());
+        assert_eq!(
+            updated.transition,
+            ChatToolTransition::Ended(ToolEndTransition::Updated {
+                detail_updated: true,
+                marked_failed: true,
+            })
+        );
+        assert_eq!(
+            updated.coordination,
+            vec![ChatCoordination::InvalidateCardCache]
+        );
+        assert!(updated.effects.is_empty());
+        assert!(matches!(
+            chat.messages.as_slice(),
+            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output_tail: Some(tail), .. }, .. }]
+                if tail.lines == ["line one", "line two"]
+        ));
+
+        let repeated = chat.reduce_tool(end);
+        assert_eq!(
+            repeated.transition,
+            ChatToolTransition::Ended(ToolEndTransition::NoOp)
+        );
+        assert!(repeated.coordination.is_empty());
     }
 
     #[test]

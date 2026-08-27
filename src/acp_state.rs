@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
-use crate::chat_state::{ChatAction, ChatCoordination, ChatOutcome};
+use crate::chat_state::{
+    ChatAction, ChatCoordination, ChatOutcome, ChatToolAction, ChatToolOutcome, ChatToolTransition,
+    ToolStartPreparationTransition,
+};
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
     DelegateAction, DelegateChildActivity, DelegateContext, DelegateCoordination, DelegateOutcome,
@@ -22,7 +25,6 @@ use crate::domain::profile::{AgentInfo, ProfileInfo};
 use crate::domain::session::{
     ForkResult, RedoResult, SessionListPage, UndoResult, UndoStackSnapshot,
 };
-use crate::domain::tool::ToolDetail;
 use crate::models_state::{ModelAction, ModelContext, ModelCoordination, ModelOutcome};
 use crate::navigation_state::{Popup, Screen};
 use crate::profiles_state::{ProfileAction, ProfileOutcome};
@@ -723,6 +725,24 @@ impl crate::app::App {
             coordination,
             effects,
         } = self.chat.reduce(action);
+        self.apply_chat_coordination(coordination);
+        effects
+    }
+
+    fn apply_chat_tool_action(
+        &mut self,
+        action: ChatToolAction,
+    ) -> (ChatToolTransition, Vec<Effect>) {
+        let ChatToolOutcome {
+            transition,
+            coordination,
+            effects,
+        } = self.chat.reduce_tool(action);
+        self.apply_chat_coordination(coordination);
+        (transition, effects)
+    }
+
+    fn apply_chat_coordination(&mut self, coordination: Vec<ChatCoordination>) {
         for coordination in coordination {
             match coordination {
                 ChatCoordination::InvalidateContentCache => {
@@ -741,7 +761,6 @@ impl crate::app::App {
                 } => self.set_status(level, target, message),
             }
         }
-        effects
     }
 
     fn reset_active_session_view(&mut self) {
@@ -872,40 +891,43 @@ impl crate::app::App {
                 name,
                 arguments,
             } => {
-                if self.chat.suppress_turn_output {
-                    return Vec::new();
+                let (transition, mut effects) =
+                    self.apply_chat_tool_action(ChatToolAction::PrepareToolStart {
+                        name: name.clone(),
+                    });
+                match transition {
+                    ChatToolTransition::StartPrepared(
+                        ToolStartPreparationTransition::Suppressed,
+                    ) => return effects,
+                    ChatToolTransition::StartPrepared(
+                        ToolStartPreparationTransition::QuestionOnly { .. },
+                    ) => return effects,
+                    ChatToolTransition::StartPrepared(
+                        ToolStartPreparationTransition::Prepared { .. },
+                    ) => {}
+                    _ => unreachable!("prepare tool start returned a non-prepare transition"),
                 }
-                self.chat.activity = ActivityState::RunningTool { name: name.clone() };
-                self.set_status(LogLevel::Debug, "tool", format!("tool: {name}"));
-                self.finalize_streaming_segment();
+
                 if name == "delegate" {
-                    let effects =
-                        self.apply_delegate_action(DelegateAction::ProvisionalToolDelegate {
+                    effects.extend(self.apply_delegate_action(
+                        DelegateAction::ProvisionalToolDelegate {
                             tool_call_id: tool_call_id.clone(),
                             arguments: arguments.clone(),
-                        });
-                    debug_assert!(effects.is_empty());
+                        },
+                    ));
                 }
-                if name != "question" {
-                    let cwd = self.current_session_cwd();
-                    let detail =
-                        tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
-                    if self.chat.reconcile_tool_call_start(
-                        tool_call_id.as_deref(),
-                        &name,
-                        detail.clone(),
-                    ) {
-                        self.chat.clear_streaming_thinking();
-                        self.render.invalidate_thinking_cache();
-                        self.render.invalidate_card_cache();
-                        return Vec::new();
-                    }
-                    self.chat.record_tool_call();
-                    if self.chat.push_streaming_thinking_entry() {
-                        self.render.invalidate_thinking_cache();
-                    }
-                    self.chat.push_tool_call(tool_call_id, name, false, detail);
-                }
+
+                let cwd = self.current_session_cwd();
+                let detail =
+                    tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
+                let (_, insertion_effects) =
+                    self.apply_chat_tool_action(ChatToolAction::InsertOrReconcileToolStart {
+                        tool_call_id,
+                        name,
+                        detail,
+                    });
+                effects.extend(insertion_effects);
+                return effects;
             }
             AcpSessionUpdate::ToolCallEnd {
                 tool_call_id,
@@ -913,33 +935,13 @@ impl crate::app::App {
                 is_error,
                 result,
             } => {
-                let mut updated = false;
-                if let Some(result) = result.as_deref() {
-                    updated = tool_detail::update_tool_detail(
-                        &mut self.chat.messages,
-                        tool_call_id.as_deref(),
-                        result,
-                    );
-                }
-                if is_error {
-                    if self
-                        .chat
-                        .mark_tool_call_failed(tool_call_id.as_deref(), &name)
-                    {
-                        updated = true;
-                    } else {
-                        self.chat.push_tool_call(
-                            tool_call_id,
-                            format!("{name} (failed)"),
-                            true,
-                            result.map(ToolDetail::Summary).unwrap_or(ToolDetail::None),
-                        );
-                        updated = true;
-                    }
-                }
-                if updated {
-                    self.render.invalidate_card_cache();
-                }
+                let (_, effects) = self.apply_chat_tool_action(ChatToolAction::ToolCallEnd {
+                    tool_call_id,
+                    name,
+                    is_error,
+                    result,
+                });
+                return effects;
             }
             AcpSessionUpdate::UsageUpdate {
                 used,
@@ -999,15 +1001,6 @@ impl crate::app::App {
             }
         }
         Vec::new()
-    }
-
-    fn finalize_streaming_segment(&mut self) {
-        if self.chat.finalize_streaming_segment() {
-            self.render.invalidate_content_cache();
-            self.chat.clear_streaming_thinking();
-            self.render.invalidate_thinking_cache();
-            self.render.invalidate_card_cache();
-        }
     }
 
     fn push_undoable_user_turn(&mut self, message_id: String, text: String) {
@@ -1524,6 +1517,7 @@ mod tests {
         SessionGroup, SessionListPage, SessionSummary, UndoFrame, UndoFrameStatus, UndoState,
         UndoableTurn,
     };
+    use crate::domain::tool::ToolDetail;
 
     const TEST_SESSION_ID: &str = "session-1";
     const TEST_ASSISTANT_ID: &str = "a1";

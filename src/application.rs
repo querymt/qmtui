@@ -271,6 +271,7 @@ mod tests {
     use super::*;
     use crate::auth_state::AuthUiNotice;
     use crate::{
+        acp_state::AcpSessionUpdate,
         chat_state::ElicitationUiState,
         command::SessionListRequest,
         composer_state::FileIndexEntryLite,
@@ -323,6 +324,17 @@ mod tests {
             description: None,
             capabilities: Vec::new(),
         }
+    }
+
+    fn apply_session_update(app: &mut App, update_value: AcpSessionUpdate) -> Vec<Effect> {
+        update(
+            app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: update_value,
+                is_replay: false,
+            }),
+        )
     }
 
     fn delegation_update(
@@ -473,11 +485,13 @@ mod tests {
     fn provisional_delegate_acp_route_reconciles_without_reordering_chat_tool_state() {
         let mut app = App::new();
         app.sessions.session_id = Some("parent".into());
-        app.chat.messages.push(ChatEntry::Assistant {
-            content: "before delegate".into(),
-            thinking: None,
-            message_id: Some("assistant-1".into()),
-        });
+        app.chat.streaming_content = "before delegate".into();
+        app.chat.streaming_content_message_id = Some("assistant-1".into());
+        app.chat.streaming_thinking = "delegate plan".into();
+        app.chat.streaming_thinking_message_id = Some("assistant-1".into());
+        app.render.streaming_cache.store(15, Vec::new());
+        app.render.streaming_thinking_cache.store(13, Vec::new());
+        app.render.card_cache.processed_messages = 7;
 
         let effects = update(
             &mut app,
@@ -495,6 +509,24 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("parent"));
+        assert_eq!(
+            app.chat.activity,
+            ActivityState::RunningTool {
+                name: "delegate".into()
+            }
+        );
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.render.streaming_cache.get(15).is_none());
+        assert!(app.render.streaming_thinking_cache.get(13).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "tool: delegate");
+        let diagnostic = app.diagnostics.logs.last().expect("delegate tool status");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "tool");
+        assert_eq!(diagnostic.message, "tool: delegate");
         assert_eq!(app.delegates.delegate_entries.len(), 1);
         assert_eq!(
             app.delegates.delegate_entries[0].delegation_id,
@@ -504,7 +536,7 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [
-                ChatEntry::Assistant { content, .. },
+                ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) },
                 ChatEntry::ToolCall {
                     tool_call_id: Some(tool_call_id),
                     name,
@@ -512,6 +544,8 @@ mod tests {
                     detail: ToolDetail::Summary(summary),
                 },
             ] if content == "before delegate"
+                && thinking == "delegate plan"
+                && message_id == "assistant-1"
                 && tool_call_id == "delegate-call"
                 && name == "delegate"
                 && summary == "(coder) Implement the feature"
@@ -537,6 +571,246 @@ mod tests {
         assert_eq!(entry.target_agent_id.as_deref(), Some("coder"));
         assert_eq!(entry.objective, "Implement the feature");
         assert!(app.delegates.pending_delegate_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn chat_tool_start_acp_route_is_owner_bounded_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.chat.suppress_turn_output = true;
+        app.chat.activity = ActivityState::Thinking;
+        app.chat.streaming_content = "preserved while suppressed".into();
+        app.chat.streaming_content_message_id = Some("assistant-suppressed".into());
+        app.render.streaming_cache.store(26, Vec::new());
+        app.render.streaming_thinking_cache.store(9, Vec::new());
+        app.render.card_cache.processed_messages = 8;
+        let status_before = app.diagnostics.status.clone();
+        let log_count_before = app.diagnostics.logs.len();
+
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "cargo check" })),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert_eq!(app.chat.activity, ActivityState::Thinking);
+        assert_eq!(app.chat.streaming_content, "preserved while suppressed");
+        assert!(app.chat.messages.is_empty());
+        assert_eq!(app.chat.session_stats.total_tool_calls, 0);
+        assert_eq!(app.diagnostics.status, status_before);
+        assert_eq!(app.diagnostics.logs.len(), log_count_before);
+        assert!(app.render.streaming_cache.get(26).is_some());
+        assert!(app.render.streaming_thinking_cache.get(9).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 8);
+
+        app.chat.suppress_turn_output = false;
+        app.chat.streaming_thinking = "plan".into();
+        app.chat.streaming_thinking_message_id = Some("assistant-suppressed".into());
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "cargo check" })),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat.activity,
+            ActivityState::RunningTool {
+                name: "shell".into()
+            }
+        );
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
+        assert!(app.chat.streaming_content.is_empty());
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.render.streaming_cache.get(26).is_none());
+        assert!(app.render.streaming_thinking_cache.get(9).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "tool: shell");
+        let diagnostic = app.diagnostics.logs.last().expect("shell tool status");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "tool");
+        assert_eq!(diagnostic.message, "tool: shell");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [
+                ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(message_id) },
+                ChatEntry::ToolCall { tool_call_id: Some(tool_call_id), name, is_error: false, detail: ToolDetail::Shell { command, .. } },
+            ] if content == "preserved while suppressed"
+                && thinking == "plan"
+                && message_id == "assistant-suppressed"
+                && tool_call_id == "shell-1"
+                && name == "shell"
+                && command == "cargo check"
+        ));
+
+        app.render.streaming_cache.store(15, Vec::new());
+        app.render.streaming_thinking_cache.store(16, Vec::new());
+        app.render.card_cache.processed_messages = 9;
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("question-1".into()),
+                name: "question".into(),
+                arguments: Some(serde_json::json!({ "prompt": "Continue?" })),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.chat.activity,
+            ActivityState::RunningTool {
+                name: "question".into()
+            }
+        );
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(app.render.streaming_cache.get(15).is_some());
+        assert!(app.render.streaming_thinking_cache.get(16).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(app.diagnostics.status, "tool: question");
+        let diagnostic = app.diagnostics.logs.last().expect("question tool status");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "tool");
+        assert_eq!(diagnostic.message, "tool: question");
+
+        app.render.streaming_cache.store(17, Vec::new());
+        app.render.streaming_thinking_cache.store(18, Vec::new());
+        app.render.card_cache.processed_messages = 10;
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "ignored duplicate args" })),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.session_stats.total_tool_calls, 1);
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(app.chat.streaming_thinking.is_empty());
+        assert!(app.render.streaming_cache.get(17).is_some());
+        assert!(app.render.streaming_thinking_cache.get(18).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            &app.chat.messages[1],
+            ChatEntry::ToolCall { detail: ToolDetail::Shell { command, .. }, .. }
+                if command == "cargo check"
+        ));
+    }
+
+    #[test]
+    fn chat_tool_end_acp_route_is_idempotent_and_release_safe() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        app.render.streaming_cache.store(11, Vec::new());
+        app.render.streaming_thinking_cache.store(12, Vec::new());
+        app.render.card_cache.processed_messages = 7;
+
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some("successful before start".into()),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(app.sessions.session_activity.contains_key("active"));
+        assert!(app.chat.messages.is_empty());
+        assert!(app.render.streaming_cache.get(11).is_some());
+        assert!(app.render.streaming_thinking_cache.get(12).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 7);
+
+        let failed_end = AcpSessionUpdate::ToolCallEnd {
+            tool_call_id: Some("tool-1".into()),
+            name: "shell".into(),
+            is_error: true,
+            result: Some("failed before start".into()),
+        };
+        let effects = apply_session_update(&mut app, failed_end.clone());
+        assert!(effects.is_empty());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Summary(detail) }]
+                if id == "tool-1" && name == "shell (failed)" && detail == "failed before start"
+        ));
+
+        app.render.card_cache.processed_messages = 8;
+        let effects = apply_session_update(&mut app, failed_end);
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.render.card_cache.processed_messages, 8);
+
+        app.render.streaming_cache.store(13, Vec::new());
+        app.render.streaming_thinking_cache.store(14, Vec::new());
+        app.render.card_cache.processed_messages = 9;
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({ "command": "echo late" })),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.session_stats.total_tool_calls, 0);
+        assert_eq!(app.chat.messages.len(), 1);
+        assert!(app.render.streaming_cache.get(13).is_some());
+        assert!(app.render.streaming_thinking_cache.get(14).is_none());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.diagnostics.status, "tool: shell");
+        let diagnostic = app.diagnostics.logs.last().expect("late shell status");
+        assert_eq!(diagnostic.level, LogLevel::Debug);
+        assert_eq!(diagnostic.target, "tool");
+        assert_eq!(diagnostic.message, "tool: shell");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, output_tail: None, .. } }]
+                if id == "tool-1" && name == "shell" && command == "echo late"
+        ));
+
+        app.render.streaming_cache.store(15, Vec::new());
+        app.render.streaming_thinking_cache.store(16, Vec::new());
+        app.render.card_cache.processed_messages = 10;
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: true,
+                result: Some("line one\nline two".into()),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(app.render.streaming_cache.get(15).is_some());
+        assert!(app.render.streaming_thinking_cache.get(16).is_some());
+        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output_tail: Some(tail), .. }, .. }]
+                if tail.lines == ["line one", "line two"]
+        ));
+
+        app.render.card_cache.processed_messages = 11;
+        let effects = apply_session_update(
+            &mut app,
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: true,
+                result: Some("line one\nline two".into()),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.render.card_cache.processed_messages, 11);
     }
 
     #[test]
