@@ -3,6 +3,7 @@ mod completions;
 mod composer;
 mod elicitation;
 mod header;
+mod history;
 mod screen;
 mod streaming;
 mod tools;
@@ -16,6 +17,7 @@ pub(crate) use elicitation::{
 };
 #[cfg(test)]
 pub(crate) use header::{ICON_DELEGATES, ICON_MULTI_SESSION};
+pub(crate) use history::{ForkPopupInput, draw_fork_turn_popup};
 pub(crate) use screen::{ChatScreenInput, draw_chat, draw_delegate_view};
 #[cfg(test)]
 pub(crate) use streaming::{StreamingRenderInput, build_streaming_card};

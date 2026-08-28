@@ -1,23 +1,21 @@
-mod popups;
-
 use crate::features::auth::view::draw_auth_popup;
 use crate::features::chat::view::{
-    ChatScreenInput, draw_chat as draw_chat_screen, draw_delegate_view as draw_delegate_screen,
+    ChatScreenInput, ForkPopupInput, draw_chat as draw_chat_screen,
+    draw_delegate_view as draw_delegate_screen, draw_fork_turn_popup,
 };
+use crate::features::diagnostics::view::{LogPopupInput, draw_log_popup};
 use crate::features::mesh::view::{
     draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
 };
 use crate::features::models::view::{ModelPopupInput, draw_model_popup};
+use crate::features::navigation::view::{
+    draw_command_palette_popup, draw_help_popup, draw_theme_popup,
+};
 use crate::features::profiles::view::{ProfilePopupInput, draw_profile_popup};
 use crate::features::sessions::view::{
     StartScreenInput, draw_new_session_popup, draw_session_popup, draw_start as draw_start_screen,
     short_cwd,
 };
-use popups::{
-    draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup,
-    draw_theme_popup,
-};
-
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
 pub(crate) use crate::features::chat::view::{
@@ -34,8 +32,6 @@ pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
 pub(crate) use crate::view_shared::{
     SpinnerKind, scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
 };
-#[cfg(test)]
-pub(crate) use popups::{build_theme_list_item, shortcut_sections};
 
 #[cfg(test)]
 use ratatui::text::{Line, Span};
@@ -50,14 +46,10 @@ use crate::theme::Theme;
 #[cfg(test)]
 use crate::view_shared;
 
-// ── Symbols shared across sub-modules ──────────────────────────────────────────
-pub(super) const COLOR_SWATCH: &str = "\u{25A0}"; // ■ black square  – theme palette colour preview
-pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
-pub(super) const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
 
 #[cfg(test)]
-use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE, ELLIPSIS};
+use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE};
 
 fn draw_chat_app(f: &mut Frame, app: &mut App) {
     let effective_cwd = app.current_session_cwd();
@@ -126,7 +118,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     match app.navigation.popup {
-        Popup::CommandPalette => draw_command_palette_popup(f, app),
+        Popup::CommandPalette => draw_command_palette_popup(f, &app.navigation),
         Popup::Mesh => draw_mesh_popup(f, &app.mesh),
         Popup::MeshInvite => draw_mesh_invite_popup(f, &app.mesh),
         Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, &app.mesh),
@@ -141,11 +133,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render)
         }
         Popup::NewSession => draw_new_session_popup(f, &app.sessions),
-        Popup::ThemeSelect => draw_theme_popup(f, app),
-        Popup::Help => draw_help_popup(f, app),
-        Popup::Log => draw_log_popup(f, app),
+        Popup::ThemeSelect => draw_theme_popup(f, &app.navigation),
+        Popup::Help => draw_help_popup(f, &app.navigation),
+        Popup::Log => draw_log_popup(
+            f,
+            LogPopupInput {
+                diagnostics: &app.diagnostics,
+            },
+        ),
         Popup::ProviderAuth => draw_auth_popup(f, &app.auth),
-        Popup::ForkTurnSelect => draw_fork_turn_popup(f, app),
+        Popup::ForkTurnSelect => draw_fork_turn_popup(f, ForkPopupInput { chat: &app.chat }),
         Popup::ProfileSelect => {
             let input = ProfilePopupInput {
                 profiles: &app.profiles,
@@ -174,7 +171,6 @@ mod tests {
     use crate::app::App;
     use crate::auth_state::{AuthPanel, AuthUiNotice};
     use crate::chat_state::ElicitationUiState;
-    use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
         ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
         SessionActivity, SessionOp,
@@ -194,7 +190,6 @@ mod tests {
     };
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
-    use ratatui::widgets::ListItem;
     use serial_test::serial;
     use std::time::{Duration, Instant};
 
@@ -593,100 +588,6 @@ mod tests {
             }
         }
         None
-    }
-
-    #[test]
-    fn fork_popup_table_styles_dim_boundary_cells() {
-        let selected_bg = Theme::selected().bg.expect("selected style must define bg");
-        let dim_style = Theme::status().add_modifier(ratatui::style::Modifier::DIM);
-        let selected_dim_style = ratatui::style::Style::default()
-            .fg(dim_style.fg.unwrap_or_else(Theme::dim))
-            .bg(selected_bg)
-            .add_modifier(ratatui::style::Modifier::DIM);
-
-        assert_eq!(dim_style.fg, Theme::status().fg);
-        assert!(
-            dim_style
-                .add_modifier
-                .contains(ratatui::style::Modifier::DIM)
-        );
-        assert_eq!(selected_dim_style.fg, Theme::status().fg);
-        assert_eq!(selected_dim_style.bg, Some(selected_bg));
-        assert!(
-            selected_dim_style
-                .add_modifier
-                .contains(ratatui::style::Modifier::DIM)
-        );
-    }
-
-    #[test]
-    fn draw_fork_popup_renders_turns_as_table() {
-        let mut app = App::new();
-        app.navigation.screen = Screen::Chat;
-        app.navigation.popup = Popup::ForkTurnSelect;
-        app.chat.messages = vec![
-            ChatEntry::User {
-                text: "alpha prompt".into(),
-                message_id: Some("user-1".into()),
-            },
-            ChatEntry::Assistant {
-                content: "alpha reply".into(),
-                thinking: None,
-                message_id: Some("asst-1".into()),
-            },
-            ChatEntry::User {
-                text: "beta prompt".into(),
-                message_id: Some("user-2".into()),
-            },
-        ];
-
-        let backend = ratatui::backend::TestBackend::new(120, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_fork_turn_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
-
-        assert!(
-            !rendered.contains("#")
-                && !rendered.contains("user message")
-                && !rendered.contains("agent message"),
-            "table headers should not render: {rendered}"
-        );
-        assert!(
-            rendered.contains(ELLIPSIS),
-            "missing ellipsis column: {rendered}"
-        );
-        assert!(
-            rendered.contains("alpha prompt"),
-            "missing user text: {rendered}"
-        );
-        assert!(
-            rendered.contains("alpha reply"),
-            "missing agent text: {rendered}"
-        );
-        assert!(
-            rendered.contains("beta prompt"),
-            "missing user-only text: {rendered}"
-        );
-        let (_, beta_row) = find_buffer_text(&buffer, "beta prompt").expect("missing beta row");
-        let (_, alpha_row) = find_buffer_text(&buffer, "alpha prompt").expect("missing alpha row");
-        assert!(
-            beta_row < alpha_row,
-            "latest forkable turn should render before older turn: {rendered}"
-        );
-        let (_, hint_row) = find_buffer_text(&buffer, "enter fork").expect("missing hint row");
-        assert!(
-            hint_row > alpha_row + 1,
-            "expected a blank row between the last table row and hint: {rendered}"
-        );
-        assert!(
-            buffer_line(&buffer, hint_row - 1).trim().is_empty(),
-            "row before hint should be empty: {rendered}"
-        );
-        assert!(
-            !rendered.contains("asst") && !rendered.contains("user beta prompt"),
-            "old boundary labels should not render: {rendered}"
-        );
     }
 
     #[test]
@@ -2694,62 +2595,6 @@ mod tests {
     }
 
     #[test]
-    fn draw_command_palette_popup_aligns_columns_and_highlights_selection() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::CommandPalette;
-        app.navigation.screen = Screen::Chat;
-        app.navigation.command_palette_filter = "session switcher".into();
-        app.navigation.command_palette_cursor = 0;
-
-        let backend = ratatui::backend::TestBackend::new(100, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| draw_command_palette_popup(f, &app))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-
-        let (title_x, row_y) =
-            find_buffer_text(&buffer, "Session switcher").expect("selected command row missing");
-        let (shortcut_x, shortcut_y) =
-            find_buffer_text(&buffer, "C-x l").expect("selected shortcut missing");
-        let (description_x, description_y) =
-            find_buffer_text(&buffer, "Browse and load sessions").expect("description missing");
-
-        assert_eq!(row_y, shortcut_y);
-        assert_eq!(row_y, description_y);
-        assert!(shortcut_x > title_x);
-        assert!(description_x > shortcut_x);
-        assert!(
-            find_buffer_text(&buffer, "action").is_none(),
-            "table headers should not render"
-        );
-        assert_eq!(buffer[(shortcut_x, row_y)].style().bg, Theme::selected().bg);
-    }
-
-    #[test]
-    fn draw_theme_popup_highlights_hint_keys() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::ThemeSelect;
-
-        let backend = ratatui::backend::TestBackend::new(80, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-
-        let (esc_x, esc_y) = find_buffer_text(&buffer, "esc").expect("esc hint missing");
-        let (cancel_x, cancel_y) =
-            find_buffer_text(&buffer, "cancel").expect("cancel hint missing");
-        let (enter_x, enter_y) = find_buffer_text(&buffer, "enter").expect("enter hint missing");
-        let (apply_x, apply_y) = find_buffer_text(&buffer, "apply").expect("apply hint missing");
-
-        assert_eq!(esc_y, cancel_y);
-        assert_eq!(enter_y, apply_y);
-        assert_eq!(buffer[(esc_x, esc_y)].fg, buffer[(enter_x, enter_y)].fg);
-        assert_ne!(buffer[(esc_x, esc_y)].fg, buffer[(cancel_x, cancel_y)].fg);
-        assert_ne!(buffer[(enter_x, enter_y)].fg, buffer[(apply_x, apply_y)].fg);
-    }
-
-    #[test]
     fn draw_model_popup_shows_current_mode_model_on_short_terminal() {
         let mut app = App::new();
         app.navigation.popup = Popup::ModelSelect;
@@ -2786,103 +2631,6 @@ mod tests {
             rendered.contains("Model 8"),
             "current mode model should be visible when popup opens"
         );
-    }
-
-    #[test]
-    fn draw_theme_popup_truncates_long_labels_with_unicode_ellipsis() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::ThemeSelect;
-        app.navigation.theme_filter = "Penumbra Dark Contrast Plus Plus".into();
-
-        let backend = ratatui::backend::TestBackend::new(40, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains('…'));
-        assert!(!rendered.contains("..."));
-    }
-
-    #[test]
-    fn draw_theme_popup_uses_bounded_width_on_wide_terminal() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::ThemeSelect;
-
-        let backend = ratatui::backend::TestBackend::new(120, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let (theme_x, _) = find_buffer_text(&buffer, "theme").expect("theme title missing");
-
-        assert!(
-            theme_x >= 28,
-            "theme popup should be centered and use a bounded width"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn draw_theme_popup_shows_current_theme_when_opened_on_short_terminal() {
-        crate::theme::Theme::set_by_index(20);
-        crate::theme::Theme::begin_frame();
-
-        let mut app = App::new();
-        app.navigation.popup = Popup::ThemeSelect;
-        app.navigation.theme_cursor = 20;
-
-        let current_label = crate::theme::Theme::available_themes()[20].label;
-        let backend = ratatui::backend::TestBackend::new(80, 10);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(
-            rendered.contains(current_label),
-            "current theme should be visible when popup opens"
-        );
-
-        crate::theme::Theme::set_by_index(0);
-        crate::theme::Theme::begin_frame();
-    }
-
-    #[test]
-    #[serial]
-    fn draw_theme_popup_highlights_current_theme_marker_with_accent() {
-        crate::theme::Theme::set_by_index(20);
-        crate::theme::Theme::begin_frame();
-
-        let mut app = App::new();
-        app.navigation.popup = Popup::ThemeSelect;
-        app.navigation.theme_cursor = 20;
-
-        let current_label = crate::theme::Theme::available_themes()[20].label;
-        let backend = ratatui::backend::TestBackend::new(80, 10);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_theme_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let (label_x, label_y) =
-            find_buffer_text(&buffer, current_label).expect("current theme label missing");
-        let marker_x = label_x.saturating_sub(2);
-
-        assert_eq!(buffer[(marker_x, label_y)].symbol(), "●");
-        assert_eq!(
-            buffer[(marker_x, label_y)].fg,
-            crate::theme::Theme::status_accent().fg.expect("accent fg")
-        );
-        assert_eq!(buffer[(marker_x, label_y)].bg, crate::theme::Theme::bg_hl());
-
-        crate::theme::Theme::set_by_index(0);
-        crate::theme::Theme::begin_frame();
     }
 
     #[test]
@@ -2955,35 +2703,6 @@ mod tests {
             .find(|line| line.contains("Fix live bug"))
             .expect("delegate row");
         assert!(row.contains("awaiting input"));
-    }
-
-    #[test]
-    fn draw_log_popup_shows_filter_level_and_entries() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::Log;
-        app.diagnostics.log_filter = "server".into();
-        app.diagnostics.log_level_filter = LogLevel::Info;
-        app.push_log(LogLevel::Info, "server", "starting local server");
-        app.push_log(LogLevel::Error, "server", "start failed");
-        app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-
-        let backend = ratatui::backend::TestBackend::new(100, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_log_popup(f, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let rendered = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(rendered.contains("logs"));
-        assert!(rendered.contains("level: INFO+"));
-        assert!(rendered.contains("starting local server"));
-        assert!(rendered.contains("start failed"));
-        assert!(rendered.contains("server"));
-        assert!(rendered.contains("esc close"));
-        assert!(rendered.contains("tab level"));
     }
 
     #[test]
@@ -4952,285 +4671,6 @@ mod tests {
         );
         // inner_w = 4 - 4 = 0 → treat as 1 row
         assert_eq!(card.height(4), 3); // top=1, rows=1, bottom=1
-    }
-
-    // ── build_theme_list_item tests ──────────────────────────────────────────
-
-    /// Helper: build a minimal fake palette with all 16 colours set to the
-    /// given value so tests can assert on specific fg colours.
-    fn fake_palette(colors: [u32; 16]) -> crate::themes_gen::Base16Palette {
-        crate::themes_gen::Base16Palette {
-            id: "test-id",
-            label: "Test Theme",
-            colors,
-        }
-    }
-
-    /// The item must carry exactly 16 swatch spans after marker + label + gap.
-    #[test]
-    fn theme_list_item_has_sixteen_swatches() {
-        crate::theme::Theme::begin_frame();
-        let colors = [
-            0xff0000, 0x00ff00, 0x0000ff, 0xffffff, 0x000000, 0x111111, 0x222222, 0x333333,
-            0x444444, 0x555555, 0x666666, 0x777777, 0x888888, 0x999999, 0xaaaaaa, 0xbbbbbb,
-        ];
-        let t = fake_palette(colors);
-        let _item = build_theme_list_item(&t, 0, 99, 80, false);
-        // Extract the underlying Line from the ListItem via Debug round-trip is
-        // not ideal, so we build a second item and count spans via the Line.
-        // We call the function again and introspect the span count indirectly:
-        // marker(1) + label(1) + gap(1) + swatches(16) = 19 spans total.
-        let line = {
-            // build_theme_list_item returns a ListItem whose content is a Text
-            // with one Line. We rebuild it with known inputs so we can count.
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::raw("  ")); // marker
-            spans.push(Span::raw("Test Theme")); // label
-            spans.push(Span::raw(" ")); // gap
-            for &c in &colors {
-                let fg = crate::theme::u32_to_color(c);
-                spans.push(Span::styled(
-                    COLOR_SWATCH,
-                    ratatui::style::Style::default().fg(fg),
-                ));
-            }
-            Line::from(spans)
-        };
-        // 19 spans: 1 marker + 1 label + 1 gap + 16 swatches
-        assert_eq!(line.spans.len(), 19);
-        // Verify the swatch fg colours match the palette entries
-        for (i, &c) in colors.iter().enumerate() {
-            let expected_fg = crate::theme::u32_to_color(c);
-            assert_eq!(
-                line.spans[3 + i].style.fg,
-                Some(expected_fg),
-                "swatch {i} should have correct fg colour"
-            );
-        }
-    }
-
-    /// Each swatch span must contain exactly the `■` character.
-    #[test]
-    fn theme_list_item_swatches_use_block_char() {
-        crate::theme::Theme::begin_frame();
-        let _t = fake_palette([0x123456; 16]);
-        // We test the swatch character via u32_to_color directly and the
-        // constant, since the actual ListItem internals are opaque. The real
-        // guarantee is that build_theme_list_item uses SWATCH = "■" for every
-        // colour span — confirmed by the implementation.  Here we verify the
-        // helper produces a valid Color from the u32.
-        let color = crate::theme::u32_to_color(0x123456);
-        assert_eq!(color, ratatui::style::Color::Rgb(0x12, 0x34, 0x56));
-    }
-
-    /// Marker is `"* "` when orig_idx == current_idx, `"  "` otherwise.
-    #[test]
-    fn theme_list_item_marker_active_vs_inactive() {
-        crate::theme::Theme::begin_frame();
-        let t = fake_palette([0; 16]);
-        // active: orig_idx == current_idx == 3
-        let active = build_theme_list_item(&t, 3, 3, 80, false);
-        // inactive: orig_idx != current_idx
-        let inactive = build_theme_list_item(&t, 5, 3, 80, false);
-
-        // Verify by rebuilding a reference line for each case.
-        let active_marker = "* ";
-        let inactive_marker = "  ";
-
-        // The marker is always the first span content.
-        // We use the same logic as the implementation to verify:
-        let check = |marker: &str, item: ListItem<'static>| {
-            // ListItem::new(Line::from(spans)) — we need to access the text.
-            // Since ListItem's content is not directly inspectable in all
-            // ratatui versions, we confirm via a parallel build:
-            let _ = item; // item was built correctly if it compiles
-            marker.len() // just return length as a proxy assertion value
-        };
-        assert_eq!(check(active_marker, active), 2);
-        assert_eq!(check(inactive_marker, inactive), 2);
-
-        // More meaningful: assert the marker strings themselves are correct
-        // by constructing the expected first span content directly.
-        assert_eq!(active_marker, "* ");
-        assert_eq!(inactive_marker, "  ");
-    }
-
-    /// Label longer than `avail` must be truncated with `…`.
-    #[test]
-    fn theme_list_item_label_truncated_with_ellipsis() {
-        crate::theme::Theme::begin_frame();
-        // list_w = 24: marker(2) + swatches+gap(17) = 19 overhead → avail = 5
-        // label "Very Long Theme Name" (20 chars) must be cut to 4 + "…" = 5 chars
-        let t = crate::themes_gen::Base16Palette {
-            id: "t",
-            label: "Very Long Theme Name",
-            colors: [0; 16],
-        };
-        let list_w = 24usize;
-        // avail = 24 - 2 (marker) - 17 (16 swatches + 1 gap) = 5
-        let avail = list_w.saturating_sub(2 + 17);
-        let expected_label: String = "Very Long Theme Name"
-            .chars()
-            .take(avail.saturating_sub(1))
-            .collect();
-        let expected_display = format!("{expected_label}{ELLIPSIS}");
-        assert_eq!(avail, 5);
-        // take(4) → "Very" + ELLIPSIS = "Very…"  (5 chars, fits in avail=5)
-        assert_eq!(expected_display, "Very\u{2026}");
-
-        // The item must compile and not panic — truncation is exercised.
-        let _item = build_theme_list_item(&t, 0, 99, list_w, false);
-    }
-
-    /// Short label that fits must NOT get an ellipsis.
-    #[test]
-    fn theme_list_item_short_label_no_truncation() {
-        crate::theme::Theme::begin_frame();
-        let t = crate::themes_gen::Base16Palette {
-            id: "t",
-            label: "Hi",
-            colors: [0; 16],
-        };
-        // list_w = 80, avail = 80 - 2 - 17 = 61 — "Hi" (2 chars) fits fine
-        let _item = build_theme_list_item(&t, 0, 99, 80, false);
-        // Just confirm no panic; label is short, no truncation needed.
-        // The label_gap = 61 - 2 = 59, which pads between label and swatches.
-        assert_eq!("Hi".chars().count(), 2);
-    }
-
-    /// u32_to_color converts RGB u32 correctly for all byte boundaries.
-    #[test]
-    fn u32_to_color_correct_rgb_extraction() {
-        use ratatui::style::Color;
-        assert_eq!(crate::theme::u32_to_color(0x000000), Color::Rgb(0, 0, 0));
-        assert_eq!(
-            crate::theme::u32_to_color(0xffffff),
-            Color::Rgb(255, 255, 255)
-        );
-        assert_eq!(crate::theme::u32_to_color(0xff0000), Color::Rgb(255, 0, 0));
-        assert_eq!(crate::theme::u32_to_color(0x00ff00), Color::Rgb(0, 255, 0));
-        assert_eq!(crate::theme::u32_to_color(0x0000ff), Color::Rgb(0, 0, 255));
-        assert_eq!(
-            crate::theme::u32_to_color(0xaabbcc),
-            Color::Rgb(0xaa, 0xbb, 0xcc)
-        );
-    }
-
-    // ── shortcut_sections() tests ─────────────────────────────────────────────
-
-    /// Every section must have at least one row.
-    #[test]
-    fn shortcut_sections_all_sections_nonempty() {
-        for section in shortcut_sections() {
-            assert!(
-                !section.rows.is_empty(),
-                "section '{}' has no rows",
-                section.title
-            );
-        }
-    }
-
-    /// The chat section must contain the 'Ctrl+t' thinking-level cycling entry.
-    #[test]
-    fn shortcut_sections_chat_contains_ctrl_t_thinking_cycle() {
-        let chat = shortcut_sections()
-            .iter()
-            .find(|s| s.title == "chat")
-            .expect("chat section missing");
-        assert!(
-            chat.rows.iter().any(|&(k, _)| k == "Ctrl+t"),
-            "chat section must have a 'Ctrl+t' row for cycling thinking level"
-        );
-    }
-
-    /// The chord section must contain the '?' help entry.
-    #[test]
-    fn shortcut_sections_chord_contains_help_entry() {
-        let chord = shortcut_sections()
-            .iter()
-            .find(|s| s.title.contains("chord"))
-            .expect("chord section missing");
-        assert!(
-            chord.rows.iter().any(|&(k, _)| k == "?"),
-            "chord section must have a '?' row"
-        );
-    }
-
-    #[test]
-    fn shortcut_sections_chord_contains_external_editor_entry() {
-        let chord = shortcut_sections()
-            .iter()
-            .find(|s| s.title.contains("chord"))
-            .expect("chord section missing");
-        assert!(
-            chord
-                .rows
-                .iter()
-                .any(|&(key, desc)| key == "e" && desc == "external editor")
-        );
-    }
-
-    #[test]
-    fn shortcut_sections_chord_contains_logs_entry() {
-        let chord = shortcut_sections()
-            .iter()
-            .find(|s| s.title.contains("chord"))
-            .expect("chord section missing");
-        assert!(
-            chord
-                .rows
-                .iter()
-                .any(|&(key, desc)| key == "l" && desc == "logs popup")
-        );
-    }
-
-    /// Every section title must be unique.
-    #[test]
-    fn shortcut_sections_titles_are_unique() {
-        let titles: Vec<_> = shortcut_sections().iter().map(|s| s.title).collect();
-        let unique: std::collections::HashSet<_> = titles.iter().copied().collect();
-        assert_eq!(titles.len(), unique.len(), "duplicate section titles found");
-    }
-
-    /// No key string within a single section appears more than once.
-    #[test]
-    fn shortcut_sections_no_duplicate_keys_within_section() {
-        for section in shortcut_sections() {
-            let keys: Vec<_> = section.rows.iter().map(|&(k, _)| k).collect();
-            let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
-            assert_eq!(
-                keys.len(),
-                unique.len(),
-                "section '{}' has duplicate key entries",
-                section.title
-            );
-        }
-    }
-
-    /// The global section contains the chord prefix entry.
-    #[test]
-    fn shortcut_sections_global_has_chord_prefix() {
-        let global = shortcut_sections()
-            .iter()
-            .find(|s| s.title == "global")
-            .expect("global section missing");
-        assert!(
-            global.rows.iter().any(|&(_, desc)| desc.contains("chord")),
-            "global section should document the chord prefix"
-        );
-    }
-
-    /// The chat section documents the @ mention shortcut.
-    #[test]
-    fn shortcut_sections_chat_has_mention() {
-        let chat = shortcut_sections()
-            .iter()
-            .find(|s| s.title == "chat")
-            .expect("chat section missing");
-        assert!(
-            chat.rows.iter().any(|&(k, _)| k == "@"),
-            "chat section must document @ mention"
-        );
     }
 
     // ── start-page session list row builder ───────────────────────────────────
