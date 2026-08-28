@@ -3195,6 +3195,42 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn root_router_keeps_session_popup_tab_and_backtab_ahead_of_tab_handlers() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.agent_mode = "build".into();
+        app.sessions.session_filter = "sessions-owner".into();
+        app.sessions.session_cursor = 3;
+        app.delegates.delegate_filter = "delegates-owner".into();
+        app.delegates.delegate_cursor = 4;
+
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),).is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 1);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.session_filter, "sessions-owner");
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.delegates.delegate_filter, "delegates-owner");
+        assert_eq!(app.delegates.delegate_cursor, 4);
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 0);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.session_filter, "sessions-owner");
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.delegates.delegate_filter, "delegates-owner");
+        assert_eq!(app.delegates.delegate_cursor, 4);
+    }
+
+    #[test]
     fn popup_backspace_removes_last_filter_char_and_resets_cursor() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
@@ -3546,7 +3582,7 @@ mod chord_reasoning_effort_tests {
 #[cfg(test)]
 mod reasoning_effort_integration_tests {
     use super::*;
-    use crate::domain::model::ModelEntry;
+    use crate::domain::{model::ModelEntry, profile::AgentInfo};
     use crate::handlers::handle_key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
@@ -3623,6 +3659,60 @@ mod reasoning_effort_integration_tests {
                 .any(|m| matches!(m, Command::SetReasoningEffort { .. })),
             "no effort restore on mode switch: {msgs:?}"
         );
+    }
+
+    #[test]
+    fn root_router_cycles_model_backtab_but_has_no_global_backtab_mode_switch() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::ModelSelect;
+        app.sessions.agent_mode = "build".into();
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.agents = vec![
+            AgentInfo {
+                id: "primary".into(),
+                name: "Primary".into(),
+                description: None,
+                capabilities: Vec::new(),
+            },
+            AgentInfo {
+                id: "coder".into(),
+                name: "Coder".into(),
+                description: None,
+                capabilities: Vec::new(),
+            },
+        ];
+        app.models.model_popup_agent_tab = 0;
+        let expected_delegate_cursor = app.delegate_model_cursor("coder");
+        app.models.model_filter = "clear-on-tab-change".into();
+        app.models.model_cursor = 9;
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::ModelSelect);
+        assert_eq!(app.models.model_popup_agent_tab, 1);
+        assert!(app.models.model_filter.is_empty());
+        assert_eq!(app.models.model_cursor, expected_delegate_cursor);
+        assert_eq!(app.sessions.agent_mode, "build");
+
+        app.navigation.popup = Popup::None;
+        app.models.model_filter = "unchanged-without-popup".into();
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.models.model_popup_agent_tab, 1);
+        assert_eq!(app.models.model_filter, "unchanged-without-popup");
     }
 
     #[test]

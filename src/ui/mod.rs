@@ -347,6 +347,13 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn render_root_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     fn draw_session_popup_for_test(f: &mut Frame, app: &mut App) {
         draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render);
     }
@@ -475,6 +482,144 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    #[test]
+    fn root_draw_dispatches_each_major_screen_to_its_established_renderer() {
+        let mut sessions_app = App::new();
+        sessions_app.navigation.screen = Screen::Sessions;
+        sessions_app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/root-dispatch".into()),
+            sessions: vec![SessionSummary {
+                session_id: "sessions-screen-marker".into(),
+                title: Some("ROOT SESSIONS SCREEN".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let sessions = render_root_buffer(&mut sessions_app, 100, 30);
+        assert!(find_buffer_text(&sessions, "ROOT SESSIONS SCREEN").is_some());
+        assert!(find_buffer_text(&sessions, "+ New Session").is_some());
+
+        let mut chat_app = App::new();
+        chat_app.navigation.screen = Screen::Chat;
+        chat_app.sessions.session_id = Some("chat-root".into());
+        chat_app
+            .chat
+            .messages
+            .push(ChatEntry::Info("ROOT CHAT SCREEN".into()));
+        chat_app.composer.replace_input("ROOT CHAT COMPOSER".into());
+        let chat = render_root_buffer(&mut chat_app, 100, 30);
+        assert!(find_buffer_text(&chat, "ROOT CHAT SCREEN").is_some());
+        assert!(find_buffer_text(&chat, "ROOT CHAT COMPOSER").is_some());
+
+        let mut delegate_app = App::new();
+        delegate_app.navigation.screen = Screen::Delegate;
+        delegate_app.sessions.session_id = Some("child-root".into());
+        delegate_app.delegates.parent_session_id = Some("parent-root".into());
+        delegate_app
+            .chat
+            .messages
+            .push(ChatEntry::Info("ROOT DELEGATE SCREEN".into()));
+        delegate_app
+            .composer
+            .replace_input("ROOT HIDDEN DELEGATE COMPOSER".into());
+        let delegate = render_root_buffer(&mut delegate_app, 100, 30);
+        assert!(find_buffer_text(&delegate, "ROOT DELEGATE SCREEN").is_some());
+        assert!(find_buffer_text(&delegate, "child").is_some());
+        assert!(find_buffer_text(&delegate, "ROOT HIDDEN DELEGATE COMPOSER").is_none());
+    }
+
+    #[test]
+    fn root_draw_dispatches_every_popup_after_drawing_the_base_screen() {
+        for (popup, marker) in [
+            (Popup::CommandPalette, "command palette"),
+            (Popup::Mesh, "no mesh nodes loaded"),
+            (Popup::MeshInvite, "Create Invite"),
+            (Popup::MeshInviteQr, "QR Code Invite"),
+            (Popup::ModelSelect, "select model"),
+            (Popup::SessionSelect, "delegates"),
+            (Popup::NewSession, "new session"),
+            (Popup::ThemeSelect, "theme"),
+            (Popup::Help, "shortcuts"),
+            (Popup::Log, "logs"),
+            (Popup::ProviderAuth, "provider auth"),
+            (Popup::ForkTurnSelect, "Fork Session"),
+            (Popup::ProfileSelect, "No profiles available"),
+        ] {
+            let mut app = App::new();
+            app.navigation.screen = Screen::Chat;
+            app.navigation.popup = popup.clone();
+            app.composer.replace_input("ROOT BASE COMPOSER".into());
+
+            let buffer = render_root_buffer(&mut app, 100, 30);
+
+            assert!(
+                find_buffer_text(&buffer, marker).is_some(),
+                "root draw did not dispatch {popup:?} to marker {marker:?}"
+            );
+            assert!(
+                find_buffer_text(&buffer, "ROOT BASE COMPOSER").is_some(),
+                "root draw did not compose the base screen before {popup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_help_popup_buffer_pins_content_styles_scroll_clipping_and_overlay_order() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.navigation.popup = Popup::Help;
+        app.sessions.session_filter = "UNDERLYING ROOT FILTER".into();
+
+        let top = render_root_buffer(&mut app, 100, 30);
+        let title = find_buffer_text(&top, "shortcuts").expect("help title");
+        let global = find_buffer_text(&top, "global").expect("global section");
+        let key = find_buffer_text(&top, "C-p").expect("global shortcut key");
+        let description = find_buffer_text(&top, "command palette").expect("shortcut description");
+        let hint = find_buffer_text(&top, "scroll  esc close").expect("help hint");
+
+        for position in [title, global] {
+            assert_eq!(
+                top[position].fg,
+                Theme::popup_title().fg.expect("popup title foreground")
+            );
+            assert_eq!(
+                top[position].bg,
+                Theme::popup_title().bg.expect("popup title background")
+            );
+            assert!(
+                top[position]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+        for (position, expected) in [
+            (key, Theme::status()),
+            (description, Theme::popup_bg()),
+            (hint, Theme::status()),
+        ] {
+            assert_eq!(top[position].fg, expected.fg.expect("expected foreground"));
+            assert_eq!(top[position].bg, expected.bg.expect("expected background"));
+        }
+        assert!(find_buffer_text(&top, "cycle mode (build").is_some());
+        assert!(find_buffer_text(&top, "slash commands").is_none());
+        assert!(find_buffer_text(&top, "UNDERLYING ROOT FILTER").is_none());
+
+        app.navigation.help_scroll = 56;
+        let scrolled = render_root_buffer(&mut app, 100, 30);
+        assert!(find_buffer_text(&scrolled, "global").is_none());
+        assert!(find_buffer_text(&scrolled, "command palette").is_none());
+        assert!(find_buffer_text(&scrolled, "slash commands").is_some());
+        assert!(find_buffer_text(&scrolled, "/model [q]").is_some());
+
+        app.navigation.help_scroll = 0;
+        let clipped = render_root_buffer(&mut app, 52, 10);
+        assert!(find_buffer_text(&clipped, "shortcuts").is_some());
+        assert!(find_buffer_text(&clipped, "global").is_some());
+        assert!(find_buffer_text(&clipped, "command palette").is_some());
+        assert!(find_buffer_text(&clipped, "chord  (C-x").is_none());
+        assert!(find_buffer_text(&clipped, "scroll  esc close").is_some());
     }
 
     #[test]

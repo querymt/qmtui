@@ -266,7 +266,7 @@ mod tests {
             },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::{ChatEntry, ElicitationResponseOutcome},
-            elicitation::ElicitationState,
+            elicitation::{ElicitationField, ElicitationFieldKind, ElicitationState},
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             model::DelegateModelPreference,
             profile::{AgentInfo, ProfileInfo},
@@ -469,6 +469,376 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn root_key_precedence_keeps_ctrl_c_ctrl_p_and_armed_chord_above_elicitation() {
+        let text_elicitation = || {
+            ElicitationState::new_for_test(vec![ElicitationField {
+                name: "answer".into(),
+                title: "Answer".into(),
+                description: None,
+                required: true,
+                kind: ElicitationFieldKind::TextInput,
+            }])
+        };
+
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::Help;
+        app.navigation.chord = true;
+        app.chat.elicitation = Some(text_elicitation());
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        app.chat.pending_cancel_confirm_until = Some(Instant::now() + Duration::from_secs(1));
+        app.composer.replace_input("draft".into());
+        app.composer.input_preferred_col = Some(4);
+        app.render.test_seed_composer_input_geometry(24, 2);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+
+        assert!(effects.is_empty());
+        assert!(app.chat.pending_cancel_confirm_until.is_none());
+        assert_eq!(
+            app.diagnostics.status,
+            "question - answer in the panel above input"
+        );
+        assert!(app.composer.input.is_empty());
+        assert_eq!(app.composer.input_cursor, 0);
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert!(app.navigation.chord);
+        assert_eq!(app.navigation.popup, Popup::Help);
+        assert!(app.chat.elicitation.is_some());
+
+        let mut empty_app = App::new();
+        empty_app.navigation.popup = Popup::Help;
+        empty_app.navigation.chord = true;
+        empty_app.chat.elicitation = Some(text_elicitation());
+        empty_app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        assert_eq!(
+            update(
+                &mut empty_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ),
+            vec![Effect::Quit]
+        );
+        assert!(empty_app.navigation.chord);
+        assert_eq!(empty_app.navigation.popup, Popup::Help);
+        assert!(empty_app.chat.elicitation.is_some());
+
+        let mut palette_app = App::new();
+        palette_app.navigation.screen = Screen::Sessions;
+        palette_app.navigation.popup = Popup::Help;
+        palette_app.navigation.chord = true;
+        palette_app.navigation.command_palette_filter = "stale".into();
+        palette_app.navigation.command_palette_cursor = 3;
+        palette_app.chat.elicitation = Some(text_elicitation());
+        palette_app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        palette_app.sessions.session_filter = "sessions-owner".into();
+        palette_app.composer.replace_input("composer-owner".into());
+
+        assert!(
+            update(
+                &mut palette_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        assert_eq!(palette_app.navigation.popup, Popup::CommandPalette);
+        assert!(!palette_app.navigation.chord);
+        assert!(palette_app.navigation.command_palette_filter.is_empty());
+        assert_eq!(palette_app.navigation.command_palette_cursor, 0);
+        assert_eq!(
+            palette_app
+                .chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.text_input.as_str()),
+            Some("")
+        );
+        assert_eq!(palette_app.sessions.session_filter, "sessions-owner");
+        assert_eq!(palette_app.composer.input, "composer-owner");
+
+        let mut chord_app = App::new();
+        chord_app.navigation.screen = Screen::Chat;
+        chord_app.navigation.popup = Popup::Help;
+        chord_app.navigation.chord = true;
+        chord_app.chat.elicitation = Some(text_elicitation());
+        chord_app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        chord_app.composer.replace_input("draft".into());
+
+        assert_eq!(
+            update(
+                &mut chord_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ),
+            vec![Effect::Quit]
+        );
+        assert!(!chord_app.navigation.chord);
+        assert_eq!(chord_app.navigation.popup, Popup::Help);
+        assert_eq!(chord_app.composer.input, "draft");
+        assert_eq!(
+            chord_app
+                .chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.text_input.as_str()),
+            Some("")
+        );
+
+        let mut gated_editor_app = App::new();
+        gated_editor_app.navigation.screen = Screen::Sessions;
+        gated_editor_app.navigation.popup = Popup::Help;
+        gated_editor_app.navigation.chord = true;
+        gated_editor_app.chat.elicitation = Some(text_elicitation());
+        gated_editor_app.chat.elicitation_ui = Some(ElicitationUiState::default());
+        gated_editor_app.sessions.session_filter = "unchanged".into();
+
+        assert!(
+            update(
+                &mut gated_editor_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert!(!gated_editor_app.navigation.chord);
+        assert_eq!(gated_editor_app.navigation.popup, Popup::Help);
+        assert_eq!(gated_editor_app.sessions.session_filter, "unchanged");
+        assert_eq!(
+            gated_editor_app.diagnostics.status,
+            "external editor is only available in chat"
+        );
+        assert_eq!(
+            gated_editor_app
+                .chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.text_input.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn root_key_precedence_keeps_elicitation_above_later_globals_popup_and_screen() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.screen = Screen::Sessions;
+        app.navigation.popup = Popup::Help;
+        app.navigation.help_scroll = 4;
+        app.sessions.agent_mode = "build".into();
+        app.sessions.session_filter = "sessions-owner".into();
+        app.models.reasoning_effort = Some("high".into());
+        app.diagnostics.log_filter = "logs-owner".into();
+        app.composer.replace_input("composer-owner".into());
+        app.chat.pending_cancel_confirm_until = Some(Instant::now() + Duration::from_secs(1));
+        app.chat.elicitation = Some(ElicitationState::new_for_test(vec![ElicitationField {
+            name: "answer".into(),
+            title: "Answer".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::TextInput,
+        }]));
+        app.chat.elicitation_ui = Some(ElicitationUiState::default());
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert!(app.chat.pending_cancel_confirm_until.is_none());
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.text_input.as_str()),
+            Some("z")
+        );
+        assert_eq!(
+            app.chat.elicitation_ui.as_ref().map(|ui| ui.text_cursor),
+            Some(1)
+        );
+
+        for code in [KeyCode::Char('t'), KeyCode::Char('l'), KeyCode::Char('x')] {
+            assert!(
+                update(
+                    &mut app,
+                    AppEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+                )
+                .is_empty()
+            );
+            assert_eq!(app.navigation.popup, Popup::Help);
+            assert!(!app.navigation.chord);
+            assert_eq!(app.models.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(app.diagnostics.log_filter, "logs-owner");
+            assert_eq!(app.sessions.agent_mode, "build");
+            assert_eq!(app.sessions.session_filter, "sessions-owner");
+            assert_eq!(app.composer.input, "composer-owner");
+            assert_eq!(
+                app.chat
+                    .elicitation
+                    .as_ref()
+                    .map(|state| state.text_input.as_str()),
+                Some("z")
+            );
+        }
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::CommandPalette);
+        assert!(!app.navigation.chord);
+        assert_eq!(
+            app.chat
+                .elicitation
+                .as_ref()
+                .map(|state| state.text_input.as_str()),
+            Some("z")
+        );
+    }
+
+    #[test]
+    fn root_key_dispatch_orders_globals_popup_tab_and_active_screen_handlers() {
+        let mut effort_app = App::new();
+        effort_app.connection.conn = ConnState::Connected;
+        effort_app.navigation.popup = Popup::Help;
+        let effects = update(
+            &mut effort_app,
+            AppEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::SetReasoningEffort {
+                reasoning_effort: "low".into(),
+            })]
+        );
+        assert_eq!(effort_app.models.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(effort_app.navigation.popup, Popup::Help);
+
+        let mut log_app = App::new();
+        log_app.navigation.popup = Popup::Help;
+        log_app.diagnostics.log_filter = "stale".into();
+        assert!(
+            update(
+                &mut log_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        assert_eq!(log_app.navigation.popup, Popup::Log);
+        assert!(log_app.diagnostics.log_filter.is_empty());
+
+        let mut chord_app = App::new();
+        chord_app.navigation.popup = Popup::Help;
+        assert!(
+            update(
+                &mut chord_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        assert!(chord_app.navigation.chord);
+        assert_eq!(chord_app.navigation.popup, Popup::Help);
+
+        let mut popup_app = App::new();
+        popup_app.connection.conn = ConnState::Connected;
+        popup_app.navigation.screen = Screen::Chat;
+        popup_app.navigation.popup = Popup::Help;
+        popup_app.sessions.agent_mode = "build".into();
+        popup_app.composer.replace_input("underlying-chat".into());
+        assert!(
+            update(
+                &mut popup_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(popup_app.navigation.popup, Popup::Help);
+        assert_eq!(popup_app.sessions.agent_mode, "build");
+        assert_eq!(popup_app.composer.input, "underlying-chat");
+
+        let mut global_tab_app = App::new();
+        global_tab_app.connection.conn = ConnState::Connected;
+        global_tab_app.sessions.agent_mode = "build".into();
+        assert_eq!(
+            update(
+                &mut global_tab_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ),
+            vec![
+                Effect::Command(Command::SetAgentMode {
+                    mode: "plan".into(),
+                }),
+                Effect::PersistConfig,
+            ]
+        );
+        assert_eq!(global_tab_app.sessions.agent_mode, "plan");
+
+        let mut disconnected_app = App::new();
+        disconnected_app.connection.conn = ConnState::Disconnected;
+        disconnected_app.sessions.agent_mode = "build".into();
+        assert!(
+            update(
+                &mut disconnected_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(disconnected_app.sessions.agent_mode, "build");
+        assert_eq!(
+            disconnected_app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+
+        let mut sessions_app = App::new();
+        sessions_app.navigation.screen = Screen::Sessions;
+        sessions_app.composer.replace_input("chat-owner".into());
+        assert!(
+            update(
+                &mut sessions_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(sessions_app.sessions.session_filter, "s");
+        assert_eq!(sessions_app.composer.input, "chat-owner");
+
+        let mut chat_app = App::new();
+        chat_app.navigation.screen = Screen::Chat;
+        chat_app.sessions.session_filter = "sessions-owner".into();
+        assert!(
+            update(
+                &mut chat_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(chat_app.composer.input, "c");
+        assert_eq!(chat_app.composer.input_cursor, 1);
+        assert_eq!(chat_app.sessions.session_filter, "sessions-owner");
+
+        let mut delegate_app = App::new();
+        delegate_app.navigation.screen = Screen::Delegate;
+        delegate_app.sessions.session_filter = "sessions-owner".into();
+        delegate_app.composer.replace_input("chat-owner".into());
+        delegate_app.render.set_chat_scroll_offset(2);
+        assert!(
+            update(
+                &mut delegate_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(delegate_app.render.chat_scroll_offset(), 3);
+        assert_eq!(delegate_app.sessions.session_filter, "sessions-owner");
+        assert_eq!(delegate_app.composer.input, "chat-owner");
     }
 
     #[test]
