@@ -13,6 +13,7 @@ mod connection_state;
 mod delegates_state;
 mod diagnostics;
 mod domain;
+mod features;
 mod handlers;
 mod highlight;
 mod input_layout;
