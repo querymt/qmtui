@@ -5,7 +5,10 @@ use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
-use crate::features::chat::input::{ElicitationResponseEffect, handle_elicitation_key};
+use crate::features::chat::input::{
+    CompletionResult, ComposerKeyResult, ElicitationResponseEffect, handle_completion_key,
+    handle_composer_key, handle_elicitation_key,
+};
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -1118,11 +1121,13 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     let mut effects = Vec::new();
     match key.code {
         KeyCode::Esc => {
-            if app.composer.mention_state.is_some() || app.composer.slash_state.is_some() {
-                app.composer.mention_state = None;
-                app.composer.slash_state = None;
+            if handle_completion_key(&mut app.composer, key, !input_blocked)
+                == CompletionResult::Dismissed
+            {
                 app.chat.clear_cancel_confirm();
-            } else if app.chat.has_cancellable_activity() {
+                return effects;
+            }
+            if app.chat.has_cancellable_activity() {
                 if app.chat.cancel_confirm_active() {
                     app.chat.clear_cancel_confirm();
                     app.set_status(LogLevel::Warn, "activity", "stopping...");
@@ -1135,10 +1140,11 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             }
         }
         KeyCode::Enter => {
-            if app.composer.slash_state.is_some() {
-                app.composer.accept_selected_slash_completion();
-            }
-            if !app.composer.input.is_empty() && app.composer.input.trim_start().starts_with('/') {
+            let completion = handle_completion_key(&mut app.composer, key, !input_blocked);
+            if completion == CompletionResult::SlashAccepted
+                || (!app.composer.input.is_empty()
+                    && app.composer.input.trim_start().starts_with('/'))
+            {
                 let (result, slash_effects) = try_execute_slash_command(app);
                 effects.extend(slash_effects);
                 match result {
@@ -1152,8 +1158,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                     SlashResult::NotACommand => {}
                 }
             }
-            if app.composer.mention_state.is_some() && app.composer.accept_selected_mention() {
-                if app.composer.prepare_file_index_request() {
+            if let CompletionResult::MentionAccepted { request_file_index } = completion {
+                if request_file_index {
                     effects.push(Effect::Command(Command::GetFileIndex));
                 }
                 return effects;
@@ -1182,60 +1188,37 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             }
         }
         KeyCode::Tab if !input_blocked => {
-            if app.composer.slash_state.is_some() {
-                app.composer.accept_selected_slash_completion();
-            } else if app.composer.mention_state.is_some()
-                && app.composer.accept_selected_mention()
-                && app.composer.prepare_file_index_request()
+            if let CompletionResult::MentionAccepted { request_file_index } =
+                handle_completion_key(&mut app.composer, key, true)
+                && request_file_index
             {
                 effects.push(Effect::Command(Command::GetFileIndex));
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
-            app.composer.input_insert(c);
-            if app.composer.prepare_file_index_request() {
-                effects.push(Effect::Command(Command::GetFileIndex));
-            }
+        KeyCode::Char(_)
+            if handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked)
+                == ComposerKeyResult::Edited
+                && app.composer.prepare_file_index_request() =>
+        {
+            effects.push(Effect::Command(Command::GetFileIndex));
         }
-        KeyCode::Up => {
-            if input_blocked {
-                return effects;
-            }
-            if app.composer.slash_state.is_some() {
-                app.composer.move_slash_selection(-1);
-            } else if app.composer.mention_state.is_some() {
-                app.composer.move_mention_selection(-1);
-            } else {
-                let line_width = app.render.composer_input_line_width();
-                app.composer.input_up_visual(line_width, 2);
-            }
-        }
-        KeyCode::Down => {
-            if input_blocked {
-                return effects;
-            }
-            if app.composer.slash_state.is_some() {
-                app.composer.move_slash_selection(1);
-            } else if app.composer.mention_state.is_some() {
-                app.composer.move_mention_selection(1);
-            } else {
-                let line_width = app.render.composer_input_line_width();
-                app.composer.input_down_visual(line_width, 2);
-            }
+        KeyCode::Up | KeyCode::Down
+            if !input_blocked
+                && handle_completion_key(&mut app.composer, key, true)
+                    == CompletionResult::NoOp =>
+        {
+            handle_composer_key(&mut app.composer, &mut app.render, key, true);
         }
         KeyCode::PageUp => app.render.scroll_chat_up(10),
         KeyCode::PageDown => app.render.scroll_chat_down(10),
-        KeyCode::Backspace if !input_blocked => app.composer.input_backspace(),
-        KeyCode::Delete if !input_blocked => app.composer.input_delete(),
-        KeyCode::Left if !input_blocked => app.composer.input_left(),
-        KeyCode::Right if !input_blocked => app.composer.input_right(),
-        KeyCode::Home if !input_blocked => app.composer.input_home(),
-        KeyCode::End => {
-            if input_blocked || app.composer.input.is_empty() {
-                app.render.scroll_chat_to_bottom();
-            } else {
-                app.composer.input_end();
-            }
+        KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right | KeyCode::Home => {
+            handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked);
+        }
+        KeyCode::End
+            if handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked)
+                == ComposerKeyResult::NotHandled =>
+        {
+            app.render.scroll_chat_to_bottom();
         }
         _ => {}
     }
