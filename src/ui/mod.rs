@@ -1463,6 +1463,56 @@ mod tests {
                     end_line: Some(9),
                 },
             },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "glob".into(),
+                is_error: false,
+                detail: ToolDetail::Glob {
+                    pattern: "*.rs".into(),
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "ls".into(),
+                is_error: false,
+                detail: ToolDetail::List {
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "delete_file".into(),
+                is_error: false,
+                detail: ToolDetail::DeleteFile {
+                    path: "tmp/out.txt".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "language_query".into(),
+                is_error: false,
+                detail: ToolDetail::LanguageQuery {
+                    action: "definition".into(),
+                    uri: "src/lib.rs".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "question".into(),
+                is_error: false,
+                detail: ToolDetail::Question {
+                    prompt: "Which option?".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "apply_patch".into(),
+                is_error: false,
+                detail: ToolDetail::ApplyPatch {
+                    patch: "*** Begin Patch\n*** End Patch".into(),
+                },
+            },
         ]);
 
         let cards = build_message_cards(&mut app);
@@ -1489,15 +1539,25 @@ mod tests {
                 "  language: rust",
                 "  symbols: 3",
                 "> read_tool src/lib.rs:7-9",
+                "> glob *.rs in project/src",
+                "> ls project/src",
+                "> delete_file tmp/out.txt",
+                "> language_query definition src/lib.rs",
+                "> question asking...",
+                "> apply_patch patch",
             ]
         );
+        assert_eq!(cards[0].kind, CardKind::Tool { compact: false });
         assert_eq!(lines[1].spans[1].style.fg, Theme::diff_file().fg);
         assert_eq!(lines[3].spans[0].style.fg, Theme::diff_file().fg);
         assert_eq!(lines[5].spans[1].style.fg, Theme::diff_file().fg);
         assert_eq!(lines[6].spans[0].style.fg, Theme::tool_output().fg);
         assert_eq!(lines[8].spans[3].style.fg, Theme::status_accent().fg);
+        for line in &lines[9..=14] {
+            assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        }
         drop(lines);
-        assert_eq!(cards[0].height(20), 13, "narrow Unicode rows must wrap");
+        assert_eq!(cards[0].height(20), 25, "narrow Unicode rows must wrap");
     }
 
     #[test]
