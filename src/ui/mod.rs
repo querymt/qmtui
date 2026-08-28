@@ -1,16 +1,17 @@
 mod popups;
-mod start;
 
 use crate::features::chat::view::{
     ChatScreenInput, draw_chat as draw_chat_screen, draw_delegate_view as draw_delegate_screen,
 };
+use crate::features::sessions::view::{
+    StartScreenInput, draw_new_session_popup, draw_session_popup, draw_start as draw_start_screen,
+    short_cwd,
+};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
     draw_log_popup, draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
-    draw_model_popup, draw_new_session_popup, draw_profile_popup, draw_session_popup,
-    draw_theme_popup,
+    draw_model_popup, draw_profile_popup, draw_theme_popup,
 };
-use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
@@ -19,22 +20,21 @@ pub(crate) use crate::features::chat::view::{
     build_message_cards_for_width_at, build_streaming_card_for_test,
 };
 #[cfg(test)]
+pub(crate) use crate::features::sessions::view::{StartPageRow, build_start_page_rows};
+#[cfg(test)]
 pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
 #[cfg(test)]
 pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
 #[cfg(test)]
-pub(crate) use crate::view_shared::{SpinnerKind, spinner};
-#[cfg(test)]
-pub(crate) use popups::{
-    build_theme_list_item, scroll_input, scroll_input_chars, shortcut_sections,
-    truncate_with_ellipsis,
+pub(crate) use crate::view_shared::{
+    SpinnerKind, scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
 };
 #[cfg(test)]
-pub(crate) use start::build_start_page_rows;
+pub(crate) use popups::{build_theme_list_item, shortcut_sections};
 
 #[cfg(test)]
-use ratatui::text::Line;
-use ratatui::{Frame, layout::Rect, text::Span, widgets::Block};
+use ratatui::text::{Line, Span};
+use ratatui::{Frame, widgets::Block};
 
 use crate::app::App;
 #[cfg(test)]
@@ -42,111 +42,21 @@ use crate::connection_state::ConnState;
 use crate::navigation_state::{Popup, Screen};
 use crate::render_state::ThemeCacheKey;
 use crate::theme::Theme;
+#[cfg(test)]
 use crate::view_shared;
 
 // ── Symbols shared across sub-modules ──────────────────────────────────────────
 pub(super) const COLOR_SWATCH: &str = "\u{25A0}"; // ■ black square  – theme palette colour preview
-pub(crate) const ELLIPSIS: &str = "\u{2026}"; // … horizontal ellipsis – truncation marker
 pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 pub(super) const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
 
 #[cfg(test)]
-use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE};
-
-/// Parse an ISO 8601 timestamp and return a human-readable relative time.
-pub(super) fn relative_time(iso: &str) -> String {
-    // parse "2026-03-21T14:30:00Z" or "2026-03-21T14:30:00.000Z" etc.
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // strip fractional seconds and parse manually
-    let cleaned = iso.replace('T', " ").replace('Z', "");
-    // try to extract year/month/day/hour/min/sec
-    let parts: Vec<&str> = cleaned.split(&['-', ' ', ':', '.'][..]).collect();
-    if parts.len() < 6 {
-        return iso.to_string();
-    }
-    let Ok(year) = parts[0].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(month) = parts[1].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(day) = parts[2].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(hour) = parts[3].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(min) = parts[4].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(sec) = parts[5].parse::<i64>() else {
-        return iso.to_string();
-    };
-
-    // rough epoch calculation (not accounting for leap years perfectly, good enough)
-    let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut total_days: i64 = 0;
-    for y in 1970..year {
-        total_days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
-        } else {
-            365
-        };
-    }
-    for m in 1..month {
-        total_days += days_in_month[m as usize] as i64;
-        if m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            total_days += 1;
-        }
-    }
-    total_days += day - 1;
-    let ts = total_days * 86400 + hour * 3600 + min * 60 + sec;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let diff = now - ts;
-    if diff < 0 {
-        return "just now".into();
-    }
-
-    let secs = diff;
-    if secs < 60 {
-        return "just now".into();
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m ago");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
-    let days = hours / 24;
-    if days < 7 {
-        return format!("{days}d ago");
-    }
-    let weeks = days / 7;
-    if weeks < 5 {
-        return format!("{weeks}w ago");
-    }
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months}mo ago");
-    }
-    let years = days / 365;
-    format!("{years}y ago")
-}
+use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE, ELLIPSIS};
 
 fn draw_chat_app(f: &mut Frame, app: &mut App) {
     let effective_cwd = app.current_session_cwd();
-    let cwd_label = effective_cwd
-        .as_deref()
-        .map(|cwd| start::short_cwd(cwd, 20));
+    let cwd_label = effective_cwd.as_deref().map(|cwd| short_cwd(cwd, 20));
     let input = ChatScreenInput {
         chat: &app.chat,
         composer: &app.composer,
@@ -164,11 +74,21 @@ fn draw_chat_app(f: &mut Frame, app: &mut App) {
     draw_chat_screen(f, input, &mut app.render);
 }
 
+fn draw_start_app(f: &mut Frame, app: &mut App) {
+    let active_profile_label = app.profiles.active_profile_label();
+    let input = StartScreenInput {
+        sessions: &app.sessions,
+        active_profile_label: &active_profile_label,
+        mesh_node_count: app.mesh.mesh_node_count,
+        chord: app.navigation.chord,
+        connection: app.connection.conn,
+    };
+    draw_start_screen(f, input, &mut app.render);
+}
+
 fn draw_delegate_app(f: &mut Frame, app: &mut App) {
     let effective_cwd = app.current_session_cwd();
-    let cwd_label = effective_cwd
-        .as_deref()
-        .map(|cwd| start::short_cwd(cwd, 20));
+    let cwd_label = effective_cwd.as_deref().map(|cwd| short_cwd(cwd, 20));
     let input = ChatScreenInput {
         chat: &app.chat,
         composer: &app.composer,
@@ -195,7 +115,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Block::default().style(Theme::base()), area);
 
     match app.navigation.screen {
-        Screen::Sessions => draw_start(f, app),
+        Screen::Sessions => draw_start_app(f, app),
         Screen::Chat => draw_chat_app(f, app),
         Screen::Delegate => draw_delegate_app(f, app),
     }
@@ -209,7 +129,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::SessionSelect => {
             draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render)
         }
-        Popup::NewSession => draw_new_session_popup(f, app),
+        Popup::NewSession => draw_new_session_popup(f, &app.sessions),
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
         Popup::Log => draw_log_popup(f, app),
@@ -223,27 +143,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 #[cfg(test)]
 fn conn_indicator(app: &App) -> Span<'static> {
     view_shared::connection_indicator(app.connection.conn)
-}
-
-pub(crate) fn mesh_header_span(app: &App) -> Option<Span<'static>> {
-    view_shared::mesh_header_span(app.mesh.mesh_node_count)
-}
-
-fn draw_header(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    left: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
-) {
-    view_shared::draw_header(
-        f,
-        area,
-        left,
-        right,
-        app.navigation.chord,
-        app.connection.conn,
-    );
 }
 
 #[cfg(test)]
@@ -2939,7 +2838,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_new_session_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_new_session_popup(f, &app.sessions))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -5294,7 +5195,7 @@ mod tests {
         }
     }
 
-    fn row_text(row: &super::start::StartPageRow) -> String {
+    fn row_text(row: &StartPageRow) -> String {
         row.line
             .spans
             .iter()

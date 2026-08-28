@@ -5,16 +5,24 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use crate::app::App;
+use crate::connection_state::ConnState;
+use crate::render_state::RenderState;
 use crate::session_state::{SessionsState, StartPageItem, session_group_count_text};
 use crate::theme::Theme;
-
-use super::{ELLIPSIS, draw_header, mesh_header_span, relative_time};
+use crate::view_shared::{ELLIPSIS, draw_header, mesh_header_span};
 
 // ── Start-page session list ────────────────────────────────────────────────────
 
 pub(super) const COLLAPSE_OPEN: &str = "\u{25BE}"; // ▾ expanded group
 pub(super) const COLLAPSE_CLOSED: &str = "\u{25B8}"; // ▸ collapsed group
+
+pub(crate) struct StartScreenInput<'a> {
+    pub(crate) sessions: &'a SessionsState,
+    pub(crate) active_profile_label: &'a str,
+    pub(crate) mesh_node_count: Option<u32>,
+    pub(crate) chord: bool,
+    pub(crate) connection: ConnState,
+}
 
 /// A single rendered row for the start-page session list.
 ///
@@ -26,6 +34,94 @@ pub(crate) struct StartPageRow {
     pub(crate) line: Line<'static>,
     /// True when `session_cursor` points at this row.
     pub(crate) selected: bool,
+}
+
+/// Parse an ISO 8601 timestamp and return a human-readable relative time.
+pub(super) fn relative_time(iso: &str) -> String {
+    // parse "2026-03-21T14:30:00Z" or "2026-03-21T14:30:00.000Z" etc.
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // strip fractional seconds and parse manually
+    let cleaned = iso.replace('T', " ").replace('Z', "");
+    // try to extract year/month/day/hour/min/sec
+    let parts: Vec<&str> = cleaned.split(&['-', ' ', ':', '.'][..]).collect();
+    if parts.len() < 6 {
+        return iso.to_string();
+    }
+    let Ok(year) = parts[0].parse::<i64>() else {
+        return iso.to_string();
+    };
+    let Ok(month) = parts[1].parse::<i64>() else {
+        return iso.to_string();
+    };
+    let Ok(day) = parts[2].parse::<i64>() else {
+        return iso.to_string();
+    };
+    let Ok(hour) = parts[3].parse::<i64>() else {
+        return iso.to_string();
+    };
+    let Ok(min) = parts[4].parse::<i64>() else {
+        return iso.to_string();
+    };
+    let Ok(sec) = parts[5].parse::<i64>() else {
+        return iso.to_string();
+    };
+
+    // rough epoch calculation (not accounting for leap years perfectly, good enough)
+    let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        total_days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+    }
+    for m in 1..month {
+        total_days += days_in_month[m as usize] as i64;
+        if m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            total_days += 1;
+        }
+    }
+    total_days += day - 1;
+    let ts = total_days * 86400 + hour * 3600 + min * 60 + sec;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let diff = now - ts;
+    if diff < 0 {
+        return "just now".into();
+    }
+
+    let secs = diff;
+    if secs < 60 {
+        return "just now".into();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d ago");
+    }
+    let weeks = days / 7;
+    if weeks < 5 {
+        return format!("{weeks}w ago");
+    }
+    let months = days / 30;
+    if months < 12 {
+        return format!("{months}mo ago");
+    }
+    let years = days / 365;
+    format!("{years}y ago")
 }
 
 /// Build the displayable rows for the start-page session list.
@@ -154,7 +250,7 @@ pub(crate) fn build_start_page_rows(
 }
 
 /// Shorten a path to fit within `max_chars` by keeping the last N components.
-pub(super) fn short_cwd(path: &str, max_chars: usize) -> String {
+pub(crate) fn short_cwd(path: &str, max_chars: usize) -> String {
     if path.chars().count() <= max_chars {
         return path.to_string();
     }
@@ -172,7 +268,7 @@ pub(super) fn short_cwd(path: &str, max_chars: usize) -> String {
     format!("{t}{ELLIPSIS}")
 }
 
-pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
+pub(crate) fn draw_start(f: &mut Frame, input: StartScreenInput<'_>, render: &mut RenderState) {
     let area = f.area();
 
     // Minimum height to show the ASCII art: art (6 rows) + 2 padding = 8.
@@ -194,20 +290,22 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         .split(area);
 
     // ── header ────────────────────────────────────────────────────────────────
-    let right = mesh_header_span(app).into_iter().collect();
+    let right = mesh_header_span(input.mesh_node_count)
+        .into_iter()
+        .collect();
     draw_header(
         f,
-        app,
         outer[0],
         vec![Span::styled(
-            format!(" profile:{} ", app.profiles.active_profile_label()),
+            format!(" profile:{} ", input.active_profile_label),
             Theme::status(),
         )],
         right,
+        input.chord,
+        input.connection,
     );
 
-    let sessions = &app.sessions;
-    let render = &mut app.render;
+    let sessions = input.sessions;
 
     // ── hints ─────────────────────────────────────────────────────────────────
     // Rendered now (fixed bottom) so we can focus the rest on centring.
@@ -517,37 +615,57 @@ mod tests {
         }
     }
 
-    fn session_semantics(app: &App) -> String {
+    fn session_semantics(sessions: &SessionsState) -> String {
         format!(
             "groups={:?};cursor={};filter={:?};tab={};collapsed={:?};popup_collapsed={:?};discovery={};discovery_cursors={:?};pending_groups={:?};hydrated={:?};expanded={:?};pending_children={:?};session={:?};agent={:?};mode={:?};review={:?};new_path={:?};new_cursor={};completion={:?};activity={:?};remote={:?}",
-            app.sessions.session_groups,
-            app.sessions.session_cursor,
-            app.sessions.session_filter,
-            app.sessions.session_popup_tab,
-            app.sessions.collapsed_groups,
-            app.sessions.popup_collapsed_groups,
-            app.sessions.session_discovery_in_progress,
-            app.sessions.session_discovery_cursors,
-            app.sessions.pending_session_group_loads,
-            app.sessions.hydrated_session_groups,
-            app.sessions.expanded_session_children,
-            app.sessions.pending_session_child_loads,
-            app.sessions.session_id,
-            app.sessions.agent_id,
-            app.sessions.agent_mode,
-            app.sessions.mode_before_review,
-            app.sessions.new_session_path,
-            app.sessions.new_session_cursor,
-            app.sessions.new_session_completion,
-            app.sessions.session_activity,
-            app.sessions.remote_session_locations,
+            sessions.session_groups,
+            sessions.session_cursor,
+            sessions.session_filter,
+            sessions.session_popup_tab,
+            sessions.collapsed_groups,
+            sessions.popup_collapsed_groups,
+            sessions.session_discovery_in_progress,
+            sessions.session_discovery_cursors,
+            sessions.pending_session_group_loads,
+            sessions.hydrated_session_groups,
+            sessions.expanded_session_children,
+            sessions.pending_session_child_loads,
+            sessions.session_id,
+            sessions.agent_id,
+            sessions.agent_mode,
+            sessions.mode_before_review,
+            sessions.new_session_path,
+            sessions.new_session_cursor,
+            sessions.new_session_completion,
+            sessions.session_activity,
+            sessions.remote_session_locations,
         )
     }
 
-    fn draw_at(app: &mut App, width: u16, height: u16) -> String {
+    fn draw_at(
+        sessions: &SessionsState,
+        render: &mut RenderState,
+        active_profile_label: &str,
+        width: u16,
+        height: u16,
+    ) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_start(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_start(
+                    frame,
+                    StartScreenInput {
+                        sessions,
+                        active_profile_label,
+                        mesh_node_count: None,
+                        chord: false,
+                        connection: ConnState::Connecting,
+                    },
+                    render,
+                )
+            })
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -559,68 +677,64 @@ mod tests {
 
     #[test]
     fn start_draw_clamps_resize_button_and_short_lists_without_mutating_sessions() {
-        let mut app = App::new();
-        app.sessions.session_groups =
-            vec![group("repo-a", 4), group("repo-b", 4), group("repo-c", 4)];
-        let row_count = build_start_page_rows(&app.sessions, 64).len();
+        let mut sessions = SessionsState::new();
+        let mut render = RenderState::new();
+        sessions.session_groups = vec![group("repo-a", 4), group("repo-b", 4), group("repo-c", 4)];
+        let row_count = build_start_page_rows(&sessions, 64).len();
         assert_eq!(row_count, 15);
-        app.sessions.session_cursor = row_count;
-        app.render.test_seed_start_page_scroll(usize::MAX);
-        let before = session_semantics(&app);
+        sessions.session_cursor = row_count;
+        render.test_seed_start_page_scroll(usize::MAX);
+        let before = session_semantics(&sessions);
 
-        draw_at(&mut app, 100, 10);
-        assert_eq!(app.render.start_page_scroll(), 11);
-        assert_eq!(session_semantics(&app), before);
+        draw_at(&sessions, &mut render, "default", 100, 10);
+        assert_eq!(render.start_page_scroll(), 11);
+        assert_eq!(session_semantics(&sessions), before);
 
-        draw_at(&mut app, 100, 14);
-        assert_eq!(app.render.start_page_scroll(), 7);
-        assert_eq!(session_semantics(&app), before);
+        draw_at(&sessions, &mut render, "default", 100, 14);
+        assert_eq!(render.start_page_scroll(), 7);
+        assert_eq!(session_semantics(&sessions), before);
 
-        draw_at(&mut app, 100, 30);
-        assert_eq!(app.render.start_page_scroll(), 0);
-        assert_eq!(session_semantics(&app), before);
+        draw_at(&sessions, &mut render, "default", 100, 30);
+        assert_eq!(render.start_page_scroll(), 0);
+        assert_eq!(session_semantics(&sessions), before);
 
-        app.sessions.session_groups = vec![group("short", 1)];
-        app.sessions.session_cursor = 1;
-        app.render.test_seed_start_page_scroll(9);
-        let short_before = session_semantics(&app);
-        draw_at(&mut app, 80, 20);
-        assert_eq!(app.render.start_page_scroll(), 0);
-        assert_eq!(session_semantics(&app), short_before);
+        sessions.session_groups = vec![group("short", 1)];
+        sessions.session_cursor = 1;
+        render.test_seed_start_page_scroll(9);
+        let short_before = session_semantics(&sessions);
+        draw_at(&sessions, &mut render, "default", 80, 20);
+        assert_eq!(render.start_page_scroll(), 0);
+        assert_eq!(session_semantics(&sessions), short_before);
     }
 
     #[test]
     fn start_draw_preserves_empty_scroll_and_handles_zero_height_list() {
-        let mut app = App::new();
-        app.render.test_seed_start_page_scroll(7);
-        let before = session_semantics(&app);
-        let rendered = draw_at(&mut app, 80, 20);
+        let mut sessions = SessionsState::new();
+        let mut render = RenderState::new();
+        render.test_seed_start_page_scroll(7);
+        let before = session_semantics(&sessions);
+        let rendered = draw_at(&sessions, &mut render, "default", 80, 20);
         assert!(rendered.contains("No sessions yet"));
-        assert_eq!(app.render.start_page_scroll(), 7);
-        assert_eq!(session_semantics(&app), before);
+        assert_eq!(render.start_page_scroll(), 7);
+        assert_eq!(session_semantics(&sessions), before);
 
-        app.sessions.session_groups = vec![group("tiny", 4)];
-        app.sessions.session_cursor = 2;
-        app.render.test_seed_start_page_scroll(0);
-        let tiny_before = session_semantics(&app);
-        draw_at(&mut app, 20, 3);
-        assert_eq!(app.render.start_page_scroll(), 2);
-        app.render.test_seed_start_page_scroll(0);
-        draw_at(&mut app, 20, 2);
-        assert_eq!(app.render.start_page_scroll(), 2);
-        assert_eq!(session_semantics(&app), tiny_before);
+        sessions.session_groups = vec![group("tiny", 4)];
+        sessions.session_cursor = 2;
+        render.test_seed_start_page_scroll(0);
+        let tiny_before = session_semantics(&sessions);
+        draw_at(&sessions, &mut render, "default", 20, 3);
+        assert_eq!(render.start_page_scroll(), 2);
+        render.test_seed_start_page_scroll(0);
+        draw_at(&sessions, &mut render, "default", 20, 2);
+        assert_eq!(render.start_page_scroll(), 2);
+        assert_eq!(session_semantics(&sessions), tiny_before);
     }
 
     #[test]
     fn start_page_header_uses_active_profile_label() {
-        let mut app = App::new();
-        app.profiles.profiles = vec![crate::domain::profile::ProfileInfo {
-            id: "fast".into(),
-            name: "Fast".into(),
-            ..Default::default()
-        }];
-        app.profiles.active_profile_id = Some("fast".into());
-        let text = draw_at(&mut app, 100, 20);
+        let sessions = SessionsState::new();
+        let mut render = RenderState::new();
+        let text = draw_at(&sessions, &mut render, "Fast", 100, 20);
         assert!(text.contains("profile:Fast"));
     }
 }

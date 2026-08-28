@@ -19,6 +19,35 @@ const ICON_MESH: &str = "\u{1F5A7}";
 
 pub(crate) const CHECK_CHECKED: &str = "\u{2611} ";
 pub(crate) const CHECK_FAILED: &str = "\u{2612}";
+pub(crate) const ELLIPSIS: &str = "\u{2026}";
+
+/// Keep a single-line input cursor visible within the available columns.
+pub(crate) fn scroll_input(text: &str, cursor_byte: usize, avail: usize) -> (String, usize) {
+    let cursor_chars = text[..cursor_byte.min(text.len())].chars().count();
+    scroll_input_chars(text, cursor_chars, avail)
+}
+
+pub(crate) fn scroll_input_chars(text: &str, cursor_chars: usize, avail: usize) -> (String, usize) {
+    if avail == 0 {
+        return (String::new(), 0);
+    }
+    let scroll = if cursor_chars >= avail {
+        cursor_chars + 1 - avail
+    } else {
+        0
+    };
+    let visible = text.chars().skip(scroll).take(avail).collect();
+    (visible, cursor_chars - scroll)
+}
+
+pub(crate) fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}{ELLIPSIS}")
+    } else {
+        text.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpinnerKind {
