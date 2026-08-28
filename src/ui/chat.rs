@@ -9,14 +9,17 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::composer_state::{InputVisualLayout, build_input_visual_layout};
+use crate::chat_state::{ChatState, ElicitationUiState};
+use crate::composer_state::ComposerState;
 use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
 use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
+use crate::domain::elicitation::ElicitationState;
 use crate::domain::tool::{
     MultiEditSection, ShellOutput, SymbolDiffSection, SymbolReplacement, ToolDetail,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::input_layout::InputVisualLayout;
 use crate::markdown;
 use crate::render_state::{
     Card, CardKind, DelegatePresentationKeyRef, FinalizedCardKeyRef, FinalizedMessageKeyRef,
@@ -923,8 +926,13 @@ fn build_chat_header_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>
 pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
-    let (input_height, input_layout) = input_layout_metrics(app, area);
-    let elicitation_height = elicitation_popup_height(app, area);
+    let (input_height, input_layout) = input_layout_metrics(&app.composer, &mut app.render, area);
+    let elicitation_height = elicitation_popup_height(
+        app.chat.elicitation.as_ref(),
+        app.chat.elicitation_ui.as_ref(),
+        &mut app.render,
+        area,
+    );
 
     let chunks = if elicitation_height > 0 {
         Layout::default()
@@ -967,8 +975,18 @@ pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
     draw_messages(f, chunks[1], input, &mut app.render);
 
     if elicitation_height > 0 {
-        draw_elicitation_popup(f, app, chunks[2]);
-        draw_input_panel(f, app, chunks[3], chunks[4], input_layout);
+        if let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui) {
+            draw_elicitation_popup(f, state, ui, &mut app.render, chunks[2]);
+        }
+        draw_input_panel(
+            f,
+            &app.composer,
+            &app.chat,
+            &app.sessions.agent_mode,
+            &mut app.render,
+            (chunks[3], chunks[4]),
+            input_layout,
+        );
     }
 }
 
@@ -987,8 +1005,13 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         0u16
     };
 
-    let (input_height, input_layout) = input_layout_metrics(app, area);
-    let elicitation_height = elicitation_popup_height(app, area);
+    let (input_height, input_layout) = input_layout_metrics(&app.composer, &mut app.render, area);
+    let elicitation_height = elicitation_popup_height(
+        app.chat.elicitation.as_ref(),
+        app.chat.elicitation_ui.as_ref(),
+        &mut app.render,
+        area,
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1031,21 +1054,35 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
         }
     }
 
-    if elicitation_height > 0 {
-        draw_elicitation_popup(f, app, chunks[3]);
+    if elicitation_height > 0
+        && let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui)
+    {
+        draw_elicitation_popup(f, state, ui, &mut app.render, chunks[3]);
     }
 
-    draw_input_panel(f, app, chunks[4], chunks[5], input_layout);
+    draw_input_panel(
+        f,
+        &app.composer,
+        &app.chat,
+        &app.sessions.agent_mode,
+        &mut app.render,
+        (chunks[4], chunks[5]),
+        input_layout,
+    );
 }
 
-fn input_layout_metrics(app: &App, area: Rect) -> (u16, InputVisualLayout) {
+fn input_layout_metrics(
+    composer: &ComposerState,
+    render: &mut RenderState,
+    area: Rect,
+) -> (u16, InputVisualLayout) {
     // Compute how many visual rows the input text needs when wrapped.
     let input_inner_width = area.width.saturating_sub(4) as usize;
     let prefix_width = 2usize; // "> "
-    let input_layout = build_input_visual_layout(
-        &app.composer.input,
-        app.composer.input_cursor,
-        input_inner_width.max(1),
+    let input_layout = render.prepare_composer_input_layout(
+        &composer.input,
+        composer.input_cursor,
+        input_inner_width,
         prefix_width,
     );
     let max_input_lines: u16 = 5;
@@ -1112,12 +1149,8 @@ fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
         .unwrap_or_else(|| label.to_string())
 }
 
-fn elicitation_option_rows(app: &App, width: u16) -> u16 {
+fn elicitation_option_rows(state: &ElicitationState, ui: &ElicitationUiState, width: u16) -> u16 {
     use crate::domain::elicitation::ElicitationFieldKind;
-
-    let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui) else {
-        return 0;
-    };
     let schema_rows = match ui
         .current_field_index(state.fields.len())
         .and_then(|index| state.fields.get(index))
@@ -1147,15 +1180,21 @@ fn elicitation_option_rows(app: &App, width: u16) -> u16 {
     schema_rows + u16::from(state.allow_custom && option_count > 0)
 }
 
-fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
-    if let (Some(state), Some(ui)) = (&app.chat.elicitation, &app.chat.elicitation_ui) {
+fn elicitation_popup_height(
+    state: Option<&ElicitationState>,
+    ui: Option<&ElicitationUiState>,
+    render: &mut RenderState,
+    area: Rect,
+) -> u16 {
+    if let (Some(state), Some(ui)) = (state, ui) {
         let message_width = area.width.saturating_sub(4).max(1);
         let message_rows = wrapped_text_rows(&state.message, message_width);
         let option_width = area.width.saturating_sub(6).max(1);
-        let option_rows = elicitation_option_rows(app, option_width);
+        let option_rows = elicitation_option_rows(state, ui, option_width);
         let custom_rows = if ui.custom_active {
             let width = area.width.saturating_sub(4) as usize;
-            build_input_visual_layout(&state.custom_input, ui.custom_cursor, width.max(1), 2)
+            render
+                .prepare_elicitation_custom_layout(&state.custom_input, ui.custom_cursor, width, 2)
                 .total_rows() as u16
         } else {
             0
@@ -1171,22 +1210,25 @@ fn elicitation_popup_height(app: &App, area: Rect) -> u16 {
 
 fn draw_input_panel(
     f: &mut Frame,
-    app: &mut App,
-    border_area: Rect,
-    input_area: Rect,
+    _composer: &ComposerState,
+    chat: &ChatState,
+    agent_mode: &str,
+    render: &mut RenderState,
+    areas: (Rect, Rect),
     input_layout: InputVisualLayout,
 ) {
+    let (border_area, input_area) = areas;
     // input border line reflects active session state
-    let border_style = match &app.chat.activity {
+    let border_style = match &chat.activity {
         ActivityState::SessionOp(SessionOp::Undo) => Theme::input_border_undo(),
         ActivityState::SessionOp(SessionOp::Redo) => Theme::input_border_redo(),
-        _ if app.chat.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
+        _ if chat.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
         ActivityState::Compacting { .. } => Theme::input_border_compacting(),
         ActivityState::Thinking | ActivityState::Streaming | ActivityState::RunningTool { .. } => {
             Theme::input_border_thinking()
         }
-        _ if app.chat.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
-        _ => Theme::mode_border(&app.sessions.agent_mode),
+        _ if chat.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
+        _ => Theme::mode_border(agent_mode),
     };
     let border_line =
         Paragraph::new(INPUT_OVERLINE.repeat(border_area.width as usize)).style(border_style);
@@ -1197,28 +1239,21 @@ fn draw_input_panel(
         .padding(Padding::new(2, 2, 0, 1))
         .style(Theme::input());
     let inner = input_bg.inner(input_area);
-    app.composer.input_line_width = (inner.width as usize).max(1);
     f.render_widget(input_bg, input_area);
 
-    let (label_text, label_style) = match &app.chat.activity {
+    let (label_text, label_style) = match &chat.activity {
         ActivityState::SessionOp(SessionOp::Undo) => (
-            format!(
-                "{} undoing ",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            ),
+            format!("{} undoing ", spinner(SpinnerKind::Braille, render.tick)),
             Theme::input_undo(),
         ),
         ActivityState::SessionOp(SessionOp::Redo) => (
-            format!(
-                "{} redoing ",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            ),
+            format!("{} redoing ", spinner(SpinnerKind::Braille, render.tick)),
             Theme::input_redo(),
         ),
-        _ if app.chat.cancel_confirm_active() => (
+        _ if chat.cancel_confirm_active() => (
             format!(
                 "{} Esc again to stop ",
-                spinner(SpinnerKind::Braille, app.render.tick)
+                spinner(SpinnerKind::Braille, render.tick)
             ),
             Theme::input_cancel_confirm(),
         ),
@@ -1226,20 +1261,20 @@ fn draw_input_panel(
         | ActivityState::RunningTool { .. }
         | ActivityState::Thinking
         | ActivityState::Streaming => (
-            format!("{} ", spinner(SpinnerKind::Braille, app.render.tick)),
+            format!("{} ", spinner(SpinnerKind::Braille, render.tick)),
             Theme::input_thinking(),
         ),
-        _ if app.chat.elicitation.is_some() => (
+        _ if chat.elicitation.is_some() => (
             format!("  answer above {ARROW_UP} "),
             Theme::input_thinking(),
         ),
-        _ => ("> ".into(), Theme::mode_border(&app.sessions.agent_mode)),
+        _ => ("> ".into(), Theme::mode_border(agent_mode)),
     };
     let input_style = Theme::input();
-    let hide_input_contents = app.chat.should_hide_input_contents();
+    let hide_input_contents = chat.should_hide_input_contents();
 
     if hide_input_contents {
-        app.composer.input_scroll = 0;
+        render.ensure_composer_input_cursor_visible(inner.height, true);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(label_text, label_style))),
             inner,
@@ -1261,25 +1296,12 @@ fn draw_input_panel(
             lines.push(Line::from(Span::styled("", input_style)));
         }
 
-        let total_lines = lines.len() as u16;
         let visible = inner.height;
-        if (layout.cursor_row as u16) >= app.composer.input_scroll + visible {
-            app.composer.input_scroll = (layout.cursor_row as u16) - visible + 1;
-        }
-        if (layout.cursor_row as u16) < app.composer.input_scroll {
-            app.composer.input_scroll = layout.cursor_row as u16;
-        }
-        app.composer.input_scroll = app
-            .composer
-            .input_scroll
-            .min(total_lines.saturating_sub(visible));
+        let scroll = render.ensure_composer_input_cursor_visible(visible, false);
 
-        f.render_widget(
-            Paragraph::new(lines).scroll((app.composer.input_scroll, 0)),
-            inner,
-        );
+        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 
-        let visual_row = (layout.cursor_row as u16).saturating_sub(app.composer.input_scroll);
+        let visual_row = (layout.cursor_row as u16).saturating_sub(scroll);
         if visual_row < visible {
             f.set_cursor_position((inner.x + layout.cursor_col as u16, inner.y + visual_row));
         }
@@ -1288,18 +1310,18 @@ fn draw_input_panel(
 
 // ── Elicitation popup ─────────────────────────────────────────────────────────
 
-fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_elicitation_popup(
+    f: &mut Frame,
+    state: &ElicitationState,
+    ui: &ElicitationUiState,
+    render: &mut RenderState,
+    area: Rect,
+) {
     use crate::domain::elicitation::ElicitationFieldKind;
 
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let (Some(state), Some(ui)) = (
-        app.chat.elicitation.as_mut(),
-        app.chat.elicitation_ui.as_mut(),
-    ) else {
-        return;
-    };
 
     f.render_widget(Block::default().style(Theme::popup_bg()), area);
     let inner = Rect {
@@ -1451,23 +1473,16 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
             if ui.custom_active && row < max_y {
                 // Keep the custom editor visually separate from the choices.
                 row = row.saturating_add(1).min(max_y);
-                ui.custom_line_width = (inner.width.saturating_sub(2) as usize).max(1);
-                let layout = build_input_visual_layout(
+                let layout = render.prepare_elicitation_custom_layout(
                     &state.custom_input,
                     ui.custom_cursor,
-                    ui.custom_line_width,
+                    inner.width.saturating_sub(2) as usize,
                     2,
                 );
                 let total_rows = layout.total_rows() as u16;
                 // Reserve a spacer, the help row, and bottom padding below the editor.
                 let visible = total_rows.min(max_y.saturating_sub(row + 3)).min(5);
-                if layout.cursor_row as u16 >= ui.custom_scroll + visible {
-                    ui.custom_scroll = layout.cursor_row as u16 - visible + 1;
-                }
-                if (layout.cursor_row as u16) < ui.custom_scroll {
-                    ui.custom_scroll = layout.cursor_row as u16;
-                }
-                ui.custom_scroll = ui.custom_scroll.min(total_rows.saturating_sub(visible));
+                let scroll = render.ensure_elicitation_custom_cursor_visible(visible);
 
                 let lines: Vec<Line<'static>> = layout
                     .rows
@@ -1487,10 +1502,10 @@ fn draw_elicitation_popup(f: &mut Frame, app: &mut App, area: Rect) {
                 f.render_widget(
                     Paragraph::new(lines)
                         .style(Theme::popup_bg())
-                        .scroll((ui.custom_scroll, 0)),
+                        .scroll((scroll, 0)),
                     Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), visible),
                 );
-                let cursor_row = (layout.cursor_row as u16).saturating_sub(ui.custom_scroll);
+                let cursor_row = (layout.cursor_row as u16).saturating_sub(scroll);
                 if cursor_row < visible {
                     f.set_cursor_position((
                         inner.x + 2 + layout.cursor_col as u16,

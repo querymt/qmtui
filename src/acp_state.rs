@@ -810,6 +810,15 @@ impl crate::app::App {
         ) {
             self.render.scroll_chat_to_bottom();
         }
+        match transition {
+            ElicitationTransition::InsertedSupported {
+                is_replay: false, ..
+            }
+            | ElicitationTransition::ResolvedActive => {
+                self.render.reset_elicitation_custom_geometry();
+            }
+            _ => {}
+        }
         self.apply_render_changes(elicitation_render_changes(&transition));
         self.apply_chat_coordination(coordination);
         effects
@@ -855,6 +864,8 @@ impl crate::app::App {
                 remote_node_id,
                 is_remote,
             )));
+        self.render.reset_composer_input_geometry();
+        self.render.reset_elicitation_custom_geometry();
         let effects = self.apply_delegate_action(DelegateAction::ClearRootSessionState);
         self.composer.reset_for_session_switch();
         effects
@@ -2588,10 +2599,10 @@ mod tests {
             child_state: DelegateChildState::None,
         });
         app.render.test_seed_chat_viewport(3, 24);
+        app.render.test_seed_composer_input_geometry(40, 2);
+        app.render.test_seed_elicitation_custom_geometry(30, 1);
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
-        app.composer.input_scroll = 2;
-        app.composer.input_line_width = 40;
         app.composer.input_preferred_col = Some(4);
         app.composer.refresh_slash_state();
         app.composer.file_index = vec![FileIndexEntryLite {
@@ -2642,9 +2653,9 @@ mod tests {
         assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert_eq!(app.composer.input, "/mo");
         assert_eq!(app.composer.input_cursor, 3);
-        assert_eq!(app.composer.input_scroll, 2);
-        assert_eq!(app.composer.input_line_width, 40);
         assert_eq!(app.composer.input_preferred_col, Some(4));
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
         assert!(app.composer.file_index.is_empty());
         assert_eq!(app.composer.file_index_generated_at, None);
         assert!(!app.composer.file_index_loading);

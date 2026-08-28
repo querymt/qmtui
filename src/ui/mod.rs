@@ -236,7 +236,7 @@ mod tests {
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
         ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
-        SessionActivity,
+        SessionActivity, SessionOp,
     };
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
@@ -1531,17 +1531,125 @@ mod tests {
     }
 
     #[test]
+    fn composer_draw_publishes_resized_geometry_scrolls_both_ways_and_preserves_semantics() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.sessions.agent_mode = "build".into();
+        app.composer.input = "a\nb\nc\nd\ne\nf\ng\nh".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = Some(3);
+        app.composer.file_index = vec![crate::composer_state::FileIndexEntryLite {
+            path: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        app.composer.file_index_generated_at = Some(7);
+        app.composer.file_index_error = Some("preserved".into());
+        app.composer.mention_state = Some(crate::composer_state::MentionState {
+            trigger_start: 1,
+            query: "src".into(),
+            selected_index: 2,
+            results: app.composer.file_index.clone(),
+        });
+        app.composer.slash_state = Some(crate::composer_state::SlashCompletionState {
+            query: "mo".into(),
+            selected_index: 1,
+            results: vec![&crate::slash::SLASH_COMMANDS[0]],
+        });
+        let semantic_snapshot = (
+            app.composer.input.clone(),
+            app.composer.input_cursor,
+            app.composer.input_preferred_col,
+            app.composer.file_index.clone(),
+            app.composer.file_index_generated_at,
+            app.composer.file_index_loading,
+            app.composer.file_index_error.clone(),
+            app.composer.mention_state.as_ref().map(|mention| {
+                (
+                    mention.trigger_start,
+                    mention.query.clone(),
+                    mention.selected_index,
+                    mention.results.clone(),
+                )
+            }),
+            app.composer.slash_state.as_ref().map(|slash| {
+                (
+                    slash.query.clone(),
+                    slash.selected_index,
+                    slash
+                        .results
+                        .iter()
+                        .map(|command| command.name)
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        );
+
+        render_chat_buffer(&mut app, 40, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (36, 3, true));
+        assert_eq!(
+            (
+                app.composer.input.clone(),
+                app.composer.input_cursor,
+                app.composer.input_preferred_col,
+                app.composer.file_index.clone(),
+                app.composer.file_index_generated_at,
+                app.composer.file_index_loading,
+                app.composer.file_index_error.clone(),
+                app.composer.mention_state.as_ref().map(|mention| (
+                    mention.trigger_start,
+                    mention.query.clone(),
+                    mention.selected_index,
+                    mention.results.clone(),
+                )),
+                app.composer.slash_state.as_ref().map(|slash| (
+                    slash.query.clone(),
+                    slash.selected_index,
+                    slash
+                        .results
+                        .iter()
+                        .map(|command| command.name)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            semantic_snapshot
+        );
+
+        app.composer.input_cursor = 0;
+        render_chat_buffer(&mut app, 20, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (16, 0, true));
+        render_chat_buffer(&mut app, 60, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (56, 0, true));
+    }
+
+    #[test]
+    fn hidden_composer_draw_resets_only_render_scroll() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "draft\nkept".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = Some(2);
+        app.render.test_seed_composer_input_geometry(12, 4);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+
+        render_chat_buffer(&mut app, 40, 12);
+
+        assert_eq!(app.render.test_composer_input_geometry(), (36, 0, true));
+        assert_eq!(app.composer.input, "draft\nkept");
+        assert_eq!(app.composer.input_cursor, "draft\nkept".len());
+        assert_eq!(app.composer.input_preferred_col, Some(2));
+    }
+
+    #[test]
     fn custom_editor_visual_movement_crosses_wrapped_rows() {
         let mut ui = ElicitationUiState {
             custom_cursor: 5,
-            custom_line_width: 5,
             ..Default::default()
         };
         let input = "abcdefghij";
 
-        ui.custom_move_visual(input, 1);
+        ui.custom_move_visual(input, 5, 1);
         assert_eq!(ui.custom_cursor, 10);
-        ui.custom_move_visual(input, -1);
+        ui.custom_move_visual(input, 5, -1);
         assert_eq!(ui.custom_cursor, 5);
     }
 
@@ -1549,15 +1657,98 @@ mod tests {
     fn custom_editor_visual_movement_crosses_explicit_newline() {
         let mut ui = ElicitationUiState {
             custom_cursor: 2,
-            custom_line_width: 20,
             ..Default::default()
         };
         let input = "ab\ncdef";
 
-        ui.custom_move_visual(input, 1);
+        ui.custom_move_visual(input, 20, 1);
         assert_eq!(ui.custom_cursor, 5);
-        ui.custom_move_visual(input, -1);
+        ui.custom_move_visual(input, 20, -1);
         assert_eq!(ui.custom_cursor, 2);
+    }
+
+    #[test]
+    fn custom_editor_draw_owns_scroll_resize_and_preserves_elicitation_semantics() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: Some("description".into()),
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.custom_input = "a\nb\nc\nd\ne\nf\ng".into();
+        state.text_input = "semantic text".into();
+        state
+            .selected
+            .insert("choice".into(), serde_json::json!("a"));
+        let ui = ElicitationUiState {
+            field_cursor: 0,
+            option_cursor: 1,
+            text_cursor: 4,
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+        };
+        let state_snapshot = (
+            state.elicitation_id.clone(),
+            state.message.clone(),
+            state.source.clone(),
+            state.fields.clone(),
+            state.selected.clone(),
+            state.text_input.clone(),
+            state.custom_input.clone(),
+            state.allow_custom,
+        );
+        let ui_snapshot = (
+            ui.field_cursor,
+            ui.option_cursor,
+            ui.text_cursor,
+            ui.custom_active,
+            ui.custom_cursor,
+        );
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(ui);
+
+        render_chat_buffer(&mut app, 40, 24);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (36, 2, true));
+        let state = app.chat.elicitation.as_ref().unwrap();
+        let ui = app.chat.elicitation_ui.as_ref().unwrap();
+        assert_eq!(
+            (
+                state.elicitation_id.clone(),
+                state.message.clone(),
+                state.source.clone(),
+                state.fields.clone(),
+                state.selected.clone(),
+                state.text_input.clone(),
+                state.custom_input.clone(),
+                state.allow_custom,
+            ),
+            state_snapshot
+        );
+        assert_eq!(
+            (
+                ui.field_cursor,
+                ui.option_cursor,
+                ui.text_cursor,
+                ui.custom_active,
+                ui.custom_cursor,
+            ),
+            ui_snapshot
+        );
+
+        app.chat.elicitation_ui.as_mut().unwrap().custom_cursor = 0;
+        render_chat_buffer(&mut app, 20, 24);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (16, 0, true));
+        render_chat_buffer(&mut app, 3, 4);
+        assert_eq!(app.render.elicitation_custom_line_width(), 1);
     }
 
     #[test]

@@ -205,6 +205,7 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             match outcome {
                 ExternalEditorOutcome::Completed(updated_input) => {
                     app.composer.replace_input_from_editor(updated_input);
+                    app.render.reset_composer_input_geometry();
                     app.set_status(
                         LogLevel::Info,
                         "editor",
@@ -403,6 +404,7 @@ mod tests {
     fn key_and_mouse_events_dispatch_through_update() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        app.render.test_seed_composer_input_geometry(24, 2);
 
         let effects = update(
             &mut app,
@@ -410,6 +412,7 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(app.composer.input.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
 
         app.navigation.screen = Screen::Chat;
         app.render.set_chat_scroll_offset(2);
@@ -1012,6 +1015,7 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 7);
+        app.render.test_seed_elicitation_custom_geometry(24, 3);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
@@ -1024,6 +1028,7 @@ mod tests {
             Some("elic-live")
         );
         assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
         assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
@@ -1057,10 +1062,12 @@ mod tests {
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 2);
         app.render.set_chat_scroll_offset(6);
+        app.render.test_seed_elicitation_custom_geometry(18, 2);
         let log_count_before_duplicate = app.diagnostics.logs.len();
         let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
         assert!(effects.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 6);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (18, 2, true));
         assert_eq!(app.chat.messages.len(), 2);
         assert!(content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
@@ -1076,6 +1083,7 @@ mod tests {
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 7);
         app.render.set_chat_scroll_offset(7);
+        app.render.test_seed_elicitation_custom_geometry(22, 2);
         let log_count_before_replay = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1087,6 +1095,7 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (22, 2, true));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -1118,6 +1127,7 @@ mod tests {
         let effects = apply_session_update(&mut app, unsupported_elicitation("elic-unsupported"));
         assert!(effects.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (22, 2, true));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -3232,6 +3242,7 @@ mod tests {
     fn editor_results_apply_state_then_request_redraw() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        app.render.test_seed_composer_input_geometry(30, 2);
         seed_card_cache(&mut app, 2);
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
@@ -3245,6 +3256,7 @@ mod tests {
 
         assert_eq!(app.composer.input, "revised");
         assert_eq!(app.composer.input_cursor, "revised".len());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(card_cache_count(&app), 0);
         assert!(!content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
@@ -3256,6 +3268,7 @@ mod tests {
     fn editor_cancel_and_failure_preserve_input_and_request_redraw() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        app.render.test_seed_composer_input_geometry(30, 2);
         seed_card_cache(&mut app, 2);
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
@@ -3267,6 +3280,7 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(app.render.test_composer_input_geometry(), (30, 2, true));
         assert_eq!(card_cache_count(&app), 0);
         assert!(!content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
@@ -3283,6 +3297,7 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(app.render.test_composer_input_geometry(), (30, 2, true));
         assert_eq!(card_cache_count(&app), 0);
         assert!(!content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
@@ -3302,6 +3317,7 @@ mod tests {
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 5);
         app.render.set_chat_scroll_offset(6);
+        app.render.test_seed_elicitation_custom_geometry(26, 2);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3315,6 +3331,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 6);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -3388,6 +3405,7 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 2);
+        app.render.test_seed_elicitation_custom_geometry(28, 3);
         app.diagnostics.status = "newer question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3408,6 +3426,7 @@ mod tests {
             Some("elic-new")
         );
         assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (28, 3, true));
         assert!(content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
         assert_eq!(card_cache_count(&app), 0);
@@ -3432,6 +3451,7 @@ mod tests {
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 5);
         app.render.set_chat_scroll_offset(7);
+        app.render.test_seed_elicitation_custom_geometry(32, 1);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3453,6 +3473,7 @@ mod tests {
             Some("elic-active")
         );
         assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (32, 1, true));
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
@@ -3470,6 +3491,7 @@ mod tests {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", false);
         seed_card_cache(&mut app, 5);
+        app.render.test_seed_elicitation_custom_geometry(34, 2);
         app.diagnostics.status = "preserved status".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3499,6 +3521,7 @@ mod tests {
                     && outcome == &ElicitationResponseOutcome::Declined
         ));
         assert_eq!(card_cache_count(&app), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (34, 2, true));
         assert_eq!(app.diagnostics.status, "preserved status");
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
     }

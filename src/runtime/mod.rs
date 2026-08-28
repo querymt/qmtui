@@ -596,6 +596,7 @@ mod tests {
             effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
         }
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        app.render.test_seed_elicitation_custom_geometry(19, 3);
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
 
         assert!(
@@ -604,6 +605,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ui| !ui.custom_active)
         );
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (19, 0, true));
         assert!(effects.next_command().is_none());
 
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
@@ -966,13 +968,40 @@ mod external_editor_tests {
     }
 
     #[test]
+    fn composer_visual_movement_uses_default_published_and_resized_render_widths() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "abc".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.render.composer_input_line_width(), 1);
+        assert_eq!(app.composer.input_cursor, 2);
+
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = None;
+        app.render.prepare_composer_input_layout("abc", 3, 4, 2);
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.composer.input_cursor, 1);
+
+        app.composer.input_preferred_col = None;
+        app.render.prepare_composer_input_layout("abc", 1, 20, 2);
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(app.composer.input_cursor, 1);
+        assert_eq!(app.composer.input_preferred_col, Some(1));
+    }
+
+    #[test]
     fn chat_up_down_navigate_wrapped_input_without_scrolling_history() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "abcdef".into();
         app.composer.input_cursor = 4;
-        app.composer.input_line_width = 4;
+        app.render.prepare_composer_input_layout("abcdef", 4, 4, 2);
         app.render.set_chat_scroll_offset(7);
 
         effects.extend(handle_chat_key(

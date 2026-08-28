@@ -101,8 +101,8 @@ impl App {
 
     pub fn take_input(&mut self) -> String {
         self.composer.input_cursor = 0;
-        self.composer.input_scroll = 0;
         self.composer.input_preferred_col = None;
+        self.render.reset_composer_input_geometry();
         self.render.scroll_chat_to_bottom();
         self.composer.mention_state = None;
         self.composer.slash_state = None;

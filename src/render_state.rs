@@ -11,6 +11,7 @@ use crate::domain::activity::{DelegateEntry, DelegateStatus};
 use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
 use crate::domain::tool::ToolDetail;
 use crate::highlight::Highlighter;
+use crate::input_layout::{InputVisualLayout, build_input_visual_layout};
 use crate::markdown::CardBlock;
 use crate::theme::Theme;
 
@@ -864,6 +865,38 @@ struct ChatViewportState {
     previous_total_height: u16,
 }
 
+struct ComposerInputGeometry {
+    line_width: usize,
+    scroll: u16,
+    layout: Option<InputVisualLayout>,
+}
+
+impl Default for ComposerInputGeometry {
+    fn default() -> Self {
+        Self {
+            line_width: 1,
+            scroll: 0,
+            layout: None,
+        }
+    }
+}
+
+struct ElicitationCustomEditorGeometry {
+    line_width: usize,
+    scroll: u16,
+    layout: Option<InputVisualLayout>,
+}
+
+impl Default for ElicitationCustomEditorGeometry {
+    fn default() -> Self {
+        Self {
+            line_width: 1,
+            scroll: 0,
+            layout: None,
+        }
+    }
+}
+
 /// Owner for render-local cards, caches, identity, and viewport accounting.
 pub(crate) struct RenderState {
     highlighter: Highlighter,
@@ -873,6 +906,8 @@ pub(crate) struct RenderState {
     session_identity: Option<SessionIdentity>,
     session_epoch: u64,
     chat_viewport: ChatViewportState,
+    composer_input: ComposerInputGeometry,
+    elicitation_custom_editor: ElicitationCustomEditorGeometry,
     pub(crate) tick: u64,
     #[cfg(test)]
     invalidation_order: Vec<CacheInvalidation>,
@@ -896,6 +931,8 @@ impl RenderState {
             session_identity: None,
             session_epoch: 0,
             chat_viewport: ChatViewportState::default(),
+            composer_input: ComposerInputGeometry::default(),
+            elicitation_custom_editor: ElicitationCustomEditorGeometry::default(),
             tick: 0,
             #[cfg(test)]
             invalidation_order: Vec::new(),
@@ -1023,6 +1060,100 @@ impl RenderState {
         self.tick = tick;
     }
 
+    pub(crate) fn prepare_composer_input_layout(
+        &mut self,
+        input: &str,
+        cursor: usize,
+        line_width: usize,
+        prefix_width: usize,
+    ) -> InputVisualLayout {
+        let line_width = line_width.max(1);
+        let layout = build_input_visual_layout(input, cursor, line_width, prefix_width);
+        self.composer_input.line_width = line_width;
+        self.composer_input.layout = Some(layout.clone());
+        layout
+    }
+
+    pub(crate) fn composer_input_line_width(&self) -> usize {
+        self.composer_input.line_width
+    }
+
+    pub(crate) fn ensure_composer_input_cursor_visible(
+        &mut self,
+        visible_rows: u16,
+        hidden: bool,
+    ) -> u16 {
+        if hidden {
+            self.composer_input.scroll = 0;
+            return 0;
+        }
+        let Some(layout) = self.composer_input.layout.as_ref() else {
+            return self.composer_input.scroll;
+        };
+        let cursor_row = layout.cursor_row as u16;
+        if cursor_row >= self.composer_input.scroll + visible_rows {
+            self.composer_input.scroll = cursor_row - visible_rows + 1;
+        }
+        if cursor_row < self.composer_input.scroll {
+            self.composer_input.scroll = cursor_row;
+        }
+        let total_rows = layout.total_rows() as u16;
+        self.composer_input.scroll = self
+            .composer_input
+            .scroll
+            .min(total_rows.saturating_sub(visible_rows));
+        self.composer_input.scroll
+    }
+
+    pub(crate) fn reset_composer_input_geometry(&mut self) {
+        self.composer_input = ComposerInputGeometry::default();
+    }
+
+    pub(crate) fn prepare_elicitation_custom_layout(
+        &mut self,
+        input: &str,
+        cursor: usize,
+        line_width: usize,
+        prefix_width: usize,
+    ) -> InputVisualLayout {
+        let line_width = line_width.max(1);
+        let layout = build_input_visual_layout(input, cursor, line_width, prefix_width);
+        self.elicitation_custom_editor.line_width = line_width;
+        self.elicitation_custom_editor.layout = Some(layout.clone());
+        layout
+    }
+
+    pub(crate) fn elicitation_custom_line_width(&self) -> usize {
+        self.elicitation_custom_editor.line_width
+    }
+
+    pub(crate) fn ensure_elicitation_custom_cursor_visible(&mut self, visible_rows: u16) -> u16 {
+        let Some(layout) = self.elicitation_custom_editor.layout.as_ref() else {
+            return self.elicitation_custom_editor.scroll;
+        };
+        let cursor_row = layout.cursor_row as u16;
+        if cursor_row >= self.elicitation_custom_editor.scroll + visible_rows {
+            self.elicitation_custom_editor.scroll = cursor_row - visible_rows + 1;
+        }
+        if cursor_row < self.elicitation_custom_editor.scroll {
+            self.elicitation_custom_editor.scroll = cursor_row;
+        }
+        let total_rows = layout.total_rows() as u16;
+        self.elicitation_custom_editor.scroll = self
+            .elicitation_custom_editor
+            .scroll
+            .min(total_rows.saturating_sub(visible_rows));
+        self.elicitation_custom_editor.scroll
+    }
+
+    pub(crate) fn reset_elicitation_custom_scroll(&mut self) {
+        self.elicitation_custom_editor.scroll = 0;
+    }
+
+    pub(crate) fn reset_elicitation_custom_geometry(&mut self) {
+        self.elicitation_custom_editor = ElicitationCustomEditorGeometry::default();
+    }
+
     pub(crate) fn chat_scroll_offset(&self) -> u16 {
         self.chat_viewport.scroll_offset
     }
@@ -1065,6 +1196,36 @@ impl RenderState {
 
     pub(crate) fn reset_chat_viewport(&mut self) {
         self.chat_viewport = ChatViewportState::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_composer_input_geometry(&self) -> (usize, u16, bool) {
+        (
+            self.composer_input.line_width,
+            self.composer_input.scroll,
+            self.composer_input.layout.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_elicitation_custom_geometry(&self) -> (usize, u16, bool) {
+        (
+            self.elicitation_custom_editor.line_width,
+            self.elicitation_custom_editor.scroll,
+            self.elicitation_custom_editor.layout.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seed_composer_input_geometry(&mut self, width: usize, scroll: u16) {
+        self.prepare_composer_input_layout("a\nb\nc\nd\ne\nf", 11, width, 2);
+        self.composer_input.scroll = scroll;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seed_elicitation_custom_geometry(&mut self, width: usize, scroll: u16) {
+        self.prepare_elicitation_custom_layout("a\nb\nc\nd\ne\nf", 11, width, 2);
+        self.elicitation_custom_editor.scroll = scroll;
     }
 
     #[cfg(test)]
@@ -1182,6 +1343,8 @@ mod tests {
         assert_eq!(state.test_session_epoch(), 0);
         assert_eq!(state.chat_scroll_offset(), 0);
         assert_eq!(state.test_chat_previous_total_height(), 0);
+        assert_eq!(state.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(state.test_elicitation_custom_geometry(), (1, 0, false));
         assert_eq!(state.tick, 0);
     }
 
@@ -1415,6 +1578,66 @@ mod tests {
         state.replace_tick(17);
         state.replace_tick(3);
         assert_eq!(state.tick, 3);
+    }
+
+    #[test]
+    fn editor_geometry_preparation_scroll_and_resets_preserve_exact_boundaries() {
+        let mut state = RenderState::new();
+
+        let composer = state.prepare_composer_input_layout("a\nb\nc\nd\ne\nf", 11, 8, 2);
+        assert_eq!(composer.total_rows(), 6);
+        assert_eq!(state.test_composer_input_geometry(), (8, 0, true));
+        assert_eq!(state.ensure_composer_input_cursor_visible(5, false), 1);
+        state.prepare_composer_input_layout("a\nb\nc\nd\ne\nf", 0, 4, 2);
+        assert_eq!(state.ensure_composer_input_cursor_visible(5, false), 0);
+        state.test_seed_composer_input_geometry(9, 3);
+        assert_eq!(state.ensure_composer_input_cursor_visible(5, true), 0);
+        assert_eq!(state.test_composer_input_geometry(), (9, 0, true));
+        state.reset_composer_input_geometry();
+        assert_eq!(state.test_composer_input_geometry(), (1, 0, false));
+
+        let custom = state.prepare_elicitation_custom_layout("a\nb\nc\nd\ne\nf", 11, 7, 2);
+        assert_eq!(custom.total_rows(), 6);
+        assert_eq!(state.ensure_elicitation_custom_cursor_visible(5), 1);
+        assert_eq!(state.test_elicitation_custom_geometry(), (7, 1, true));
+        assert_eq!(state.ensure_elicitation_custom_cursor_visible(0), 5);
+        state.reset_elicitation_custom_scroll();
+        assert_eq!(state.test_elicitation_custom_geometry(), (7, 0, true));
+        state.reset_elicitation_custom_geometry();
+        assert_eq!(state.test_elicitation_custom_geometry(), (1, 0, false));
+    }
+
+    #[test]
+    fn editor_geometry_changes_do_not_touch_caches_epoch_viewport_or_invalidation() {
+        let mut state = seeded_caches();
+        state.advance_session_epoch(identity("session", None, false));
+        state.test_seed_chat_viewport(4, 18);
+        let card_identity = state.test_card_identity(0);
+        let content_identity = state.test_streaming_cache_identity(StreamKind::Content);
+        let thinking_identity = state.test_streaming_cache_identity(StreamKind::Thinking);
+        state.invalidation_order.clear();
+
+        state.prepare_composer_input_layout("composer", 8, 12, 2);
+        state.ensure_composer_input_cursor_visible(2, false);
+        state.reset_composer_input_geometry();
+        state.prepare_elicitation_custom_layout("custom", 6, 10, 2);
+        state.ensure_elicitation_custom_cursor_visible(0);
+        state.reset_elicitation_custom_scroll();
+        state.reset_elicitation_custom_geometry();
+
+        assert_eq!(state.test_card_identity(0), card_identity);
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Thinking),
+            thinking_identity
+        );
+        assert_eq!(state.test_session_epoch(), 1);
+        assert_eq!(state.chat_scroll_offset(), 4);
+        assert_eq!(state.test_chat_previous_total_height(), 18);
+        assert!(state.invalidation_order.is_empty());
     }
 
     #[test]

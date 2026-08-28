@@ -63,6 +63,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
     use crate::domain::elicitation::ElicitationFieldKind;
 
     let mut effects = Vec::new();
+    let custom_line_width = app.render.elicitation_custom_line_width();
     let (Some(state), Some(ui)) = (
         app.chat.elicitation.as_mut(),
         app.chat.elicitation_ui.as_mut(),
@@ -120,7 +121,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
         match key.code {
             KeyCode::Esc => {
                 ui.custom_active = false;
-                ui.custom_scroll = 0;
+                app.render.reset_elicitation_custom_scroll();
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 ui.custom_insert(&mut state.custom_input, '\n');
@@ -145,8 +146,8 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             KeyCode::Right => ui.custom_right(&state.custom_input),
             KeyCode::Home => ui.custom_home(&state.custom_input),
             KeyCode::End => ui.custom_end(&state.custom_input),
-            KeyCode::Up => ui.custom_move_visual(&state.custom_input, -1),
-            KeyCode::Down => ui.custom_move_visual(&state.custom_input, 1),
+            KeyCode::Up => ui.custom_move_visual(&state.custom_input, custom_line_width, -1),
+            KeyCode::Down => ui.custom_move_visual(&state.custom_input, custom_line_width, 1),
             _ => {}
         }
         return effects;
@@ -482,6 +483,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if !app.composer.input.is_empty() {
             app.composer.clear_input();
+            app.render.reset_composer_input_geometry();
             return Vec::new();
         }
         return vec![Effect::Quit];
@@ -695,6 +697,7 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
+                    app.render.reset_composer_input_geometry();
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -1300,9 +1303,6 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
 }
 
 pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    if app.composer.input_line_width == 0 {
-        app.composer.input_line_width = 1;
-    }
     let input_blocked = app.chat.input_blocked_by_activity();
     let mut effects = Vec::new();
     match key.code {
@@ -1395,7 +1395,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if app.composer.mention_state.is_some() {
                 app.composer.move_mention_selection(-1);
             } else {
-                app.composer.input_up_visual(2);
+                let line_width = app.render.composer_input_line_width();
+                app.composer.input_up_visual(line_width, 2);
             }
         }
         KeyCode::Down => {
@@ -1407,7 +1408,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if app.composer.mention_state.is_some() {
                 app.composer.move_mention_selection(1);
             } else {
-                app.composer.input_down_visual(2);
+                let line_width = app.render.composer_input_line_width();
+                app.composer.input_down_visual(line_width, 2);
             }
         }
         KeyCode::PageUp => app.render.scroll_chat_up(10),
@@ -1694,6 +1696,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
+                    app.render.reset_composer_input_geometry();
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -2241,7 +2244,7 @@ mod model_popup_tests {
     use crate::domain::chat::ChatEntry;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
-    use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
     use crate::runtime::TestEffects;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -2272,11 +2275,13 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.composer.replace_input(" hello ".into());
+        app.render.test_seed_composer_input_geometry(24, 2);
         app.render.set_chat_scroll_offset(9);
 
         effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.composer.input.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(app.render.chat_scroll_offset(), 0);
         let local_id = match app.chat.messages.as_slice() {
             [
@@ -2300,6 +2305,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.composer.replace_input("   ".into());
+        app.render.test_seed_composer_input_geometry(18, 1);
         app.render.set_chat_scroll_offset(9);
 
         let effects = handle_chat_key(&mut app, key(KeyCode::Enter));
@@ -2307,6 +2313,7 @@ mod model_popup_tests {
         assert!(effects.is_empty());
         assert!(app.composer.input.is_empty());
         assert!(app.chat.messages.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(app.render.chat_scroll_offset(), 0);
     }
 
@@ -2362,7 +2369,7 @@ mod model_popup_tests {
         let mut app = App::new();
         app.composer.input = "draft".into();
         app.composer.input_cursor = 3;
-        app.composer.input_scroll = 2;
+        app.render.test_seed_composer_input_geometry(20, 2);
         app.composer.input_preferred_col = Some(4);
         app.composer.refresh_mention_state();
         app.composer.input = "/mo".into();
@@ -2372,11 +2379,51 @@ mod model_popup_tests {
 
         assert_eq!(app.take_input(), "/mo");
         assert_eq!(app.composer.input_cursor, 0);
-        assert_eq!(app.composer.input_scroll, 0);
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(app.composer.input_preferred_col, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_none());
         assert_eq!(app.render.chat_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn chord_and_slash_undo_replacements_reset_render_geometry() {
+        let turn = UndoableTurn {
+            turn_id: "turn-1".into(),
+            message_id: "message-1".into(),
+            text: "restored prompt".into(),
+        };
+
+        let mut chord_app = App::new();
+        chord_app.connection.conn = ConnState::Connected;
+        chord_app.chat.undoable_turns.push(turn.clone());
+        chord_app.render.test_seed_composer_input_geometry(25, 2);
+        let effects = handle_chord(&mut chord_app, key(KeyCode::Char('u')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Command(Command::Undo { message_id })] if message_id == "message-1"
+        ));
+        assert_eq!(chord_app.composer.input, "restored prompt");
+        assert_eq!(
+            chord_app.render.test_composer_input_geometry(),
+            (1, 0, false)
+        );
+
+        let mut slash_app = App::new();
+        slash_app.connection.conn = ConnState::Connected;
+        slash_app.chat.undoable_turns.push(turn);
+        slash_app.composer.replace_input("/undo".into());
+        slash_app.render.test_seed_composer_input_geometry(31, 3);
+        let effects = handle_chat_key(&mut slash_app, key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Command(Command::Undo { message_id })] if message_id == "message-1"
+        ));
+        assert_eq!(slash_app.composer.input, "restored prompt");
+        assert_eq!(
+            slash_app.render.test_composer_input_geometry(),
+            (1, 0, false)
+        );
     }
 
     #[test]

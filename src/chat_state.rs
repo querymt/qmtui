@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::application::Effect;
-use crate::composer_state::build_input_visual_layout;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp, SessionStatsLite};
 use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
@@ -11,6 +10,7 @@ use crate::domain::session::{
     UndoStackSnapshot, UndoState, UndoableTurn,
 };
 use crate::domain::tool::ToolDetail;
+use crate::input_layout::build_input_visual_layout;
 use crate::tool_detail;
 
 const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -22,8 +22,6 @@ pub(crate) struct ElicitationUiState {
     pub(crate) text_cursor: usize,
     pub(crate) custom_active: bool,
     pub(crate) custom_cursor: usize,
-    pub(crate) custom_line_width: usize,
-    pub(crate) custom_scroll: u16,
 }
 
 impl ElicitationUiState {
@@ -95,9 +93,8 @@ impl ElicitationUiState {
             .unwrap_or(input.len());
     }
 
-    pub(crate) fn custom_move_visual(&mut self, input: &str, delta: i32) {
-        let layout =
-            build_input_visual_layout(input, self.custom_cursor, self.custom_line_width.max(1), 2);
+    pub(crate) fn custom_move_visual(&mut self, input: &str, line_width: usize, delta: i32) {
+        let layout = build_input_visual_layout(input, self.custom_cursor, line_width, 2);
         let row = (layout.cursor_row as i32 + delta)
             .clamp(0, layout.total_rows().saturating_sub(1) as i32) as usize;
         self.custom_cursor = layout.cursor_offset_for_row_col(row, layout.cursor_text_col);
@@ -3789,15 +3786,40 @@ mod tests {
     }
 
     #[test]
+    fn elicitation_custom_editor_preserves_utf8_editing_and_hard_line_navigation() {
+        let mut ui = ElicitationUiState::default();
+        let mut input = String::new();
+
+        ui.custom_insert(&mut input, '界');
+        ui.custom_insert(&mut input, 'é');
+        assert_eq!(ui.custom_cursor, input.len());
+        ui.custom_left(&input);
+        assert_eq!(ui.custom_cursor, "界".len());
+        ui.custom_delete(&mut input);
+        assert_eq!(input, "界");
+        ui.custom_backspace(&mut input);
+        assert!(input.is_empty());
+        assert_eq!(ui.custom_cursor, 0);
+
+        input = "ab\n界d".into();
+        ui.custom_cursor = input.len();
+        ui.custom_home(&input);
+        assert_eq!(ui.custom_cursor, "ab\n".len());
+        ui.custom_end(&input);
+        assert_eq!(ui.custom_cursor, input.len());
+        ui.custom_move_visual(&input, 20, -1);
+        assert_eq!(ui.custom_cursor, 2);
+    }
+
+    #[test]
     fn elicitation_editor_reuses_composer_visual_layout() {
         let mut ui = ElicitationUiState {
             custom_cursor: 4,
-            custom_line_width: 4,
             ..Default::default()
         };
-        ui.custom_move_visual("abcdef", -1);
+        ui.custom_move_visual("abcdef", 4, -1);
         assert_eq!(ui.custom_cursor, 2);
-        ui.custom_move_visual("abcdef", 1);
+        ui.custom_move_visual("abcdef", 4, 1);
         assert_eq!(ui.custom_cursor, 4);
     }
 }
