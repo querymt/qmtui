@@ -2,7 +2,6 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::CardCache;
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
@@ -14,10 +13,14 @@ use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
-pub(crate) use crate::markdown::CardBlock;
+pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
+#[cfg(test)]
+pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
 #[cfg(test)]
 pub(crate) use chat::{
-    Card, CardKind, ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
+    ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards,
+    build_message_cards_for_width, build_message_cards_for_width_at, build_streaming_card_for_test,
+    spinner,
 };
 #[cfg(test)]
 pub(crate) use popups::{
@@ -45,8 +48,6 @@ pub(crate) const ELLIPSIS: &str = "\u{2026}"; // … horizontal ellipsis – tru
 pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 pub(super) const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
-pub(crate) const MD_HRULE_CHAR: &str = "\u{2500}"; // ─ box drawings light horizontal – HR
-pub(crate) const MD_BULLET: &str = "\u{2022} "; // • bullet – unordered list item prefix
 
 // ── Connection indicators ─────────────────────────────────────────────────────
 const CONN_ONLINE: &str = "\u{25CF}"; // ● filled circle – connected / disconnected
@@ -160,7 +161,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::MeshInvite => draw_mesh_invite_popup(f, app),
         Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, app),
         Popup::ModelSelect => draw_model_popup(f, app),
-        Popup::SessionSelect => draw_session_popup(f, app),
+        Popup::SessionSelect => {
+            draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render)
+        }
         Popup::NewSession => draw_new_session_popup(f, app),
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
@@ -234,18 +237,22 @@ mod tests {
     use crate::chat_state::ElicitationUiState;
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
-        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
+        ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+        SessionActivity, SessionOp,
     };
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
-    use crate::domain::chat::ChatEntry;
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::{
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
     use crate::domain::model::ModelEntry;
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::domain::tool::{DiffPreviewSection, ShellOutputTail, ToolDetail};
+    use crate::domain::tool::{
+        IndexMetadata, MultiEditSection, SearchResultCounts, ShellOutput, SymbolDiffSection,
+        SymbolReplacement, TodoItem, ToolDetail,
+    };
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
     use ratatui::widgets::ListItem;
@@ -283,7 +290,10 @@ mod tests {
             tool_call_id: Some(id.into()),
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary(format!("({agent}) {objective}")),
+            detail: ToolDetail::Delegate {
+                target_agent_id: agent.into(),
+                objective: objective.into(),
+            },
         }
     }
 
@@ -304,6 +314,25 @@ mod tests {
             .collect()
     }
 
+    fn rendered_card_snapshot(app: &mut App, width: u16) -> Vec<(CardKind, Vec<String>, u16)> {
+        build_message_cards_for_width(app, width)
+            .iter()
+            .map(|card| {
+                let lines = card
+                    .lines_for(width.saturating_sub(4))
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect();
+                (card.kind.clone(), lines, card.height(width))
+            })
+            .collect()
+    }
+
     fn render_chat_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -315,6 +344,46 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_delegate_view(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn draw_session_popup_for_test(f: &mut Frame, app: &mut App) {
+        draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render);
+    }
+
+    fn session_draw_snapshot(app: &App) -> String {
+        format!(
+            "groups={:?};cursor={};filter={:?};tab={};collapsed={:?};popup_collapsed={:?};discovery={};discovery_cursors={:?};pending_groups={:?};hydrated={:?};expanded={:?};pending_children={:?};session={:?};agent={:?};mode={:?};review={:?};new_path={:?};new_cursor={};completion={:?};activity={:?};remote={:?}",
+            app.sessions.session_groups,
+            app.sessions.session_cursor,
+            app.sessions.session_filter,
+            app.sessions.session_popup_tab,
+            app.sessions.collapsed_groups,
+            app.sessions.popup_collapsed_groups,
+            app.sessions.session_discovery_in_progress,
+            app.sessions.session_discovery_cursors,
+            app.sessions.pending_session_group_loads,
+            app.sessions.hydrated_session_groups,
+            app.sessions.expanded_session_children,
+            app.sessions.pending_session_child_loads,
+            app.sessions.session_id,
+            app.sessions.agent_id,
+            app.sessions.agent_mode,
+            app.sessions.mode_before_review,
+            app.sessions.new_session_path,
+            app.sessions.new_session_cursor,
+            app.sessions.new_session_completion,
+            app.sessions.session_activity,
+            app.sessions.remote_session_locations,
+        )
+    }
+
+    fn render_session_popup(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, app))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -729,6 +798,42 @@ mod tests {
     }
 
     #[test]
+    fn session_popup_draw_publishes_only_active_metric_and_preserves_feature_state() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::SessionSelect;
+        app.render.publish_session_popup_visible_rows(11);
+        app.render.publish_delegate_popup_visible_rows(13);
+        let sessions_before = session_draw_snapshot(&app);
+        let delegates_before = app.delegates.clone();
+
+        let buffer = render_session_popup(&mut app, 90, 20);
+        assert!(buffer_text(&buffer).contains("sessions"));
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+        assert_eq!(session_draw_snapshot(&app), sessions_before);
+        assert_eq!(app.delegates, delegates_before);
+
+        render_session_popup(&mut app, 36, 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 1);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+        render_session_popup(&mut app, 36, 1);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+
+        app.sessions.session_popup_tab = 1;
+        let sessions_before = session_draw_snapshot(&app);
+        let delegates_before = app.delegates.clone();
+        render_session_popup(&mut app, 36, 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 1);
+        render_session_popup(&mut app, 36, 1);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 0);
+        assert_eq!(session_draw_snapshot(&app), sessions_before);
+        assert_eq!(app.delegates, delegates_before);
+    }
+
+    #[test]
     fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
@@ -776,7 +881,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
@@ -818,7 +925,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
 
@@ -886,7 +995,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -933,7 +1044,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -984,7 +1097,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
         assert_eq!(
@@ -1044,7 +1159,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
@@ -1118,7 +1235,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1148,7 +1267,10 @@ mod tests {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+            detail: ToolDetail::Delegate {
+                target_agent_id: "coder".into(),
+                objective: "Fix the bug".into(),
+            },
         });
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -1188,9 +1310,14 @@ mod tests {
             tool_call_id: None,
             name: "index".into(),
             is_error: false,
-            detail: ToolDetail::Summary(
-                "src/(generated)/main.rs (rust, 2 imports, 1 functions)".into(),
-            ),
+            detail: ToolDetail::Index {
+                path: "src/(generated)/main.rs".into(),
+                metadata: Some(IndexMetadata {
+                    language: "rust".into(),
+                    imports: 2,
+                    functions: 1,
+                }),
+            },
         });
 
         let cards = build_message_cards(&mut app);
@@ -1216,7 +1343,15 @@ mod tests {
             tool_call_id: None,
             name: "search_text".into(),
             is_error: false,
-            detail: ToolDetail::Summary("\"needle\" *.rs (5 files, 28 matches)".into()),
+            detail: ToolDetail::SearchText {
+                pattern: "needle".into(),
+                path: String::new(),
+                include: "*.rs".into(),
+                counts: Some(SearchResultCounts {
+                    files: 5,
+                    matches: 28,
+                }),
+            },
         });
 
         let cards = build_message_cards(&mut app);
@@ -1275,6 +1410,191 @@ mod tests {
     }
 
     #[test]
+    fn summary_tool_detail_families_preserve_exact_visible_lines_and_styles() {
+        let mut app = App::new();
+        app.chat.messages.extend([
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "mystery".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "browse".into(),
+                is_error: false,
+                detail: ToolDetail::Browse {
+                    url: "https://例.test/文档…".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "todowrite".into(),
+                is_error: false,
+                detail: ToolDetail::Todo {
+                    items: vec![
+                        TodoItem {
+                            content: "done".into(),
+                            status: "completed".into(),
+                        },
+                        TodoItem {
+                            content: "next".into(),
+                            status: "pending".into(),
+                        },
+                    ],
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "inspect".into(),
+                is_error: false,
+                detail: ToolDetail::Generic {
+                    input: Some("src/lib.rs".into()),
+                    result: Some("language: rust\nsymbols: 3".into()),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "read_tool".into(),
+                is_error: false,
+                detail: ToolDetail::ReadTool {
+                    path: "/workspace/project/src/lib.rs".into(),
+                    start_line: Some(7),
+                    end_line: Some(9),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "glob".into(),
+                is_error: false,
+                detail: ToolDetail::Glob {
+                    pattern: "*.rs".into(),
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "ls".into(),
+                is_error: false,
+                detail: ToolDetail::List {
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "delete_file".into(),
+                is_error: false,
+                detail: ToolDetail::DeleteFile {
+                    path: "tmp/out.txt".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "language_query".into(),
+                is_error: false,
+                detail: ToolDetail::LanguageQuery {
+                    action: "definition".into(),
+                    uri: "src/lib.rs".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "question".into(),
+                is_error: false,
+                detail: ToolDetail::Question {
+                    prompt: "Which option?".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "apply_patch".into(),
+                is_error: false,
+                detail: ToolDetail::ApplyPatch {
+                    patch: "*** Begin Patch\n*** End Patch".into(),
+                },
+            },
+        ]);
+
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        let lines = cards[0].lines_for(120);
+        let visible_lines = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_lines,
+            [
+                "> mystery",
+                "> browse https://例.test/文档…",
+                "> todowrite",
+                "  [x] done",
+                "  [ ] next",
+                "> inspect src/lib.rs",
+                "  language: rust",
+                "  symbols: 3",
+                "> read_tool src/lib.rs:7-9",
+                "> glob *.rs in project/src",
+                "> ls project/src",
+                "> delete_file tmp/out.txt",
+                "> language_query definition src/lib.rs",
+                "> question asking...",
+                "> apply_patch patch",
+            ]
+        );
+        assert_eq!(cards[0].kind, CardKind::Tool { compact: false });
+        assert_eq!(lines[1].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[3].spans[0].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[5].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[6].spans[0].style.fg, Theme::tool_output().fg);
+        assert_eq!(lines[8].spans[3].style.fg, Theme::status_accent().fg);
+        for line in &lines[9..=14] {
+            assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        }
+        drop(lines);
+        assert_eq!(cards[0].height(20), 25, "narrow Unicode rows must wrap");
+    }
+
+    #[test]
+    fn tool_summary_utf8_truncation_is_render_owned_and_char_safe() {
+        let browse_url = format!("https://example.test/{}tail", "界".repeat(50));
+        let objective = format!("{}tail", "界".repeat(50));
+        let expected_url = format!("{}…", browse_url.chars().take(59).collect::<String>());
+        let expected_objective = format!("{}…", objective.chars().take(49).collect::<String>());
+        let mut app = App::new();
+        app.chat.messages.extend([
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "browse".into(),
+                is_error: false,
+                detail: ToolDetail::Browse { url: browse_url },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "delegate".into(),
+                is_error: false,
+                detail: ToolDetail::Delegate {
+                    target_agent_id: String::new(),
+                    objective,
+                },
+            },
+        ]);
+
+        assert_eq!(
+            rendered_card_lines(&mut app),
+            [
+                format!("> browse {expected_url}"),
+                format!("> delegate {expected_objective}"),
+            ]
+        );
+    }
+
+    #[test]
     fn delegate_tool_call_shows_awaiting_input_marker() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
@@ -1283,7 +1603,10 @@ mod tests {
             tool_call_id: None,
             name: "delegate".into(),
             is_error: false,
-            detail: ToolDetail::Summary("(coder) Fix the bug".into()),
+            detail: ToolDetail::Delegate {
+                target_agent_id: "coder".into(),
+                objective: "Fix the bug".into(),
+            },
         });
         app.delegates.delegate_entries.push(DelegateEntry {
             delegation_id: "del-1".into(),
@@ -1302,6 +1625,9 @@ mod tests {
                 source: "builtin:question".into(),
             },
         });
+
+        let lines = rendered_card_lines(&mut app);
+        assert_eq!(lines, ["> delegate (coder:45s) awaiting input Fix the bug"]);
 
         let buffer = render_chat_buffer(&mut app, 90, 10);
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
@@ -1357,17 +1683,125 @@ mod tests {
     }
 
     #[test]
+    fn composer_draw_publishes_resized_geometry_scrolls_both_ways_and_preserves_semantics() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.sessions.agent_mode = "build".into();
+        app.composer.input = "a\nb\nc\nd\ne\nf\ng\nh".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = Some(3);
+        app.composer.file_index = vec![crate::composer_state::FileIndexEntryLite {
+            path: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        app.composer.file_index_generated_at = Some(7);
+        app.composer.file_index_error = Some("preserved".into());
+        app.composer.mention_state = Some(crate::composer_state::MentionState {
+            trigger_start: 1,
+            query: "src".into(),
+            selected_index: 2,
+            results: app.composer.file_index.clone(),
+        });
+        app.composer.slash_state = Some(crate::composer_state::SlashCompletionState {
+            query: "mo".into(),
+            selected_index: 1,
+            results: vec![&crate::slash::SLASH_COMMANDS[0]],
+        });
+        let semantic_snapshot = (
+            app.composer.input.clone(),
+            app.composer.input_cursor,
+            app.composer.input_preferred_col,
+            app.composer.file_index.clone(),
+            app.composer.file_index_generated_at,
+            app.composer.file_index_loading,
+            app.composer.file_index_error.clone(),
+            app.composer.mention_state.as_ref().map(|mention| {
+                (
+                    mention.trigger_start,
+                    mention.query.clone(),
+                    mention.selected_index,
+                    mention.results.clone(),
+                )
+            }),
+            app.composer.slash_state.as_ref().map(|slash| {
+                (
+                    slash.query.clone(),
+                    slash.selected_index,
+                    slash
+                        .results
+                        .iter()
+                        .map(|command| command.name)
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        );
+
+        render_chat_buffer(&mut app, 40, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (36, 3, true));
+        assert_eq!(
+            (
+                app.composer.input.clone(),
+                app.composer.input_cursor,
+                app.composer.input_preferred_col,
+                app.composer.file_index.clone(),
+                app.composer.file_index_generated_at,
+                app.composer.file_index_loading,
+                app.composer.file_index_error.clone(),
+                app.composer.mention_state.as_ref().map(|mention| (
+                    mention.trigger_start,
+                    mention.query.clone(),
+                    mention.selected_index,
+                    mention.results.clone(),
+                )),
+                app.composer.slash_state.as_ref().map(|slash| (
+                    slash.query.clone(),
+                    slash.selected_index,
+                    slash
+                        .results
+                        .iter()
+                        .map(|command| command.name)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            semantic_snapshot
+        );
+
+        app.composer.input_cursor = 0;
+        render_chat_buffer(&mut app, 20, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (16, 0, true));
+        render_chat_buffer(&mut app, 60, 14);
+        assert_eq!(app.render.test_composer_input_geometry(), (56, 0, true));
+    }
+
+    #[test]
+    fn hidden_composer_draw_resets_only_render_scroll() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "draft\nkept".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = Some(2);
+        app.render.test_seed_composer_input_geometry(12, 4);
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+
+        render_chat_buffer(&mut app, 40, 12);
+
+        assert_eq!(app.render.test_composer_input_geometry(), (36, 0, true));
+        assert_eq!(app.composer.input, "draft\nkept");
+        assert_eq!(app.composer.input_cursor, "draft\nkept".len());
+        assert_eq!(app.composer.input_preferred_col, Some(2));
+    }
+
+    #[test]
     fn custom_editor_visual_movement_crosses_wrapped_rows() {
         let mut ui = ElicitationUiState {
             custom_cursor: 5,
-            custom_line_width: 5,
             ..Default::default()
         };
         let input = "abcdefghij";
 
-        ui.custom_move_visual(input, 1);
+        ui.custom_move_visual(input, 5, 1);
         assert_eq!(ui.custom_cursor, 10);
-        ui.custom_move_visual(input, -1);
+        ui.custom_move_visual(input, 5, -1);
         assert_eq!(ui.custom_cursor, 5);
     }
 
@@ -1375,15 +1809,98 @@ mod tests {
     fn custom_editor_visual_movement_crosses_explicit_newline() {
         let mut ui = ElicitationUiState {
             custom_cursor: 2,
-            custom_line_width: 20,
             ..Default::default()
         };
         let input = "ab\ncdef";
 
-        ui.custom_move_visual(input, 1);
+        ui.custom_move_visual(input, 20, 1);
         assert_eq!(ui.custom_cursor, 5);
-        ui.custom_move_visual(input, -1);
+        ui.custom_move_visual(input, 20, -1);
         assert_eq!(ui.custom_cursor, 2);
+    }
+
+    #[test]
+    fn custom_editor_draw_owns_scroll_resize_and_preserves_elicitation_semantics() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: Some("description".into()),
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![ElicitationOption {
+                    value: serde_json::json!("a"),
+                    label: "Alpha".into(),
+                    description: None,
+                }],
+            },
+        }]);
+        state.custom_input = "a\nb\nc\nd\ne\nf\ng".into();
+        state.text_input = "semantic text".into();
+        state
+            .selected
+            .insert("choice".into(), serde_json::json!("a"));
+        let ui = ElicitationUiState {
+            field_cursor: 0,
+            option_cursor: 1,
+            text_cursor: 4,
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+        };
+        let state_snapshot = (
+            state.elicitation_id.clone(),
+            state.message.clone(),
+            state.source.clone(),
+            state.fields.clone(),
+            state.selected.clone(),
+            state.text_input.clone(),
+            state.custom_input.clone(),
+            state.allow_custom,
+        );
+        let ui_snapshot = (
+            ui.field_cursor,
+            ui.option_cursor,
+            ui.text_cursor,
+            ui.custom_active,
+            ui.custom_cursor,
+        );
+        app.chat.elicitation = Some(state);
+        app.chat.elicitation_ui = Some(ui);
+
+        render_chat_buffer(&mut app, 40, 24);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (36, 2, true));
+        let state = app.chat.elicitation.as_ref().unwrap();
+        let ui = app.chat.elicitation_ui.as_ref().unwrap();
+        assert_eq!(
+            (
+                state.elicitation_id.clone(),
+                state.message.clone(),
+                state.source.clone(),
+                state.fields.clone(),
+                state.selected.clone(),
+                state.text_input.clone(),
+                state.custom_input.clone(),
+                state.allow_custom,
+            ),
+            state_snapshot
+        );
+        assert_eq!(
+            (
+                ui.field_cursor,
+                ui.option_cursor,
+                ui.text_cursor,
+                ui.custom_active,
+                ui.custom_cursor,
+            ),
+            ui_snapshot
+        );
+
+        app.chat.elicitation_ui.as_mut().unwrap().custom_cursor = 0;
+        render_chat_buffer(&mut app, 20, 24);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (16, 0, true));
+        render_chat_buffer(&mut app, 3, 4);
+        assert_eq!(app.render.elicitation_custom_line_width(), 1);
     }
 
     #[test]
@@ -1535,7 +2052,7 @@ mod tests {
         let rendered = buffer_text(&buffer);
 
         assert!(
-            rendered.contains("Question"),
+            rendered.contains("\u{25B8} Question"),
             "missing popup title: {rendered}"
         );
         assert!(
@@ -1590,7 +2107,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -1611,7 +2130,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (marker_x, marker_y) = find_buffer_text(&buffer, "●").expect("active marker missing");
@@ -1632,7 +2153,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer_text(&buffer);
 
@@ -1662,7 +2185,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -2333,7 +2858,107 @@ mod tests {
         let mut app = App::new();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
+    }
+
+    fn elicitation_card_snapshot(
+        outcome: Option<ElicitationResponseOutcome>,
+    ) -> Vec<(String, ratatui::style::Style)> {
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Choose".into(),
+            source: "builtin:question".into(),
+            outcome,
+        });
+        let cards = build_message_cards(&mut app);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].kind, CardKind::Elicitation);
+        cards[0]
+            .lines_for(120)
+            .iter()
+            .map(|line| {
+                (
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect(),
+                    line.spans.first().expect("elicitation line span").style,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn elicitation_cards_render_every_semantic_outcome_exactly() {
+        let cases = [
+            (
+                None,
+                vec![("  waiting for response\u{2026}", Theme::thinking())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Selected(vec![
+                    "Alpha".into(),
+                    "custom\nanswer".into(),
+                    "Beta".into(),
+                ])),
+                vec![
+                    ("  \u{25B8} Alpha", Theme::info_text()),
+                    ("  \u{25B8} custom", Theme::info_text()),
+                    ("  answer", Theme::info_text()),
+                    ("  \u{25B8} Beta", Theme::info_text()),
+                ],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Text(
+                    "line one\nline two".into(),
+                )),
+                vec![
+                    ("  line one", Theme::info_text()),
+                    ("  line two", Theme::info_text()),
+                ],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Boolean(true)),
+                vec![("  Yes", Theme::info_text())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Boolean(false)),
+                vec![("  No", Theme::info_text())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Declined),
+                vec![("  declined", Theme::status())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Cancelled),
+                vec![("  cancelled", Theme::status())],
+            ),
+            (
+                Some(ElicitationResponseOutcome::UnsupportedSchema),
+                vec![(
+                    "  unsupported schema - cannot answer in TUI",
+                    Theme::info_text(),
+                )],
+            ),
+            (
+                Some(ElicitationResponseOutcome::Responded),
+                vec![("  responded", Theme::info_text())],
+            ),
+        ];
+
+        for (outcome, expected_outcome) in cases {
+            let snapshot = elicitation_card_snapshot(outcome);
+            assert_eq!(
+                snapshot.first(),
+                Some(&("[?] Choose".into(), Theme::status_accent()))
+            );
+            let expected: Vec<(String, ratatui::style::Style)> = expected_outcome
+                .into_iter()
+                .map(|(text, style)| (text.into(), style))
+                .collect();
+            assert_eq!(&snapshot[1..], expected, "unexpected outcome rendering");
+        }
     }
 
     #[test]
@@ -2346,7 +2971,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
     }
 
     #[test]
@@ -2409,12 +3034,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
 
         // Second call with no new messages — cache hit
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
     }
 
     #[test]
@@ -2439,7 +3064,7 @@ mod tests {
         let lines = rendered_card_lines(&mut app);
         assert!(!lines.iter().any(|line| line.contains("awaiting input")));
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -2449,7 +3074,6 @@ mod tests {
             requested_schema: serde_json::json!({ "properties": {} }),
             source: "builtin:question".into(),
         };
-        app.render.invalidate_card_cache();
         let lines = rendered_card_lines(&mut app);
 
         assert_eq!(
@@ -2509,7 +3133,8 @@ mod tests {
                 child_state: DelegateChildState::None,
             },
         ];
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
 
         let lines = rendered_card_lines(&mut app);
         let first = lines
@@ -2587,13 +3212,14 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
 
         app.chat.messages.clear();
-        app.render.card_cache.invalidate();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
     }
 
     #[test]
@@ -2609,7 +3235,7 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert_eq!(app.render.test_card_source_entry_count(), 2);
 
         // Simulate retain() shrinking messages (like compaction does)
         app.chat
@@ -2618,6 +3244,518 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
+    }
+
+    #[test]
+    fn same_length_content_replacement_rebuilds_only_the_changed_suffix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable prefix".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "aaaa".into(),
+                thinking: None,
+                message_id: Some("assistant-1".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let changed_identity = app.render.test_card_identity(1);
+
+        let ChatEntry::Assistant { content, .. } = &mut app.chat.messages[1] else {
+            unreachable!("assistant fixture")
+        };
+        *content = "bbbb".into();
+
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), changed_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn same_count_tool_detail_mutation_rebuilds_affected_batch_and_preserves_prefix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable prefix".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                detail: ToolDetail::Generic {
+                    input: Some("aaaa".into()),
+                    result: None,
+                },
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let tool_identity = app.render.test_card_identity(1);
+
+        let ChatEntry::ToolCall { detail, .. } = &mut app.chat.messages[1] else {
+            unreachable!("tool fixture")
+        };
+        *detail = ToolDetail::Generic {
+            input: Some("bbbb".into()),
+            result: None,
+        };
+
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), tool_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn width_change_matches_cold_table_relayout() {
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::Assistant {
+            content:
+                "| Column one | Column two |\n| --- | --- |\n| a long value | another long value |"
+                    .into(),
+            thinking: None,
+            message_id: Some("table-1".into()),
+        });
+
+        let wide = rendered_card_snapshot(&mut app, 100);
+        let warm_narrow = rendered_card_snapshot(&mut app, 30);
+        assert_ne!(wide, warm_narrow);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_narrow = rendered_card_snapshot(&mut app, 30);
+        assert_eq!(warm_narrow, cold_narrow);
+    }
+
+    #[test]
+    fn shrink_truncates_stale_suffix_without_rebuilding_prefix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "keep".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "remove".into(),
+                thinking: None,
+                message_id: Some("assistant-1".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+
+        app.chat.messages.truncate(1);
+        let cards = build_message_cards_for_width(&mut app, 80);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+    }
+
+    #[test]
+    fn out_of_order_reordering_preserves_unchanged_prefix_and_matches_cold() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "second".into(),
+                thinking: None,
+                message_id: Some("assistant-2".into()),
+            },
+            ChatEntry::Assistant {
+                content: "third".into(),
+                thinking: None,
+                message_id: Some("assistant-3".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let old_second_identity = app.render.test_card_identity(1);
+
+        app.chat.messages.swap(1, 2);
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), old_second_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn session_identity_change_rebuilds_equal_content_and_matches_cold() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("session-a".into());
+        app.chat.messages.push(ChatEntry::User {
+            text: "same content".into(),
+            message_id: Some("user-1".into()),
+        });
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let old_identity = app.render.test_card_identity(0);
+
+        app.sessions.session_id = Some("session-b".into());
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), old_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn streaming_keys_rebuild_exact_content_ids_and_visibility_axes() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("session-1".into());
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "aaaa".into();
+        app.chat.streaming_content_message_id = Some("content-1".into());
+        app.chat.streaming_thinking = "plan".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-1".into());
+
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        let thinking_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity
+        );
+
+        app.chat.streaming_content = "bbbb".into();
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let replaced_content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        assert_ne!(replaced_content_identity, content_identity);
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity,
+            "the thinking key does not include the other stream's content"
+        );
+
+        app.chat.streaming_content_message_id = Some("content-2".into());
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            replaced_content_identity
+        );
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity,
+            "the paired content ID participates in the thinking key"
+        );
+
+        let visible_content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        app.chat.show_thinking = false;
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            visible_content_identity
+        );
+    }
+
+    #[test]
+    fn thinking_visibility_regroups_finalized_tools_without_manual_invalidation() {
+        let mut app = App::new();
+        app.chat.show_thinking = false;
+        app.chat.messages = vec![
+            tool_call("glob"),
+            ChatEntry::Thinking {
+                content: "visible when enabled".into(),
+                message_id: Some("thinking-1".into()),
+            },
+            tool_call("read_tool"),
+        ];
+
+        let hidden = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].0, CardKind::Tool { compact: false });
+
+        app.chat.show_thinking = true;
+        let warm_visible = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(
+            warm_visible
+                .iter()
+                .map(|card| card.0.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                CardKind::Tool { compact: false },
+                CardKind::Thinking,
+                CardKind::Tool { compact: true },
+            ]
+        );
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_visible = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm_visible, cold_visible);
+    }
+
+    #[test]
+    fn delegate_duration_and_status_rekey_tool_batch_without_manual_invalidation() {
+        let mut app = App::new();
+        app.chat
+            .messages
+            .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
+        app.delegates.delegate_entries.push(DelegateEntry {
+            delegation_id: "delegation-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: Some("tool-1".into()),
+            target_agent_id: Some("coder".into()),
+            objective: "Fix cache bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: Some(90),
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        let _ = build_message_cards_for_width_at(&mut app, 80, 100);
+        let running_identity = app.render.test_card_identity(0);
+        let running_lines = app.render.cards()[0]
+            .lines_for(76)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(running_lines.iter().any(|line| line.contains("coder:10s")));
+
+        let _ = build_message_cards_for_width_at(&mut app, 80, 101);
+        let duration_identity = app.render.test_card_identity(0);
+        assert_ne!(duration_identity, running_identity);
+
+        app.delegates.delegate_entries[0].status = DelegateStatus::Completed;
+        app.delegates.delegate_entries[0].ended_at = Some(101);
+        let warm = {
+            let cards = build_message_cards_for_width_at(&mut app, 80, 101);
+            cards[0]
+                .lines_for(76)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(warm.iter().any(|line| line.contains("done")));
+        assert_ne!(app.render.test_card_identity(0), duration_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = {
+            let cards = build_message_cards_for_width_at(&mut app, 80, 101);
+            cards[0]
+                .lines_for(76)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    #[serial]
+    fn theme_revision_rekeys_finalized_and_both_streaming_caches_without_invalidation() {
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::User {
+            text: "styled".into(),
+            message_id: Some("user-1".into()),
+        });
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "content".into();
+        app.chat.streaming_content_message_id = Some("content-1".into());
+        app.chat.streaming_thinking = "thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-1".into());
+
+        let _ = build_message_cards_for_width(&mut app, 80);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let card_identity = app.render.test_card_identity(0);
+        let content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        let thinking_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking);
+
+        Theme::set_by_index(2);
+        Theme::begin_frame();
+        let _ = build_message_cards_for_width(&mut app, 80);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), card_identity);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            content_identity
+        );
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity
+        );
+
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+    }
+
+    #[test]
+    #[serial]
+    fn stable_key_axes_match_cold_rebuild_table() {
+        for axis in [
+            "content",
+            "tool",
+            "delegate",
+            "width",
+            "theme",
+            "session",
+            "visibility",
+        ] {
+            Theme::set_by_index(0);
+            Theme::begin_frame();
+            let mut app = App::new();
+            app.sessions.session_id = Some("session-a".into());
+            app.chat.show_thinking = false;
+            app.chat.messages = vec![
+                ChatEntry::User {
+                    text: "prefix".into(),
+                    message_id: Some("user-1".into()),
+                },
+                ChatEntry::Assistant {
+                    content: "aaaa".into(),
+                    thinking: None,
+                    message_id: Some("assistant-1".into()),
+                },
+                ChatEntry::ToolCall {
+                    tool_call_id: Some("tool-1".into()),
+                    name: "shell".into(),
+                    is_error: false,
+                    detail: ToolDetail::Generic {
+                        input: Some("first".into()),
+                        result: None,
+                    },
+                },
+                ChatEntry::Thinking {
+                    content: "hidden".into(),
+                    message_id: Some("thinking-1".into()),
+                },
+                delegate_tool_call("delegate-1", "coder", "task"),
+            ];
+            app.delegates.delegate_entries.push(DelegateEntry {
+                delegation_id: "delegation-1".into(),
+                child_session_id: Some("child-1".into()),
+                delegate_tool_call_id: Some("delegate-1".into()),
+                target_agent_id: Some("coder".into()),
+                objective: "task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            });
+            let mut width = 80;
+            let _ = rendered_card_snapshot(&mut app, width);
+
+            match axis {
+                "content" => {
+                    let ChatEntry::Assistant { content, .. } = &mut app.chat.messages[1] else {
+                        unreachable!("assistant fixture")
+                    };
+                    *content = "bbbb".into();
+                }
+                "tool" => {
+                    let ChatEntry::ToolCall { detail, .. } = &mut app.chat.messages[2] else {
+                        unreachable!("tool fixture")
+                    };
+                    *detail = ToolDetail::Generic {
+                        input: Some("second".into()),
+                        result: None,
+                    };
+                }
+                "delegate" => app.delegates.delegate_entries[0].status = DelegateStatus::Completed,
+                "width" => width = 40,
+                "theme" => {
+                    Theme::set_by_index(2);
+                    Theme::begin_frame();
+                }
+                "session" => app.sessions.session_id = Some("session-b".into()),
+                "visibility" => app.chat.show_thinking = true,
+                _ => unreachable!("known stable-key axis"),
+            }
+
+            let warm = rendered_card_snapshot(&mut app, width);
+            app.render
+                .apply_change(RenderChange::FinalizedMessagesChanged);
+            let cold = rendered_card_snapshot(&mut app, width);
+            assert_eq!(warm, cold, "warm/cold mismatch for {axis}");
+        }
+
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+    }
+
+    #[test]
+    fn effective_cwd_change_rekeys_replace_symbol_title() {
+        let mut app = App::new();
+        app.connection.launch_cwd = Some("/workspace/one".into());
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("replace-1".into()),
+            name: "replace_symbol".into(),
+            is_error: false,
+            detail: ToolDetail::ReplaceSymbolInput {
+                replacements: vec![SymbolReplacement {
+                    path: "/workspace/one/src/deep/lib.rs".into(),
+                    symbol: "run".into(),
+                    new_text: "fn run() {}".into(),
+                }],
+            },
+        });
+
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let old_identity = app.render.test_card_identity(0);
+        app.connection.launch_cwd = Some("/workspace/two".into());
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), old_identity);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
     }
 
     #[test]
@@ -2648,10 +3786,19 @@ mod tests {
             ChatEntry::ToolCall { is_error: true, .. }
         ));
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "cache must invalidate"
         );
-        let lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let lines = rebuilt_from_warm_update
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .collect::<Vec<_>>();
         assert!(lines.iter().any(|line| line.contains("x shell")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
         assert!(matches!(app.chat.messages[1], ChatEntry::Assistant { .. }));
@@ -2675,7 +3822,7 @@ mod tests {
         assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
         assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -2696,10 +3843,16 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "semantic update should invalidate the warm card"
         );
-        let rebuilt_lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let rebuilt_lines = &rebuilt_from_warm_update[0].1;
         assert!(
             rebuilt_lines
                 .iter()
@@ -2738,7 +3891,7 @@ mod tests {
                 .any(|line| line.contains("  1 ") && line.contains("- before"))
         );
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -2759,15 +3912,84 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "semantic update should invalidate the warm card"
         );
-        let rebuilt_lines = rendered_card_lines(&mut app);
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        let rebuilt_lines = &rebuilt_from_warm_update[0].1;
         assert!(
             rebuilt_lines
                 .iter()
                 .any(|line| line.contains("  42 ") && line.contains("- before")),
             "rebuilt card returned stale edit detail: {rebuilt_lines:?}"
+        );
+    }
+
+    #[test]
+    fn warm_tool_detail_update_matches_cold_full_rebuild() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("test-session".into());
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("shell-parity".into()),
+                name: "shell".into(),
+                arguments: Some(serde_json::json!({
+                    "command": "printf",
+                    "args": ["界 output"],
+                    "workdir": "/repo/工作",
+                })),
+            },
+        );
+        let warm_start = rendered_card_snapshot(&mut app, 34);
+        assert!(
+            warm_start[0]
+                .1
+                .iter()
+                .any(|line| line.contains("$ printf '界 output'"))
+        );
+
+        live_update(
+            &mut app,
+            "test-session",
+            AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("shell-parity".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: Some(
+                    serde_json::json!({
+                        "stdout": "one\ntwo\nthree\nfour\nfive\nsix\n",
+                        "stderr": "错误\n",
+                    })
+                    .to_string(),
+                ),
+            },
+        );
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
+
+        let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 34);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 34);
+
+        assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
+        assert!(
+            rebuilt_from_warm_update[0]
+                .1
+                .iter()
+                .any(|line| line == "  ... 2 earlier output lines hidden")
+        );
+        assert!(
+            rebuilt_from_warm_update[0]
+                .1
+                .iter()
+                .any(|line| line == "    错误")
         );
     }
 
@@ -2799,7 +4021,17 @@ mod tests {
             failed_tool_end("tool-out-of-order", "shell"),
         );
 
-        let lines = rendered_card_lines(&mut app);
+        let warm_reconciled = rendered_card_snapshot(&mut app, 42);
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
+        assert_eq!(warm_reconciled, cold_full_rebuild);
+
+        let lines = warm_reconciled
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .cloned()
+            .collect::<Vec<_>>();
         assert!(lines.iter().any(|line| line.contains("x shell")));
         assert!(lines.iter().any(|line| line.contains("$ echo replay")));
         assert!(!lines.iter().any(|line| line.contains("shell (failed)")));
@@ -2810,40 +4042,77 @@ mod tests {
     fn message_cards_incremental_matches_full_rebuild() {
         let mut app = App::new();
 
-        // Build incrementally
         app.chat.messages.push(ChatEntry::User {
             text: "q1".into(),
             message_id: None,
         });
-        build_message_cards(&mut app);
+        rendered_card_snapshot(&mut app, 42);
 
         app.chat.messages.push(ChatEntry::Assistant {
             content: "a1".into(),
             thinking: None,
             message_id: None,
         });
-        build_message_cards(&mut app);
+        rendered_card_snapshot(&mut app, 42);
 
-        app.chat.messages.push(tool_call("edit"));
-        build_message_cards(&mut app);
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("shell-1".into()),
+            name: "shell".into(),
+            is_error: false,
+            detail: ToolDetail::Shell {
+                command: "printf '界界界 wide output'".into(),
+                arguments: Vec::new(),
+                workdir: Some("/repo/工作".into()),
+                output: Some(ShellOutput {
+                    stdout: "第一行\nlast line".into(),
+                    stderr: String::new(),
+                    preceding_line_count: 3,
+                }),
+            },
+        });
+        rendered_card_snapshot(&mut app, 42);
+
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("edit-1".into()),
+            name: "edit".into(),
+            is_error: false,
+            detail: ToolDetail::Edit {
+                file: "src/lib.rs".into(),
+                old: "before 界\n".into(),
+                new: "after 界\n".into(),
+                replace_all: false,
+                start_line: Some(99),
+            },
+        });
+        rendered_card_snapshot(&mut app, 42);
 
         app.chat.messages.push(ChatEntry::User {
             text: "q2".into(),
             message_id: None,
         });
-        let incremental_kinds: Vec<_> = {
-            let cards = build_message_cards(&mut app);
-            cards.iter().map(|c| c.kind.clone()).collect()
-        };
+        let incremental = rendered_card_snapshot(&mut app, 42);
 
-        // Full rebuild from scratch
-        app.render.card_cache.invalidate();
-        let full_kinds: Vec<_> = {
-            let cards = build_message_cards(&mut app);
-            cards.iter().map(|c| c.kind.clone()).collect()
-        };
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
+        let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
 
-        assert_eq!(incremental_kinds, full_kinds);
+        assert_eq!(incremental, cold_full_rebuild);
+        let all_visible_lines = incremental
+            .iter()
+            .flat_map(|(_, lines, _)| lines)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            all_visible_lines
+                .iter()
+                .any(|line| line == "> shell@/repo/工作")
+        );
+        assert!(all_visible_lines.iter().any(|line| line.contains("第一行")));
+        assert!(
+            all_visible_lines
+                .iter()
+                .any(|line| line.contains("99 - before 界"))
+        );
     }
 
     #[test]
@@ -2859,12 +4128,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert_eq!(app.render.test_card_source_entry_count(), 2);
 
         load_session(&mut app, "delegate-session", "agent-2");
         assert!(app.chat.messages.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
-        assert!(app.render.card_cache.cards.is_empty());
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
+        assert!(app.render.cards().is_empty());
 
         replay_session(
             &mut app,
@@ -2910,7 +4179,7 @@ mod tests {
             elicitation_id: "elic-1".into(),
             message: "Need approval".into(),
             source: "builtin:question".into(),
-            outcome: Some("responded".into()),
+            outcome: Some(ElicitationResponseOutcome::Responded),
         });
         replay_session(
             &mut app,
@@ -2924,9 +4193,13 @@ mod tests {
             }],
         );
         assert!(app.chat.elicitation.is_none());
-        assert!(
-            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { outcome: Some(outcome), .. }] if outcome == "responded")
-        );
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::Elicitation {
+                outcome: Some(ElicitationResponseOutcome::Responded),
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -2999,7 +4272,7 @@ mod tests {
         );
         assert!(app.chat.elicitation.is_none());
         assert!(
-            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }] if elicitation_id == "elic-1" && outcome == "unsupported schema - cannot answer in TUI")
+            matches!(app.chat.messages.as_slice(), [ChatEntry::Elicitation { elicitation_id, outcome: Some(ElicitationResponseOutcome::UnsupportedSchema), .. }] if elicitation_id == "elic-1")
         );
     }
 
@@ -3105,57 +4378,60 @@ mod tests {
                 file: "f.rs".into(),
                 old: old.into(),
                 new: new.into(),
-                start_line: Some(1),
+                replace_all: false,
+                start_line: Some(41),
             },
         });
 
-        let cards = build_message_cards(&mut app);
-        assert_eq!(cards.len(), 1);
-        // header line + diff lines (at least equal + changed = 2 original lines)
-        assert!(
-            cards[0].lines_for(80).len() > 1,
-            "tool card should include header + diff lines, got {} lines",
-            cards[0].lines_for(80).len()
+        let snapshot = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, CardKind::Tool { compact: false });
+        assert_eq!(
+            snapshot[0].1,
+            ["> edit f.rs", "  41   aaa", "  42 - bbb", "  42 + ccc",]
         );
+        assert_eq!(snapshot[0].2, 5);
     }
 
     #[test]
     fn message_cards_write_tool_includes_content_lines() {
         let mut app = App::new();
-        let content = "fn main() {}\n";
+        let content = (1..=22)
+            .map(|line| format!("line {line} 界"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "write_file".into(),
             is_error: false,
             detail: ToolDetail::WriteFile {
-                path: "out.rs".into(),
-                content: content.into(),
+                path: "/workspace/src/out.rs".into(),
+                content,
             },
         });
 
-        let cards = build_message_cards(&mut app);
-        assert_eq!(cards.len(), 1);
-        // header line + 1 content line
-        assert_eq!(cards[0].lines_for(80).len(), 2);
+        let snapshot = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].1.len(), 22);
+        assert_eq!(snapshot[0].1[0], "> write_file src/out.rs");
+        assert_eq!(snapshot[0].1[1], "   1 + line 1 界");
+        assert_eq!(snapshot[0].1[20], "  20 + line 20 界");
+        assert_eq!(snapshot[0].1[21], "       ... (2 more lines)");
+        assert_eq!(snapshot[0].2, 23);
     }
 
     #[test]
     fn message_cards_multiedit_tool_includes_sectioned_diff_lines() {
         let mut app = App::new();
-        let sections = vec![
-            DiffPreviewSection {
-                header: "edit 1".into(),
-                old: "aaa\n".into(),
-                new: "bbb\n".into(),
-                start_line: Some(10),
-            },
-            DiffPreviewSection {
-                header: "edit 2".into(),
-                old: "ccc\n".into(),
-                new: "ddd\n".into(),
-                start_line: Some(20),
-            },
-        ];
+        let sections = (1..=8)
+            .map(|index| MultiEditSection {
+                edit_index: index,
+                replace_all: index == 1,
+                old: format!("old {index}\n"),
+                new: format!("new {index}\n"),
+                start_line: Some(index * 10),
+            })
+            .collect::<Vec<_>>();
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "multiedit".into(),
@@ -3185,11 +4461,17 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("> multiedit src/lib.rs (2 edits)"))
+                .any(|line| line.contains("> multiedit src/lib.rs (8 edits)"))
         );
-        assert!(lines.iter().any(|line| line.contains("@@ edit 1")));
-        assert!(lines.iter().any(|line| line.contains("- aaa")));
-        assert!(lines.iter().any(|line| line.contains("+ bbb")));
+        assert!(lines.iter().any(|line| line.contains("@@ edit 1 (all)")));
+        assert!(lines.iter().any(|line| line.contains("  10 - old 1")));
+        assert!(lines.iter().any(|line| line.contains("  10 + new 1")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  ... 2 more sections collapsed")
+        );
+        assert!(!lines.iter().any(|line| line.contains("@@ edit 7")));
 
         let section_line = card_lines
             .iter()
@@ -3198,30 +4480,37 @@ mod tests {
                     .iter()
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
-                    .contains("@@ edit 1")
+                    .contains("@@ edit 1 (all)")
             })
             .expect("missing multiedit section header");
         assert_eq!(section_line.spans[0].content, "  @@ ");
         assert_eq!(section_line.spans[0].style.fg, Theme::diff_context().fg);
-        assert_eq!(section_line.spans[1].content, "edit 1");
+        assert_eq!(section_line.spans[1].content, "edit 1 (all)");
         assert_eq!(section_line.spans[1].style.fg, Theme::status_accent().fg);
     }
 
     #[test]
     fn message_cards_replace_symbol_tool_includes_symbol_diff_lines() {
         let mut app = App::new();
-        let sections = vec![DiffPreviewSection {
-            header: "build_message_cards".into(),
-            old: "fn build_message_cards() {\n    old();\n}\n".into(),
-            new: "fn build_message_cards() {\n    new();\n}\n".into(),
-            start_line: Some(211),
-        }];
+        let sections = (1..=6)
+            .map(|index| SymbolDiffSection {
+                path: "src/ui/chat.rs".into(),
+                symbol: if index == 1 {
+                    "build_message_cards".into()
+                } else {
+                    format!("symbol_{index}")
+                },
+                old: format!("fn symbol_{index}() {{\n    old();\n}}\n"),
+                new: format!("fn symbol_{index}() {{\n    new();\n}}\n"),
+                start_line: Some(210 + index),
+            })
+            .collect::<Vec<_>>();
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
             name: "replace_symbol".into(),
             is_error: false,
-            detail: ToolDetail::ReplaceSymbol {
-                title: "src/ui/chat.rs build_message_cards".into(),
+            detail: ToolDetail::ReplaceSymbolDiff {
+                replacements: Vec::new(),
                 sections,
             },
         });
@@ -3253,6 +4542,12 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("-     old();")));
         assert!(lines.iter().any(|line| line.contains("+     new();")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  ... 2 more sections collapsed")
+        );
+        assert!(!lines.iter().any(|line| line.contains("@@ symbol_5")));
 
         let section_line = card_lines
             .iter()
@@ -3271,16 +4566,95 @@ mod tests {
     }
 
     #[test]
+    fn replace_symbol_titles_are_derived_from_semantic_paths() {
+        let cases = [
+            (Vec::new(), "symbols"),
+            (
+                vec![SymbolReplacement {
+                    path: String::new(),
+                    symbol: "missing".into(),
+                    new_text: "fn missing() {}".into(),
+                }],
+                "symbols",
+            ),
+            (
+                vec![SymbolReplacement {
+                    path: "/workspace/project/src/nested/lib.rs".into(),
+                    symbol: "run".into(),
+                    new_text: "fn run() {}".into(),
+                }],
+                "nested/lib.rs",
+            ),
+            (
+                vec![
+                    SymbolReplacement {
+                        path: "/workspace/project/src/nested/lib.rs".into(),
+                        symbol: "run".into(),
+                        new_text: "fn run() {}".into(),
+                    },
+                    SymbolReplacement {
+                        path: "/workspace/project/src/nested/lib.rs".into(),
+                        symbol: "stop".into(),
+                        new_text: "fn stop() {}".into(),
+                    },
+                ],
+                "nested/lib.rs",
+            ),
+            (
+                vec![
+                    SymbolReplacement {
+                        path: "/workspace/project/src/one.rs".into(),
+                        symbol: "one".into(),
+                        new_text: "fn one() {}".into(),
+                    },
+                    SymbolReplacement {
+                        path: "/workspace/project/src/two.rs".into(),
+                        symbol: "two".into(),
+                        new_text: "fn two() {}".into(),
+                    },
+                ],
+                "src/one.rs (+1)",
+            ),
+        ];
+
+        for (replacements, expected_title) in cases {
+            let mut app = App::new();
+            app.sessions.session_id = Some("session-1".into());
+            app.sessions.session_groups = vec![SessionGroup {
+                cwd: Some("/workspace/project".into()),
+                sessions: vec![SessionSummary {
+                    session_id: "session-1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            app.chat.messages.push(ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "replace_symbol".into(),
+                is_error: false,
+                detail: ToolDetail::ReplaceSymbolInput { replacements },
+            });
+
+            assert_eq!(
+                rendered_card_lines(&mut app),
+                [format!("> replace_symbol {expected_title}")]
+            );
+        }
+    }
+
+    #[test]
     fn message_cards_shell_tool_shows_command_and_last_output_lines() {
         let mut app = App::new();
         let command = "cargo \\\ntest \\\n--lib";
-        let output_tail = ShellOutputTail {
-            lines: vec![
-                "running 1 test".into(),
-                "test ui::tests::shell ... ok".into(),
-                "test result: ok".into(),
-            ],
-            hidden_line_count: 12,
+        let output = ShellOutput {
+            stdout: [
+                "running 1 test",
+                "test ui::tests::shell ... ok",
+                "test result: ok",
+            ]
+            .join("\n"),
+            stderr: String::new(),
+            preceding_line_count: 12,
         };
         app.chat.messages.push(ChatEntry::ToolCall {
             tool_call_id: None,
@@ -3288,8 +4662,9 @@ mod tests {
             is_error: false,
             detail: ToolDetail::Shell {
                 command: command.into(),
+                arguments: Vec::new(),
                 workdir: Some("/repo".into()),
-                output_tail: Some(output_tail),
+                output: Some(output),
             },
         });
 
@@ -3308,16 +4683,20 @@ mod tests {
             })
             .collect();
 
-        assert!(lines.iter().any(|line| line == "> shell@/repo"));
-        assert!(!lines.iter().any(|line| line.contains("cwd:")));
-        assert!(lines.iter().any(|line| line.contains("$ cargo \\")));
-        assert!(lines.iter().any(|line| line.contains("test \\")));
-        assert!(lines.iter().any(|line| line.contains("output tail:")));
-        assert!(lines.iter().any(|line| line.contains("test result: ok")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("12 earlier output lines hidden"))
+        assert_eq!(
+            lines,
+            [
+                "> shell@/repo",
+                "  $ cargo \\",
+                "    test \\",
+                "    --lib",
+                "",
+                "  output tail:",
+                "    running 1 test",
+                "    test ui::tests::shell ... ok",
+                "    test result: ok",
+                "  ... 12 earlier output lines hidden",
+            ]
         );
 
         let command_line = card_lines
@@ -3759,7 +5138,7 @@ mod tests {
     #[test]
     fn start_page_rows_empty_groups_yields_empty_rows() {
         let app = App::new();
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(rows.is_empty());
     }
 
@@ -3768,7 +5147,7 @@ mod tests {
     fn start_page_rows_single_expanded_group() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0].item, StartPageItem::GroupHeader { .. }));
         assert!(matches!(rows[1].item, StartPageItem::Session { .. }));
@@ -3781,7 +5160,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         app.sessions.collapsed_groups.insert("/a".to_string());
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert_eq!(rows.len(), 1);
         assert!(matches!(
             rows[0].item,
@@ -3798,7 +5177,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         app.sessions.session_cursor = 1; // points at first session row (index 1)
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(!rows[0].selected); // header not selected
         assert!(rows[1].selected); // first session selected
         assert!(!rows[2].selected);
@@ -3809,7 +5188,7 @@ mod tests {
     fn start_page_rows_header_contains_cwd() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         // The header line should contain the cwd somewhere in its text
         let header_text = rows[0]
             .line
@@ -3828,7 +5207,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
         app.sessions.session_groups[0].total_count = Some(5);
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let header_text = row_text(&rows[0]);
 
         assert!(header_text.contains("(2/5)"), "header text: {header_text}");
@@ -3839,7 +5218,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
         app.sessions.session_groups[0].total_count = None;
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let header_text = row_text(&rows[0]);
 
         assert!(header_text.contains("(2)"), "header text: {header_text}");
@@ -3851,7 +5230,7 @@ mod tests {
     fn start_page_rows_session_contains_id() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = rows[1]
             .line
             .spans
@@ -3870,7 +5249,7 @@ mod tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 3;
 
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = row_text(&rows[1]);
 
         assert!(
@@ -3900,7 +5279,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
 
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = row_text(&rows[1]);
 
         assert!(
@@ -3915,7 +5294,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         app.sessions.collapsed_groups.insert("/a".to_string());
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = rows[0]
             .line
             .spans
@@ -3934,7 +5313,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         // not collapsed
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = rows[0]
             .line
             .spans
@@ -3951,7 +5330,7 @@ mod tests {
     fn start_page_show_more_row_uses_show_all_label_not_load_more() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = row_text(rows.last().expect("missing show more row"));
 
         assert!(text.contains("show all"), "row text: {text}");
@@ -3963,7 +5342,7 @@ mod tests {
     #[test]
     fn start_page_rows_no_sessions_yields_empty_state_row() {
         let app = App::new();
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(
             rows.is_empty(),
             "no groups means no rows (empty state handled in draw_start)"
@@ -4054,14 +5433,15 @@ mod tests {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let incremental_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
+        let incremental_tool_lines = app.render.cards()[0].lines_for(80).len();
 
-        app.render.card_cache.invalidate();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let full_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let full_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
+        let full_tool_lines = app.render.cards()[0].lines_for(80).len();
 
         assert_eq!(incremental_kinds, full_kinds);
         assert_eq!(incremental_kinds, vec![CardKind::Tool { compact: false }]);

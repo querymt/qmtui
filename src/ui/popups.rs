@@ -9,13 +9,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::auth_state::AuthPanel;
+use crate::delegates_state::DelegatesState;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::DelegateStats;
-use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
+use crate::domain::auth::{AuthMethod, AuthStatus, OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::domain::profile::ProfileInfo;
 use crate::models_state::ModelPopupItem;
-use crate::session_state::session_group_count_text;
+use crate::render_state::RenderState;
+use crate::session_state::{SessionsState, session_group_count_text};
 use crate::theme::Theme;
 
 use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
@@ -363,7 +365,12 @@ pub(super) fn draw_model_popup(f: &mut Frame, app: &App) {
 
 // ── Session popup ─────────────────────────────────────────────────────────────
 
-pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
+pub(super) fn draw_session_popup(
+    f: &mut Frame,
+    sessions: &SessionsState,
+    delegates: &DelegatesState,
+    render: &mut RenderState,
+) {
     const SESSION_POPUP_MAX_W: u16 = 86;
     const SESSION_POPUP_MIN_W: u16 = 36;
 
@@ -404,7 +411,7 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
     let tab_labels = ["sessions", "delegates"];
     let mut tab_spans = Vec::new();
     for (i, label) in tab_labels.iter().enumerate() {
-        let is_active = i == app.sessions.session_popup_tab;
+        let is_active = i == sessions.session_popup_tab;
         let style = if is_active {
             Theme::popup_title().add_modifier(Modifier::UNDERLINED)
         } else {
@@ -420,21 +427,27 @@ pub(super) fn draw_session_popup(f: &mut Frame, app: &mut App) {
         chunks[0],
     );
 
-    if app.sessions.session_popup_tab == 0 {
-        draw_session_tab_content(f, app, &chunks);
+    if sessions.session_popup_tab == 0 {
+        draw_session_tab_content(f, sessions, delegates, render, &chunks);
     } else {
-        draw_delegate_tab_content(f, app, &chunks);
+        draw_delegate_tab_content(f, sessions, delegates, render, &chunks);
     }
 }
 
-fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
+fn draw_session_tab_content(
+    f: &mut Frame,
+    sessions: &SessionsState,
+    delegates: &DelegatesState,
+    render: &mut RenderState,
+    chunks: &std::rc::Rc<[Rect]>,
+) {
     use crate::session_state::PopupItem;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
     let (session_filter_display, session_filter_cur) = scroll_input(
-        &app.sessions.session_filter,
-        app.sessions.session_filter.len(),
+        &sessions.session_filter,
+        sessions.session_filter.len(),
         avail,
     );
     let filter_line = Line::from(vec![
@@ -448,16 +461,16 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
     f.set_cursor_position((chunks[1].x + 2 + session_filter_cur as u16, chunks[1].y));
 
     // grouped session list
-    let popup_items = app.sessions.visible_popup_items();
+    let popup_items = sessions.visible_popup_items();
     let list_w = chunks[3].width as usize;
     let visible_rows = chunks[3].height as usize;
-    app.sessions.session_popup_visible_rows = visible_rows;
+    render.publish_session_popup_visible_rows(visible_rows);
 
     let items: Vec<ListItem> = popup_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let selected = i == app.sessions.session_cursor;
+            let selected = i == sessions.session_cursor;
             match item {
                 PopupItem::GroupHeader {
                     cwd,
@@ -489,7 +502,7 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     path,
                     depth,
                 } => {
-                    let Some(s) = app.sessions.session_by_path(*group_idx, path) else {
+                    let Some(s) = sessions.session_by_path(*group_idx, path) else {
                         return ListItem::new(Line::from(""));
                     };
                     let id_short: String = s.session_id.chars().take(8).collect();
@@ -500,10 +513,9 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                         .unwrap_or_default();
                     let title = s.title.as_deref().unwrap_or("(untitled)");
 
-                    let is_active =
-                        app.sessions.session_id.as_deref() == Some(s.session_id.as_str());
+                    let is_active = sessions.session_id.as_deref() == Some(s.session_id.as_str());
                     let is_parent =
-                        app.delegates.parent_session_id.as_deref() == Some(s.session_id.as_str());
+                        delegates.parent_session_id.as_deref() == Some(s.session_id.as_str());
                     let marker_part = if is_active {
                         " ● "
                     } else if is_parent {
@@ -513,16 +525,13 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
                     };
                     let indent = "  ".repeat(*depth);
                     let id_part = format!(" {indent}{id_short} ");
-                    let fork_marker = if app.sessions.expandable_root_session(*group_idx, path) {
-                        let indicator = if app
-                            .sessions
-                            .expanded_session_children
-                            .contains(&s.session_id)
-                        {
-                            COLLAPSE_OPEN
-                        } else {
-                            COLLAPSE_CLOSED
-                        };
+                    let fork_marker = if sessions.expandable_root_session(*group_idx, path) {
+                        let indicator =
+                            if sessions.expanded_session_children.contains(&s.session_id) {
+                                COLLAPSE_OPEN
+                            } else {
+                                COLLAPSE_CLOSED
+                            };
                         format!(" {indicator} ↳ {}", s.fork_count)
                     } else if s.fork_count > 0 && *depth == 0 {
                         format!(" ↳ {}", s.fork_count)
@@ -594,13 +603,12 @@ fn draw_session_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[
         .collect();
 
     let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
-    let offset = app
-        .sessions
+    let offset = sessions
         .session_cursor
         .saturating_sub(visible_rows.saturating_sub(1));
     let mut state = ListState::default()
         .with_offset(offset)
-        .with_selected(Some(app.sessions.session_cursor));
+        .with_selected(Some(sessions.session_cursor));
     f.render_stateful_widget(list, chunks[3], &mut state);
 
     // hint
@@ -684,14 +692,20 @@ fn delegate_display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text) as u16
 }
 
-fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<[Rect]>) {
+fn draw_delegate_tab_content(
+    f: &mut Frame,
+    sessions: &SessionsState,
+    delegates: &DelegatesState,
+    render: &mut RenderState,
+    chunks: &std::rc::Rc<[Rect]>,
+) {
     use crate::domain::activity::DelegateStatus;
 
     // filter
     let avail = chunks[1].width.saturating_sub(2) as usize;
     let (filter_display, filter_cur) = scroll_input(
-        &app.delegates.delegate_filter,
-        app.delegates.delegate_filter.len(),
+        &delegates.delegate_filter,
+        delegates.delegate_filter.len(),
         avail,
     );
     let filter_line = Line::from(vec![
@@ -706,8 +720,8 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
 
     // delegate entry list (built from event stream)
     let visible_rows = chunks[3].height as usize;
-    app.delegates.delegate_popup_visible_rows = visible_rows;
-    let entries = app.delegates.visible_entries();
+    render.publish_delegate_popup_visible_rows(visible_rows);
+    let entries = delegates.visible_entries();
 
     if entries.is_empty() {
         let list = List::new(vec![ListItem::new(Line::from(Span::styled(
@@ -723,7 +737,7 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
             .map(|entry| {
                 let status_badge = match entry.status {
                     DelegateStatus::InProgress => {
-                        spinner(SpinnerKind::Braille, app.render.tick).to_string()
+                        spinner(SpinnerKind::Braille, render.tick).to_string()
                     }
                     DelegateStatus::Completed => CHECK_CHECKED.to_string(),
                     DelegateStatus::Failed => CHECK_FAILED.to_string(),
@@ -742,7 +756,7 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
                 };
 
                 let is_current =
-                    entry.child_session_id.as_deref() == app.sessions.session_id.as_deref();
+                    entry.child_session_id.as_deref() == sessions.session_id.as_deref();
                 let duration = entry
                     .started_at
                     .map(|start| {
@@ -926,8 +940,7 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
             .style(Theme::popup_bg())
             .row_highlight_style(Theme::selected());
 
-        let selected_idx = app
-            .delegates
+        let selected_idx = delegates
             .delegate_cursor
             .min(entries.len().saturating_sub(1));
         let offset = selected_idx.saturating_sub(visible_rows.saturating_sub(1));
@@ -940,7 +953,7 @@ fn draw_delegate_tab_content(f: &mut Frame, app: &mut App, chunks: &std::rc::Rc<
 
     // hint
     let selected_entry = entries.get(
-        app.delegates
+        delegates
             .delegate_cursor
             .min(entries.len().saturating_sub(1)),
     );
@@ -2533,6 +2546,23 @@ pub(super) fn draw_help_popup(f: &mut Frame, app: &App) {
 const AUTH_POPUP_MAX_W: u16 = 68;
 const AUTH_POPUP_MIN_W: u16 = 44;
 
+fn auth_method_label(method: AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::OAuth => "OAuth",
+        AuthMethod::ApiKey => "API Key",
+        AuthMethod::EnvVar => "Env",
+    }
+}
+
+fn auth_status_label(status: AuthStatus) -> &'static str {
+    match status {
+        AuthStatus::Unconfigurable => "OAuth required",
+        AuthStatus::Expired => "Expired",
+        AuthStatus::Active(method) => auth_method_label(method),
+        AuthStatus::NotConfigured => "Not configured",
+    }
+}
+
 pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
     let area = f.area();
     let popup_width = area
@@ -2620,7 +2650,8 @@ pub(super) fn draw_auth_popup(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, (_, provider))| {
             let selected = i == app.auth.cursor;
-            let badge = provider.auth_badge_label();
+            let status = provider.auth_status();
+            let badge = auth_status_label(status);
             let badge_active = provider.is_auth_active();
             let is_expired = provider.oauth_status == Some(OAuthStatus::Expired);
 
@@ -2756,7 +2787,7 @@ fn draw_auth_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             // Show selected provider status summary
             let mut lines: Vec<Line<'static>> = Vec::new();
 
-            let status_label = provider.auth_badge_label();
+            let status_label = auth_status_label(provider.auth_status());
             let is_active = provider.is_auth_active();
             let status_style = if is_active {
                 ratatui::style::Style::default()
@@ -3051,7 +3082,40 @@ fn draw_auth_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::auth::AuthProviderEntry;
     use crate::domain::profile::ProfileInfo;
+
+    fn auth_provider(display_name: &str, status: AuthStatus) -> AuthProviderEntry {
+        let (supports_oauth, env_var_name) = match status {
+            AuthStatus::Unconfigurable => (false, None),
+            AuthStatus::Active(AuthMethod::OAuth) | AuthStatus::Expired => (true, None),
+            AuthStatus::Active(AuthMethod::ApiKey) | AuthStatus::Active(AuthMethod::EnvVar) => (
+                false,
+                Some(format!("{}_API_KEY", display_name.to_uppercase())),
+            ),
+            AuthStatus::NotConfigured => (
+                true,
+                Some(format!("{}_API_KEY", display_name.to_uppercase())),
+            ),
+        };
+        AuthProviderEntry {
+            provider: display_name.to_lowercase().replace(' ', "-"),
+            display_name: display_name.into(),
+            oauth_status: match status {
+                AuthStatus::Expired => Some(OAuthStatus::Expired),
+                AuthStatus::Active(AuthMethod::OAuth) => Some(OAuthStatus::Connected),
+                AuthStatus::Unconfigurable
+                | AuthStatus::Active(AuthMethod::ApiKey)
+                | AuthStatus::Active(AuthMethod::EnvVar) => None,
+                AuthStatus::NotConfigured => Some(OAuthStatus::NotAuthenticated),
+            },
+            has_stored_api_key: status == AuthStatus::Active(AuthMethod::ApiKey),
+            has_env_api_key: status == AuthStatus::Active(AuthMethod::EnvVar),
+            env_var_name,
+            supports_oauth,
+            preferred_method: None,
+        }
+    }
 
     fn profile(id: &str, name: &str) -> ProfileInfo {
         ProfileInfo {
@@ -3075,6 +3139,108 @@ mod tests {
             }
         }
         None
+    }
+
+    fn find_last_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in (0..buffer.area.height).rev() {
+            let line = buffer_line(buffer, y);
+            if let Some(byte_idx) = line.find(needle) {
+                return Some((line[..byte_idx].chars().count() as u16, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn auth_labels_map_semantic_methods_and_statuses() {
+        assert_eq!(auth_method_label(AuthMethod::OAuth), "OAuth");
+        assert_eq!(auth_method_label(AuthMethod::ApiKey), "API Key");
+        assert_eq!(auth_method_label(AuthMethod::EnvVar), "Env");
+        assert_eq!(
+            auth_status_label(AuthStatus::Unconfigurable),
+            "OAuth required"
+        );
+        assert_eq!(auth_status_label(AuthStatus::Expired), "Expired");
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::OAuth)),
+            "OAuth"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::ApiKey)),
+            "API Key"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::Active(AuthMethod::EnvVar)),
+            "Env"
+        );
+        assert_eq!(
+            auth_status_label(AuthStatus::NotConfigured),
+            "Not configured"
+        );
+    }
+
+    #[test]
+    fn auth_popup_renders_exact_badges_and_styles_in_list_and_detail() {
+        let mut app = App::new();
+        app.auth.providers = vec![
+            auth_provider("OAuth Active", AuthStatus::Active(AuthMethod::OAuth)),
+            auth_provider("API Active", AuthStatus::Active(AuthMethod::ApiKey)),
+            auth_provider("Env Active", AuthStatus::Active(AuthMethod::EnvVar)),
+            auth_provider("Expired Auth", AuthStatus::Expired),
+            auth_provider("OAuth Missing", AuthStatus::Unconfigurable),
+            auth_provider("No Auth", AuthStatus::NotConfigured),
+        ];
+        app.auth.cursor = app.auth.providers.len();
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_auth_popup(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for (name, label, foreground) in [
+            ("OAuth Active", "[OAuth]", Theme::ok()),
+            ("API Active", "[API Key]", Theme::ok()),
+            ("Env Active", "[Env]", Theme::ok()),
+            ("Expired Auth", "[Expired]", Theme::warn()),
+        ] {
+            let row = find_buffer_text(buffer, name).expect("provider row").1;
+            let badge = find_buffer_text(buffer, label).expect("provider badge");
+            assert_eq!(badge.1, row);
+            assert_eq!(buffer[badge].fg, foreground);
+        }
+        for (name, label) in [
+            ("OAuth Missing", "[OAuth required]"),
+            ("No Auth", "[Not configured]"),
+        ] {
+            let row = find_buffer_text(buffer, name).expect("provider row").1;
+            let badge = find_buffer_text(buffer, label).expect("provider badge");
+            assert_eq!(badge.1, row);
+            assert_eq!(buffer[badge].fg, Theme::status().fg.unwrap());
+            assert_eq!(buffer[badge].bg, Theme::status().bg.unwrap());
+        }
+
+        for (index, label, active) in [
+            (0, "[OAuth]", true),
+            (1, "[API Key]", true),
+            (2, "[Env]", true),
+            (3, "[Expired]", false),
+            (4, "[OAuth required]", false),
+            (5, "[Not configured]", false),
+        ] {
+            app.auth.selected = Some(index);
+            let backend = ratatui::backend::TestBackend::new(80, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw_auth_popup(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let badge = find_last_buffer_text(buffer, label).expect("detail badge");
+            let (expected_fg, expected_bg) = if active {
+                (Theme::ok(), Theme::bg_dim())
+            } else {
+                (Theme::status().fg.unwrap(), Theme::status().bg.unwrap())
+            };
+            assert_eq!(buffer[badge].fg, expected_fg);
+            assert_eq!(buffer[badge].bg, expected_bg);
+        }
     }
 
     #[test]

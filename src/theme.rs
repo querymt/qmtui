@@ -18,28 +18,44 @@ pub(crate) fn u32_to_color(c: u32) -> Color {
 
 /// Global theme instance — uses atomic index into DARK_THEMES.
 static THEME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static THEME_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// Per-frame snapshot of the theme index. Avoids repeated atomic loads
-// during a single render pass. Updated by `Theme::begin_frame()`.
+// Per-frame snapshots keep cache keys and styles on the same theme version.
 thread_local! {
     static FRAME_THEME_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FRAME_THEME_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Theme {
     pub fn init(id: &str) {
         let idx = DARK_THEMES.iter().position(|t| t.id == id).unwrap_or(0);
-        THEME_IDX.store(idx, std::sync::atomic::Ordering::Relaxed);
-        FRAME_THEME_IDX.set(idx);
+        Self::set_index_if_changed(idx);
+        Self::begin_frame();
     }
 
     pub fn set_by_index(idx: usize) {
         if idx < DARK_THEMES.len() {
-            THEME_IDX.store(idx, std::sync::atomic::Ordering::Relaxed);
+            Self::set_index_if_changed(idx);
+        }
+    }
+
+    fn set_index_if_changed(idx: usize) {
+        let previous = THEME_IDX.swap(idx, std::sync::atomic::Ordering::Relaxed);
+        if previous != idx {
+            THEME_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     pub fn current_index() -> usize {
         THEME_IDX.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn frame_index() -> usize {
+        FRAME_THEME_IDX.get()
+    }
+
+    pub(crate) fn render_revision() -> u64 {
+        FRAME_THEME_REVISION.get()
     }
 
     pub fn current_id() -> &'static str {
@@ -440,14 +456,18 @@ impl Theme {
     /// Call once at frame start to avoid repeated atomic loads.
     pub fn begin_frame() {
         FRAME_THEME_IDX.set(THEME_IDX.load(std::sync::atomic::Ordering::Relaxed));
+        FRAME_THEME_REVISION.set(THEME_REVISION.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
+    #[serial]
     fn begin_frame_snapshots_theme_index() {
         // Set theme to index 2
         Theme::set_by_index(2);
@@ -476,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn styles_use_frame_snapshot() {
         Theme::set_by_index(3);
         Theme::begin_frame();
@@ -497,6 +518,34 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn theme_revision_is_monotonic_only_for_valid_index_changes() {
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+        let start = Theme::render_revision();
+
+        Theme::set_by_index(2);
+        Theme::begin_frame();
+        let switched = Theme::render_revision();
+        assert!(switched > start);
+
+        Theme::set_by_index(2);
+        Theme::begin_frame();
+        assert_eq!(Theme::render_revision(), switched);
+
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+        assert!(Theme::render_revision() > switched);
+
+        let returned = Theme::render_revision();
+        Theme::set_by_index(DARK_THEMES.len());
+        Theme::begin_frame();
+        assert_eq!(Theme::frame_index(), 0);
+        assert_eq!(Theme::render_revision(), returned);
+    }
+
+    #[test]
+    #[serial]
     fn profile_kind_uses_popup_background_and_kind_colors() {
         Theme::begin_frame();
 

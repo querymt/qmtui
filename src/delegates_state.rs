@@ -58,15 +58,10 @@ pub(crate) struct DelegateContext {
     pub(crate) inactive_activity_session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DelegateCoordination {
-    InvalidateCardCache,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DelegateOutcome {
     pub(crate) changed: bool,
-    pub(crate) coordination: Vec<DelegateCoordination>,
+    pub(crate) presentation_changed: bool,
     pub(crate) effects: Vec<Effect>,
 }
 
@@ -87,7 +82,6 @@ struct DelegateLifecycleUpdate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DelegatesState {
-    pub(crate) delegate_popup_visible_rows: usize,
     pub(crate) delegate_entries: Vec<DelegateEntry>,
     pub(crate) delegate_cursor: usize,
     pub(crate) delegate_filter: String,
@@ -138,7 +132,7 @@ impl DelegatesState {
                     result_summary: update.result_summary,
                     error: update.error,
                 });
-                Self::outcome_with_card_invalidation(accepted && *self != before)
+                Self::presentation_outcome(accepted && *self != before)
             }
             DelegateAction::ProvisionalToolDelegate {
                 tool_call_id,
@@ -160,7 +154,7 @@ impl DelegatesState {
                     .to_string();
                 let changed =
                     self.upsert_provisional_delegate(&tool_call_id, target_agent_id, objective);
-                Self::outcome_with_card_invalidation(changed)
+                Self::presentation_outcome(changed)
             }
             DelegateAction::InactiveChildActivity {
                 session_id,
@@ -170,14 +164,7 @@ impl DelegatesState {
                     return DelegateOutcome::default();
                 }
                 let changed = self.apply_child_activity(&session_id, activity);
-                DelegateOutcome {
-                    changed,
-                    coordination: changed
-                        .then_some(DelegateCoordination::InvalidateCardCache)
-                        .into_iter()
-                        .collect(),
-                    effects: Vec::new(),
-                }
+                Self::presentation_outcome(changed)
             }
             DelegateAction::ResolveLoadedSessionParent(discovered_parent) => {
                 let parent_before = self.parent_session_id.clone();
@@ -211,13 +198,10 @@ impl DelegatesState {
         }
     }
 
-    fn outcome_with_card_invalidation(changed: bool) -> DelegateOutcome {
+    fn presentation_outcome(changed: bool) -> DelegateOutcome {
         DelegateOutcome {
             changed,
-            coordination: changed
-                .then_some(DelegateCoordination::InvalidateCardCache)
-                .into_iter()
-                .collect(),
+            presentation_changed: changed,
             effects: Vec::new(),
         }
     }
@@ -281,7 +265,6 @@ impl DelegatesState {
 
     pub(crate) fn new() -> Self {
         Self {
-            delegate_popup_visible_rows: 0,
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
             delegate_filter: String::new(),
@@ -341,8 +324,7 @@ impl DelegatesState {
         self.delegate_cursor = self.delegate_cursor.saturating_add(1).min(max);
     }
 
-    pub(crate) fn move_cursor_page(&mut self, down: bool) {
-        let step = self.delegate_popup_visible_rows.saturating_sub(1).max(1);
+    pub(crate) fn move_cursor_page(&mut self, step: usize, down: bool) {
         if down {
             let max = self.visible_entries().len().saturating_sub(1);
             self.delegate_cursor = self.delegate_cursor.saturating_add(step).min(max);
@@ -674,10 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn constructor_uses_all_fourteen_exact_defaults() {
+    fn constructor_uses_exact_defaults() {
         let state = DelegatesState::new();
 
-        assert_eq!(state.delegate_popup_visible_rows, 0);
         assert!(state.delegate_entries.is_empty());
         assert_eq!(state.delegate_cursor, 0);
         assert!(state.delegate_filter.is_empty());
@@ -731,12 +712,11 @@ mod tests {
                 )
             })
             .collect();
-        state.delegate_popup_visible_rows = 4;
 
         state.move_cursor_down();
-        state.move_cursor_page(true);
+        state.move_cursor_page(3, true);
         assert_eq!(state.delegate_cursor, 4);
-        state.move_cursor_page(false);
+        state.move_cursor_page(3, false);
         assert_eq!(state.delegate_cursor, 1);
         state.filter_insert('d');
         state.filter_insert('o');
@@ -747,20 +727,6 @@ mod tests {
         assert_eq!(state.delegate_cursor, 0);
         state.reset_popup();
         assert!(state.delegate_filter.is_empty());
-        assert_eq!(state.delegate_cursor, 0);
-    }
-
-    #[test]
-    fn page_movement_falls_back_to_one_when_visible_rows_are_unknown() {
-        let mut state = DelegatesState::new();
-        state.delegate_entries = vec![
-            entry("d1", "one", None, DelegateStatus::InProgress),
-            entry("d2", "two", None, DelegateStatus::InProgress),
-        ];
-
-        state.move_cursor_page(true);
-        assert_eq!(state.delegate_cursor, 1);
-        state.move_cursor_page(false);
         assert_eq!(state.delegate_cursor, 0);
     }
 
@@ -946,7 +912,6 @@ mod tests {
             .insert("d1".to_string(), "boom".to_string());
         state.delegate_filter = "stale".to_string();
         state.delegate_cursor = 3;
-        state.delegate_popup_visible_rows = 5;
         state.parent_session_id = Some("parent".to_string());
 
         let entries_before = state.delegate_entries.clone();
@@ -965,7 +930,6 @@ mod tests {
         assert!(state.delegation_errors.is_empty());
         assert_eq!(state.delegate_filter, "stale");
         assert_eq!(state.delegate_cursor, 3);
-        assert_eq!(state.delegate_popup_visible_rows, 5);
     }
 
     #[test]
@@ -1007,10 +971,7 @@ mod tests {
             context.clone(),
         );
         assert!(accepted.changed);
-        assert_eq!(
-            accepted.coordination,
-            vec![DelegateCoordination::InvalidateCardCache]
-        );
+        assert!(accepted.presentation_changed);
         assert!(accepted.effects.is_empty());
 
         let stale = state.reduce(
@@ -1029,6 +990,7 @@ mod tests {
             context.clone(),
         );
         assert!(equal_rank_tie.changed);
+        assert!(equal_rank_tie.presentation_changed);
         assert_eq!(state.delegate_entries[0].status, DelegateStatus::Failed);
         assert_eq!(state.delegation_errors["d1"], "boom");
         assert!(!state.delegation_result_summaries.contains_key("d1"));
@@ -1053,10 +1015,7 @@ mod tests {
 
         let inserted = state.reduce(action.clone(), DelegateContext::default());
         assert!(inserted.changed);
-        assert_eq!(
-            inserted.coordination,
-            vec![DelegateCoordination::InvalidateCardCache]
-        );
+        assert!(inserted.presentation_changed);
         assert!(inserted.effects.is_empty());
         assert_eq!(
             state.reduce(action, DelegateContext::default()),
@@ -1095,6 +1054,7 @@ mod tests {
             },
         );
         assert!(authoritative.changed);
+        assert!(authoritative.presentation_changed);
         assert_eq!(state.delegate_entries.len(), 1);
         let entry = &state.delegate_entries[0];
         assert_eq!(entry.delegation_id, "d1");
@@ -1106,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_inactive_activity_stages_then_attaches_and_orders_coordination() {
+    fn reducer_inactive_activity_stages_then_attaches_and_reports_presentation_changes() {
         let mut state = DelegatesState::new();
         let context = DelegateContext {
             active_session_id: Some("parent".into()),
@@ -1125,7 +1085,7 @@ mod tests {
             },
         );
         assert!(!rejected.changed);
-        assert!(rejected.coordination.is_empty());
+        assert!(!rejected.presentation_changed);
         assert!(state.pending_delegate_child_states.is_empty());
         assert!(state.pending_delegate_child_stats.is_empty());
 
@@ -1139,7 +1099,7 @@ mod tests {
             context.clone(),
         );
         assert!(!staged.changed);
-        assert!(staged.coordination.is_empty());
+        assert!(!staged.presentation_changed);
         assert!(staged.effects.is_empty());
         assert_eq!(
             state.pending_delegate_child_states["child"],
@@ -1166,6 +1126,7 @@ mod tests {
             context.clone(),
         );
         assert!(linked.changed);
+        assert!(linked.presentation_changed);
         assert_eq!(state.delegate_entries[0].stats.messages, 1);
         assert_eq!(
             state.delegate_entries[0].child_state,
@@ -1182,10 +1143,7 @@ mod tests {
             context.clone(),
         );
         assert!(changed.changed);
-        assert_eq!(
-            changed.coordination,
-            vec![DelegateCoordination::InvalidateCardCache]
-        );
+        assert!(changed.presentation_changed);
         assert_eq!(state.delegate_entries[0].stats.tool_calls, 1);
 
         let unchanged = state.reduce(
@@ -1196,7 +1154,7 @@ mod tests {
             context,
         );
         assert!(!unchanged.changed);
-        assert!(unchanged.coordination.is_empty());
+        assert!(!unchanged.presentation_changed);
     }
 
     #[test]
@@ -1212,7 +1170,7 @@ mod tests {
             DelegateContext::default(),
         );
         assert!(resolved.changed);
-        assert!(resolved.coordination.is_empty());
+        assert!(!resolved.presentation_changed);
         assert!(resolved.effects.is_empty());
         assert_eq!(state.parent_session_id.as_deref(), Some("staged-parent"));
         assert_eq!(state.pending_parent_session_id, None);
@@ -1236,6 +1194,7 @@ mod tests {
             DelegateContext::default(),
         );
         assert!(cleared_parent.changed);
+        assert!(!cleared_parent.presentation_changed);
         assert_eq!(
             state.reduce(
                 DelegateAction::ClearNewRootParent,
@@ -1248,6 +1207,7 @@ mod tests {
             DelegateContext::default(),
         );
         assert!(cleared_root.changed);
+        assert!(!cleared_root.presentation_changed);
         assert!(state.delegate_entries.is_empty());
         assert_eq!(
             state.reduce(

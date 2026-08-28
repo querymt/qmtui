@@ -15,6 +15,7 @@ mod diagnostics;
 mod domain;
 mod handlers;
 mod highlight;
+mod input_layout;
 mod markdown;
 mod mesh;
 mod mesh_state;

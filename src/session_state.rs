@@ -142,8 +142,6 @@ pub(crate) struct SessionsState {
     pub(crate) hydrated_session_groups: HashSet<String>,
     pub(crate) expanded_session_children: HashSet<String>,
     pub(crate) pending_session_child_loads: HashSet<String>,
-    pub(crate) start_page_scroll: usize,
-    pub(crate) session_popup_visible_rows: usize,
     pub(crate) session_id: Option<String>,
     pub(crate) agent_id: Option<String>,
     pub(crate) agent_mode: String,
@@ -307,8 +305,6 @@ impl SessionsState {
             hydrated_session_groups: HashSet::new(),
             expanded_session_children: HashSet::new(),
             pending_session_child_loads: HashSet::new(),
-            start_page_scroll: 0,
-            session_popup_visible_rows: 0,
             session_id: None,
             agent_id: None,
             agent_mode: "build".into(),
@@ -548,9 +544,6 @@ impl SessionsState {
 
     pub(crate) fn move_start_cursor_up(&mut self) {
         self.session_cursor = self.session_cursor.saturating_sub(1);
-        if self.session_cursor < self.start_page_scroll {
-            self.start_page_scroll = self.session_cursor;
-        }
     }
 
     pub(crate) fn move_start_cursor_down(&mut self) {
@@ -581,13 +574,11 @@ impl SessionsState {
     pub(crate) fn start_filter_insert(&mut self, character: char) {
         self.session_filter.push(character);
         self.session_cursor = 0;
-        self.start_page_scroll = 0;
     }
 
     pub(crate) fn start_filter_backspace(&mut self) {
         self.session_filter.pop();
         self.session_cursor = 0;
-        self.start_page_scroll = 0;
     }
 
     pub(crate) fn popup_filter_insert(&mut self, character: char) {
@@ -1507,8 +1498,6 @@ mod tests {
         assert!(state.hydrated_session_groups.is_empty());
         assert!(state.expanded_session_children.is_empty());
         assert!(state.pending_session_child_loads.is_empty());
-        assert_eq!(state.start_page_scroll, 0);
-        assert_eq!(state.session_popup_visible_rows, 0);
         assert_eq!(state.session_id, None);
         assert_eq!(state.agent_id, None);
         assert_eq!(state.agent_mode, "build");
@@ -1608,20 +1597,16 @@ mod tests {
     }
 
     #[test]
-    fn cursor_filter_and_scroll_transitions_keep_view_contracts_distinct() {
+    fn start_and_popup_filter_transitions_reset_semantic_cursor() {
         let mut state = SessionsState::new();
         state.session_cursor = 4;
-        state.start_page_scroll = 3;
         state.start_filter_insert('x');
         assert_eq!(state.session_filter, "x");
         assert_eq!(state.session_cursor, 0);
-        assert_eq!(state.start_page_scroll, 0);
 
         state.session_cursor = 4;
-        state.start_page_scroll = 3;
         state.popup_filter_backspace();
         assert_eq!(state.session_cursor, 0);
-        assert_eq!(state.start_page_scroll, 3);
     }
 
     #[test]

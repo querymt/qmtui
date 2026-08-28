@@ -8,6 +8,7 @@ use crate::{
     command::Command,
     connection_state::ConnState,
     diagnostics::LogLevel,
+    domain::chat::ElicitationResponseOutcome,
     handlers,
     server_manager::ServerEvent,
 };
@@ -33,7 +34,7 @@ pub(crate) enum RuntimeEvent {
     },
     ElicitationResponseSent {
         elicitation_id: String,
-        outcome: String,
+        outcome: ElicitationResponseOutcome,
     },
     CommandFailed {
         command: Command,
@@ -61,7 +62,7 @@ pub(crate) enum Effect {
         elicitation_id: String,
         action: String,
         content: Option<serde_json::Value>,
-        outcome: String,
+        outcome: ElicitationResponseOutcome,
     },
     PersistConfig,
     CopyToClipboard {
@@ -199,11 +200,12 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             ClipboardTarget::MeshInvite => app.apply_mesh_clipboard_result(success),
         },
         RuntimeEvent::ExternalEditorFinished { outcome } => {
-            app.render.invalidate_card_cache();
-            app.render.invalidate_content_cache();
+            app.render
+                .apply_change(crate::render_state::RenderChange::ExternalEditorReturned);
             match outcome {
                 ExternalEditorOutcome::Completed(updated_input) => {
                     app.composer.replace_input_from_editor(updated_input);
+                    app.render.reset_composer_input_geometry();
                     app.set_status(
                         LogLevel::Info,
                         "editor",
@@ -259,11 +261,11 @@ mod tests {
         domain::tool::ToolDetail,
         domain::{
             activity::{
-                ActivityState, DelegateChildState, DelegateStatus, DelegationState,
-                DelegationUpdate, SessionOp,
+                ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+                DelegationState, DelegationUpdate, SessionOp,
             },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
-            chat::ChatEntry,
+            chat::{ChatEntry, ElicitationResponseOutcome},
             elicitation::ElicitationState,
             mesh::{MeshInviteCreatedInfo, MeshNodesInfo, RemoteNodeInfo},
             model::DelegateModelPreference,
@@ -275,6 +277,40 @@ mod tests {
         },
         navigation_state::{Popup, Screen},
     };
+
+    fn draw_app(app: &mut App, width: u16, height: u16) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+    }
+
+    fn seed_card_cache(app: &mut App, source_entry_count: usize) {
+        app.render.test_seed_card_cache(source_entry_count);
+    }
+
+    fn card_cache_count(app: &App) -> usize {
+        app.render.test_card_source_entry_count()
+    }
+
+    fn seed_content_cache(app: &mut App) {
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Content);
+    }
+
+    fn seed_thinking_cache(app: &mut App) {
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Thinking);
+    }
+
+    fn content_cache_populated(app: &App) -> bool {
+        app.render
+            .test_streaming_cache_populated(crate::render_state::StreamKind::Content)
+    }
+
+    fn thinking_cache_populated(app: &App) -> bool {
+        app.render
+            .test_streaming_cache_populated(crate::render_state::StreamKind::Thinking)
+    }
 
     fn add_elicitation(app: &mut App, elicitation_id: &str, active: bool) {
         app.chat.messages.push(ChatEntry::Elicitation {
@@ -374,6 +410,7 @@ mod tests {
     fn key_and_mouse_events_dispatch_through_update() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        app.render.test_seed_composer_input_geometry(24, 2);
 
         let effects = update(
             &mut app,
@@ -381,9 +418,10 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(app.composer.input.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
 
         app.navigation.screen = Screen::Chat;
-        app.chat.scroll_offset = 2;
+        app.render.set_chat_scroll_offset(2);
         let effects = update(
             &mut app,
             AppEvent::Mouse(MouseEvent {
@@ -394,7 +432,32 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.chat.scroll_offset, 5);
+        assert_eq!(app.render.chat_scroll_offset(), 5);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 2);
+
+        app.render.set_chat_scroll_offset(1);
+        let effects = update(
+            &mut app,
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
 
         let effects = update(
             &mut app,
@@ -406,6 +469,227 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn render_metric_key_routes_preserve_start_and_popup_filter_contracts() {
+        let mut app = App::new();
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: (0..6)
+                .map(|index| SessionSummary {
+                    session_id: format!("session-{index}"),
+                    title: Some(format!("Session {index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        app.sessions.session_cursor = 4;
+        app.render.test_seed_start_page_scroll(4);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.render.start_page_scroll(), 3);
+
+        app.render.test_seed_start_page_scroll(8);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_filter, "x");
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert_eq!(app.render.start_page_scroll(), 0);
+
+        app.render.test_seed_start_page_scroll(8);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert!(app.sessions.session_filter.is_empty());
+        assert_eq!(app.render.start_page_scroll(), 0);
+
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_cursor = 4;
+        app.render.test_seed_start_page_scroll(8);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_filter, "p");
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert_eq!(app.render.start_page_scroll(), 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
+    }
+
+    #[test]
+    fn popup_draw_page_tab_close_and_reopen_retain_independent_metrics() {
+        let mut app = App::new();
+        app.connection.conn = crate::connection_state::ConnState::Connected;
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: (0..8)
+                .map(|index| SessionSummary {
+                    session_id: format!("session-{index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        app.delegates.delegate_entries = (0..8)
+            .map(|index| DelegateEntry {
+                delegation_id: format!("delegate-{index}"),
+                child_session_id: Some(format!("child-{index}")),
+                delegate_tool_call_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: format!("Task {index}"),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            })
+            .collect();
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 1);
+
+        app.sessions.session_cursor = 0;
+        app.render.publish_delegate_popup_visible_rows(9);
+        draw_app(&mut app, 90, 20);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 9);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 5);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 0);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        draw_app(&mut app, 90, 20);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.delegates.delegate_cursor, 5);
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.delegates.delegate_filter, "z");
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        update(
+            &mut app,
+            AppEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 0);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        app.open_delegate_popup();
+        assert_eq!(app.sessions.session_popup_tab, 1);
+        assert!(app.delegates.delegate_filter.is_empty());
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+    }
+
+    #[test]
+    fn mouse_chat_viewport_respects_screen_and_popup_gating() {
+        let mut app = App::new();
+        app.render.set_chat_scroll_offset(4);
+        let scroll_up = || MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.navigation.screen = Screen::Sessions;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 4);
+
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::Help;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 4);
+
+        app.navigation.popup = Popup::None;
+        app.navigation.screen = Screen::Delegate;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
     }
 
     #[test]
@@ -436,7 +720,7 @@ mod tests {
     fn delegation_lifecycle_acp_route_is_filtered_ranked_and_release_safe() {
         let mut app = App::new();
         app.sessions.session_id = Some("parent".into());
-        app.render.card_cache.processed_messages = 7;
+        seed_card_cache(&mut app, 7);
 
         let effects = update(
             &mut app,
@@ -447,7 +731,7 @@ mod tests {
             ))),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.delegates.delegate_entries.len(), 1);
         assert_eq!(
             app.delegates.delegate_entries[0].status,
@@ -458,7 +742,7 @@ mod tests {
             "done"
         );
 
-        app.render.card_cache.processed_messages = 8;
+        seed_card_cache(&mut app, 8);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
@@ -468,13 +752,13 @@ mod tests {
             ))),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert_eq!(card_cache_count(&app), 8);
         assert_eq!(
             app.delegates.delegate_entries[0].status,
             DelegateStatus::Completed
         );
 
-        app.render.card_cache.processed_messages = 9;
+        seed_card_cache(&mut app, 9);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::DelegationUpdate(delegation_update(
@@ -484,7 +768,7 @@ mod tests {
             ))),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(card_cache_count(&app), 9);
         assert_eq!(app.delegates.delegate_entries.len(), 1);
     }
 
@@ -496,9 +780,9 @@ mod tests {
         app.chat.streaming_content_message_id = Some("assistant-1".into());
         app.chat.streaming_thinking = "delegate plan".into();
         app.chat.streaming_thinking_message_id = Some("assistant-1".into());
-        app.render.streaming_cache.store(15, Vec::new());
-        app.render.streaming_thinking_cache.store(13, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
 
         let effects = update(
             &mut app,
@@ -526,9 +810,9 @@ mod tests {
         assert_eq!(app.chat.session_stats.total_tool_calls, 1);
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
-        assert!(app.render.streaming_cache.get(15).is_none());
-        assert!(app.render.streaming_thinking_cache.get(13).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "tool: delegate");
         let diagnostic = app.diagnostics.logs.last().expect("delegate tool status");
         assert_eq!(diagnostic.level, LogLevel::Debug);
@@ -548,14 +832,18 @@ mod tests {
                     tool_call_id: Some(tool_call_id),
                     name,
                     is_error: false,
-                    detail: ToolDetail::Summary(summary),
+                    detail: ToolDetail::Delegate {
+                        target_agent_id,
+                        objective,
+                    },
                 },
             ] if content == "before delegate"
                 && thinking == "delegate plan"
                 && message_id == "assistant-1"
                 && tool_call_id == "delegate-call"
                 && name == "delegate"
-                && summary == "(coder) Implement the feature"
+                && target_agent_id == "coder"
+                && objective == "Implement the feature"
         ));
 
         let effects = update(
@@ -588,9 +876,9 @@ mod tests {
         app.chat.activity = ActivityState::Thinking;
         app.chat.streaming_content = "preserved while suppressed".into();
         app.chat.streaming_content_message_id = Some("assistant-suppressed".into());
-        app.render.streaming_cache.store(26, Vec::new());
-        app.render.streaming_thinking_cache.store(9, Vec::new());
-        app.render.card_cache.processed_messages = 8;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 8);
         let status_before = app.diagnostics.status.clone();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -610,9 +898,9 @@ mod tests {
         assert_eq!(app.chat.session_stats.total_tool_calls, 0);
         assert_eq!(app.diagnostics.status, status_before);
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
-        assert!(app.render.streaming_cache.get(26).is_some());
-        assert!(app.render.streaming_thinking_cache.get(9).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 8);
 
         app.chat.suppress_turn_output = false;
         app.chat.streaming_thinking = "plan".into();
@@ -635,9 +923,9 @@ mod tests {
         assert_eq!(app.chat.session_stats.total_tool_calls, 1);
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
-        assert!(app.render.streaming_cache.get(26).is_none());
-        assert!(app.render.streaming_thinking_cache.get(9).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "tool: shell");
         let diagnostic = app.diagnostics.logs.last().expect("shell tool status");
         assert_eq!(diagnostic.level, LogLevel::Debug);
@@ -656,9 +944,9 @@ mod tests {
                 && command == "cargo check"
         ));
 
-        app.render.streaming_cache.store(15, Vec::new());
-        app.render.streaming_thinking_cache.store(16, Vec::new());
-        app.render.card_cache.processed_messages = 9;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 9);
         let effects = apply_session_update(
             &mut app,
             AcpSessionUpdate::ToolCallStart {
@@ -676,18 +964,18 @@ mod tests {
         );
         assert_eq!(app.chat.session_stats.total_tool_calls, 1);
         assert_eq!(app.chat.messages.len(), 2);
-        assert!(app.render.streaming_cache.get(15).is_some());
-        assert!(app.render.streaming_thinking_cache.get(16).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 9);
         assert_eq!(app.diagnostics.status, "tool: question");
         let diagnostic = app.diagnostics.logs.last().expect("question tool status");
         assert_eq!(diagnostic.level, LogLevel::Debug);
         assert_eq!(diagnostic.target, "tool");
         assert_eq!(diagnostic.message, "tool: question");
 
-        app.render.streaming_cache.store(17, Vec::new());
-        app.render.streaming_thinking_cache.store(18, Vec::new());
-        app.render.card_cache.processed_messages = 10;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 10);
         let effects = apply_session_update(
             &mut app,
             AcpSessionUpdate::ToolCallStart {
@@ -700,9 +988,9 @@ mod tests {
         assert_eq!(app.chat.session_stats.total_tool_calls, 1);
         assert_eq!(app.chat.messages.len(), 2);
         assert!(app.chat.streaming_thinking.is_empty());
-        assert!(app.render.streaming_cache.get(17).is_some());
-        assert!(app.render.streaming_thinking_cache.get(18).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             &app.chat.messages[1],
             ChatEntry::ToolCall { detail: ToolDetail::Shell { command, .. }, .. }
@@ -714,9 +1002,9 @@ mod tests {
     fn chat_tool_end_acp_route_is_idempotent_and_release_safe() {
         let mut app = App::new();
         app.sessions.session_id = Some("active".into());
-        app.render.streaming_cache.store(11, Vec::new());
-        app.render.streaming_thinking_cache.store(12, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
 
         let effects = apply_session_update(
             &mut app,
@@ -730,9 +1018,9 @@ mod tests {
         assert!(effects.is_empty());
         assert!(app.sessions.session_activity.contains_key("active"));
         assert!(app.chat.messages.is_empty());
-        assert!(app.render.streaming_cache.get(11).is_some());
-        assert!(app.render.streaming_thinking_cache.get(12).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
 
         let failed_end = AcpSessionUpdate::ToolCallEnd {
             tool_call_id: Some("tool-1".into()),
@@ -742,22 +1030,22 @@ mod tests {
         };
         let effects = apply_session_update(&mut app, failed_end.clone());
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Summary(detail) }]
-                if id == "tool-1" && name == "shell (failed)" && detail == "failed before start"
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Generic { input: None, result: Some(result) } }]
+                if id == "tool-1" && name == "shell (failed)" && result == "failed before start"
         ));
 
-        app.render.card_cache.processed_messages = 8;
+        seed_card_cache(&mut app, 8);
         let effects = apply_session_update(&mut app, failed_end);
         assert!(effects.is_empty());
         assert_eq!(app.chat.messages.len(), 1);
-        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert_eq!(card_cache_count(&app), 8);
 
-        app.render.streaming_cache.store(13, Vec::new());
-        app.render.streaming_thinking_cache.store(14, Vec::new());
-        app.render.card_cache.processed_messages = 9;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 9);
         let effects = apply_session_update(
             &mut app,
             AcpSessionUpdate::ToolCallStart {
@@ -769,9 +1057,9 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(app.chat.session_stats.total_tool_calls, 0);
         assert_eq!(app.chat.messages.len(), 1);
-        assert!(app.render.streaming_cache.get(13).is_some());
-        assert!(app.render.streaming_thinking_cache.get(14).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "tool: shell");
         let diagnostic = app.diagnostics.logs.last().expect("late shell status");
         assert_eq!(diagnostic.level, LogLevel::Debug);
@@ -779,13 +1067,13 @@ mod tests {
         assert_eq!(diagnostic.message, "tool: shell");
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, output_tail: None, .. } }]
+            [ChatEntry::ToolCall { tool_call_id: Some(id), name, is_error: true, detail: ToolDetail::Shell { command, output: None, .. } }]
                 if id == "tool-1" && name == "shell" && command == "echo late"
         ));
 
-        app.render.streaming_cache.store(15, Vec::new());
-        app.render.streaming_thinking_cache.store(16, Vec::new());
-        app.render.card_cache.processed_messages = 10;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 10);
         let effects = apply_session_update(
             &mut app,
             AcpSessionUpdate::ToolCallEnd {
@@ -796,16 +1084,16 @@ mod tests {
             },
         );
         assert!(effects.is_empty());
-        assert!(app.render.streaming_cache.get(15).is_some());
-        assert!(app.render.streaming_thinking_cache.get(16).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
-            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output_tail: Some(tail), .. }, .. }]
-                if tail.lines == ["line one", "line two"]
+            [ChatEntry::ToolCall { is_error: true, detail: ToolDetail::Shell { output: Some(output), .. }, .. }]
+                if output.stdout == "line one\nline two" && output.stderr.is_empty()
         ));
 
-        app.render.card_cache.processed_messages = 11;
+        seed_card_cache(&mut app, 11);
         let effects = apply_session_update(
             &mut app,
             AcpSessionUpdate::ToolCallEnd {
@@ -817,7 +1105,7 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(app.chat.messages.len(), 1);
-        assert_eq!(app.render.card_cache.processed_messages, 11);
+        assert_eq!(card_cache_count(&app), 11);
     }
 
     #[test]
@@ -828,7 +1116,7 @@ mod tests {
         app.chat.streaming_content = "active stream".into();
         app.chat.activity = ActivityState::Streaming;
         app.chat.apply_usage(900, 9_000, Some(9.0));
-        app.render.card_cache.processed_messages = 6;
+        seed_card_cache(&mut app, 6);
 
         let effects = update(
             &mut app,
@@ -843,7 +1131,7 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(app.sessions.session_activity.contains_key("child-1"));
-        assert_eq!(app.render.card_cache.processed_messages, 6);
+        assert_eq!(card_cache_count(&app), 6);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Error(message)] if message == "preserved"
@@ -884,7 +1172,7 @@ mod tests {
         assert_eq!(app.chat.context_limit, 9_000);
         assert_eq!(app.chat.cumulative_cost, Some(9.0));
         assert_eq!(app.diagnostics.logs.len(), log_count_before_usage);
-        assert_eq!(app.render.card_cache.processed_messages, 6);
+        assert_eq!(card_cache_count(&app), 6);
 
         let effects = update(
             &mut app,
@@ -907,7 +1195,7 @@ mod tests {
                 .pending_delegate_child_states
                 .contains_key("child-1")
         );
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Error(message)] if message == "preserved"
@@ -924,10 +1212,11 @@ mod tests {
         app.chat.streaming_thinking_message_id = Some("assistant-1".into());
         app.chat.streaming_content = "answer".into();
         app.chat.streaming_content_message_id = Some("assistant-1".into());
-        app.chat.scroll_offset = 8;
-        app.render.streaming_cache.store(6, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        app.render.set_chat_scroll_offset(8);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
+        app.render.test_seed_elicitation_custom_geometry(24, 3);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
@@ -940,12 +1229,13 @@ mod tests {
             Some("elic-live")
         );
         assert!(app.chat.elicitation_ui.is_some());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
-        assert!(app.render.streaming_cache.get(6).is_none());
-        assert!(app.render.streaming_thinking_cache.get(4).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [
@@ -969,16 +1259,20 @@ mod tests {
             "question - answer in the panel above input"
         );
 
-        app.render.streaming_cache.store(9, Vec::new());
-        app.render.streaming_thinking_cache.store(10, Vec::new());
-        app.render.card_cache.processed_messages = 2;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 2);
+        app.render.set_chat_scroll_offset(6);
+        app.render.test_seed_elicitation_custom_geometry(18, 2);
         let log_count_before_duplicate = app.diagnostics.logs.len();
         let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 6);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (18, 2, true));
         assert_eq!(app.chat.messages.len(), 2);
-        assert!(app.render.streaming_cache.get(9).is_some());
-        assert!(app.render.streaming_thinking_cache.get(10).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 2);
         assert_eq!(app.diagnostics.logs.len(), log_count_before_duplicate);
     }
 
@@ -986,9 +1280,11 @@ mod tests {
     fn chat_elicitation_replay_and_unsupported_routes_preserve_exact_behavior() {
         let mut app = App::new();
         app.sessions.session_id = Some("active".into());
-        app.render.streaming_cache.store(5, Vec::new());
-        app.render.streaming_thinking_cache.store(6, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
+        app.render.set_chat_scroll_offset(7);
+        app.render.test_seed_elicitation_custom_geometry(22, 2);
         let log_count_before_replay = app.diagnostics.logs.len();
 
         let effects = update(
@@ -999,6 +1295,8 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (22, 2, true));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -1006,9 +1304,9 @@ mod tests {
             [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
                 if elicitation_id == "elic-replay"
         ));
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(6).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(
             app.diagnostics.status,
             "question - answer in the panel above input"
@@ -1025,9 +1323,12 @@ mod tests {
             "question - answer in the panel above input"
         );
 
+        app.render.set_chat_scroll_offset(5);
         let log_count_before_unsupported = app.diagnostics.logs.len();
         let effects = apply_session_update(&mut app, unsupported_elicitation("elic-unsupported"));
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (22, 2, true));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -1037,9 +1338,9 @@ mod tests {
                 ChatEntry::Elicitation { elicitation_id: unsupported, outcome: Some(outcome), .. },
             ] if replay == "elic-replay"
                 && unsupported == "elic-unsupported"
-                && outcome == "unsupported schema - cannot answer in TUI"
+                && outcome == &ElicitationResponseOutcome::UnsupportedSchema
         ));
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(
             app.diagnostics.status,
             "question skipped - unsupported schema"
@@ -1063,7 +1364,7 @@ mod tests {
         app.sessions.session_id = Some("parent".into());
         add_elicitation(&mut app, "active-elicitation", true);
         app.chat.streaming_content = "active stream".into();
-        app.render.card_cache.processed_messages = 6;
+        seed_card_cache(&mut app, 6);
         app.diagnostics.status = "preserved status".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -1086,7 +1387,7 @@ mod tests {
         assert!(app.chat.elicitation_ui.is_some());
         assert_eq!(app.chat.streaming_content, "active stream");
         assert_eq!(app.chat.messages.len(), 1);
-        assert_eq!(app.render.card_cache.processed_messages, 6);
+        assert_eq!(card_cache_count(&app), 6);
         assert_eq!(app.diagnostics.status, "preserved status");
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
         assert!(matches!(
@@ -1104,9 +1405,9 @@ mod tests {
         app.sessions.session_id = Some("active".into());
         app.chat.apply_usage(128, 4_096, Some(1.5));
         app.chat.add_active_llm_duration(Duration::from_secs(2));
-        app.render.streaming_cache.store(5, Vec::new());
-        app.render.streaming_thinking_cache.store(6, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
         app.diagnostics.status = "preserved status".into();
         app.push_log(LogLevel::Debug, "test", "before usage");
         let log_count_before = app.diagnostics.logs.len();
@@ -1173,18 +1474,18 @@ mod tests {
         assert_eq!(diagnostics[2].level, LogLevel::Info);
         assert_eq!(diagnostics[2].target, "usage");
         assert_eq!(diagnostics[2].message, "usage: active time 3s");
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(6).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
     }
 
     #[test]
     fn chat_usage_timing_replay_preserves_summary_and_diagnostic_order() {
         let mut app = App::new();
         app.sessions.session_id = Some("active".into());
-        app.render.streaming_cache.store(8, Vec::new());
-        app.render.streaming_thinking_cache.store(9, Vec::new());
-        app.render.card_cache.processed_messages = 10;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 10);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1222,9 +1523,9 @@ mod tests {
             diagnostics[2].message,
             "usage: context 30/120 tokens (25%), cost $0.5000"
         );
-        assert!(app.render.streaming_cache.get(8).is_some());
-        assert!(app.render.streaming_thinking_cache.get(9).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 10);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 10);
     }
 
     #[test]
@@ -1233,9 +1534,9 @@ mod tests {
         app.sessions.session_id = Some("active".into());
         app.chat.streaming_content = "discarded".into();
         app.chat.streaming_thinking = "discarded thinking".into();
-        app.render.streaming_cache.store(9, Vec::new());
-        app.render.streaming_thinking_cache.store(8, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
 
         let effects = update(
             &mut app,
@@ -1251,9 +1552,9 @@ mod tests {
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
         assert!(app.chat.session_stats.open_llm_request_instant.is_some());
-        assert!(app.render.streaming_cache.get(9).is_none());
-        assert!(app.render.streaming_thinking_cache.get(8).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(app.diagnostics.status, "thinking...");
         let diagnostic = app.diagnostics.logs.last().expect("turn diagnostic");
         assert_eq!(diagnostic.level, LogLevel::Debug);
@@ -1261,7 +1562,7 @@ mod tests {
         assert_eq!(diagnostic.message, "thinking...");
 
         let local_id = app.chat.push_pending_prompt("  repeat\n".into());
-        app.render.card_cache.processed_messages = 8;
+        seed_card_cache(&mut app, 8);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::SessionUpdate {
@@ -1274,7 +1575,7 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::User { text, message_id: Some(id) }]
@@ -1283,7 +1584,7 @@ mod tests {
         assert_eq!(app.chat.undoable_turns[0].message_id, "server-user");
 
         app.sessions.session_activity.remove("active");
-        app.render.card_cache.processed_messages = 9;
+        seed_card_cache(&mut app, 9);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::SessionUpdate {
@@ -1296,7 +1597,7 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert_eq!(card_cache_count(&app), 9);
         assert_eq!(app.chat.messages.len(), 1);
     }
 
@@ -1305,9 +1606,9 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_id = Some("active".into());
         app.chat.activity = ActivityState::Thinking;
-        app.render.streaming_cache.store(5, Vec::new());
-        app.render.streaming_thinking_cache.store(6, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
 
         for update_value in [
             crate::acp_state::AcpSessionUpdate::AssistantThinkingDelta {
@@ -1329,9 +1630,9 @@ mod tests {
             );
             assert!(effects.is_empty());
         }
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(6).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
 
         let effects = update(
             &mut app,
@@ -1345,9 +1646,9 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert!(app.render.streaming_cache.get(5).is_none());
-        assert!(app.render.streaming_thinking_cache.get(6).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
@@ -1355,9 +1656,9 @@ mod tests {
         ));
         assert_eq!(app.chat.streaming_thinking, "second plan");
 
-        app.render.streaming_cache.store(10, Vec::new());
-        app.render.streaming_thinking_cache.store(11, Vec::new());
-        app.render.card_cache.processed_messages = 12;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 12);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::SessionUpdate {
@@ -1371,14 +1672,35 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert!(app.render.streaming_cache.get(10).is_none());
-        assert!(app.render.streaming_thinking_cache.get(11).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 12);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 12);
         assert!(matches!(
             &app.chat.messages[1],
             ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }
                 if content == "final" && thinking == "second plan" && id == "assistant-2"
         ));
+
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 13);
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::AssistantMessage {
+                    content: "duplicate final".into(),
+                    thinking: Some("duplicate thinking".into()),
+                    message_id: Some("assistant-2".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 13);
+        assert_eq!(app.chat.messages.len(), 2);
     }
 
     #[test]
@@ -1395,8 +1717,8 @@ mod tests {
         );
         app.chat.streaming_content = "discarded".into();
         app.chat.streaming_thinking = "discarded thinking".into();
-        app.render.streaming_cache.store(9, Vec::new());
-        app.render.streaming_thinking_cache.store(8, Vec::new());
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::SessionUpdate {
@@ -1411,8 +1733,8 @@ mod tests {
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
         assert!(app.chat.messages.is_empty());
-        assert!(app.render.streaming_cache.get(9).is_none());
-        assert!(app.render.streaming_thinking_cache.get(8).is_none());
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "cancelled");
         let diagnostic = app.diagnostics.logs.last().expect("cancel diagnostic");
         assert_eq!(diagnostic.level, LogLevel::Warn);
@@ -1460,9 +1782,9 @@ mod tests {
         app.chat.messages.push(ChatEntry::Error("preserved".into()));
         app.chat.session_stats.open_llm_request_instant =
             Some(Instant::now() - Duration::from_secs(2));
-        app.render.streaming_cache.store(5, Vec::new());
-        app.render.streaming_thinking_cache.store(6, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
         app.composer.input = "preserved input".into();
         app.mesh.mesh_invite_name = "preserved invite".into();
         let log_count_before = app.diagnostics.logs.len();
@@ -1488,9 +1810,9 @@ mod tests {
             [ChatEntry::Error(preserved), ChatEntry::Error(inserted)]
                 if preserved == "preserved" && inserted == "connection lost"
         ));
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(6).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(app.diagnostics.status, "error: connection lost");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -1508,7 +1830,7 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(app.chat.messages.len(), 2);
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(app.diagnostics.logs.len(), log_count_before + 1);
     }
 
@@ -1521,9 +1843,9 @@ mod tests {
         app.chat.recent_prompt_text = Some("preserved prompt".into());
         app.chat.session_stats.open_llm_request_instant =
             Some(Instant::now() - Duration::from_secs(2));
-        app.render.streaming_cache.store(8, Vec::new());
-        app.render.streaming_thinking_cache.store(9, Vec::new());
-        app.render.card_cache.processed_messages = 10;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 10);
         app.composer.input = "preserved input".into();
         app.mesh.mesh_invite_name = "preserved invite".into();
         let log_count_before = app.diagnostics.logs.len();
@@ -1556,9 +1878,9 @@ mod tests {
         assert!(app.chat.messages.iter().all(|entry| {
             !matches!(entry, ChatEntry::User { message_id: Some(id), .. } if id == &failed_id)
         }));
-        assert!(app.render.streaming_cache.get(8).is_some());
-        assert!(app.render.streaming_thinking_cache.get(9).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "error: backend rejected prompt");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -1567,6 +1889,21 @@ mod tests {
         assert_eq!(diagnostics[0].message, "error: backend rejected prompt");
         assert_eq!(app.composer.input, "preserved input");
         assert_eq!(app.mesh.mesh_invite_name, "preserved invite");
+
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 11);
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::PromptFailed {
+                local_id: "missing".into(),
+                message: "backend rejected prompt".into(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
     }
 
     #[test]
@@ -1579,9 +1916,9 @@ mod tests {
         app.chat.streaming_thinking_message_id = Some("thinking-id".into());
         app.chat.recent_prompt_text = Some("prompt".into());
         app.chat.pending_fork_message_id = Some("fork-target".into());
-        app.render.streaming_cache.store(7, Vec::new());
-        app.render.streaming_thinking_cache.store(8, Vec::new());
-        app.render.card_cache.processed_messages = 9;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 9);
         let log_count = app.diagnostics.logs.len();
         let status = app.diagnostics.status.clone();
 
@@ -1616,9 +1953,9 @@ mod tests {
                 .and_then(|state| state.frontier_message_id.as_deref()),
             Some("one")
         );
-        assert!(app.render.streaming_cache.get(7).is_some());
-        assert!(app.render.streaming_thinking_cache.get(8).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 9);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 9);
         assert_eq!(app.diagnostics.logs.len(), log_count);
         assert_eq!(app.diagnostics.status, status);
     }
@@ -1656,9 +1993,9 @@ mod tests {
         app.chat.streaming_thinking = "keep thinking".into();
         app.chat.streaming_thinking_message_id = Some("thinking-id".into());
         app.chat.recent_prompt_text = Some("discard prompt".into());
-        app.render.streaming_cache.store(15, Vec::new());
-        app.render.streaming_thinking_cache.store(13, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
         let log_count = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1686,9 +2023,9 @@ mod tests {
         assert_eq!(state.frontier_message_id.as_deref(), Some("two"));
         assert!(state.stack[0].reverted_files.is_empty());
         assert_eq!(state.stack[1].reverted_files, ["src/main.rs"]);
-        assert!(app.render.streaming_cache.get(15).is_none());
-        assert!(app.render.streaming_thinking_cache.get(13).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(app.diagnostics.status, "undone - reloading session");
         let diagnostics = &app.diagnostics.logs[log_count..];
         assert_eq!(diagnostics.len(), 1);
@@ -1715,9 +2052,9 @@ mod tests {
         app.chat.streaming_thinking = "preserve thinking".into();
         app.chat.streaming_thinking_message_id = Some("preserve-thinking-id".into());
         app.chat.recent_prompt_text = Some("preserve prompt".into());
-        app.render.streaming_cache.store(16, Vec::new());
-        app.render.streaming_thinking_cache.store(17, Vec::new());
-        app.render.card_cache.processed_messages = 8;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 8);
         let log_count = app.diagnostics.logs.len();
         let effects = update(
             &mut app,
@@ -1753,9 +2090,9 @@ mod tests {
                 .and_then(|state| state.frontier_message_id.as_deref()),
             Some("one")
         );
-        assert!(app.render.streaming_cache.get(16).is_some());
-        assert!(app.render.streaming_thinking_cache.get(17).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 8);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 8);
         assert_eq!(app.diagnostics.status, "undo failed");
         let diagnostics = &app.diagnostics.logs[log_count..];
         assert_eq!(diagnostics.len(), 1);
@@ -1785,9 +2122,9 @@ mod tests {
         app.chat.streaming_thinking = "keep thinking".into();
         app.chat.streaming_thinking_message_id = Some("thinking-id".into());
         app.chat.recent_prompt_text = Some("keep prompt".into());
-        app.render.streaming_cache.store(12, Vec::new());
-        app.render.streaming_thinking_cache.store(13, Vec::new());
-        app.render.card_cache.processed_messages = 14;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 14);
         let log_count = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1812,9 +2149,9 @@ mod tests {
             Some("thinking-id")
         );
         assert_eq!(app.chat.recent_prompt_text.as_deref(), Some("keep prompt"));
-        assert!(app.render.streaming_cache.get(12).is_some());
-        assert!(app.render.streaming_thinking_cache.get(13).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 14);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 14);
         assert_eq!(app.diagnostics.status, "redone - reloading session");
         let diagnostics = &app.diagnostics.logs[log_count..];
         assert_eq!(diagnostics.len(), 1);
@@ -1955,8 +2292,8 @@ mod tests {
         app.chat.streaming_thinking = "keep thinking".into();
         app.chat.streaming_thinking_message_id = Some("thinking-id".into());
         app.chat.recent_prompt_text = Some("discard prompt".into());
-        app.render.streaming_cache.store(7, Vec::new());
-        app.render.streaming_thinking_cache.store(8, Vec::new());
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
         let log_count = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1976,8 +2313,8 @@ mod tests {
         assert!(app.chat.streaming_content_message_id.is_none());
         assert_eq!(app.chat.streaming_thinking, "keep thinking");
         assert!(app.chat.recent_prompt_text.is_none());
-        assert!(app.render.streaming_cache.get(7).is_none());
-        assert!(app.render.streaming_thinking_cache.get(8).is_some());
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "undone - reloading session");
         assert_eq!(app.diagnostics.logs.len(), log_count + 1);
 
@@ -2425,15 +2762,19 @@ mod tests {
             .messages
             .push(ChatEntry::Error("stale chat".into()));
         app.chat.streaming_content = "stale stream".into();
+        app.render.test_seed_chat_viewport(8, 34);
+        app.render.test_seed_start_page_scroll(6);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
         app.composer.input = "preserved draft".into();
         app.composer.input_cursor = 4;
         app.composer.file_index = vec![FileIndexEntryLite {
             path: "src/main.rs".into(),
             is_dir: false,
         }];
-        app.render.streaming_cache.store(7, Vec::new());
-        app.render.streaming_thinking_cache.store(8, Vec::new());
-        app.render.card_cache.processed_messages = 2;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 2);
         app.sessions.mode_before_review = Some("plan".into());
         app.models.agents_profile_id = Some("code".into());
         app.models.agents = vec![agent("primary"), agent("coder")];
@@ -2471,12 +2812,17 @@ mod tests {
         assert_eq!(app.profiles.session_profile_id("session-1"), Some("code"));
         assert!(app.chat.messages.is_empty());
         assert!(app.chat.streaming_content.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
+        assert_eq!(app.render.start_page_scroll(), 6);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
         assert_eq!(app.composer.input, "preserved draft");
         assert_eq!(app.composer.input_cursor, 4);
         assert!(app.composer.file_index.is_empty());
-        assert!(app.render.streaming_cache.get(7).is_none());
-        assert!(app.render.streaming_thinking_cache.get(8).is_none());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "session created");
         let diagnostic = app.diagnostics.logs.last().expect("creation diagnostic");
         assert_eq!(diagnostic.level, LogLevel::Info);
@@ -2529,6 +2875,10 @@ mod tests {
         app.chat
             .messages
             .push(ChatEntry::Error("stale chat".into()));
+        app.render.test_seed_chat_viewport(6, 28);
+        app.render.test_seed_start_page_scroll(4);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
         app.composer.file_index = vec![FileIndexEntryLite {
             path: "src/lib.rs".into(),
             is_dir: false,
@@ -2553,6 +2903,11 @@ mod tests {
         assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-local"));
         assert_eq!(app.sessions.mode_before_review, None);
         assert!(app.chat.messages.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
+        assert_eq!(app.render.start_page_scroll(), 4);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
         assert!(app.composer.file_index.is_empty());
         assert_eq!(app.diagnostics.status, "ready");
         let diagnostic = app.diagnostics.logs.last().expect("load diagnostic");
@@ -2595,6 +2950,7 @@ mod tests {
             .pending_delegate_child_states
             .insert("keep-child".into(), DelegateChildState::OtherProgress);
         app.chat.activity = ActivityState::Thinking;
+        app.render.test_seed_chat_viewport(7, 39);
 
         let remote_effects = update(
             &mut app,
@@ -2617,6 +2973,8 @@ mod tests {
                 .contains_key("keep-child")
         );
         assert_eq!(app.navigation.screen, Screen::Delegate);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert!(app.profiles.session_profile_id("remote-child").is_none());
         assert_eq!(
             remote_effects,
@@ -3097,7 +3455,10 @@ mod tests {
     fn editor_results_apply_state_then_request_redraw() {
         let mut app = App::new();
         app.composer.input = "draft".into();
-        app.render.card_cache.processed_messages = 2;
+        app.render.test_seed_composer_input_geometry(30, 2);
+        seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
 
         let effects = update(
             &mut app,
@@ -3108,7 +3469,10 @@ mod tests {
 
         assert_eq!(app.composer.input, "revised");
         assert_eq!(app.composer.input_cursor, "revised".len());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "loaded prompt from external editor");
         assert_eq!(effects, vec![Effect::Terminal(TerminalAction::Redraw)]);
     }
@@ -3117,6 +3481,10 @@ mod tests {
     fn editor_cancel_and_failure_preserve_input_and_request_redraw() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        app.render.test_seed_composer_input_geometry(30, 2);
+        seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
 
         let effects = update(
             &mut app,
@@ -3125,9 +3493,16 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(app.render.test_composer_input_geometry(), (30, 2, true));
+        assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "external editor cancelled");
         assert_eq!(effects, vec![Effect::Terminal(TerminalAction::Redraw)]);
 
+        seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
         let effects = update(
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ExternalEditorFinished {
@@ -3135,6 +3510,10 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(app.render.test_composer_input_geometry(), (30, 2, true));
+        assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(
             app.diagnostics.status,
             "external editor failed: editor exited"
@@ -3147,9 +3526,11 @@ mod tests {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", true);
         app.connection.conn = ConnState::Connected;
-        app.render.streaming_cache.store(3, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 5;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 5);
+        app.render.set_chat_scroll_offset(6);
+        app.render.test_seed_elicitation_custom_geometry(26, 2);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3157,21 +3538,24 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 6);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "accepted"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Text("accepted".into())
         ));
-        assert!(app.render.streaming_cache.get(3).is_some());
-        assert!(app.render.streaming_thinking_cache.get(4).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "ready");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -3184,9 +3568,9 @@ mod tests {
     fn elicitation_command_failure_leaves_active_card_pending() {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", true);
-        app.render.streaming_cache.store(3, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 5;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 5);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
@@ -3215,9 +3599,9 @@ mod tests {
             [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
                 if elicitation_id == "elic-1"
         ));
-        assert!(app.render.streaming_cache.get(3).is_some());
-        assert!(app.render.streaming_thinking_cache.get(4).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 5);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 5);
         assert_eq!(app.diagnostics.status, "channel closed");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -3231,9 +3615,10 @@ mod tests {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-old", false);
         add_elicitation(&mut app, "elic-new", true);
-        app.render.streaming_cache.store(3, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 2;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 2);
+        app.render.test_seed_elicitation_custom_geometry(28, 3);
         app.diagnostics.status = "newer question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3241,7 +3626,7 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-old".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
@@ -3254,9 +3639,10 @@ mod tests {
             Some("elic-new")
         );
         assert!(app.chat.elicitation_ui.is_some());
-        assert!(app.render.streaming_cache.get(3).is_some());
-        assert!(app.render.streaming_thinking_cache.get(4).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (28, 3, true));
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "newer question pending");
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
         assert!(matches!(
@@ -3264,7 +3650,9 @@ mod tests {
             [
                 ChatEntry::Elicitation { elicitation_id: old_id, outcome: Some(outcome), .. },
                 ChatEntry::Elicitation { elicitation_id: new_id, outcome: None, .. },
-            ] if old_id == "elic-old" && outcome == "accepted" && new_id == "elic-new"
+            ] if old_id == "elic-old"
+                && outcome == &ElicitationResponseOutcome::Text("accepted".into())
+                && new_id == "elic-new"
         ));
     }
 
@@ -3272,9 +3660,11 @@ mod tests {
     fn unknown_elicitation_ack_is_a_complete_noop() {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-active", true);
-        app.render.streaming_cache.store(3, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 5;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 5);
+        app.render.set_chat_scroll_offset(7);
+        app.render.test_seed_elicitation_custom_geometry(32, 1);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3282,11 +3672,12 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "missing".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
 
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
         assert_eq!(
             app.chat
                 .elicitation
@@ -3295,14 +3686,15 @@ mod tests {
             Some("elic-active")
         );
         assert!(app.chat.elicitation_ui.is_some());
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (32, 1, true));
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: None, .. }]
                 if elicitation_id == "elic-active"
         ));
-        assert!(app.render.streaming_cache.get(3).is_some());
-        assert!(app.render.streaming_thinking_cache.get(4).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 5);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 5);
         assert_eq!(app.diagnostics.status, "question pending");
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
     }
@@ -3311,7 +3703,8 @@ mod tests {
     fn duplicate_elicitation_ack_rewrites_and_invalidates_again_without_status_refresh() {
         let mut app = App::new();
         add_elicitation(&mut app, "elic-1", false);
-        app.render.card_cache.processed_messages = 5;
+        seed_card_cache(&mut app, 5);
+        app.render.test_seed_elicitation_custom_geometry(34, 2);
         app.diagnostics.status = "preserved status".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3319,27 +3712,29 @@ mod tests {
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "accepted".into(),
+                outcome: ElicitationResponseOutcome::Text("accepted".into()),
             }),
         );
         assert!(first_effects.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
-        app.render.card_cache.processed_messages = 6;
+        assert_eq!(card_cache_count(&app), 0);
+        seed_card_cache(&mut app, 6);
 
         let duplicate_effects = update(
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ElicitationResponseSent {
                 elicitation_id: "elic-1".into(),
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }),
         );
         assert!(duplicate_effects.is_empty());
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "declined"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Declined
         ));
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(card_cache_count(&app), 0);
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (34, 2, true));
         assert_eq!(app.diagnostics.status, "preserved status");
         assert_eq!(app.diagnostics.logs.len(), log_count_before);
     }
@@ -3352,9 +3747,9 @@ mod tests {
         app.chat.recent_prompt_text = Some("preserved prompt".into());
         app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
         let open_timing = app.chat.session_stats.open_llm_request_instant;
-        app.render.streaming_cache.store(3, Vec::new());
-        app.render.streaming_thinking_cache.store(4, Vec::new());
-        app.render.card_cache.processed_messages = 2;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 2);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
@@ -3387,9 +3782,9 @@ mod tests {
         );
         assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
         assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
-        assert!(app.render.streaming_cache.get(3).is_some());
-        assert!(app.render.streaming_thinking_cache.get(4).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "channel closed");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -3405,9 +3800,9 @@ mod tests {
         app.chat.recent_prompt_text = Some("preserved prompt".into());
         app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
         let open_timing = app.chat.session_stats.open_llm_request_instant;
-        app.render.streaming_cache.store(5, Vec::new());
-        app.render.streaming_thinking_cache.store(6, Vec::new());
-        app.render.card_cache.processed_messages = 7;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 7);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
@@ -3433,9 +3828,9 @@ mod tests {
         );
         assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
         assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(6).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 7);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 7);
         assert_eq!(app.diagnostics.status, "unknown prompt failed");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);
@@ -3451,9 +3846,9 @@ mod tests {
         app.chat.recent_prompt_text = Some("preserved prompt".into());
         app.chat.session_stats.open_llm_request_instant = Some(Instant::now());
         let open_timing = app.chat.session_stats.open_llm_request_instant;
-        app.render.streaming_cache.store(8, Vec::new());
-        app.render.streaming_thinking_cache.store(9, Vec::new());
-        app.render.card_cache.processed_messages = 10;
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 10);
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = update(
@@ -3476,9 +3871,9 @@ mod tests {
         );
         assert_eq!(app.chat.session_stats.open_llm_request_instant, open_timing);
         assert_eq!(app.chat.session_stats.active_llm_duration, Duration::ZERO);
-        assert!(app.render.streaming_cache.get(8).is_some());
-        assert!(app.render.streaming_thinking_cache.get(9).is_some());
-        assert_eq!(app.render.card_cache.processed_messages, 10);
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 10);
         assert_eq!(app.diagnostics.status, "cancel channel closed");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
         assert_eq!(diagnostics.len(), 1);

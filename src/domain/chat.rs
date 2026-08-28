@@ -1,6 +1,15 @@
 use crate::domain::tool::ToolDetail;
 
-pub const OUTCOME_BULLET: &str = "\u{25B8} ";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElicitationResponseOutcome {
+    Selected(Vec<String>),
+    Text(String),
+    Boolean(bool),
+    Declined,
+    Cancelled,
+    UnsupportedSchema,
+    Responded,
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
@@ -37,55 +46,40 @@ pub enum ChatEntry {
         elicitation_id: String,
         message: String,
         source: String,
-        /// None = pending; Some = responded with this outcome label.
-        outcome: Option<String>,
+        /// None is pending; Some records the semantic response state.
+        outcome: Option<ElicitationResponseOutcome>,
     },
-}
-
-pub fn format_outcome_label(label: &str) -> String {
-    let mut formatted = String::with_capacity(OUTCOME_BULLET.len() + label.len());
-    formatted.push_str(OUTCOME_BULLET);
-    formatted.push_str(label);
-    formatted
-}
-
-pub fn format_outcome_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> String {
-    let mut labels = labels.into_iter();
-    let Some(first) = labels.next() else {
-        return String::new();
-    };
-
-    let mut formatted = format_outcome_label(first);
-    for label in labels {
-        formatted.push('\n');
-        formatted.push_str(OUTCOME_BULLET);
-        formatted.push_str(label);
-    }
-    formatted
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OUTCOME_BULLET, format_outcome_label, format_outcome_labels};
+    use super::ElicitationResponseOutcome;
 
     #[test]
-    fn format_outcome_label_prefixes_single_label() {
-        assert_eq!(
-            format_outcome_label("Beta"),
-            format!("{OUTCOME_BULLET}Beta")
+    fn elicitation_response_outcomes_preserve_semantic_payloads_and_states() {
+        let selected = ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into()]);
+        assert!(matches!(
+            selected,
+            ElicitationResponseOutcome::Selected(labels)
+                if labels == ["Alpha".to_string(), "Beta".to_string()]
+        ));
+
+        let text = ElicitationResponseOutcome::Text("line one\nline two".into());
+        assert!(matches!(
+            text,
+            ElicitationResponseOutcome::Text(value) if value == "line one\nline two"
+        ));
+        assert_ne!(
+            ElicitationResponseOutcome::Boolean(true),
+            ElicitationResponseOutcome::Boolean(false),
         );
-    }
-
-    #[test]
-    fn format_outcome_labels_joins_multiple_labels_with_newlines() {
-        assert_eq!(
-            format_outcome_labels(["Alpha", "Beta", "Gamma"]),
-            format!("{OUTCOME_BULLET}Alpha\n{OUTCOME_BULLET}Beta\n{OUTCOME_BULLET}Gamma"),
+        assert_ne!(
+            ElicitationResponseOutcome::Declined,
+            ElicitationResponseOutcome::Cancelled,
         );
-    }
-
-    #[test]
-    fn format_outcome_labels_returns_empty_for_no_labels() {
-        assert!(format_outcome_labels(std::iter::empty()).is_empty());
+        assert_ne!(
+            ElicitationResponseOutcome::UnsupportedSchema,
+            ElicitationResponseOutcome::Responded,
+        );
     }
 }

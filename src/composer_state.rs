@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use unicode_width::UnicodeWidthChar;
+
+use crate::input_layout::build_input_visual_layout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileIndexEntryLite {
@@ -29,8 +30,6 @@ pub(crate) struct SlashCompletionState {
 pub(crate) struct ComposerState {
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
-    pub(crate) input_scroll: u16,
-    pub(crate) input_line_width: usize,
     pub(crate) input_preferred_col: Option<usize>,
     pub(crate) file_index: Vec<FileIndexEntryLite>,
     pub(crate) file_index_generated_at: Option<u64>,
@@ -40,163 +39,11 @@ pub(crate) struct ComposerState {
     pub(crate) slash_state: Option<SlashCompletionState>,
 }
 
-pub(crate) struct InputVisualRow {
-    pub(crate) text: String,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) columns: Vec<(usize, usize)>,
-}
-
-pub(crate) struct InputVisualLayout {
-    pub(crate) rows: Vec<InputVisualRow>,
-    pub(crate) cursor_row: usize,
-    pub(crate) cursor_col: usize,
-    pub(crate) cursor_text_col: usize,
-}
-
-impl InputVisualLayout {
-    pub(crate) fn total_rows(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(crate) fn cursor_offset_for_row_col(&self, row: usize, preferred_col: usize) -> usize {
-        let Some(row) = self.rows.get(row) else {
-            return 0;
-        };
-        let mut best = row.end;
-        for (col, offset) in &row.columns {
-            if *col <= preferred_col {
-                best = *offset;
-            } else {
-                break;
-            }
-        }
-        best
-    }
-}
-
-pub(crate) fn build_input_visual_layout(
-    input: &str,
-    input_cursor: usize,
-    line_width: usize,
-    prefix_width: usize,
-) -> InputVisualLayout {
-    let line_width = line_width.max(1);
-    let mut rows: Vec<InputVisualRow> = Vec::new();
-    let mut row_text = String::new();
-    let mut row_columns = vec![(0usize, 0usize)];
-    let mut row_start = 0usize;
-    let mut row_end = 0usize;
-    let mut col = prefix_width;
-    let mut text_col = 0usize;
-    let mut cursor_row = 0usize;
-    let mut cursor_col = prefix_width;
-    let mut cursor_text_col = 0usize;
-    let mut cursor_found = input_cursor == 0;
-
-    let row_prefix_width = |rows_len: usize| if rows_len == 0 { prefix_width } else { 0 };
-
-    if cursor_found {
-        cursor_row = 0;
-        cursor_col = prefix_width;
-        cursor_text_col = 0;
-    }
-
-    let finish_row = |rows: &mut Vec<InputVisualRow>,
-                      row_text: &mut String,
-                      row_columns: &mut Vec<(usize, usize)>,
-                      row_start: &mut usize,
-                      row_end: &mut usize,
-                      next_start: usize| {
-        rows.push(InputVisualRow {
-            text: std::mem::take(row_text),
-            start: *row_start,
-            end: *row_end,
-            columns: std::mem::take(row_columns),
-        });
-        *row_columns = vec![(0, next_start)];
-        *row_start = next_start;
-        *row_end = next_start;
-    };
-
-    for (byte_idx, ch) in input.char_indices() {
-        if !cursor_found && byte_idx == input_cursor {
-            cursor_row = rows.len();
-            cursor_col = col;
-            cursor_text_col = text_col;
-            cursor_found = true;
-        }
-
-        if ch == '\n' {
-            row_end = byte_idx;
-            finish_row(
-                &mut rows,
-                &mut row_text,
-                &mut row_columns,
-                &mut row_start,
-                &mut row_end,
-                byte_idx + ch.len_utf8(),
-            );
-            col = row_prefix_width(rows.len());
-            text_col = 0;
-            continue;
-        }
-
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width > 0 && col + ch_width > line_width {
-            finish_row(
-                &mut rows,
-                &mut row_text,
-                &mut row_columns,
-                &mut row_start,
-                &mut row_end,
-                byte_idx,
-            );
-            col = row_prefix_width(rows.len());
-            text_col = 0;
-            if !cursor_found && byte_idx == input_cursor {
-                cursor_row = rows.len();
-                cursor_col = col;
-                cursor_text_col = 0;
-                cursor_found = true;
-            }
-        }
-
-        row_text.push(ch);
-        col += ch_width;
-        text_col += ch_width;
-        row_end = byte_idx + ch.len_utf8();
-        row_columns.push((text_col, row_end));
-    }
-
-    if !cursor_found && input_cursor == input.len() {
-        cursor_row = rows.len();
-        cursor_col = col;
-        cursor_text_col = text_col;
-    }
-
-    rows.push(InputVisualRow {
-        text: row_text,
-        start: row_start,
-        end: row_end,
-        columns: row_columns,
-    });
-
-    InputVisualLayout {
-        rows,
-        cursor_row,
-        cursor_col,
-        cursor_text_col,
-    }
-}
-
 impl ComposerState {
     pub(crate) fn new() -> Self {
         Self {
             input: String::new(),
             input_cursor: 0,
-            input_scroll: 0,
-            input_line_width: 1,
             input_preferred_col: None,
             file_index: Vec::new(),
             file_index_generated_at: None,
@@ -214,13 +61,11 @@ impl ComposerState {
     pub(crate) fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
-        self.input_scroll = 0;
     }
 
     pub(crate) fn replace_input(&mut self, input: String) {
         self.input = input;
         self.input_cursor = self.input.len();
-        self.input_scroll = 0;
     }
 
     pub(crate) fn input_insert(&mut self, character: char) {
@@ -300,13 +145,9 @@ impl ComposerState {
         self.refresh_slash_state();
     }
 
-    pub(crate) fn input_up_visual(&mut self, prefix_width: usize) {
-        let layout = build_input_visual_layout(
-            &self.input,
-            self.input_cursor,
-            self.input_line_width,
-            prefix_width,
-        );
+    pub(crate) fn input_up_visual(&mut self, line_width: usize, prefix_width: usize) {
+        let layout =
+            build_input_visual_layout(&self.input, self.input_cursor, line_width, prefix_width);
         if layout.cursor_row == 0 {
             self.input_preferred_col = Some(layout.cursor_text_col);
             return;
@@ -318,13 +159,9 @@ impl ComposerState {
         self.refresh_slash_state();
     }
 
-    pub(crate) fn input_down_visual(&mut self, prefix_width: usize) {
-        let layout = build_input_visual_layout(
-            &self.input,
-            self.input_cursor,
-            self.input_line_width,
-            prefix_width,
-        );
+    pub(crate) fn input_down_visual(&mut self, line_width: usize, prefix_width: usize) {
+        let layout =
+            build_input_visual_layout(&self.input, self.input_cursor, line_width, prefix_width);
         if layout.cursor_row + 1 >= layout.total_rows() {
             self.input_preferred_col = Some(layout.cursor_text_col);
             return;
@@ -598,8 +435,6 @@ mod tests {
 
         assert!(state.input.is_empty());
         assert_eq!(state.input_cursor, 0);
-        assert_eq!(state.input_scroll, 0);
-        assert_eq!(state.input_line_width, 1);
         assert_eq!(state.input_preferred_col, None);
         assert!(state.file_index.is_empty());
         assert_eq!(state.file_index_generated_at, None);
@@ -614,17 +449,14 @@ mod tests {
         let mut state = ComposerState::new();
         state.input = "old".into();
         state.input_cursor = 2;
-        state.input_scroll = 3;
 
         state.clear_input();
         assert!(state.input.is_empty());
         assert_eq!(state.input_cursor, 0);
-        assert_eq!(state.input_scroll, 0);
 
         state.replace_input("new".into());
         assert_eq!(state.input, "new");
         assert_eq!(state.input_cursor, 3);
-        assert_eq!(state.input_scroll, 0);
     }
 
     #[test]
@@ -674,24 +506,45 @@ mod tests {
         let mut state = ComposerState::new();
         state.input = "abcdef".into();
         state.input_cursor = 4;
-        state.input_line_width = 4;
 
-        state.input_up_visual(2);
+        state.input_up_visual(4, 2);
         assert_eq!(state.input_cursor, 2);
         assert_eq!(state.input_preferred_col, Some(2));
-        state.input_down_visual(2);
+        state.input_down_visual(4, 2);
         assert_eq!(state.input_cursor, 4);
 
         state.input = "ab\ncd".into();
         state.input_cursor = 1;
-        state.input_line_width = 6;
         state.input_preferred_col = None;
-        state.input_down_visual(2);
+        state.input_down_visual(6, 2);
         assert_eq!(state.input_cursor, 4);
 
         state.input_left();
         assert_eq!(state.input_cursor, 3);
         assert_eq!(state.input_preferred_col, None);
+    }
+
+    #[test]
+    fn visual_movement_retains_preferred_column_across_unequal_rows_and_boundaries() {
+        let mut state = ComposerState::new();
+        state.input = "abcd\nx\nwxyz".into();
+        state.input_cursor = state.input.len();
+
+        state.input_up_visual(20, 2);
+        assert_eq!(state.input_cursor, "abcd\nx".len());
+        assert_eq!(state.input_preferred_col, Some(4));
+        state.input_up_visual(20, 2);
+        assert_eq!(state.input_cursor, 4);
+        state.input_up_visual(20, 2);
+        assert_eq!(state.input_cursor, 4);
+        assert_eq!(state.input_preferred_col, Some(4));
+        state.input_down_visual(20, 2);
+        assert_eq!(state.input_cursor, "abcd\nx".len());
+        state.input_down_visual(20, 2);
+        assert_eq!(state.input_cursor, state.input.len());
+        state.input_down_visual(20, 2);
+        assert_eq!(state.input_cursor, state.input.len());
+        assert_eq!(state.input_preferred_col, Some(4));
     }
 
     #[test]
@@ -919,7 +772,6 @@ mod tests {
         state.replace_input_from_editor("/mo".into());
 
         assert_eq!(state.input_cursor, 3);
-        assert_eq!(state.input_scroll, 0);
         assert!(state.mention_state.is_none());
         assert!(state.slash_state.is_some());
 
@@ -933,13 +785,12 @@ mod tests {
         let mut state = ComposerState::new();
         state.input = "abc".into();
         state.input_cursor = 2;
-        state.input_line_width = 10;
 
-        state.input_up_visual(2);
+        state.input_up_visual(10, 2);
         assert_eq!(state.input_cursor, 2);
         assert_eq!(state.input_preferred_col, Some(2));
         state.input_preferred_col = None;
-        state.input_down_visual(2);
+        state.input_down_visual(10, 2);
         assert_eq!(state.input_cursor, 2);
         assert_eq!(state.input_preferred_col, Some(2));
     }
@@ -949,8 +800,6 @@ mod tests {
         let mut state = ComposerState::new();
         state.input = "draft".into();
         state.input_cursor = 3;
-        state.input_scroll = 2;
-        state.input_line_width = 40;
         state.input_preferred_col = Some(4);
         state.file_index = vec![entry("src/main.rs", false)];
         state.file_index_generated_at = Some(7);
@@ -970,8 +819,6 @@ mod tests {
 
         assert_eq!(state.input, "/mo");
         assert_eq!(state.input_cursor, 3);
-        assert_eq!(state.input_scroll, 2);
-        assert_eq!(state.input_line_width, 40);
         assert_eq!(state.input_preferred_col, Some(4));
         assert!(state.file_index.is_empty());
         assert_eq!(state.file_index_generated_at, None);

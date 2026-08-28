@@ -4,14 +4,12 @@ use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::chat::format_outcome_labels;
+use crate::domain::chat::ElicitationResponseOutcome;
 use crate::domain::model::ModelEntry;
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
+use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-fn popup_page_step(visible_rows: usize) -> usize {
-    visible_rows.saturating_sub(1).max(1)
-}
 use crate::command::{Command, PromptBlock};
 use crate::connection_state::ConnState;
 use crate::theme;
@@ -44,7 +42,7 @@ fn elicitation_response_effect(
     elicitation_id: String,
     action: &str,
     content: Option<serde_json::Value>,
-    outcome: String,
+    outcome: ElicitationResponseOutcome,
 ) -> Effect {
     Effect::ElicitationResponse {
         elicitation_id,
@@ -62,6 +60,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
     use crate::domain::elicitation::ElicitationFieldKind;
 
     let mut effects = Vec::new();
+    let custom_line_width = app.render.elicitation_custom_line_width();
     let (Some(state), Some(ui)) = (
         app.chat.elicitation.as_mut(),
         app.chat.elicitation_ui.as_mut(),
@@ -72,43 +71,46 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
         return effects;
     };
 
-    let selected_display = |state: &crate::domain::elicitation::ElicitationState,
+    let selected_outcome = |state: &crate::domain::elicitation::ElicitationState,
                             custom_active: bool| {
         let field = &state.fields[field_index];
         if custom_active {
-            return format_outcome_labels([state.custom_input.trim()]);
+            return ElicitationResponseOutcome::Selected(vec![
+                state.custom_input.trim().to_string(),
+            ]);
         }
         match &field.kind {
-            ElicitationFieldKind::SingleSelect { options } => options
-                .iter()
-                .find(|option| state.selected.get(&field.name) == Some(&option.value))
-                .map(|option| format_outcome_labels([option.label.as_str()]))
-                .unwrap_or_default(),
-            ElicitationFieldKind::MultiSelect { options } => state
-                .selected
-                .get(&field.name)
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    format_outcome_labels(
+            ElicitationFieldKind::SingleSelect { options } => ElicitationResponseOutcome::Selected(
+                options
+                    .iter()
+                    .find(|option| state.selected.get(&field.name) == Some(&option.value))
+                    .map(|option| vec![option.label.clone()])
+                    .unwrap_or_default(),
+            ),
+            ElicitationFieldKind::MultiSelect { options } => {
+                let labels = state
+                    .selected
+                    .get(&field.name)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
                         options
                             .iter()
                             .filter(|option| values.contains(&option.value))
-                            .map(|option| option.label.as_str()),
-                    )
-                })
-                .unwrap_or_default(),
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                state.text_input.clone()
+                            .map(|option| option.label.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ElicitationResponseOutcome::Selected(labels)
             }
-            ElicitationFieldKind::BooleanToggle => match state
+            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
+                ElicitationResponseOutcome::Text(state.text_input.clone())
+            }
+            ElicitationFieldKind::BooleanToggle => state
                 .selected
                 .get(&field.name)
                 .and_then(serde_json::Value::as_bool)
-            {
-                Some(true) => "Yes".into(),
-                Some(false) => "No".into(),
-                None => String::new(),
-            },
+                .map(ElicitationResponseOutcome::Boolean)
+                .unwrap_or_else(|| ElicitationResponseOutcome::Text(String::new())),
         }
     };
 
@@ -116,7 +118,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
         match key.code {
             KeyCode::Esc => {
                 ui.custom_active = false;
-                ui.custom_scroll = 0;
+                app.render.reset_elicitation_custom_scroll();
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 ui.custom_insert(&mut state.custom_input, '\n');
@@ -124,12 +126,12 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             KeyCode::Enter if state.is_valid(Some(&state.custom_input)) => {
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(Some(&state.custom_input));
-                let display = selected_display(state, true);
+                let outcome = selected_outcome(state, true);
                 effects.push(elicitation_response_effect(
                     elicitation_id,
                     "accept",
                     Some(content),
-                    display,
+                    outcome,
                 ));
             }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -141,8 +143,8 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             KeyCode::Right => ui.custom_right(&state.custom_input),
             KeyCode::Home => ui.custom_home(&state.custom_input),
             KeyCode::End => ui.custom_end(&state.custom_input),
-            KeyCode::Up => ui.custom_move_visual(&state.custom_input, -1),
-            KeyCode::Down => ui.custom_move_visual(&state.custom_input, 1),
+            KeyCode::Up => ui.custom_move_visual(&state.custom_input, custom_line_width, -1),
+            KeyCode::Down => ui.custom_move_visual(&state.custom_input, custom_line_width, 1),
             _ => {}
         }
         return effects;
@@ -164,7 +166,7 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
                 elicitation_id,
                 "decline",
                 None,
-                "declined".into(),
+                ElicitationResponseOutcome::Declined,
             ));
         }
         KeyCode::Down => {
@@ -206,12 +208,12 @@ pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             if state.is_valid(None) {
                 let elicitation_id = state.elicitation_id.clone();
                 let content = state.build_accept_content(None);
-                let display = selected_display(state, false);
+                let outcome = selected_outcome(state, false);
                 effects.push(elicitation_response_effect(
                     elicitation_id,
                     "accept",
                     Some(content),
-                    display,
+                    outcome,
                 ));
             }
         }
@@ -478,6 +480,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if !app.composer.input.is_empty() {
             app.composer.clear_input();
+            app.render.reset_composer_input_geometry();
             return Vec::new();
         }
         return vec![Effect::Quit];
@@ -599,10 +602,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Vec<Effect> {
     match (mouse.kind, &app.navigation.screen, &app.navigation.popup) {
         (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(3);
+            app.render.scroll_chat_up(3);
         }
         (MouseEventKind::ScrollDown, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(3);
+            app.render.scroll_chat_down(3);
         }
         _ => {}
     }
@@ -691,6 +694,7 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
+                    app.render.reset_composer_input_geometry();
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -861,11 +865,11 @@ pub(crate) fn apply_popup_session_key(
         KeyCode::Up => app.sessions.move_popup_cursor_up(),
         KeyCode::Down => app.sessions.move_popup_cursor_down(),
         KeyCode::PageUp => {
-            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            let step = app.render.session_popup_page_step();
             app.sessions.move_popup_cursor_page(step, false);
         }
         KeyCode::PageDown => {
-            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            let step = app.render.session_popup_page_step();
             app.sessions.move_popup_cursor_page(step, true);
         }
         KeyCode::Enter => {
@@ -997,12 +1001,12 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
 
 fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
-        KeyCode::Up => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(1),
-        KeyCode::Down => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(1),
-        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
-        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
-        KeyCode::Home => app.chat.scroll_offset = u16::MAX,
-        KeyCode::End => app.chat.scroll_offset = 0,
+        KeyCode::Up => app.render.scroll_chat_up(1),
+        KeyCode::Down => app.render.scroll_chat_down(1),
+        KeyCode::PageUp => app.render.scroll_chat_up(10),
+        KeyCode::PageDown => app.render.scroll_chat_down(10),
+        KeyCode::Home => app.render.scroll_chat_to_top(),
+        KeyCode::End => app.render.scroll_chat_to_bottom(),
         KeyCode::Esc => {
             if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
                 return send_load_session_commands(
@@ -1046,8 +1050,14 @@ pub(crate) fn apply_delegate_popup_key(
         }
         KeyCode::Up => app.delegates.move_cursor_up(),
         KeyCode::Down => app.delegates.move_cursor_down(),
-        KeyCode::PageUp => app.delegates.move_cursor_page(false),
-        KeyCode::PageDown => app.delegates.move_cursor_page(true),
+        KeyCode::PageUp => {
+            let step = app.render.delegate_popup_page_step();
+            app.delegates.move_cursor_page(step, false);
+        }
+        KeyCode::PageDown => {
+            let step = app.render.delegate_popup_page_step();
+            app.delegates.move_cursor_page(step, true);
+        }
         KeyCode::Enter => {
             let selected = app.delegates.selected_entry().map(|entry| {
                 (
@@ -1281,7 +1291,7 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             {
                 theme::Theme::set_by_index(idx);
                 theme::Theme::begin_frame();
-                app.render.invalidate_theme_caches();
+                app.render.apply_change(RenderChange::ThemeChanged);
                 app.navigation.popup = Popup::None;
                 return vec![Effect::PersistConfig];
             }
@@ -1296,9 +1306,6 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
 }
 
 pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    if app.composer.input_line_width == 0 {
-        app.composer.input_line_width = 1;
-    }
     let input_blocked = app.chat.input_blocked_by_activity();
     let mut effects = Vec::new();
     match key.code {
@@ -1391,7 +1398,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if app.composer.mention_state.is_some() {
                 app.composer.move_mention_selection(-1);
             } else {
-                app.composer.input_up_visual(2);
+                let line_width = app.render.composer_input_line_width();
+                app.composer.input_up_visual(line_width, 2);
             }
         }
         KeyCode::Down => {
@@ -1403,11 +1411,12 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             } else if app.composer.mention_state.is_some() {
                 app.composer.move_mention_selection(1);
             } else {
-                app.composer.input_down_visual(2);
+                let line_width = app.render.composer_input_line_width();
+                app.composer.input_down_visual(line_width, 2);
             }
         }
-        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
-        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
+        KeyCode::PageUp => app.render.scroll_chat_up(10),
+        KeyCode::PageDown => app.render.scroll_chat_down(10),
         KeyCode::Backspace if !input_blocked => app.composer.input_backspace(),
         KeyCode::Delete if !input_blocked => app.composer.input_delete(),
         KeyCode::Left if !input_blocked => app.composer.input_left(),
@@ -1415,7 +1424,7 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Home if !input_blocked => app.composer.input_home(),
         KeyCode::End => {
             if input_blocked || app.composer.input.is_empty() {
-                app.chat.scroll_offset = 0;
+                app.render.scroll_chat_to_bottom();
             } else {
                 app.composer.input_end();
             }
@@ -1690,6 +1699,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
+                    app.render.reset_composer_input_geometry();
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
@@ -2142,7 +2152,11 @@ pub(crate) fn apply_sessions_key(
     use crate::session_state::StartPageItem;
 
     match key {
-        KeyCode::Up => app.sessions.move_start_cursor_up(),
+        KeyCode::Up => {
+            app.sessions.move_start_cursor_up();
+            app.render
+                .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
+        }
         KeyCode::Down => app.sessions.move_start_cursor_down(),
         KeyCode::Enter => {
             let items = app.sessions.visible_start_items();
@@ -2219,8 +2233,14 @@ pub(crate) fn apply_sessions_key(
             }
             // Delete on a GroupHeader: no-op
         }
-        KeyCode::Backspace => app.sessions.start_filter_backspace(),
-        KeyCode::Char(c) => app.sessions.start_filter_insert(c),
+        KeyCode::Backspace => {
+            app.sessions.start_filter_backspace();
+            app.render.reset_start_page_scroll();
+        }
+        KeyCode::Char(c) => {
+            app.sessions.start_filter_insert(c);
+            app.render.reset_start_page_scroll();
+        }
         _ => {}
     }
     SessionKeyAction::None
@@ -2237,7 +2257,7 @@ mod model_popup_tests {
     use crate::domain::chat::ChatEntry;
     use crate::domain::model::ModelEntry;
     use crate::domain::profile::{AgentInfo, ProfileInfo};
-    use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::domain::session::{SessionGroup, SessionSummary, UndoableTurn};
     use crate::runtime::TestEffects;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -2268,10 +2288,14 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.composer.replace_input(" hello ".into());
+        app.render.test_seed_composer_input_geometry(24, 2);
+        app.render.set_chat_scroll_offset(9);
 
         effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.composer.input.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         let local_id = match app.chat.messages.as_slice() {
             [
                 ChatEntry::User {
@@ -2286,6 +2310,38 @@ mod model_popup_tests {
             Some(Command::Prompt { prompt, local_id: sent_id })
                 if sent_id == local_id
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn whitespace_prompt_early_return_still_snaps_chat_to_bottom() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.composer.replace_input("   ".into());
+        app.render.test_seed_composer_input_geometry(18, 1);
+        app.render.set_chat_scroll_offset(9);
+
+        let effects = handle_chat_key(&mut app, key(KeyCode::Enter));
+
+        assert!(effects.is_empty());
+        assert!(app.composer.input.is_empty());
+        assert!(app.chat.messages.is_empty());
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn optimistic_prompt_insertion_snaps_chat_to_bottom() {
+        let mut app = App::new();
+        app.render.set_chat_scroll_offset(9);
+
+        let local_id = app.push_pending_prompt("hello".into());
+
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "hello" && message_id == &local_id
         ));
     }
 
@@ -2326,21 +2382,61 @@ mod model_popup_tests {
         let mut app = App::new();
         app.composer.input = "draft".into();
         app.composer.input_cursor = 3;
-        app.composer.input_scroll = 2;
+        app.render.test_seed_composer_input_geometry(20, 2);
         app.composer.input_preferred_col = Some(4);
         app.composer.refresh_mention_state();
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
         app.composer.refresh_slash_state();
-        app.chat.scroll_offset = 7;
+        app.render.set_chat_scroll_offset(7);
 
         assert_eq!(app.take_input(), "/mo");
         assert_eq!(app.composer.input_cursor, 0);
-        assert_eq!(app.composer.input_scroll, 0);
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(app.composer.input_preferred_col, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_none());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn chord_and_slash_undo_replacements_reset_render_geometry() {
+        let turn = UndoableTurn {
+            turn_id: "turn-1".into(),
+            message_id: "message-1".into(),
+            text: "restored prompt".into(),
+        };
+
+        let mut chord_app = App::new();
+        chord_app.connection.conn = ConnState::Connected;
+        chord_app.chat.undoable_turns.push(turn.clone());
+        chord_app.render.test_seed_composer_input_geometry(25, 2);
+        let effects = handle_chord(&mut chord_app, key(KeyCode::Char('u')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Command(Command::Undo { message_id })] if message_id == "message-1"
+        ));
+        assert_eq!(chord_app.composer.input, "restored prompt");
+        assert_eq!(
+            chord_app.render.test_composer_input_geometry(),
+            (1, 0, false)
+        );
+
+        let mut slash_app = App::new();
+        slash_app.connection.conn = ConnState::Connected;
+        slash_app.chat.undoable_turns.push(turn);
+        slash_app.composer.replace_input("/undo".into());
+        slash_app.render.test_seed_composer_input_geometry(31, 3);
+        let effects = handle_chat_key(&mut slash_app, key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Command(Command::Undo { message_id })] if message_id == "message-1"
+        ));
+        assert_eq!(slash_app.composer.input, "restored prompt");
+        assert_eq!(
+            slash_app.render.test_composer_input_geometry(),
+            (1, 0, false)
+        );
     }
 
     #[test]
