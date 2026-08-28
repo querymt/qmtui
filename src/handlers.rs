@@ -603,10 +603,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
 pub(crate) fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Vec<Effect> {
     match (mouse.kind, &app.navigation.screen, &app.navigation.popup) {
         (MouseEventKind::ScrollUp, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(3);
+            app.render.scroll_chat_up(3);
         }
         (MouseEventKind::ScrollDown, Screen::Chat | Screen::Delegate, Popup::None) => {
-            app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(3);
+            app.render.scroll_chat_down(3);
         }
         _ => {}
     }
@@ -1001,12 +1001,12 @@ pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) ->
 
 fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     match key.code {
-        KeyCode::Up => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(1),
-        KeyCode::Down => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(1),
-        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
-        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
-        KeyCode::Home => app.chat.scroll_offset = u16::MAX,
-        KeyCode::End => app.chat.scroll_offset = 0,
+        KeyCode::Up => app.render.scroll_chat_up(1),
+        KeyCode::Down => app.render.scroll_chat_down(1),
+        KeyCode::PageUp => app.render.scroll_chat_up(10),
+        KeyCode::PageDown => app.render.scroll_chat_down(10),
+        KeyCode::Home => app.render.scroll_chat_to_top(),
+        KeyCode::End => app.render.scroll_chat_to_bottom(),
         KeyCode::Esc => {
             if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
                 return send_load_session_commands(
@@ -1410,8 +1410,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 app.composer.input_down_visual(2);
             }
         }
-        KeyCode::PageUp => app.chat.scroll_offset = app.chat.scroll_offset.saturating_add(10),
-        KeyCode::PageDown => app.chat.scroll_offset = app.chat.scroll_offset.saturating_sub(10),
+        KeyCode::PageUp => app.render.scroll_chat_up(10),
+        KeyCode::PageDown => app.render.scroll_chat_down(10),
         KeyCode::Backspace if !input_blocked => app.composer.input_backspace(),
         KeyCode::Delete if !input_blocked => app.composer.input_delete(),
         KeyCode::Left if !input_blocked => app.composer.input_left(),
@@ -1419,7 +1419,7 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Home if !input_blocked => app.composer.input_home(),
         KeyCode::End => {
             if input_blocked || app.composer.input.is_empty() {
-                app.chat.scroll_offset = 0;
+                app.render.scroll_chat_to_bottom();
             } else {
                 app.composer.input_end();
             }
@@ -2272,10 +2272,12 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.composer.replace_input(" hello ".into());
+        app.render.set_chat_scroll_offset(9);
 
         effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
 
         assert!(app.composer.input.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         let local_id = match app.chat.messages.as_slice() {
             [
                 ChatEntry::User {
@@ -2290,6 +2292,36 @@ mod model_popup_tests {
             Some(Command::Prompt { prompt, local_id: sent_id })
                 if sent_id == local_id
                     && matches!(prompt.as_slice(), [PromptBlock::Text { text }] if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn whitespace_prompt_early_return_still_snaps_chat_to_bottom() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.composer.replace_input("   ".into());
+        app.render.set_chat_scroll_offset(9);
+
+        let effects = handle_chat_key(&mut app, key(KeyCode::Enter));
+
+        assert!(effects.is_empty());
+        assert!(app.composer.input.is_empty());
+        assert!(app.chat.messages.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn optimistic_prompt_insertion_snaps_chat_to_bottom() {
+        let mut app = App::new();
+        app.render.set_chat_scroll_offset(9);
+
+        let local_id = app.push_pending_prompt("hello".into());
+
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "hello" && message_id == &local_id
         ));
     }
 
@@ -2336,7 +2368,7 @@ mod model_popup_tests {
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
         app.composer.refresh_slash_state();
-        app.chat.scroll_offset = 7;
+        app.render.set_chat_scroll_offset(7);
 
         assert_eq!(app.take_input(), "/mo");
         assert_eq!(app.composer.input_cursor, 0);
@@ -2344,7 +2376,7 @@ mod model_popup_tests {
         assert_eq!(app.composer.input_preferred_col, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_none());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
     }
 
     #[test]

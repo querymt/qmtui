@@ -88,6 +88,20 @@ pub(crate) struct FinalizedRenderInput<'a> {
     pub(crate) now_unix_secs: i64,
 }
 
+struct MessagesRenderInput<'a> {
+    session_identity: SessionIdentity,
+    messages: &'a [ChatEntry],
+    delegates: &'a [DelegateEntry],
+    effective_cwd: Option<String>,
+    show_thinking: bool,
+    activity: &'a ActivityState,
+    is_turn_active: bool,
+    streaming_content: &'a str,
+    streaming_content_message_id: Option<&'a str>,
+    streaming_thinking: &'a str,
+    streaming_thinking_message_id: Option<&'a str>,
+}
+
 struct PlannedFinalizedCard<'a> {
     key: FinalizedCardKeyRef<'a>,
     source_start: usize,
@@ -935,7 +949,22 @@ pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
 
     let (left_spans, right_spans) = build_chat_header_spans(app);
     draw_header(f, app, chunks[0], left_spans, right_spans);
-    draw_messages(f, app, chunks[1]);
+    let session_identity = render_session_identity(app);
+    let effective_cwd = app.current_session_cwd();
+    let input = MessagesRenderInput {
+        session_identity,
+        messages: &app.chat.messages,
+        delegates: &app.delegates.delegate_entries,
+        effective_cwd,
+        show_thinking: app.chat.show_thinking,
+        activity: &app.chat.activity,
+        is_turn_active: app.chat.is_turn_active(),
+        streaming_content: &app.chat.streaming_content,
+        streaming_content_message_id: app.chat.streaming_content_message_id.as_deref(),
+        streaming_thinking: &app.chat.streaming_thinking,
+        streaming_thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
+    };
+    draw_messages(f, chunks[1], input, &mut app.render);
 
     if elicitation_height > 0 {
         draw_elicitation_popup(f, app, chunks[2]);
@@ -977,7 +1006,22 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     draw_header(f, app, chunks[0], left_spans, right_spans);
 
     // messages
-    draw_messages(f, app, chunks[1]);
+    let session_identity = render_session_identity(app);
+    let effective_cwd = app.current_session_cwd();
+    let input = MessagesRenderInput {
+        session_identity,
+        messages: &app.chat.messages,
+        delegates: &app.delegates.delegate_entries,
+        effective_cwd,
+        show_thinking: app.chat.show_thinking,
+        activity: &app.chat.activity,
+        is_turn_active: app.chat.is_turn_active(),
+        streaming_content: &app.chat.streaming_content,
+        streaming_content_message_id: app.chat.streaming_content_message_id.as_deref(),
+        streaming_thinking: &app.chat.streaming_thinking,
+        streaming_thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
+    };
+    draw_messages(f, chunks[1], input, &mut app.render);
 
     if completion_panel_height > 0 {
         if app.composer.slash_state.is_some() {
@@ -2259,66 +2303,58 @@ pub(crate) fn build_write_lines(content: &str) -> Vec<Line<'static>> {
 
 // ── Draw messages area ────────────────────────────────────────────────────────
 
-fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_messages(
+    f: &mut Frame,
+    area: Rect,
+    input: MessagesRenderInput<'_>,
+    render: &mut RenderState,
+) {
     f.render_widget(Block::default().style(Theme::base()), area);
 
-    let session_identity = render_session_identity(app);
-    let effective_cwd = app.current_session_cwd();
     let theme = ThemeCacheKey::current_frame();
     let finalized_input = FinalizedRenderInput {
-        session_identity: session_identity.clone(),
-        messages: &app.chat.messages,
-        delegates: &app.delegates.delegate_entries,
-        effective_cwd,
-        show_thinking: app.chat.show_thinking,
+        session_identity: input.session_identity.clone(),
+        messages: input.messages,
+        delegates: input.delegates,
+        effective_cwd: input.effective_cwd,
+        show_thinking: input.show_thinking,
         full_width: area.width,
         theme,
         now_unix_secs: now_unix_secs(),
     };
-    build_finalized_cards(finalized_input, &mut app.render);
+    build_finalized_cards(finalized_input, render);
 
     let streaming_input = StreamingRenderInput {
-        session_identity,
-        fallback_ordinal: app.chat.messages.len(),
-        activity: &app.chat.activity,
-        is_turn_active: app.chat.is_turn_active(),
-        content: &app.chat.streaming_content,
-        content_message_id: app.chat.streaming_content_message_id.as_deref(),
-        thinking: &app.chat.streaming_thinking,
-        thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
-        show_thinking: app.chat.show_thinking,
+        session_identity: input.session_identity,
+        fallback_ordinal: input.messages.len(),
+        activity: input.activity,
+        is_turn_active: input.is_turn_active,
+        content: input.streaming_content,
+        content_message_id: input.streaming_content_message_id,
+        thinking: input.streaming_thinking,
+        thinking_message_id: input.streaming_thinking_message_id,
+        show_thinking: input.show_thinking,
         full_width: area.width,
         theme,
-        tick: app.render.tick,
+        tick: render.tick,
     };
-    let streaming_card = build_streaming_card(streaming_input, &mut app.render);
+    let streaming_card = build_streaming_card(streaming_input, render);
 
-    let total_height: u16 = app
-        .render
+    let total_height: u16 = render
         .cards()
         .iter()
         .chain(streaming_card.iter())
         .map(|card| card.height(area.width))
         .sum();
 
-    if total_height == 0 && app.render.cards().is_empty() && streaming_card.is_none() {
+    if total_height == 0 && render.cards().is_empty() && streaming_card.is_none() {
         return;
     }
 
-    // Keep the existing viewport growth compensation and scroll ownership unchanged.
-    app.render
-        .compensate_scroll_for_growth(total_height, &mut app.chat.scroll_offset);
+    render.compensate_chat_growth(total_height);
+    let scroll = render.clamp_chat_scroll(total_height, area.height);
 
-    let max_scroll = total_height.saturating_sub(area.height);
-    app.chat.scroll_offset = app.chat.scroll_offset.min(max_scroll);
-    let scroll = max_scroll.saturating_sub(app.chat.scroll_offset);
-
-    let all_cards: Vec<&Card> = app
-        .render
-        .cards()
-        .iter()
-        .chain(streaming_card.iter())
-        .collect();
+    let all_cards: Vec<&Card> = render.cards().iter().chain(streaming_card.iter()).collect();
 
     let mut y: i32 = -(scroll as i32);
     for card in &all_cards {
@@ -2350,9 +2386,49 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::activity::{DelegateChildState, DelegateStats};
+    use crate::domain::tool::ToolDetail;
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn user(text: &str, id: &str) -> ChatEntry {
+        ChatEntry::User {
+            text: text.into(),
+            message_id: Some(id.into()),
+        }
+    }
+
+    fn render_messages_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let session_identity = render_session_identity(app);
+        let effective_cwd = app.current_session_cwd();
+        let input = MessagesRenderInput {
+            session_identity,
+            messages: &app.chat.messages,
+            delegates: &app.delegates.delegate_entries,
+            effective_cwd,
+            show_thinking: app.chat.show_thinking,
+            activity: &app.chat.activity,
+            is_turn_active: app.chat.is_turn_active(),
+            streaming_content: &app.chat.streaming_content,
+            streaming_content_message_id: app.chat.streaming_content_message_id.as_deref(),
+            streaming_thinking: &app.chat.streaming_thinking,
+            streaming_thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
+        };
+        let backend = ratatui::backend::TestBackend::new(width.max(1), height.max(1));
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_messages(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    input,
+                    &mut app.render,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
     }
 
     #[test]
@@ -2381,5 +2457,216 @@ mod tests {
         terminal.draw(|frame| draw_chat(frame, &mut app)).unwrap();
 
         assert!(buffer_text(terminal.backend().buffer()).contains("profile:Current (new:Next)"));
+    }
+
+    #[test]
+    fn draw_messages_mutates_only_render_state() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("session-1".into());
+        app.chat.messages.push(user("hello", "user-1"));
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "answer".into();
+        app.chat.streaming_content_message_id = Some("assistant-1".into());
+        app.chat.streaming_thinking = "plan".into();
+        app.chat.streaming_thinking_message_id = Some("assistant-1".into());
+        app.delegates.delegate_entries.push(DelegateEntry {
+            delegation_id: "delegation-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Implement the change".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+        let messages = format!("{:?}", app.chat.messages);
+        let activity = app.chat.activity.clone();
+        let streaming_content = app.chat.streaming_content.clone();
+        let streaming_content_message_id = app.chat.streaming_content_message_id.clone();
+        let streaming_thinking = app.chat.streaming_thinking.clone();
+        let streaming_thinking_message_id = app.chat.streaming_thinking_message_id.clone();
+        let show_thinking = app.chat.show_thinking;
+        let session_id = app.sessions.session_id.clone();
+        let delegates = app.delegates.delegate_entries.clone();
+
+        let _ = render_messages_buffer(&mut app, 24, 5);
+
+        assert_eq!(format!("{:?}", app.chat.messages), messages);
+        assert_eq!(app.chat.activity, activity);
+        assert_eq!(app.chat.streaming_content, streaming_content);
+        assert_eq!(
+            app.chat.streaming_content_message_id,
+            streaming_content_message_id
+        );
+        assert_eq!(app.chat.streaming_thinking, streaming_thinking);
+        assert_eq!(
+            app.chat.streaming_thinking_message_id,
+            streaming_thinking_message_id
+        );
+        assert_eq!(app.chat.show_thinking, show_thinking);
+        assert_eq!(app.sessions.session_id, session_id);
+        assert_eq!(app.delegates.delegate_entries, delegates);
+        assert!(!app.render.cards().is_empty());
+        assert!(app.render.test_chat_previous_total_height() > 0);
+    }
+
+    #[test]
+    fn draw_messages_keeps_default_viewport_pinned_to_bottom() {
+        let mut app = App::new();
+        app.chat.messages = (0..4)
+            .map(|index| user(&format!("message {index}"), &format!("user-{index}")))
+            .collect();
+
+        let buffer = render_messages_buffer(&mut app, 30, 4);
+
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert!(buffer_text(&buffer).contains("message 3"));
+    }
+
+    #[test]
+    fn finalized_growth_compensates_scrolled_viewport_exactly() {
+        let mut app = App::new();
+        app.chat.messages = (0..3)
+            .map(|index| user(&format!("message {index}"), &format!("user-{index}")))
+            .collect();
+        let _ = render_messages_buffer(&mut app, 30, 4);
+        let previous_height = app.render.test_chat_previous_total_height();
+        app.render.set_chat_scroll_offset(2);
+
+        app.chat.messages.push(user("new message", "user-3"));
+        let _ = render_messages_buffer(&mut app, 30, 4);
+        let total_height = app.render.test_chat_previous_total_height();
+
+        assert!(total_height > previous_height);
+        assert_eq!(
+            app.render.chat_scroll_offset(),
+            2 + total_height.saturating_sub(previous_height)
+        );
+        let max_scroll = total_height.saturating_sub(4);
+        assert_eq!(max_scroll - app.render.chat_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn streaming_growth_includes_wrapping_thinking_and_activity_row() {
+        let mut app = App::new();
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "short".into();
+        let _ = render_messages_buffer(&mut app, 20, 1);
+        let previous_height = app.render.test_chat_previous_total_height();
+        app.render.set_chat_scroll_offset(1);
+
+        app.chat.streaming_content =
+            "a much longer streaming answer that wraps over several terminal rows".into();
+        app.chat.streaming_thinking = "thinking also wraps over multiple rows".into();
+        let _ = render_messages_buffer(&mut app, 20, 1);
+        let total_height = app.render.test_chat_previous_total_height();
+
+        assert!(total_height > previous_height);
+        assert_eq!(
+            app.render.chat_scroll_offset(),
+            1 + total_height.saturating_sub(previous_height)
+        );
+        let card = build_streaming_card_for_test(&mut app, 20).expect("streaming card");
+        assert_eq!(card.height(20), total_height);
+    }
+
+    #[test]
+    fn shrink_and_height_resize_clamp_bottom_relative_scroll() {
+        let mut app = App::new();
+        app.chat.messages = (0..4)
+            .map(|index| user(&format!("message {index}"), &format!("user-{index}")))
+            .collect();
+        let _ = render_messages_buffer(&mut app, 30, 4);
+        app.render.set_chat_scroll_offset(7);
+
+        let _ = render_messages_buffer(&mut app, 30, 6);
+        assert_eq!(app.render.chat_scroll_offset(), 6);
+
+        app.chat.messages.truncate(2);
+        let _ = render_messages_buffer(&mut app, 30, 4);
+        assert_eq!(app.render.test_chat_previous_total_height(), 6);
+        assert_eq!(app.render.chat_scroll_offset(), 2);
+    }
+
+    #[test]
+    fn width_changes_compensate_growth_then_clamp_shrink() {
+        let mut app = App::new();
+        app.chat.messages.push(user(
+            "This deliberately long message wraps differently as the viewport width changes.",
+            "user-1",
+        ));
+        let _ = render_messages_buffer(&mut app, 40, 1);
+        let wide_height = app.render.test_chat_previous_total_height();
+        let wide_identity = app.render.test_card_identity(0);
+        app.render.set_chat_scroll_offset(1);
+
+        let _ = render_messages_buffer(&mut app, 18, 1);
+        let narrow_height = app.render.test_chat_previous_total_height();
+        let narrow_identity = app.render.test_card_identity(0);
+        assert!(narrow_height > wide_height);
+        assert_eq!(
+            app.render.chat_scroll_offset(),
+            1 + narrow_height.saturating_sub(wide_height)
+        );
+        assert_ne!(narrow_identity, wide_identity);
+
+        let _ = render_messages_buffer(&mut app, 40, 1);
+        assert_eq!(app.render.test_chat_previous_total_height(), wide_height);
+        assert_eq!(
+            app.render.chat_scroll_offset(),
+            (1 + narrow_height.saturating_sub(wide_height)).min(wide_height.saturating_sub(1))
+        );
+    }
+
+    #[test]
+    fn hidden_thinking_preserves_tool_batch_height_for_viewport() {
+        let mut app = App::new();
+        app.chat.show_thinking = false;
+        app.chat.messages = vec![
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-1".into()),
+                name: "read".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+            ChatEntry::Thinking {
+                content: "hidden".into(),
+                message_id: Some("thinking-1".into()),
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-2".into()),
+                name: "write".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+        ];
+
+        let _ = render_messages_buffer(&mut app, 30, 1);
+
+        assert_eq!(app.render.cards().len(), 1);
+        assert_eq!(
+            app.render.cards()[0].kind,
+            CardKind::Tool { compact: false }
+        );
+        assert_eq!(
+            app.render.test_chat_previous_total_height(),
+            app.render.cards()[0].height(30)
+        );
+    }
+
+    #[test]
+    fn empty_draw_preserves_stale_viewport_and_tiny_areas_do_not_panic() {
+        let mut app = App::new();
+        app.render.test_seed_chat_viewport(7, 19);
+
+        let _ = render_messages_buffer(&mut app, 0, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
+        assert_eq!(app.render.test_chat_previous_total_height(), 19);
+
+        app.chat.messages.push(user("tiny", "user-1"));
+        let _ = render_messages_buffer(&mut app, 0, 0);
+        let _ = render_messages_buffer(&mut app, 1, 1);
     }
 }

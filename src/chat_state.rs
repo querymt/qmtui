@@ -388,7 +388,6 @@ pub(crate) struct ChatState {
     pub(crate) fork_filter: String,
     pub(crate) fork_cursor: usize,
     pub(crate) pending_fork_message_id: Option<String>,
-    pub(crate) scroll_offset: u16,
     pub(crate) activity: ActivityState,
     pub(crate) streaming_content: String,
     pub(crate) streaming_content_message_id: Option<String>,
@@ -880,7 +879,6 @@ impl ChatState {
                     source,
                     outcome: (!supported).then_some(ElicitationResponseOutcome::UnsupportedSchema),
                 });
-                self.scroll_offset = 0;
 
                 let (transition, status) = if supported {
                     (
@@ -959,7 +957,6 @@ impl ChatState {
             fork_filter: String::new(),
             fork_cursor: 0,
             pending_fork_message_id: None,
-            scroll_offset: 0,
             activity: ActivityState::Idle,
             streaming_content: String::new(),
             streaming_content_message_id: None,
@@ -987,7 +984,6 @@ impl ChatState {
         self.streaming_content_message_id = None;
         self.streaming_thinking.clear();
         self.streaming_thinking_message_id = None;
-        self.scroll_offset = 0;
         self.undo_state = None;
         self.undoable_turns.clear();
         self.recent_prompt_text = None;
@@ -1205,7 +1201,6 @@ impl ChatState {
             text,
             message_id: Some(local_id.clone()),
         });
-        self.scroll_offset = 0;
         local_id
     }
 
@@ -1914,7 +1909,6 @@ mod tests {
         assert!(chat.fork_filter.is_empty());
         assert_eq!(chat.fork_cursor, 0);
         assert!(chat.pending_fork_message_id.is_none());
-        assert_eq!(chat.scroll_offset, 0);
         assert_eq!(chat.activity, ActivityState::Idle);
         assert!(chat.streaming_content.is_empty());
         assert!(chat.streaming_content_message_id.is_none());
@@ -1942,7 +1936,6 @@ mod tests {
         chat.fork_filter = "keep".into();
         chat.fork_cursor = 3;
         chat.pending_fork_message_id = Some("keep-fork".into());
-        chat.scroll_offset = 7;
         chat.activity = ActivityState::Streaming;
         chat.streaming_content = "content".into();
         chat.streaming_content_message_id = Some("content-id".into());
@@ -1971,7 +1964,6 @@ mod tests {
         assert_eq!(chat.fork_filter, "keep");
         assert_eq!(chat.fork_cursor, 3);
         assert_eq!(chat.pending_fork_message_id.as_deref(), Some("keep-fork"));
-        assert_eq!(chat.scroll_offset, 0);
         assert_eq!(chat.activity, ActivityState::Streaming);
         assert!(chat.streaming_content.is_empty());
         assert!(chat.streaming_content_message_id.is_none());
@@ -2697,7 +2689,6 @@ mod tests {
         };
 
         let mut live = ChatState::new();
-        live.scroll_offset = 9;
         let live_outcome = live.reduce_elicitation(request(false));
         assert_eq!(
             live_outcome,
@@ -2721,7 +2712,6 @@ mod tests {
         assert_eq!(active.fields.len(), 1);
         assert!(active.allow_custom);
         assert!(live.elicitation_ui.is_some());
-        assert_eq!(live.scroll_offset, 0);
         assert!(matches!(
             live.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, message, source, outcome: None }]

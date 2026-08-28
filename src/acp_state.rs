@@ -803,6 +803,13 @@ impl crate::app::App {
             coordination,
             effects,
         } = self.chat.reduce_elicitation(action);
+        if matches!(
+            transition,
+            ElicitationTransition::InsertedSupported { .. }
+                | ElicitationTransition::InsertedUnsupported { .. }
+        ) {
+            self.render.scroll_chat_to_bottom();
+        }
         self.apply_render_changes(elicitation_render_changes(&transition));
         self.apply_chat_coordination(coordination);
         effects
@@ -2580,7 +2587,7 @@ mod tests {
             ended_at: None,
             child_state: DelegateChildState::None,
         });
-        app.chat.scroll_offset = 3;
+        app.render.test_seed_chat_viewport(3, 24);
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
         app.composer.input_scroll = 2;
@@ -2631,7 +2638,8 @@ mod tests {
         assert!(app.delegates.delegate_entries.is_empty());
         assert!(app.chat.messages.is_empty());
         assert!(app.chat.streaming_content.is_empty());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert_eq!(app.composer.input, "/mo");
         assert_eq!(app.composer.input_cursor, 3);
         assert_eq!(app.composer.input_scroll, 2);
@@ -2676,6 +2684,7 @@ mod tests {
             profile_id: None,
         });
         let first_epoch = app.render.test_session_epoch();
+        app.render.test_seed_chat_viewport(9, 42);
 
         app.handle_acp_event(AcpAppEvent::SessionLoaded {
             agent_id: "agent-1".into(),
@@ -2684,6 +2693,8 @@ mod tests {
         });
 
         assert!(app.render.test_session_epoch() > first_epoch);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
     }
 
     #[test]
@@ -2715,7 +2726,7 @@ mod tests {
         app.chat.streaming_content_message_id = Some("stream-1".into());
         app.chat.streaming_thinking = "stale thinking".into();
         app.chat.streaming_thinking_message_id = Some("thinking-1".into());
-        app.chat.scroll_offset = 4;
+        app.render.test_seed_chat_viewport(4, 31);
         app.chat.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
@@ -2754,7 +2765,8 @@ mod tests {
         assert_eq!(app.chat.streaming_content_message_id, None);
         assert!(app.chat.streaming_thinking.is_empty());
         assert_eq!(app.chat.streaming_thinking_message_id, None);
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert!(app.chat.undo_state.is_none());
         assert!(app.chat.undoable_turns.is_empty());
         assert!(app.chat.recent_prompt_text.is_none());
@@ -4113,6 +4125,7 @@ mod tests {
     #[test]
     fn native_live_elicitation_creates_card_and_active_state() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
 
         apply_live_update(
             &mut app,
@@ -4129,6 +4142,7 @@ mod tests {
             },
         );
 
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert_eq!(
             app.chat
                 .elicitation
@@ -4146,6 +4160,7 @@ mod tests {
     #[test]
     fn native_replay_elicitation_creates_card_without_active_state() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
 
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
@@ -4162,6 +4177,7 @@ mod tests {
             }],
         });
 
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.elicitation.is_none());
         assert!(matches!(
             app.chat.messages.as_slice(),
@@ -4185,16 +4201,21 @@ mod tests {
             allow_custom: true,
         }];
 
-        for _ in 0..2 {
-            app.handle_acp_event(AcpAppEvent::SessionReplay {
-                session_id: TEST_SESSION_ID.into(),
-                updates: updates.clone(),
-            });
-        }
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        app.render.set_chat_scroll_offset(6);
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         app.apply_chat_elicitation_action(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-1".into(),
             outcome: ElicitationResponseOutcome::Text("staging".into()),
         });
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
             updates,
@@ -4249,6 +4270,7 @@ mod tests {
     #[test]
     fn native_unsupported_replay_elicitation_is_idempotent() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
         let updates = vec![AcpSessionUpdate::ElicitationRequested {
             elicitation_id: "elic-unsupported".into(),
             message: "Upload a file".into(),
@@ -4257,13 +4279,18 @@ mod tests {
             allow_custom: false,
         }];
 
-        for _ in 0..2 {
-            app.handle_acp_event(AcpAppEvent::SessionReplay {
-                session_id: TEST_SESSION_ID.into(),
-                updates: updates.clone(),
-            });
-        }
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        app.render.set_chat_scroll_offset(5);
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates,
+        });
 
+        assert_eq!(app.render.chat_scroll_offset(), 5);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]

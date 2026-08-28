@@ -973,21 +973,21 @@ mod external_editor_tests {
         app.composer.input = "abcdef".into();
         app.composer.input_cursor = 4;
         app.composer.input_line_width = 4;
-        app.chat.scroll_offset = 7;
+        app.render.set_chat_scroll_offset(7);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
         ));
         assert_eq!(app.composer.input_cursor, 2);
-        assert_eq!(app.chat.scroll_offset, 7);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
         ));
         assert_eq!(app.composer.input_cursor, 4);
-        assert_eq!(app.chat.scroll_offset, 7);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
     }
 
     #[test]
@@ -995,19 +995,77 @@ mod external_editor_tests {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.chat.scroll_offset = 3;
+        app.render.set_chat_scroll_offset(3);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
         ));
-        assert_eq!(app.chat.scroll_offset, 13);
+        assert_eq!(app.render.chat_scroll_offset(), 13);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
         ));
-        assert_eq!(app.chat.scroll_offset, 3);
+        assert_eq!(app.render.chat_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn delegate_keys_preserve_exact_shared_viewport_steps() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Delegate;
+        app.render.set_chat_scroll_offset(10);
+
+        for (key, expected) in [
+            (KeyCode::Up, 11),
+            (KeyCode::Down, 10),
+            (KeyCode::PageUp, 20),
+            (KeyCode::PageDown, 10),
+            (KeyCode::Home, u16::MAX),
+            (KeyCode::End, 0),
+        ] {
+            effects.extend(handle_key(
+                &mut app,
+                KeyEvent::new(key, KeyModifiers::empty()),
+            ));
+            assert_eq!(app.render.chat_scroll_offset(), expected);
+        }
+    }
+
+    #[test]
+    fn chat_end_routes_between_composer_and_viewport_contextually() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "draft".into();
+        app.composer.input_cursor = 1;
+        app.render.set_chat_scroll_offset(7);
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.composer.input_cursor, app.composer.input.len());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
+
+        app.composer.input.clear();
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+
+        app.composer.input = "blocked".into();
+        app.composer.input_cursor = 1;
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.render.set_chat_scroll_offset(5);
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.composer.input_cursor, 1);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
     }
 
     #[test]

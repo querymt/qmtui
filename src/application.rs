@@ -412,7 +412,7 @@ mod tests {
         assert!(app.composer.input.is_empty());
 
         app.navigation.screen = Screen::Chat;
-        app.chat.scroll_offset = 2;
+        app.render.set_chat_scroll_offset(2);
         let effects = update(
             &mut app,
             AppEvent::Mouse(MouseEvent {
@@ -423,7 +423,32 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
-        assert_eq!(app.chat.scroll_offset, 5);
+        assert_eq!(app.render.chat_scroll_offset(), 5);
+
+        let effects = update(
+            &mut app,
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 2);
+
+        app.render.set_chat_scroll_offset(1);
+        let effects = update(
+            &mut app,
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
 
         let effects = update(
             &mut app,
@@ -435,6 +460,32 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn mouse_chat_viewport_respects_screen_and_popup_gating() {
+        let mut app = App::new();
+        app.render.set_chat_scroll_offset(4);
+        let scroll_up = || MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.navigation.screen = Screen::Sessions;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 4);
+
+        app.navigation.screen = Screen::Chat;
+        app.navigation.popup = Popup::Help;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 4);
+
+        app.navigation.popup = Popup::None;
+        app.navigation.screen = Screen::Delegate;
+        assert!(update(&mut app, AppEvent::Mouse(scroll_up())).is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
     }
 
     #[test]
@@ -957,7 +1008,7 @@ mod tests {
         app.chat.streaming_thinking_message_id = Some("assistant-1".into());
         app.chat.streaming_content = "answer".into();
         app.chat.streaming_content_message_id = Some("assistant-1".into());
-        app.chat.scroll_offset = 8;
+        app.render.set_chat_scroll_offset(8);
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 7);
@@ -973,7 +1024,7 @@ mod tests {
             Some("elic-live")
         );
         assert!(app.chat.elicitation_ui.is_some());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.streaming_content.is_empty());
         assert!(app.chat.streaming_thinking.is_empty());
         assert!(!content_cache_populated(&app));
@@ -1005,9 +1056,11 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 2);
+        app.render.set_chat_scroll_offset(6);
         let log_count_before_duplicate = app.diagnostics.logs.len();
         let effects = apply_session_update(&mut app, supported_elicitation("elic-live"));
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         assert_eq!(app.chat.messages.len(), 2);
         assert!(content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
@@ -1022,6 +1075,7 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 7);
+        app.render.set_chat_scroll_offset(7);
         let log_count_before_replay = app.diagnostics.logs.len();
 
         let effects = update(
@@ -1032,6 +1086,7 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -1058,9 +1113,11 @@ mod tests {
             "question - answer in the panel above input"
         );
 
+        app.render.set_chat_scroll_offset(5);
         let log_count_before_unsupported = app.diagnostics.logs.len();
         let effects = apply_session_update(&mut app, unsupported_elicitation("elic-unsupported"));
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -2494,6 +2551,7 @@ mod tests {
             .messages
             .push(ChatEntry::Error("stale chat".into()));
         app.chat.streaming_content = "stale stream".into();
+        app.render.test_seed_chat_viewport(8, 34);
         app.composer.input = "preserved draft".into();
         app.composer.input_cursor = 4;
         app.composer.file_index = vec![FileIndexEntryLite {
@@ -2540,6 +2598,8 @@ mod tests {
         assert_eq!(app.profiles.session_profile_id("session-1"), Some("code"));
         assert!(app.chat.messages.is_empty());
         assert!(app.chat.streaming_content.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert_eq!(app.composer.input, "preserved draft");
         assert_eq!(app.composer.input_cursor, 4);
         assert!(app.composer.file_index.is_empty());
@@ -2598,6 +2658,7 @@ mod tests {
         app.chat
             .messages
             .push(ChatEntry::Error("stale chat".into()));
+        app.render.test_seed_chat_viewport(6, 28);
         app.composer.file_index = vec![FileIndexEntryLite {
             path: "src/lib.rs".into(),
             is_dir: false,
@@ -2622,6 +2683,8 @@ mod tests {
         assert_eq!(app.sessions.agent_id.as_deref(), Some("agent-local"));
         assert_eq!(app.sessions.mode_before_review, None);
         assert!(app.chat.messages.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert!(app.composer.file_index.is_empty());
         assert_eq!(app.diagnostics.status, "ready");
         let diagnostic = app.diagnostics.logs.last().expect("load diagnostic");
@@ -2664,6 +2727,7 @@ mod tests {
             .pending_delegate_child_states
             .insert("keep-child".into(), DelegateChildState::OtherProgress);
         app.chat.activity = ActivityState::Thinking;
+        app.render.test_seed_chat_viewport(7, 39);
 
         let remote_effects = update(
             &mut app,
@@ -2686,6 +2750,8 @@ mod tests {
                 .contains_key("keep-child")
         );
         assert_eq!(app.navigation.screen, Screen::Delegate);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert!(app.profiles.session_profile_id("remote-child").is_none());
         assert_eq!(
             remote_effects,
@@ -3235,6 +3301,7 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 5);
+        app.render.set_chat_scroll_offset(6);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3247,6 +3314,7 @@ mod tests {
         );
 
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         assert!(app.chat.elicitation.is_none());
         assert!(app.chat.elicitation_ui.is_none());
         assert!(matches!(
@@ -3363,6 +3431,7 @@ mod tests {
         seed_content_cache(&mut app);
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 5);
+        app.render.set_chat_scroll_offset(7);
         app.diagnostics.status = "question pending".into();
         let log_count_before = app.diagnostics.logs.len();
 
@@ -3375,6 +3444,7 @@ mod tests {
         );
 
         assert!(effects.is_empty());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
         assert_eq!(
             app.chat
                 .elicitation

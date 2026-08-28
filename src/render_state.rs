@@ -858,6 +858,12 @@ impl StreamingCache {
     }
 }
 
+#[derive(Default)]
+struct ChatViewportState {
+    scroll_offset: u16,
+    previous_total_height: u16,
+}
+
 /// Owner for render-local cards, caches, identity, and viewport accounting.
 pub(crate) struct RenderState {
     highlighter: Highlighter,
@@ -866,7 +872,7 @@ pub(crate) struct RenderState {
     streaming_thinking_cache: StreamingCache,
     session_identity: Option<SessionIdentity>,
     session_epoch: u64,
-    pub(crate) prev_total_height: u16,
+    chat_viewport: ChatViewportState,
     pub(crate) tick: u64,
     #[cfg(test)]
     invalidation_order: Vec<CacheInvalidation>,
@@ -889,7 +895,7 @@ impl RenderState {
             streaming_thinking_cache: StreamingCache::new(),
             session_identity: None,
             session_epoch: 0,
-            prev_total_height: 0,
+            chat_viewport: ChatViewportState::default(),
             tick: 0,
             #[cfg(test)]
             invalidation_order: Vec::new(),
@@ -915,6 +921,7 @@ impl RenderState {
         match change {
             RenderChange::SessionChanged(identity) => {
                 self.advance_session_epoch(identity);
+                self.reset_chat_viewport();
                 self.invalidate_content_cache();
                 self.invalidate_thinking_cache();
                 self.invalidate_card_cache();
@@ -1016,16 +1023,61 @@ impl RenderState {
         self.tick = tick;
     }
 
-    pub(crate) fn compensate_scroll_for_growth(
-        &mut self,
-        total_height: u16,
-        scroll_offset: &mut u16,
-    ) {
-        let growth = total_height.saturating_sub(self.prev_total_height);
-        if *scroll_offset > 0 && growth > 0 {
-            *scroll_offset = (*scroll_offset).saturating_add(growth);
+    pub(crate) fn chat_scroll_offset(&self) -> u16 {
+        self.chat_viewport.scroll_offset
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_chat_scroll_offset(&mut self, offset: u16) {
+        self.chat_viewport.scroll_offset = offset;
+    }
+
+    pub(crate) fn scroll_chat_up(&mut self, rows: u16) {
+        self.chat_viewport.scroll_offset = self.chat_viewport.scroll_offset.saturating_add(rows);
+    }
+
+    pub(crate) fn scroll_chat_down(&mut self, rows: u16) {
+        self.chat_viewport.scroll_offset = self.chat_viewport.scroll_offset.saturating_sub(rows);
+    }
+
+    pub(crate) fn scroll_chat_to_top(&mut self) {
+        self.chat_viewport.scroll_offset = u16::MAX;
+    }
+
+    pub(crate) fn scroll_chat_to_bottom(&mut self) {
+        self.chat_viewport.scroll_offset = 0;
+    }
+
+    pub(crate) fn compensate_chat_growth(&mut self, total_height: u16) {
+        let growth = total_height.saturating_sub(self.chat_viewport.previous_total_height);
+        if self.chat_viewport.scroll_offset > 0 && growth > 0 {
+            self.chat_viewport.scroll_offset =
+                self.chat_viewport.scroll_offset.saturating_add(growth);
         }
-        self.prev_total_height = total_height;
+        self.chat_viewport.previous_total_height = total_height;
+    }
+
+    pub(crate) fn clamp_chat_scroll(&mut self, total_height: u16, viewport_height: u16) -> u16 {
+        let max_scroll = total_height.saturating_sub(viewport_height);
+        self.chat_viewport.scroll_offset = self.chat_viewport.scroll_offset.min(max_scroll);
+        max_scroll.saturating_sub(self.chat_viewport.scroll_offset)
+    }
+
+    pub(crate) fn reset_chat_viewport(&mut self) {
+        self.chat_viewport = ChatViewportState::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_chat_previous_total_height(&self) -> u16 {
+        self.chat_viewport.previous_total_height
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seed_chat_viewport(&mut self, offset: u16, previous_total_height: u16) {
+        self.chat_viewport = ChatViewportState {
+            scroll_offset: offset,
+            previous_total_height,
+        };
     }
 
     #[cfg(test)]
@@ -1128,7 +1180,8 @@ mod tests {
         assert!(!state.test_streaming_cache_populated(StreamKind::Content));
         assert!(!state.test_streaming_cache_populated(StreamKind::Thinking));
         assert_eq!(state.test_session_epoch(), 0);
-        assert_eq!(state.prev_total_height, 0);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 0);
         assert_eq!(state.tick, 0);
     }
 
@@ -1278,17 +1331,23 @@ mod tests {
             CacheInvalidation::Thinking,
             CacheInvalidation::Finalized,
         ];
+        state.test_seed_chat_viewport(9, 27);
 
         state.apply_change(RenderChange::SessionChanged(session.clone()));
         assert_eq!(state.test_session_epoch(), 1);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 0);
         assert_cache_scope(&state, false, false, false, &expected_order);
 
         state.test_seed_card_cache(2);
         state.test_seed_streaming_cache(StreamKind::Content);
         state.test_seed_streaming_cache(StreamKind::Thinking);
+        state.test_seed_chat_viewport(u16::MAX, 12);
         state.invalidation_order.clear();
         state.apply_change(RenderChange::SessionChanged(session));
         assert_eq!(state.test_session_epoch(), 2);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 0);
         assert_cache_scope(&state, false, false, false, &expected_order);
     }
 
@@ -1359,21 +1418,120 @@ mod tests {
     }
 
     #[test]
-    fn height_growth_compensates_only_when_scrolled_up() {
+    fn chat_viewport_movement_saturates_without_touching_render_policy() {
+        let mut state = seeded_caches();
+        state.compensate_chat_growth(12);
+        let card_identity = state.test_card_identity(0);
+        let content_identity = state.test_streaming_cache_identity(StreamKind::Content);
+        let thinking_identity = state.test_streaming_cache_identity(StreamKind::Thinking);
+
+        state.set_chat_scroll_offset(u16::MAX - 1);
+        state.scroll_chat_up(3);
+        assert_eq!(state.chat_scroll_offset(), u16::MAX);
+        state.scroll_chat_down(u16::MAX);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        state.scroll_chat_down(1);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        state.scroll_chat_to_top();
+        assert_eq!(state.chat_scroll_offset(), u16::MAX);
+        state.scroll_chat_to_bottom();
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 12);
+
+        assert_eq!(state.test_card_identity(0), card_identity);
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Thinking),
+            thinking_identity
+        );
+        assert_eq!(state.test_session_epoch(), 0);
+        assert!(state.invalidation_order.is_empty());
+    }
+
+    #[test]
+    fn bottom_pinned_chat_viewport_stays_pinned_during_growth() {
         let mut state = RenderState::new();
-        let mut scroll_offset = 4;
 
-        state.compensate_scroll_for_growth(10, &mut scroll_offset);
-        assert_eq!(scroll_offset, 14);
-        assert_eq!(state.prev_total_height, 10);
+        state.compensate_chat_growth(10);
+        state.compensate_chat_growth(17);
 
-        state.compensate_scroll_for_growth(7, &mut scroll_offset);
-        assert_eq!(scroll_offset, 14);
-        assert_eq!(state.prev_total_height, 7);
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 17);
+        assert_eq!(state.clamp_chat_scroll(17, 5), 12);
+        assert_eq!(state.chat_scroll_offset(), 0);
+    }
 
-        scroll_offset = 0;
-        state.compensate_scroll_for_growth(12, &mut scroll_offset);
-        assert_eq!(scroll_offset, 0);
-        assert_eq!(state.prev_total_height, 12);
+    #[test]
+    fn scrolled_chat_growth_preserves_top_origin_slice() {
+        let mut state = RenderState::new();
+        state.compensate_chat_growth(10);
+        state.set_chat_scroll_offset(3);
+        assert_eq!(state.clamp_chat_scroll(10, 4), 3);
+
+        state.compensate_chat_growth(15);
+
+        assert_eq!(state.chat_scroll_offset(), 8);
+        assert_eq!(state.test_chat_previous_total_height(), 15);
+        assert_eq!(state.clamp_chat_scroll(15, 4), 3);
+    }
+
+    #[test]
+    fn shrink_updates_baseline_then_clamps_chat_scroll() {
+        let mut state = RenderState::new();
+        state.test_seed_chat_viewport(12, 20);
+
+        state.compensate_chat_growth(8);
+
+        assert_eq!(state.test_chat_previous_total_height(), 8);
+        assert_eq!(state.clamp_chat_scroll(8, 5), 0);
+        assert_eq!(state.chat_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn chat_scroll_clamp_handles_empty_short_zero_and_tiny_viewports() {
+        let mut state = RenderState::new();
+        state.scroll_chat_to_top();
+        assert_eq!(state.clamp_chat_scroll(0, 0), 0);
+        assert_eq!(state.chat_scroll_offset(), 0);
+
+        state.scroll_chat_to_top();
+        assert_eq!(state.clamp_chat_scroll(3, 5), 0);
+        assert_eq!(state.chat_scroll_offset(), 0);
+
+        state.set_chat_scroll_offset(2);
+        assert_eq!(state.clamp_chat_scroll(5, 0), 3);
+        assert_eq!(state.chat_scroll_offset(), 2);
+
+        state.scroll_chat_to_top();
+        assert_eq!(state.clamp_chat_scroll(5, 1), 0);
+        assert_eq!(state.chat_scroll_offset(), 4);
+    }
+
+    #[test]
+    fn reset_chat_viewport_clears_offset_and_baseline_only() {
+        let mut state = seeded_caches();
+        state.test_seed_chat_viewport(7, 19);
+        let card_identity = state.test_card_identity(0);
+        let content_identity = state.test_streaming_cache_identity(StreamKind::Content);
+        let thinking_identity = state.test_streaming_cache_identity(StreamKind::Thinking);
+
+        state.reset_chat_viewport();
+
+        assert_eq!(state.chat_scroll_offset(), 0);
+        assert_eq!(state.test_chat_previous_total_height(), 0);
+        assert_eq!(state.test_card_identity(0), card_identity);
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Thinking),
+            thinking_identity
+        );
+        assert_eq!(state.test_session_epoch(), 0);
+        assert!(state.invalidation_order.is_empty());
     }
 }

@@ -103,7 +103,7 @@ impl App {
         self.composer.input_cursor = 0;
         self.composer.input_scroll = 0;
         self.composer.input_preferred_col = None;
-        self.chat.scroll_offset = 0;
+        self.render.scroll_chat_to_bottom();
         self.composer.mention_state = None;
         self.composer.slash_state = None;
         std::mem::take(&mut self.composer.input)
@@ -198,6 +198,7 @@ impl App {
 
     pub fn push_pending_prompt(&mut self, text: String) -> String {
         let local_id = self.chat.push_pending_prompt(text);
+        self.render.scroll_chat_to_bottom();
         self.render
             .apply_change(RenderChange::FinalizedMessagesChanged);
         local_id
