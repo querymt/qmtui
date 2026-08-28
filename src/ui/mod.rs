@@ -161,7 +161,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::MeshInvite => draw_mesh_invite_popup(f, app),
         Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, app),
         Popup::ModelSelect => draw_model_popup(f, app),
-        Popup::SessionSelect => draw_session_popup(f, app),
+        Popup::SessionSelect => {
+            draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render)
+        }
         Popup::NewSession => draw_new_session_popup(f, app),
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
@@ -342,6 +344,46 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| draw_delegate_view(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn draw_session_popup_for_test(f: &mut Frame, app: &mut App) {
+        draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render);
+    }
+
+    fn session_draw_snapshot(app: &App) -> String {
+        format!(
+            "groups={:?};cursor={};filter={:?};tab={};collapsed={:?};popup_collapsed={:?};discovery={};discovery_cursors={:?};pending_groups={:?};hydrated={:?};expanded={:?};pending_children={:?};session={:?};agent={:?};mode={:?};review={:?};new_path={:?};new_cursor={};completion={:?};activity={:?};remote={:?}",
+            app.sessions.session_groups,
+            app.sessions.session_cursor,
+            app.sessions.session_filter,
+            app.sessions.session_popup_tab,
+            app.sessions.collapsed_groups,
+            app.sessions.popup_collapsed_groups,
+            app.sessions.session_discovery_in_progress,
+            app.sessions.session_discovery_cursors,
+            app.sessions.pending_session_group_loads,
+            app.sessions.hydrated_session_groups,
+            app.sessions.expanded_session_children,
+            app.sessions.pending_session_child_loads,
+            app.sessions.session_id,
+            app.sessions.agent_id,
+            app.sessions.agent_mode,
+            app.sessions.mode_before_review,
+            app.sessions.new_session_path,
+            app.sessions.new_session_cursor,
+            app.sessions.new_session_completion,
+            app.sessions.session_activity,
+            app.sessions.remote_session_locations,
+        )
+    }
+
+    fn render_session_popup(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, app))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -756,6 +798,42 @@ mod tests {
     }
 
     #[test]
+    fn session_popup_draw_publishes_only_active_metric_and_preserves_feature_state() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::SessionSelect;
+        app.render.publish_session_popup_visible_rows(11);
+        app.render.publish_delegate_popup_visible_rows(13);
+        let sessions_before = session_draw_snapshot(&app);
+        let delegates_before = app.delegates.clone();
+
+        let buffer = render_session_popup(&mut app, 90, 20);
+        assert!(buffer_text(&buffer).contains("sessions"));
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+        assert_eq!(session_draw_snapshot(&app), sessions_before);
+        assert_eq!(app.delegates, delegates_before);
+
+        render_session_popup(&mut app, 36, 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 1);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+        render_session_popup(&mut app, 36, 1);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 13);
+
+        app.sessions.session_popup_tab = 1;
+        let sessions_before = session_draw_snapshot(&app);
+        let delegates_before = app.delegates.clone();
+        render_session_popup(&mut app, 36, 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 1);
+        render_session_popup(&mut app, 36, 1);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 0);
+        assert_eq!(session_draw_snapshot(&app), sessions_before);
+        assert_eq!(app.delegates, delegates_before);
+    }
+
+    #[test]
     fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
@@ -803,7 +881,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
@@ -845,7 +925,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
 
@@ -913,7 +995,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -960,7 +1044,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(70, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1011,7 +1097,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
         assert_eq!(
@@ -1071,7 +1159,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
@@ -1145,7 +1235,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(90, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -1955,7 +2047,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -1976,7 +2070,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (marker_x, marker_y) = find_buffer_text(&buffer, "●").expect("active marker missing");
@@ -1997,7 +2093,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer_text(&buffer);
 
@@ -2027,7 +2125,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_session_popup(f, &mut app)).unwrap();
+        terminal
+            .draw(|f| draw_session_popup_for_test(f, &mut app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -4978,7 +5078,7 @@ mod tests {
     #[test]
     fn start_page_rows_empty_groups_yields_empty_rows() {
         let app = App::new();
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(rows.is_empty());
     }
 
@@ -4987,7 +5087,7 @@ mod tests {
     fn start_page_rows_single_expanded_group() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0].item, StartPageItem::GroupHeader { .. }));
         assert!(matches!(rows[1].item, StartPageItem::Session { .. }));
@@ -5000,7 +5100,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         app.sessions.collapsed_groups.insert("/a".to_string());
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert_eq!(rows.len(), 1);
         assert!(matches!(
             rows[0].item,
@@ -5017,7 +5117,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
         app.sessions.session_cursor = 1; // points at first session row (index 1)
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(!rows[0].selected); // header not selected
         assert!(rows[1].selected); // first session selected
         assert!(!rows[2].selected);
@@ -5028,7 +5128,7 @@ mod tests {
     fn start_page_rows_header_contains_cwd() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         // The header line should contain the cwd somewhere in its text
         let header_text = rows[0]
             .line
@@ -5047,7 +5147,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
         app.sessions.session_groups[0].total_count = Some(5);
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let header_text = row_text(&rows[0]);
 
         assert!(header_text.contains("(2/5)"), "header text: {header_text}");
@@ -5058,7 +5158,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/home/user/proj"), &["s1", "s2"])];
         app.sessions.session_groups[0].total_count = None;
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let header_text = row_text(&rows[0]);
 
         assert!(header_text.contains("(2)"), "header text: {header_text}");
@@ -5070,7 +5170,7 @@ mod tests {
     fn start_page_rows_session_contains_id() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = rows[1]
             .line
             .spans
@@ -5089,7 +5189,7 @@ mod tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 3;
 
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = row_text(&rows[1]);
 
         assert!(
@@ -5119,7 +5219,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abcdef12"])];
 
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let session_text = row_text(&rows[1]);
 
         assert!(
@@ -5134,7 +5234,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         app.sessions.collapsed_groups.insert("/a".to_string());
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = rows[0]
             .line
             .spans
@@ -5153,7 +5253,7 @@ mod tests {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
         // not collapsed
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = rows[0]
             .line
             .spans
@@ -5170,7 +5270,7 @@ mod tests {
     fn start_page_show_more_row_uses_show_all_label_not_load_more() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3", "s4"])];
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         let text = row_text(rows.last().expect("missing show more row"));
 
         assert!(text.contains("show all"), "row text: {text}");
@@ -5182,7 +5282,7 @@ mod tests {
     #[test]
     fn start_page_rows_no_sessions_yields_empty_state_row() {
         let app = App::new();
-        let rows = build_start_page_rows(&app, 80);
+        let rows = build_start_page_rows(&app.sessions, 80);
         assert!(
             rows.is_empty(),
             "no groups means no rows (empty state handled in draw_start)"

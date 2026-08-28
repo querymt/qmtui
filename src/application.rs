@@ -261,8 +261,8 @@ mod tests {
         domain::tool::ToolDetail,
         domain::{
             activity::{
-                ActivityState, DelegateChildState, DelegateStatus, DelegationState,
-                DelegationUpdate, SessionOp,
+                ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+                DelegationState, DelegationUpdate, SessionOp,
             },
             auth::{OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus},
             chat::{ChatEntry, ElicitationResponseOutcome},
@@ -277,6 +277,12 @@ mod tests {
         },
         navigation_state::{Popup, Screen},
     };
+
+    fn draw_app(app: &mut App, width: u16, height: u16) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+    }
 
     fn seed_card_cache(app: &mut App, source_entry_count: usize) {
         app.render.test_seed_card_cache(source_entry_count);
@@ -463,6 +469,201 @@ mod tests {
             }),
         );
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn render_metric_key_routes_preserve_start_and_popup_filter_contracts() {
+        let mut app = App::new();
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: (0..6)
+                .map(|index| SessionSummary {
+                    session_id: format!("session-{index}"),
+                    title: Some(format!("Session {index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        app.sessions.session_cursor = 4;
+        app.render.test_seed_start_page_scroll(4);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.render.start_page_scroll(), 3);
+
+        app.render.test_seed_start_page_scroll(8);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_filter, "x");
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert_eq!(app.render.start_page_scroll(), 0);
+
+        app.render.test_seed_start_page_scroll(8);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert!(app.sessions.session_filter.is_empty());
+        assert_eq!(app.render.start_page_scroll(), 0);
+
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_cursor = 4;
+        app.render.test_seed_start_page_scroll(8);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_filter, "p");
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert_eq!(app.render.start_page_scroll(), 8);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
+    }
+
+    #[test]
+    fn popup_draw_page_tab_close_and_reopen_retain_independent_metrics() {
+        let mut app = App::new();
+        app.connection.conn = crate::connection_state::ConnState::Connected;
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_groups = vec![SessionGroup {
+            cwd: Some("/repo".into()),
+            sessions: (0..8)
+                .map(|index| SessionSummary {
+                    session_id: format!("session-{index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        app.delegates.delegate_entries = (0..8)
+            .map(|index| DelegateEntry {
+                delegation_id: format!("delegate-{index}"),
+                child_session_id: Some(format!("child-{index}")),
+                delegate_tool_call_id: None,
+                target_agent_id: Some("coder".into()),
+                objective: format!("Task {index}"),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            })
+            .collect();
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 1);
+
+        app.sessions.session_cursor = 0;
+        app.render.publish_delegate_popup_visible_rows(9);
+        draw_app(&mut app, 90, 20);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 9);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 5);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.sessions.session_cursor, 0);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        draw_app(&mut app, 90, 20);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.delegates.delegate_cursor, 5);
+        assert_eq!(app.sessions.session_cursor, 0);
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.delegates.delegate_filter, "z");
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        assert!(
+            update(
+                &mut app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            )
+            .is_empty()
+        );
+        update(
+            &mut app,
+            AppEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 0);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
+
+        app.open_delegate_popup();
+        assert_eq!(app.sessions.session_popup_tab, 1);
+        assert!(app.delegates.delegate_filter.is_empty());
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 6);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 6);
     }
 
     #[test]
@@ -2562,6 +2763,9 @@ mod tests {
             .push(ChatEntry::Error("stale chat".into()));
         app.chat.streaming_content = "stale stream".into();
         app.render.test_seed_chat_viewport(8, 34);
+        app.render.test_seed_start_page_scroll(6);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
         app.composer.input = "preserved draft".into();
         app.composer.input_cursor = 4;
         app.composer.file_index = vec![FileIndexEntryLite {
@@ -2610,6 +2814,9 @@ mod tests {
         assert!(app.chat.streaming_content.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 0);
         assert_eq!(app.render.test_chat_previous_total_height(), 0);
+        assert_eq!(app.render.start_page_scroll(), 6);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
         assert_eq!(app.composer.input, "preserved draft");
         assert_eq!(app.composer.input_cursor, 4);
         assert!(app.composer.file_index.is_empty());
@@ -2669,6 +2876,9 @@ mod tests {
             .messages
             .push(ChatEntry::Error("stale chat".into()));
         app.render.test_seed_chat_viewport(6, 28);
+        app.render.test_seed_start_page_scroll(4);
+        app.render.publish_session_popup_visible_rows(5);
+        app.render.publish_delegate_popup_visible_rows(7);
         app.composer.file_index = vec![FileIndexEntryLite {
             path: "src/lib.rs".into(),
             is_dir: false,
@@ -2695,6 +2905,9 @@ mod tests {
         assert!(app.chat.messages.is_empty());
         assert_eq!(app.render.chat_scroll_offset(), 0);
         assert_eq!(app.render.test_chat_previous_total_height(), 0);
+        assert_eq!(app.render.start_page_scroll(), 4);
+        assert_eq!(app.render.test_session_popup_visible_rows(), 5);
+        assert_eq!(app.render.test_delegate_popup_visible_rows(), 7);
         assert!(app.composer.file_index.is_empty());
         assert_eq!(app.diagnostics.status, "ready");
         let diagnostic = app.diagnostics.logs.last().expect("load diagnostic");

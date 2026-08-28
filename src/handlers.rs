@@ -10,9 +10,6 @@ use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-fn popup_page_step(visible_rows: usize) -> usize {
-    visible_rows.saturating_sub(1).max(1)
-}
 use crate::command::{Command, PromptBlock};
 use crate::connection_state::ConnState;
 use crate::theme;
@@ -868,11 +865,11 @@ pub(crate) fn apply_popup_session_key(
         KeyCode::Up => app.sessions.move_popup_cursor_up(),
         KeyCode::Down => app.sessions.move_popup_cursor_down(),
         KeyCode::PageUp => {
-            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            let step = app.render.session_popup_page_step();
             app.sessions.move_popup_cursor_page(step, false);
         }
         KeyCode::PageDown => {
-            let step = popup_page_step(app.sessions.session_popup_visible_rows);
+            let step = app.render.session_popup_page_step();
             app.sessions.move_popup_cursor_page(step, true);
         }
         KeyCode::Enter => {
@@ -1053,8 +1050,14 @@ pub(crate) fn apply_delegate_popup_key(
         }
         KeyCode::Up => app.delegates.move_cursor_up(),
         KeyCode::Down => app.delegates.move_cursor_down(),
-        KeyCode::PageUp => app.delegates.move_cursor_page(false),
-        KeyCode::PageDown => app.delegates.move_cursor_page(true),
+        KeyCode::PageUp => {
+            let step = app.render.delegate_popup_page_step();
+            app.delegates.move_cursor_page(step, false);
+        }
+        KeyCode::PageDown => {
+            let step = app.render.delegate_popup_page_step();
+            app.delegates.move_cursor_page(step, true);
+        }
         KeyCode::Enter => {
             let selected = app.delegates.selected_entry().map(|entry| {
                 (
@@ -2149,7 +2152,11 @@ pub(crate) fn apply_sessions_key(
     use crate::session_state::StartPageItem;
 
     match key {
-        KeyCode::Up => app.sessions.move_start_cursor_up(),
+        KeyCode::Up => {
+            app.sessions.move_start_cursor_up();
+            app.render
+                .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
+        }
         KeyCode::Down => app.sessions.move_start_cursor_down(),
         KeyCode::Enter => {
             let items = app.sessions.visible_start_items();
@@ -2226,8 +2233,14 @@ pub(crate) fn apply_sessions_key(
             }
             // Delete on a GroupHeader: no-op
         }
-        KeyCode::Backspace => app.sessions.start_filter_backspace(),
-        KeyCode::Char(c) => app.sessions.start_filter_insert(c),
+        KeyCode::Backspace => {
+            app.sessions.start_filter_backspace();
+            app.render.reset_start_page_scroll();
+        }
+        KeyCode::Char(c) => {
+            app.sessions.start_filter_insert(c);
+            app.render.reset_start_page_scroll();
+        }
         _ => {}
     }
     SessionKeyAction::None

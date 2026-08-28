@@ -865,6 +865,21 @@ struct ChatViewportState {
     previous_total_height: u16,
 }
 
+#[derive(Default)]
+struct StartPageMetrics {
+    scroll: usize,
+}
+
+#[derive(Default)]
+struct SessionPopupMetrics {
+    visible_rows: usize,
+}
+
+#[derive(Default)]
+struct DelegatePopupMetrics {
+    visible_rows: usize,
+}
+
 struct ComposerInputGeometry {
     line_width: usize,
     scroll: u16,
@@ -906,6 +921,9 @@ pub(crate) struct RenderState {
     session_identity: Option<SessionIdentity>,
     session_epoch: u64,
     chat_viewport: ChatViewportState,
+    start_page: StartPageMetrics,
+    session_popup: SessionPopupMetrics,
+    delegate_popup: DelegatePopupMetrics,
     composer_input: ComposerInputGeometry,
     elicitation_custom_editor: ElicitationCustomEditorGeometry,
     pub(crate) tick: u64,
@@ -931,6 +949,9 @@ impl RenderState {
             session_identity: None,
             session_epoch: 0,
             chat_viewport: ChatViewportState::default(),
+            start_page: StartPageMetrics::default(),
+            session_popup: SessionPopupMetrics::default(),
+            delegate_popup: DelegatePopupMetrics::default(),
             composer_input: ComposerInputGeometry::default(),
             elicitation_custom_editor: ElicitationCustomEditorGeometry::default(),
             tick: 0,
@@ -1058,6 +1079,55 @@ impl RenderState {
 
     pub(crate) fn replace_tick(&mut self, tick: u64) {
         self.tick = tick;
+    }
+
+    pub(crate) fn start_page_scroll(&self) -> usize {
+        self.start_page.scroll
+    }
+
+    pub(crate) fn reset_start_page_scroll(&mut self) {
+        self.start_page.scroll = 0;
+    }
+
+    pub(crate) fn keep_start_page_cursor_visible_from_above(&mut self, cursor: usize) {
+        if cursor < self.start_page.scroll {
+            self.start_page.scroll = cursor;
+        }
+    }
+
+    pub(crate) fn clamp_start_page_scroll(
+        &mut self,
+        cursor: usize,
+        total_rows: usize,
+        visible_rows: usize,
+    ) -> usize {
+        if cursor >= self.start_page.scroll.saturating_add(visible_rows) {
+            self.start_page.scroll = cursor.saturating_add(1).saturating_sub(visible_rows);
+        }
+        if cursor < self.start_page.scroll {
+            self.start_page.scroll = cursor;
+        }
+        self.start_page.scroll = self
+            .start_page
+            .scroll
+            .min(total_rows.saturating_sub(visible_rows));
+        self.start_page.scroll
+    }
+
+    pub(crate) fn publish_session_popup_visible_rows(&mut self, rows: usize) {
+        self.session_popup.visible_rows = rows;
+    }
+
+    pub(crate) fn session_popup_page_step(&self) -> usize {
+        self.session_popup.visible_rows.saturating_sub(1).max(1)
+    }
+
+    pub(crate) fn publish_delegate_popup_visible_rows(&mut self, rows: usize) {
+        self.delegate_popup.visible_rows = rows;
+    }
+
+    pub(crate) fn delegate_popup_page_step(&self) -> usize {
+        self.delegate_popup.visible_rows.saturating_sub(1).max(1)
     }
 
     pub(crate) fn prepare_composer_input_layout(
@@ -1196,6 +1266,21 @@ impl RenderState {
 
     pub(crate) fn reset_chat_viewport(&mut self) {
         self.chat_viewport = ChatViewportState::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_session_popup_visible_rows(&self) -> usize {
+        self.session_popup.visible_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delegate_popup_visible_rows(&self) -> usize {
+        self.delegate_popup.visible_rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seed_start_page_scroll(&mut self, scroll: usize) {
+        self.start_page.scroll = scroll;
     }
 
     #[cfg(test)]
@@ -1345,7 +1430,99 @@ mod tests {
         assert_eq!(state.test_chat_previous_total_height(), 0);
         assert_eq!(state.test_composer_input_geometry(), (1, 0, false));
         assert_eq!(state.test_elicitation_custom_geometry(), (1, 0, false));
+        assert_eq!(state.start_page_scroll(), 0);
+        assert_eq!(state.test_session_popup_visible_rows(), 0);
+        assert_eq!(state.test_delegate_popup_visible_rows(), 0);
+        assert_eq!(state.session_popup_page_step(), 1);
+        assert_eq!(state.delegate_popup_page_step(), 1);
         assert_eq!(state.tick, 0);
+    }
+
+    #[test]
+    fn start_page_scroll_visibility_clamping_and_reset_preserve_exact_boundaries() {
+        let mut state = RenderState::new();
+
+        state.test_seed_start_page_scroll(6);
+        state.keep_start_page_cursor_visible_from_above(4);
+        assert_eq!(state.start_page_scroll(), 4);
+        state.keep_start_page_cursor_visible_from_above(7);
+        assert_eq!(state.start_page_scroll(), 4);
+
+        assert_eq!(state.clamp_start_page_scroll(9, 20, 4), 6);
+        assert_eq!(state.clamp_start_page_scroll(6, 20, 4), 6);
+        assert_eq!(state.clamp_start_page_scroll(2, 20, 4), 2);
+        assert_eq!(state.clamp_start_page_scroll(2, 3, 5), 0);
+
+        state.test_seed_start_page_scroll(usize::MAX);
+        assert_eq!(
+            state.clamp_start_page_scroll(usize::MAX, usize::MAX, 0),
+            usize::MAX
+        );
+        assert_eq!(
+            state.clamp_start_page_scroll(usize::MAX, usize::MAX, 1),
+            usize::MAX - 1
+        );
+        assert_eq!(state.clamp_start_page_scroll(10, 10, 3), 7);
+
+        state.publish_session_popup_visible_rows(5);
+        state.publish_delegate_popup_visible_rows(7);
+        state.reset_start_page_scroll();
+        assert_eq!(state.start_page_scroll(), 0);
+        assert_eq!(state.test_session_popup_visible_rows(), 5);
+        assert_eq!(state.test_delegate_popup_visible_rows(), 7);
+    }
+
+    #[test]
+    fn popup_page_steps_use_one_row_overlap_and_saturating_fallback() {
+        let mut state = RenderState::new();
+
+        for (rows, expected) in [(0, 1), (1, 1), (2, 1), (5, 4), (usize::MAX, usize::MAX - 1)] {
+            state.publish_session_popup_visible_rows(rows);
+            assert_eq!(state.test_session_popup_visible_rows(), rows);
+            assert_eq!(state.session_popup_page_step(), expected);
+
+            state.publish_delegate_popup_visible_rows(rows);
+            assert_eq!(state.test_delegate_popup_visible_rows(), rows);
+            assert_eq!(state.delegate_popup_page_step(), expected);
+        }
+    }
+
+    #[test]
+    fn render_metric_changes_do_not_touch_other_render_owned_state() {
+        let mut state = seeded_caches();
+        state.advance_session_epoch(identity("session", None, false));
+        state.test_seed_chat_viewport(4, 18);
+        state.test_seed_composer_input_geometry(9, 3);
+        state.test_seed_elicitation_custom_geometry(7, 2);
+        state.replace_tick(11);
+        let card_identity = state.test_card_identity(0);
+        let content_identity = state.test_streaming_cache_identity(StreamKind::Content);
+        let thinking_identity = state.test_streaming_cache_identity(StreamKind::Thinking);
+        state.invalidation_order.clear();
+
+        state.test_seed_start_page_scroll(8);
+        state.keep_start_page_cursor_visible_from_above(3);
+        state.clamp_start_page_scroll(6, 12, 4);
+        state.reset_start_page_scroll();
+        state.publish_session_popup_visible_rows(5);
+        state.publish_delegate_popup_visible_rows(7);
+
+        assert_eq!(state.test_card_identity(0), card_identity);
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            state.test_streaming_cache_identity(StreamKind::Thinking),
+            thinking_identity
+        );
+        assert_eq!(state.test_session_epoch(), 1);
+        assert_eq!(state.chat_scroll_offset(), 4);
+        assert_eq!(state.test_chat_previous_total_height(), 18);
+        assert_eq!(state.test_composer_input_geometry(), (9, 3, true));
+        assert_eq!(state.test_elicitation_custom_geometry(), (7, 2, true));
+        assert_eq!(state.tick, 11);
+        assert!(state.invalidation_order.is_empty());
     }
 
     #[test]
@@ -1495,11 +1672,17 @@ mod tests {
             CacheInvalidation::Finalized,
         ];
         state.test_seed_chat_viewport(9, 27);
+        state.test_seed_start_page_scroll(6);
+        state.publish_session_popup_visible_rows(5);
+        state.publish_delegate_popup_visible_rows(7);
 
         state.apply_change(RenderChange::SessionChanged(session.clone()));
         assert_eq!(state.test_session_epoch(), 1);
         assert_eq!(state.chat_scroll_offset(), 0);
         assert_eq!(state.test_chat_previous_total_height(), 0);
+        assert_eq!(state.start_page_scroll(), 6);
+        assert_eq!(state.test_session_popup_visible_rows(), 5);
+        assert_eq!(state.test_delegate_popup_visible_rows(), 7);
         assert_cache_scope(&state, false, false, false, &expected_order);
 
         state.test_seed_card_cache(2);
@@ -1511,6 +1694,9 @@ mod tests {
         assert_eq!(state.test_session_epoch(), 2);
         assert_eq!(state.chat_scroll_offset(), 0);
         assert_eq!(state.test_chat_previous_total_height(), 0);
+        assert_eq!(state.start_page_scroll(), 6);
+        assert_eq!(state.test_session_popup_visible_rows(), 5);
+        assert_eq!(state.test_delegate_popup_visible_rows(), 7);
         assert_cache_scope(&state, false, false, false, &expected_order);
     }
 

@@ -2626,7 +2626,7 @@ mod session_popup_key_tests {
             Some("/a"),
             &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
         )];
-        app.sessions.session_popup_visible_rows = 4;
+        app.render.publish_session_popup_visible_rows(4);
 
         apply_popup_session_key(&mut app, KeyCode::PageDown);
         assert_eq!(app.sessions.session_cursor, 3);
@@ -2643,7 +2643,7 @@ mod session_popup_key_tests {
             Some("/a"),
             &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
         )];
-        app.sessions.session_popup_visible_rows = 4;
+        app.render.publish_session_popup_visible_rows(4);
         app.sessions.session_cursor = 6;
 
         apply_popup_session_key(&mut app, KeyCode::PageUp);
@@ -3300,7 +3300,7 @@ mod delegate_popup_key_tests {
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegates.delegate_popup_visible_rows = 4;
+        app.render.publish_delegate_popup_visible_rows(4);
 
         apply_delegate_popup_key(&mut app, KeyCode::PageDown);
         assert_eq!(app.delegates.delegate_cursor, 3);
@@ -3318,7 +3318,7 @@ mod delegate_popup_key_tests {
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegates.delegate_popup_visible_rows = 4;
+        app.render.publish_delegate_popup_visible_rows(4);
         app.delegates.delegate_cursor = 6;
 
         apply_delegate_popup_key(&mut app, KeyCode::PageUp);

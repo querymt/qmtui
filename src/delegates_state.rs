@@ -82,7 +82,6 @@ struct DelegateLifecycleUpdate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DelegatesState {
-    pub(crate) delegate_popup_visible_rows: usize,
     pub(crate) delegate_entries: Vec<DelegateEntry>,
     pub(crate) delegate_cursor: usize,
     pub(crate) delegate_filter: String,
@@ -266,7 +265,6 @@ impl DelegatesState {
 
     pub(crate) fn new() -> Self {
         Self {
-            delegate_popup_visible_rows: 0,
             delegate_entries: Vec::new(),
             delegate_cursor: 0,
             delegate_filter: String::new(),
@@ -326,8 +324,7 @@ impl DelegatesState {
         self.delegate_cursor = self.delegate_cursor.saturating_add(1).min(max);
     }
 
-    pub(crate) fn move_cursor_page(&mut self, down: bool) {
-        let step = self.delegate_popup_visible_rows.saturating_sub(1).max(1);
+    pub(crate) fn move_cursor_page(&mut self, step: usize, down: bool) {
         if down {
             let max = self.visible_entries().len().saturating_sub(1);
             self.delegate_cursor = self.delegate_cursor.saturating_add(step).min(max);
@@ -659,10 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn constructor_uses_all_fourteen_exact_defaults() {
+    fn constructor_uses_exact_defaults() {
         let state = DelegatesState::new();
 
-        assert_eq!(state.delegate_popup_visible_rows, 0);
         assert!(state.delegate_entries.is_empty());
         assert_eq!(state.delegate_cursor, 0);
         assert!(state.delegate_filter.is_empty());
@@ -716,12 +712,11 @@ mod tests {
                 )
             })
             .collect();
-        state.delegate_popup_visible_rows = 4;
 
         state.move_cursor_down();
-        state.move_cursor_page(true);
+        state.move_cursor_page(3, true);
         assert_eq!(state.delegate_cursor, 4);
-        state.move_cursor_page(false);
+        state.move_cursor_page(3, false);
         assert_eq!(state.delegate_cursor, 1);
         state.filter_insert('d');
         state.filter_insert('o');
@@ -732,20 +727,6 @@ mod tests {
         assert_eq!(state.delegate_cursor, 0);
         state.reset_popup();
         assert!(state.delegate_filter.is_empty());
-        assert_eq!(state.delegate_cursor, 0);
-    }
-
-    #[test]
-    fn page_movement_falls_back_to_one_when_visible_rows_are_unknown() {
-        let mut state = DelegatesState::new();
-        state.delegate_entries = vec![
-            entry("d1", "one", None, DelegateStatus::InProgress),
-            entry("d2", "two", None, DelegateStatus::InProgress),
-        ];
-
-        state.move_cursor_page(true);
-        assert_eq!(state.delegate_cursor, 1);
-        state.move_cursor_page(false);
         assert_eq!(state.delegate_cursor, 0);
     }
 
@@ -931,7 +912,6 @@ mod tests {
             .insert("d1".to_string(), "boom".to_string());
         state.delegate_filter = "stale".to_string();
         state.delegate_cursor = 3;
-        state.delegate_popup_visible_rows = 5;
         state.parent_session_id = Some("parent".to_string());
 
         let entries_before = state.delegate_entries.clone();
@@ -950,7 +930,6 @@ mod tests {
         assert!(state.delegation_errors.is_empty());
         assert_eq!(state.delegate_filter, "stale");
         assert_eq!(state.delegate_cursor, 3);
-        assert_eq!(state.delegate_popup_visible_rows, 5);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::session_state::{StartPageItem, session_group_count_text};
+use crate::session_state::{SessionsState, StartPageItem, session_group_count_text};
 use crate::theme::Theme;
 
 use super::{ELLIPSIS, draw_header, mesh_header_span, relative_time};
@@ -32,12 +32,15 @@ pub(crate) struct StartPageRow {
 ///
 /// Pure function — does not touch the frame. Accepts `area_width` for
 /// truncating long paths/titles.
-pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPageRow> {
-    let items = app.sessions.visible_start_items();
+pub(crate) fn build_start_page_rows(
+    sessions: &SessionsState,
+    area_width: usize,
+) -> Vec<StartPageRow> {
+    let items = sessions.visible_start_items();
     let mut rows = Vec::with_capacity(items.len());
 
     for (idx, item) in items.iter().enumerate() {
-        let selected = idx == app.sessions.session_cursor;
+        let selected = idx == sessions.session_cursor;
 
         let (header_style, dim_style) = if selected {
             (Theme::selected(), Theme::selected())
@@ -78,7 +81,7 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                 path,
                 depth,
             } => {
-                let Some(session) = app.sessions.session_by_path(*group_idx, path) else {
+                let Some(session) = sessions.session_by_path(*group_idx, path) else {
                     continue;
                 };
                 let id_short: String = session.session_id.chars().take(8).collect();
@@ -89,9 +92,8 @@ pub(crate) fn build_start_page_rows(app: &App, area_width: usize) -> Vec<StartPa
                     .map(relative_time)
                     .unwrap_or_default();
 
-                let fork_marker = if app.sessions.expandable_root_session(*group_idx, path) {
-                    let indicator = if app
-                        .sessions
+                let fork_marker = if sessions.expandable_root_session(*group_idx, path) {
+                    let indicator = if sessions
                         .expanded_session_children
                         .contains(&session.session_id)
                     {
@@ -204,6 +206,9 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         right,
     );
 
+    let sessions = &app.sessions;
+    let render = &mut app.render;
+
     // ── hints ─────────────────────────────────────────────────────────────────
     // Rendered now (fixed bottom) so we can focus the rest on centring.
     let hint_area = outer[2];
@@ -225,7 +230,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 
     // ── glitch / wave variables (shared by art and button) ───────────────────
     const GLITCH_CHARS: &str = "░▒▓█▌▐▄▀┃╋╳";
-    let tick = app.render.tick as usize;
+    let tick = render.tick as usize;
     let prng = |seed: usize| -> usize {
         let mut h = seed.wrapping_mul(2654435761);
         h ^= h >> 16;
@@ -247,7 +252,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 
     // ── compute content block height for vertical centring ────────────────────
     // Build rows first so we know how many there are.
-    let rows = build_start_page_rows(app, col_w as usize);
+    let rows = build_start_page_rows(sessions, col_w as usize);
     let rows_h = rows.len() as u16;
 
     // Button: 1 gap row + 1 text row (no border).
@@ -371,7 +376,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
     };
     let filter_line = Line::from(vec![
         Span::styled(" > ", Theme::start_header()),
-        Span::styled(app.sessions.session_filter.clone(), Theme::fg()),
+        Span::styled(sessions.session_filter.clone(), Theme::fg()),
     ]);
     f.render_widget(
         Paragraph::new(filter_line).style(Theme::base()),
@@ -379,7 +384,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
     );
     // Show cursor at the end of the typed filter text
     f.set_cursor_position((
-        filter_area.x + 3 + app.sessions.session_filter.chars().count() as u16,
+        filter_area.x + 3 + sessions.session_filter.chars().count() as u16,
         filter_area.y,
     ));
 
@@ -388,7 +393,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 
     if rows.is_empty() {
         // Empty state
-        let msg = if app.sessions.session_filter.is_empty() {
+        let msg = if sessions.session_filter.is_empty() {
             "No sessions yet.  C-x n to start a new one."
         } else {
             "No sessions match the filter."
@@ -410,24 +415,10 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         let visible_rows = list_area.height as usize;
         let total_rows = rows.len();
 
-        // Clamp scroll so cursor is in view.
-        if app.sessions.session_cursor >= app.sessions.start_page_scroll + visible_rows {
-            app.sessions.start_page_scroll = app.sessions.session_cursor + 1 - visible_rows;
-        }
-        if app.sessions.session_cursor < app.sessions.start_page_scroll {
-            app.sessions.start_page_scroll = app.sessions.session_cursor;
-        }
-        app.sessions.start_page_scroll = app
-            .sessions
-            .start_page_scroll
-            .min(total_rows.saturating_sub(visible_rows));
+        let scroll =
+            render.clamp_start_page_scroll(sessions.session_cursor, total_rows, visible_rows);
 
-        for (display_row, row) in rows
-            .iter()
-            .skip(app.sessions.start_page_scroll)
-            .take(visible_rows)
-            .enumerate()
-        {
+        for (display_row, row) in rows.iter().skip(scroll).take(visible_rows).enumerate() {
             let y = list_area.y + display_row as u16;
             if y >= list_area.y + list_area.height {
                 break;
@@ -461,7 +452,7 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
         height: 1,
     };
 
-    let button_focused = app.sessions.session_cursor == rows.len();
+    let button_focused = sessions.session_cursor == rows.len();
 
     // Build text spans: glitch only when focused, always bold
     let text_spans: Vec<Span<'static>> = if button_focused {
@@ -509,6 +500,116 @@ pub(super) fn draw_start(f: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::session::{SessionGroup, SessionSummary};
+
+    fn group(cwd: &str, count: usize) -> SessionGroup {
+        SessionGroup {
+            cwd: Some(cwd.into()),
+            sessions: (0..count)
+                .map(|index| SessionSummary {
+                    session_id: format!("{cwd}-{index}"),
+                    title: Some(format!("Session {index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            total_count: Some(count as u64),
+            ..Default::default()
+        }
+    }
+
+    fn session_semantics(app: &App) -> String {
+        format!(
+            "groups={:?};cursor={};filter={:?};tab={};collapsed={:?};popup_collapsed={:?};discovery={};discovery_cursors={:?};pending_groups={:?};hydrated={:?};expanded={:?};pending_children={:?};session={:?};agent={:?};mode={:?};review={:?};new_path={:?};new_cursor={};completion={:?};activity={:?};remote={:?}",
+            app.sessions.session_groups,
+            app.sessions.session_cursor,
+            app.sessions.session_filter,
+            app.sessions.session_popup_tab,
+            app.sessions.collapsed_groups,
+            app.sessions.popup_collapsed_groups,
+            app.sessions.session_discovery_in_progress,
+            app.sessions.session_discovery_cursors,
+            app.sessions.pending_session_group_loads,
+            app.sessions.hydrated_session_groups,
+            app.sessions.expanded_session_children,
+            app.sessions.pending_session_child_loads,
+            app.sessions.session_id,
+            app.sessions.agent_id,
+            app.sessions.agent_mode,
+            app.sessions.mode_before_review,
+            app.sessions.new_session_path,
+            app.sessions.new_session_cursor,
+            app.sessions.new_session_completion,
+            app.sessions.session_activity,
+            app.sessions.remote_session_locations,
+        )
+    }
+
+    fn draw_at(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_start(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn start_draw_clamps_resize_button_and_short_lists_without_mutating_sessions() {
+        let mut app = App::new();
+        app.sessions.session_groups =
+            vec![group("repo-a", 4), group("repo-b", 4), group("repo-c", 4)];
+        let row_count = build_start_page_rows(&app.sessions, 64).len();
+        assert_eq!(row_count, 15);
+        app.sessions.session_cursor = row_count;
+        app.render.test_seed_start_page_scroll(usize::MAX);
+        let before = session_semantics(&app);
+
+        draw_at(&mut app, 100, 10);
+        assert_eq!(app.render.start_page_scroll(), 11);
+        assert_eq!(session_semantics(&app), before);
+
+        draw_at(&mut app, 100, 14);
+        assert_eq!(app.render.start_page_scroll(), 7);
+        assert_eq!(session_semantics(&app), before);
+
+        draw_at(&mut app, 100, 30);
+        assert_eq!(app.render.start_page_scroll(), 0);
+        assert_eq!(session_semantics(&app), before);
+
+        app.sessions.session_groups = vec![group("short", 1)];
+        app.sessions.session_cursor = 1;
+        app.render.test_seed_start_page_scroll(9);
+        let short_before = session_semantics(&app);
+        draw_at(&mut app, 80, 20);
+        assert_eq!(app.render.start_page_scroll(), 0);
+        assert_eq!(session_semantics(&app), short_before);
+    }
+
+    #[test]
+    fn start_draw_preserves_empty_scroll_and_handles_zero_height_list() {
+        let mut app = App::new();
+        app.render.test_seed_start_page_scroll(7);
+        let before = session_semantics(&app);
+        let rendered = draw_at(&mut app, 80, 20);
+        assert!(rendered.contains("No sessions yet"));
+        assert_eq!(app.render.start_page_scroll(), 7);
+        assert_eq!(session_semantics(&app), before);
+
+        app.sessions.session_groups = vec![group("tiny", 4)];
+        app.sessions.session_cursor = 2;
+        app.render.test_seed_start_page_scroll(0);
+        let tiny_before = session_semantics(&app);
+        draw_at(&mut app, 20, 3);
+        assert_eq!(app.render.start_page_scroll(), 2);
+        app.render.test_seed_start_page_scroll(0);
+        draw_at(&mut app, 20, 2);
+        assert_eq!(app.render.start_page_scroll(), 2);
+        assert_eq!(session_semantics(&app), tiny_before);
+    }
 
     #[test]
     fn start_page_header_uses_active_profile_label() {
@@ -519,18 +620,7 @@ mod tests {
             ..Default::default()
         }];
         app.profiles.active_profile_id = Some("fast".into());
-        let backend = ratatui::backend::TestBackend::new(100, 20);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| draw_start(frame, &mut app)).unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let text = draw_at(&mut app, 100, 20);
         assert!(text.contains("profile:Fast"));
     }
 }
