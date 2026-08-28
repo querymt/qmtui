@@ -5,13 +5,15 @@ use serde_json::Value;
 use crate::application::Effect;
 use crate::auth_state::{AuthAction, AuthOutcome};
 use crate::chat_state::{
-    ChatAction, ChatCoordination, ChatOutcome, ChatToolAction, ChatToolOutcome, ChatToolTransition,
-    ChatUsageAction, ChatUsageOutcome, ElicitationAction, ElicitationOutcome, HistoryAction,
-    HistoryCoordination, HistoryOutcome, ToolStartPreparationTransition,
+    AssistantMessageTransition, ChatAction, ChatCoordination, ChatOutcome, ChatToolAction,
+    ChatToolOutcome, ChatToolTransition, ChatTransition, ChatUsageAction, ChatUsageOutcome,
+    ElicitationAction, ElicitationOutcome, ElicitationTransition, HistoryAction,
+    HistoryCoordination, HistoryOutcome, HistoryTransition, ToolEndTransition,
+    ToolStartInsertionTransition, ToolStartPreparationTransition, UserMessageTransition,
 };
 use crate::command::{Command, SessionListRequest};
 use crate::delegates_state::{
-    DelegateAction, DelegateChildActivity, DelegateContext, DelegateCoordination, DelegateOutcome,
+    DelegateAction, DelegateChildActivity, DelegateContext, DelegateOutcome,
 };
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, DelegationUpdate};
@@ -28,6 +30,7 @@ use crate::domain::session::{
 use crate::models_state::{ModelAction, ModelContext, ModelCoordination, ModelOutcome};
 use crate::navigation_state::{Popup, Screen};
 use crate::profiles_state::{ProfileAction, ProfileOutcome};
+use crate::render_state::{RenderChange, SessionIdentity};
 use crate::session_state::{SessionAction, SessionCoordination, SessionOutcome};
 use crate::tool_detail;
 
@@ -35,6 +38,121 @@ use crate::tool_detail;
 pub(crate) struct AcpModelsMetaInfo {
     pub remote_node_count: u32,
     pub remote_timeout_count: u32,
+}
+
+fn chat_render_changes(transition: &ChatTransition) -> Vec<RenderChange> {
+    match transition {
+        ChatTransition::TurnStarted | ChatTransition::Cancelled | ChatTransition::Finished => vec![
+            RenderChange::StreamingContentChanged,
+            RenderChange::StreamingThinkingChanged,
+        ],
+        ChatTransition::UserMessage(UserMessageTransition::Reconciled) => {
+            vec![RenderChange::FinalizedMessagesChanged]
+        }
+        ChatTransition::UserMessage(_) => Vec::new(),
+        ChatTransition::AssistantContentDelta(transition)
+        | ChatTransition::AssistantThinkingDelta(transition)
+            if transition.finalized_previous =>
+        {
+            vec![
+                RenderChange::StreamingContentChanged,
+                RenderChange::StreamingThinkingChanged,
+                RenderChange::FinalizedMessagesChanged,
+            ]
+        }
+        ChatTransition::AssistantContentDelta(_) | ChatTransition::AssistantThinkingDelta(_) => {
+            Vec::new()
+        }
+        ChatTransition::AssistantMessage(transition) => {
+            let mut changes = vec![
+                RenderChange::StreamingContentChanged,
+                RenderChange::StreamingThinkingChanged,
+            ];
+            if *transition == AssistantMessageTransition::ReplacedThinking {
+                changes.push(RenderChange::FinalizedMessagesChanged);
+            }
+            changes
+        }
+        ChatTransition::BackendPromptFailed { .. } => {
+            vec![RenderChange::FinalizedMessagesChanged]
+        }
+        ChatTransition::RuntimePromptDispatchFailed {
+            prompt_rolled_back: true,
+        } => vec![RenderChange::FinalizedMessagesChanged],
+        ChatTransition::RuntimePromptDispatchFailed {
+            prompt_rolled_back: false,
+        }
+        | ChatTransition::AcpError { .. } => Vec::new(),
+    }
+}
+
+fn tool_render_changes(transition: &ChatToolTransition) -> Vec<RenderChange> {
+    match transition {
+        ChatToolTransition::StartPrepared(
+            ToolStartPreparationTransition::Prepared {
+                finalized_streaming: true,
+            }
+            | ToolStartPreparationTransition::QuestionOnly {
+                finalized_streaming: true,
+            },
+        ) => vec![
+            RenderChange::StreamingContentChanged,
+            RenderChange::StreamingThinkingChanged,
+            RenderChange::FinalizedMessagesChanged,
+        ],
+        ChatToolTransition::StartPrepared(_) => Vec::new(),
+        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled) => vec![
+            RenderChange::StreamingThinkingChanged,
+            RenderChange::FinalizedMessagesChanged,
+        ],
+        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted {
+            moved_thinking: true,
+        }) => vec![RenderChange::StreamingThinkingChanged],
+        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted {
+            moved_thinking: false,
+        }) => Vec::new(),
+        ChatToolTransition::Ended(
+            ToolEndTransition::Updated { .. } | ToolEndTransition::FallbackInserted,
+        ) => vec![RenderChange::FinalizedMessagesChanged],
+        ChatToolTransition::Ended(ToolEndTransition::NoOp) => Vec::new(),
+    }
+}
+
+fn elicitation_render_changes(transition: &ElicitationTransition) -> Vec<RenderChange> {
+    match transition {
+        ElicitationTransition::InsertedSupported {
+            finalized_streaming: true,
+            ..
+        }
+        | ElicitationTransition::InsertedUnsupported {
+            finalized_streaming: true,
+            ..
+        } => vec![
+            RenderChange::StreamingContentChanged,
+            RenderChange::StreamingThinkingChanged,
+            RenderChange::FinalizedMessagesChanged,
+        ],
+        ElicitationTransition::ResolvedActive | ElicitationTransition::ResolvedStale => {
+            vec![RenderChange::FinalizedMessagesChanged]
+        }
+        ElicitationTransition::InsertedSupported { .. }
+        | ElicitationTransition::InsertedUnsupported { .. }
+        | ElicitationTransition::Duplicate
+        | ElicitationTransition::UnknownAcknowledgement => Vec::new(),
+    }
+}
+
+fn history_render_changes(transition: HistoryTransition) -> Vec<RenderChange> {
+    match transition {
+        HistoryTransition::UndoApplied => vec![RenderChange::StreamingContentChanged],
+        HistoryTransition::StackReplaced
+        | HistoryTransition::UndoRejected
+        | HistoryTransition::RedoApplied
+        | HistoryTransition::RedoRejected
+        | HistoryTransition::ForkLoaded
+        | HistoryTransition::ForkMissingSessionId
+        | HistoryTransition::ForkFailed => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -508,7 +626,9 @@ impl crate::app::App {
                         self.profiles.remove_session_profile(&session_id);
                     }
                 }
-                SessionCoordination::ResetActiveSessionView => self.reset_active_session_view(),
+                SessionCoordination::ResetActiveSessionView => {
+                    effects.extend(self.reset_active_session_view());
+                }
                 SessionCoordination::SelectChat => self.navigation.screen = Screen::Chat,
                 SessionCoordination::SelectLoadedSessionScreen => {
                     self.navigation.screen = if self.delegates.parent_session_id.is_some() {
@@ -585,40 +705,36 @@ impl crate::app::App {
     fn apply_delegate_outcome(&mut self, outcome: DelegateOutcome) -> Vec<Effect> {
         let DelegateOutcome {
             changed: _,
-            coordination,
+            presentation_changed,
             effects,
         } = outcome;
-        for coordination in coordination {
-            match coordination {
-                DelegateCoordination::InvalidateCardCache => {
-                    self.render.invalidate_card_cache();
-                }
-            }
+        if presentation_changed {
+            self.render
+                .apply_change(RenderChange::DelegatePresentationChanged);
         }
         effects
     }
 
     pub(crate) fn apply_chat_action(&mut self, action: ChatAction) -> Vec<Effect> {
         let ChatOutcome {
-            transition: _,
+            transition,
             coordination,
             effects,
         } = self.chat.reduce(action);
+        self.apply_render_changes(chat_render_changes(&transition));
         self.apply_chat_coordination(coordination);
         effects
     }
 
     fn apply_chat_history_action(&mut self, action: HistoryAction) -> Vec<Effect> {
         let HistoryOutcome {
-            transition: _,
+            transition,
             coordination,
             mut effects,
         } = self.chat.reduce_history(action);
+        self.apply_render_changes(history_render_changes(transition));
         for coordination in coordination {
             match coordination {
-                HistoryCoordination::InvalidateContentCache => {
-                    self.render.invalidate_content_cache();
-                }
                 HistoryCoordination::Status {
                     level,
                     target,
@@ -664,6 +780,7 @@ impl crate::app::App {
             effects,
         } = self.chat.reduce_tool(action);
         self.apply_chat_coordination(coordination);
+        self.apply_render_changes(tool_render_changes(&transition));
         (transition, effects)
     }
 
@@ -682,26 +799,40 @@ impl crate::app::App {
         action: ElicitationAction,
     ) -> Vec<Effect> {
         let ElicitationOutcome {
-            transition: _,
+            transition,
             coordination,
             effects,
         } = self.chat.reduce_elicitation(action);
+        if matches!(
+            transition,
+            ElicitationTransition::InsertedSupported { .. }
+                | ElicitationTransition::InsertedUnsupported { .. }
+        ) {
+            self.render.scroll_chat_to_bottom();
+        }
+        match transition {
+            ElicitationTransition::InsertedSupported {
+                is_replay: false, ..
+            }
+            | ElicitationTransition::ResolvedActive => {
+                self.render.reset_elicitation_custom_geometry();
+            }
+            _ => {}
+        }
+        self.apply_render_changes(elicitation_render_changes(&transition));
         self.apply_chat_coordination(coordination);
         effects
+    }
+
+    fn apply_render_changes(&mut self, changes: Vec<RenderChange>) {
+        for change in changes {
+            self.render.apply_change(change);
+        }
     }
 
     fn apply_chat_coordination(&mut self, coordination: Vec<ChatCoordination>) {
         for coordination in coordination {
             match coordination {
-                ChatCoordination::InvalidateContentCache => {
-                    self.render.invalidate_content_cache();
-                }
-                ChatCoordination::InvalidateThinkingCache => {
-                    self.render.invalidate_thinking_cache();
-                }
-                ChatCoordination::InvalidateCardCache => {
-                    self.render.invalidate_card_cache();
-                }
                 ChatCoordination::Log {
                     level,
                     target,
@@ -717,14 +848,27 @@ impl crate::app::App {
         }
     }
 
-    fn reset_active_session_view(&mut self) {
+    fn reset_active_session_view(&mut self) -> Vec<Effect> {
         self.chat.reset_for_session_switch();
-        self.render.invalidate_content_cache();
-        self.render.invalidate_thinking_cache();
-        self.render.invalidate_card_cache();
+        let session_id = self.sessions.session_id.clone();
+        let remote_node_id = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.session_remote_node_id(id))
+            .map(str::to_string);
+        let is_remote = session_id
+            .as_deref()
+            .is_some_and(|id| self.sessions.is_remote_session_id(id));
+        self.render
+            .apply_change(RenderChange::SessionChanged(SessionIdentity::new(
+                session_id,
+                remote_node_id,
+                is_remote,
+            )));
+        self.render.reset_composer_input_geometry();
+        self.render.reset_elicitation_custom_geometry();
         let effects = self.apply_delegate_action(DelegateAction::ClearRootSessionState);
-        debug_assert!(effects.is_empty());
         self.composer.reset_for_session_switch();
+        effects
     }
 
     fn apply_acp_delegation_update(&mut self, update: DelegationUpdate) -> Vec<Effect> {
@@ -862,9 +1006,7 @@ impl crate::app::App {
                     ));
                 }
 
-                let cwd = self.current_session_cwd();
-                let detail =
-                    tool_detail::parse_tool_detail(&name, arguments.as_ref(), cwd.as_deref());
+                let detail = tool_detail::parse_tool_detail(&name, arguments.as_ref());
                 let (_, insertion_effects) =
                     self.apply_chat_tool_action(ChatToolAction::InsertOrReconcileToolStart {
                         tool_call_id,
@@ -1373,7 +1515,7 @@ mod tests {
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, DelegationState,
         PendingDelegateToolCall, SessionOp,
     };
-    use crate::domain::chat::ChatEntry;
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::ElicitationState;
     use crate::domain::mesh::{RemoteNodeInfo, RemoteSessionInfo};
     use crate::domain::model::DelegateModelPreference;
@@ -2456,11 +2598,11 @@ mod tests {
             ended_at: None,
             child_state: DelegateChildState::None,
         });
-        app.chat.scroll_offset = 3;
+        app.render.test_seed_chat_viewport(3, 24);
+        app.render.test_seed_composer_input_geometry(40, 2);
+        app.render.test_seed_elicitation_custom_geometry(30, 1);
         app.composer.input = "/mo".into();
         app.composer.input_cursor = 3;
-        app.composer.input_scroll = 2;
-        app.composer.input_line_width = 40;
         app.composer.input_preferred_col = Some(4);
         app.composer.refresh_slash_state();
         app.composer.file_index = vec![FileIndexEntryLite {
@@ -2507,12 +2649,13 @@ mod tests {
         assert!(app.delegates.delegate_entries.is_empty());
         assert!(app.chat.messages.is_empty());
         assert!(app.chat.streaming_content.is_empty());
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert_eq!(app.composer.input, "/mo");
         assert_eq!(app.composer.input_cursor, 3);
-        assert_eq!(app.composer.input_scroll, 2);
-        assert_eq!(app.composer.input_line_width, 40);
         assert_eq!(app.composer.input_preferred_col, Some(4));
+        assert_eq!(app.render.test_composer_input_geometry(), (1, 0, false));
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (1, 0, false));
         assert!(app.composer.file_index.is_empty());
         assert_eq!(app.composer.file_index_generated_at, None);
         assert!(!app.composer.file_index_loading);
@@ -2540,6 +2683,29 @@ mod tests {
                 && agent_id.as_deref() == Some("agent-1")
                 && profile_id == "code"
         ));
+    }
+
+    #[test]
+    fn same_id_session_reload_advances_render_epoch() {
+        let mut app = App::new();
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "same-session".into(),
+            profile_id: None,
+        });
+        let first_epoch = app.render.test_session_epoch();
+        app.render.test_seed_chat_viewport(9, 42);
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "same-session".into(),
+            profile_id: None,
+        });
+
+        assert!(app.render.test_session_epoch() > first_epoch);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
     }
 
     #[test]
@@ -2571,7 +2737,7 @@ mod tests {
         app.chat.streaming_content_message_id = Some("stream-1".into());
         app.chat.streaming_thinking = "stale thinking".into();
         app.chat.streaming_thinking_message_id = Some("thinking-1".into());
-        app.chat.scroll_offset = 4;
+        app.render.test_seed_chat_viewport(4, 31);
         app.chat.undo_state = Some(UndoState {
             stack: Vec::new(),
             frontier_message_id: Some("undo-1".into()),
@@ -2610,7 +2776,8 @@ mod tests {
         assert_eq!(app.chat.streaming_content_message_id, None);
         assert!(app.chat.streaming_thinking.is_empty());
         assert_eq!(app.chat.streaming_thinking_message_id, None);
-        assert_eq!(app.chat.scroll_offset, 0);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        assert_eq!(app.render.test_chat_previous_total_height(), 0);
         assert!(app.chat.undo_state.is_none());
         assert!(app.chat.undoable_turns.is_empty());
         assert!(app.chat.recent_prompt_text.is_none());
@@ -3418,9 +3585,9 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::ToolCall {
-                detail: ToolDetail::Shell { output_tail: Some(tail), .. },
+                detail: ToolDetail::Shell { output: Some(output), .. },
                 ..
-            }] if tail.lines.iter().any(|line| line.contains("Finished dev profile"))
+            }] if output.stdout.contains("Finished dev profile")
         ));
     }
 
@@ -3969,6 +4136,7 @@ mod tests {
     #[test]
     fn native_live_elicitation_creates_card_and_active_state() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
 
         apply_live_update(
             &mut app,
@@ -3985,6 +4153,7 @@ mod tests {
             },
         );
 
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert_eq!(
             app.chat
                 .elicitation
@@ -4002,6 +4171,7 @@ mod tests {
     #[test]
     fn native_replay_elicitation_creates_card_without_active_state() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
 
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
@@ -4018,6 +4188,7 @@ mod tests {
             }],
         });
 
+        assert_eq!(app.render.chat_scroll_offset(), 0);
         assert!(app.chat.elicitation.is_none());
         assert!(matches!(
             app.chat.messages.as_slice(),
@@ -4041,16 +4212,21 @@ mod tests {
             allow_custom: true,
         }];
 
-        for _ in 0..2 {
-            app.handle_acp_event(AcpAppEvent::SessionReplay {
-                session_id: TEST_SESSION_ID.into(),
-                updates: updates.clone(),
-            });
-        }
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        app.render.set_chat_scroll_offset(6);
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         app.apply_chat_elicitation_action(ElicitationAction::ResponseAcknowledged {
             elicitation_id: "elic-1".into(),
-            outcome: "staging".into(),
+            outcome: ElicitationResponseOutcome::Text("staging".into()),
         });
+        assert_eq!(app.render.chat_scroll_offset(), 6);
         app.handle_acp_event(AcpAppEvent::SessionReplay {
             session_id: TEST_SESSION_ID.into(),
             updates,
@@ -4060,7 +4236,8 @@ mod tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
-                if elicitation_id == "elic-1" && outcome == "staging"
+                if elicitation_id == "elic-1"
+                    && outcome == &ElicitationResponseOutcome::Text("staging".into())
         ));
     }
 
@@ -4104,6 +4281,7 @@ mod tests {
     #[test]
     fn native_unsupported_replay_elicitation_is_idempotent() {
         let mut app = app_with_active_session();
+        app.render.set_chat_scroll_offset(8);
         let updates = vec![AcpSessionUpdate::ElicitationRequested {
             elicitation_id: "elic-unsupported".into(),
             message: "Upload a file".into(),
@@ -4112,18 +4290,23 @@ mod tests {
             allow_custom: false,
         }];
 
-        for _ in 0..2 {
-            app.handle_acp_event(AcpAppEvent::SessionReplay {
-                session_id: TEST_SESSION_ID.into(),
-                updates: updates.clone(),
-            });
-        }
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates: updates.clone(),
+        });
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+        app.render.set_chat_scroll_offset(5);
+        app.handle_acp_event(AcpAppEvent::SessionReplay {
+            session_id: TEST_SESSION_ID.into(),
+            updates,
+        });
 
+        assert_eq!(app.render.chat_scroll_offset(), 5);
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { elicitation_id, outcome: Some(outcome), .. }]
                 if elicitation_id == "elic-unsupported"
-                    && outcome == "unsupported schema - cannot answer in TUI"
+                    && outcome == &ElicitationResponseOutcome::UnsupportedSchema
         ));
     }
 

@@ -367,7 +367,7 @@ async fn session_notification_reaches_application_reducer_coordination() {
     let mut app = App::new();
     app.sessions.session_id = Some("session".into());
     let local_id = app.push_pending_prompt("hello".into());
-    app.render.card_cache.processed_messages = 7;
+    app.render.test_seed_card_cache(7);
     let original_logs = app.diagnostics.logs.clone();
     let original_log_cursor = app.diagnostics.log_cursor;
     let original_log_filter = app.diagnostics.log_filter.clone();
@@ -402,7 +402,7 @@ async fn session_notification_reaches_application_reducer_coordination() {
     ));
     assert_eq!(app.chat.undoable_turns.len(), 1);
     assert_eq!(app.chat.undoable_turns[0].message_id, "u1");
-    assert_eq!(app.render.card_cache.processed_messages, 0);
+    assert_eq!(app.render.test_card_source_entry_count(), 0);
     assert_eq!(app.diagnostics.logs, original_logs);
     assert_eq!(app.diagnostics.log_cursor, original_log_cursor);
     assert_eq!(app.diagnostics.log_filter, original_log_filter);

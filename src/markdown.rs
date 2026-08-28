@@ -6,7 +6,9 @@ use ratatui::{
 
 use crate::highlight::Highlighter;
 use crate::theme::Theme;
-use crate::ui::{MD_BULLET, MD_HRULE_CHAR};
+
+pub(crate) const MD_HRULE_CHAR: &str = "\u{2500}";
+pub(crate) const MD_BULLET: &str = "\u{2022} ";
 
 /// A block inside a card — either plain text or a deferred table.
 #[derive(Clone)]

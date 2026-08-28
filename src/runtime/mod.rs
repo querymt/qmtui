@@ -202,9 +202,11 @@ impl TestEffects {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
     use crate::command::PromptBlock;
-    use crate::domain::chat::{ChatEntry, OUTCOME_BULLET};
+    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
     use crate::domain::elicitation::{
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
@@ -295,7 +297,7 @@ mod tests {
                         elicitation_id: "test-id".into(),
                         action: "accept".into(),
                         content: Some(serde_json::json!({ "choice": "a" })),
-                        outcome: format!("{OUTCOME_BULLET}Alpha"),
+                        outcome: ElicitationResponseOutcome::Selected(vec!["Alpha".into()]),
                     },
                     Effect::Command(Command::Init),
                 ],
@@ -309,7 +311,7 @@ mod tests {
         assert!(app.chat.messages.iter().any(|entry| matches!(
             entry,
             ChatEntry::Elicitation { outcome: Some(outcome), .. }
-                if outcome == &format!("{OUTCOME_BULLET}Alpha")
+                if outcome == &ElicitationResponseOutcome::Selected(vec!["Alpha".into()])
         )));
     }
 
@@ -328,7 +330,7 @@ mod tests {
                     elicitation_id: "test-id".into(),
                     action: "decline".into(),
                     content: None,
-                    outcome: "declined".into(),
+                    outcome: ElicitationResponseOutcome::Declined,
                 }],
             )
             .unwrap();
@@ -461,6 +463,29 @@ mod tests {
         }])
     }
 
+    fn make_multi_select_elicitation() -> ElicitationState {
+        ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choices".into(),
+            title: "Pick several".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::MultiSelect {
+                options: vec![
+                    ElicitationOption {
+                        value: serde_json::json!("a"),
+                        label: "Alpha".into(),
+                        description: None,
+                    },
+                    ElicitationOption {
+                        value: serde_json::json!("b"),
+                        label: "Beta".into(),
+                        description: None,
+                    },
+                ],
+            },
+        }])
+    }
+
     // ── Elicitation key handling ──────────────────────────────────────────────
 
     #[test]
@@ -492,7 +517,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "choice": "b" })),
-                outcome: format!("{OUTCOME_BULLET}Beta"),
+                outcome: ElicitationResponseOutcome::Selected(vec!["Beta".into()]),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -500,6 +525,28 @@ mod tests {
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { outcome: None, .. }]
         ));
+    }
+
+    #[test]
+    fn elicitation_multi_select_preserves_wire_and_label_order() {
+        let mut app = make_app_with_elicitation(make_multi_select_elicitation());
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Up)));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Char(' '))));
+        effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "choices": ["b", "a"] })),
+                outcome: ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into(),]),
+            }]
+        );
     }
 
     #[test]
@@ -536,7 +583,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "choice": "custom\nanswer" })),
-                outcome: format!("{OUTCOME_BULLET}custom\nanswer"),
+                outcome: ElicitationResponseOutcome::Selected(vec!["custom\nanswer".into()]),
             }]
         );
     }
@@ -549,6 +596,7 @@ mod tests {
             effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Down)));
         }
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Enter)));
+        app.render.test_seed_elicitation_custom_geometry(19, 3);
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
 
         assert!(
@@ -557,6 +605,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ui| !ui.custom_active)
         );
+        assert_eq!(app.render.test_elicitation_custom_geometry(), (19, 0, true));
         assert!(effects.next_command().is_none());
 
         effects.extend(handle_elicitation_key(&mut app, key(KeyCode::Esc)));
@@ -567,7 +616,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "decline".into(),
                 content: None,
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }]
         );
     }
@@ -599,7 +648,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "decline".into(),
                 content: None,
-                outcome: "declined".into(),
+                outcome: ElicitationResponseOutcome::Declined,
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -628,7 +677,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "name": "Alice" })),
-                outcome: "Alice".into(),
+                outcome: ElicitationResponseOutcome::Text("Alice".into()),
             }]
         );
         assert!(app.chat.elicitation.is_some());
@@ -636,6 +685,31 @@ mod tests {
             app.chat.messages.as_slice(),
             [ChatEntry::Elicitation { outcome: None, .. }]
         ));
+    }
+
+    #[test]
+    fn elicitation_enter_on_number_field_preserves_text_outcome_and_numeric_wire_value() {
+        let mut app =
+            make_app_with_elicitation(ElicitationState::new_for_test(vec![ElicitationField {
+                name: "count".into(),
+                title: "Count".into(),
+                description: None,
+                required: true,
+                kind: ElicitationFieldKind::NumberInput { integer: true },
+            }]));
+        app.chat.elicitation.as_mut().unwrap().text_input = "42".into();
+
+        let effects = handle_elicitation_key(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(
+            effects,
+            vec![Effect::ElicitationResponse {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "count": 42 })),
+                outcome: ElicitationResponseOutcome::Text("42".into()),
+            }]
+        );
     }
 
     #[test]
@@ -714,7 +788,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "confirm": true })),
-                outcome: "Yes".into(),
+                outcome: ElicitationResponseOutcome::Boolean(true),
             }]
         );
     }
@@ -743,7 +817,7 @@ mod tests {
                 elicitation_id: "test-id".into(),
                 action: "accept".into(),
                 content: Some(serde_json::json!({ "confirm": false })),
-                outcome: "No".into(),
+                outcome: ElicitationResponseOutcome::Boolean(false),
             }]
         );
     }
@@ -767,7 +841,8 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_theme_caches_clears_all_render_caches() {
+    #[serial]
+    fn theme_selection_clears_all_render_caches() {
         use crate::theme::Theme;
 
         Theme::set_by_index(0);
@@ -786,6 +861,7 @@ mod tests {
                 file: "f.rs".into(),
                 old: "aaa".into(),
                 new: "bbb".into(),
+                replace_all: false,
                 start_line: None,
             },
         });
@@ -802,44 +878,46 @@ mod tests {
             })
             .expect("edit preview should contain a styled file span");
 
-        app.render.streaming_cache.store(
-            5,
-            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
-                "stream",
-            ))],
-        );
-        app.render.streaming_thinking_cache.store(
-            3,
-            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
-                "think",
-            ))],
-        );
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Content);
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Thinking);
 
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(3).is_some());
+        assert!(
+            app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Content)
+        );
+        assert!(
+            app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Thinking)
+        );
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len(),
             "card_cache should be populated"
         );
 
-        // Match the production order: snapshot the selected theme, then clear styled caches.
-        Theme::set_by_index(2);
-        Theme::begin_frame();
+        app.navigation.popup = crate::navigation_state::Popup::ThemeSelect;
+        app.navigation.theme_cursor = 2;
+        let effects = handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::PersistConfig]);
+        assert_eq!(app.navigation.popup, crate::navigation_state::Popup::None);
         let current_preview_fg = Theme::diff_file().fg.expect("diff_file should define fg");
         assert_ne!(old_preview_fg, current_preview_fg);
-        app.render.invalidate_theme_caches();
 
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "card_cache should be invalidated"
         );
         assert!(
-            app.render.streaming_cache.get(5).is_none(),
+            !app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Content),
             "streaming_cache should be invalidated"
         );
         assert!(
-            app.render.streaming_thinking_cache.get(3).is_none(),
+            !app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Thinking),
             "streaming_thinking_cache should be invalidated"
         );
         assert!(matches!(
@@ -890,28 +968,55 @@ mod external_editor_tests {
     }
 
     #[test]
+    fn composer_visual_movement_uses_default_published_and_resized_render_widths() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "abc".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.render.composer_input_line_width(), 1);
+        assert_eq!(app.composer.input_cursor, 2);
+
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.input_preferred_col = None;
+        app.render.prepare_composer_input_layout("abc", 3, 4, 2);
+        handle_chat_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.composer.input_cursor, 1);
+
+        app.composer.input_preferred_col = None;
+        app.render.prepare_composer_input_layout("abc", 1, 20, 2);
+        handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(app.composer.input_cursor, 1);
+        assert_eq!(app.composer.input_preferred_col, Some(1));
+    }
+
+    #[test]
     fn chat_up_down_navigate_wrapped_input_without_scrolling_history() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.composer.input = "abcdef".into();
         app.composer.input_cursor = 4;
-        app.composer.input_line_width = 4;
-        app.chat.scroll_offset = 7;
+        app.render.prepare_composer_input_layout("abcdef", 4, 4, 2);
+        app.render.set_chat_scroll_offset(7);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
         ));
         assert_eq!(app.composer.input_cursor, 2);
-        assert_eq!(app.chat.scroll_offset, 7);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
         ));
         assert_eq!(app.composer.input_cursor, 4);
-        assert_eq!(app.chat.scroll_offset, 7);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
     }
 
     #[test]
@@ -919,19 +1024,77 @@ mod external_editor_tests {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
-        app.chat.scroll_offset = 3;
+        app.render.set_chat_scroll_offset(3);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
         ));
-        assert_eq!(app.chat.scroll_offset, 13);
+        assert_eq!(app.render.chat_scroll_offset(), 13);
 
         effects.extend(handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
         ));
-        assert_eq!(app.chat.scroll_offset, 3);
+        assert_eq!(app.render.chat_scroll_offset(), 3);
+    }
+
+    #[test]
+    fn delegate_keys_preserve_exact_shared_viewport_steps() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Delegate;
+        app.render.set_chat_scroll_offset(10);
+
+        for (key, expected) in [
+            (KeyCode::Up, 11),
+            (KeyCode::Down, 10),
+            (KeyCode::PageUp, 20),
+            (KeyCode::PageDown, 10),
+            (KeyCode::Home, u16::MAX),
+            (KeyCode::End, 0),
+        ] {
+            effects.extend(handle_key(
+                &mut app,
+                KeyEvent::new(key, KeyModifiers::empty()),
+            ));
+            assert_eq!(app.render.chat_scroll_offset(), expected);
+        }
+    }
+
+    #[test]
+    fn chat_end_routes_between_composer_and_viewport_contextually() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "draft".into();
+        app.composer.input_cursor = 1;
+        app.render.set_chat_scroll_offset(7);
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.composer.input_cursor, app.composer.input.len());
+        assert_eq!(app.render.chat_scroll_offset(), 7);
+
+        app.composer.input.clear();
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.render.chat_scroll_offset(), 0);
+
+        app.composer.input = "blocked".into();
+        app.composer.input_cursor = 1;
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
+        app.render.set_chat_scroll_offset(5);
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        ));
+        assert_eq!(app.composer.input_cursor, 1);
+        assert_eq!(app.render.chat_scroll_offset(), 0);
     }
 
     #[test]
@@ -2463,7 +2626,7 @@ mod session_popup_key_tests {
             Some("/a"),
             &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
         )];
-        app.sessions.session_popup_visible_rows = 4;
+        app.render.publish_session_popup_visible_rows(4);
 
         apply_popup_session_key(&mut app, KeyCode::PageDown);
         assert_eq!(app.sessions.session_cursor, 3);
@@ -2480,7 +2643,7 @@ mod session_popup_key_tests {
             Some("/a"),
             &["s1", "s2", "s3", "s4", "s5", "s6", "s7"],
         )];
-        app.sessions.session_popup_visible_rows = 4;
+        app.render.publish_session_popup_visible_rows(4);
         app.sessions.session_cursor = 6;
 
         apply_popup_session_key(&mut app, KeyCode::PageUp);
@@ -3137,7 +3300,7 @@ mod delegate_popup_key_tests {
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegates.delegate_popup_visible_rows = 4;
+        app.render.publish_delegate_popup_visible_rows(4);
 
         apply_delegate_popup_key(&mut app, KeyCode::PageDown);
         assert_eq!(app.delegates.delegate_cursor, 3);
@@ -3155,7 +3318,7 @@ mod delegate_popup_key_tests {
             make_entry("d6", "Polish UI", Some("child-6")),
             make_entry("d7", "Ship release", Some("child-7")),
         ]);
-        app.delegates.delegate_popup_visible_rows = 4;
+        app.render.publish_delegate_popup_visible_rows(4);
         app.delegates.delegate_cursor = 6;
 
         apply_delegate_popup_key(&mut app, KeyCode::PageUp);
