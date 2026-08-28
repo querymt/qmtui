@@ -1,29 +1,26 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::Block,
 };
 
 use crate::app::App;
-use crate::chat_state::{ChatState, ElicitationUiState};
-use crate::composer_state::ComposerState;
-use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus, SessionOp};
+use crate::domain::activity::{ActivityState, DelegateEntry, DelegateStatus};
 use crate::domain::chat::ChatEntry;
-use crate::domain::elicitation::ElicitationState;
-use crate::features::chat::view::{FinalizedRenderInput, build_finalized_cards};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-use crate::input_layout::InputVisualLayout;
+use crate::features::chat::view::{
+    FinalizedRenderInput, build_finalized_cards, completion_panel_height, draw_completion_panel,
+    draw_elicitation_popup, draw_input_panel, elicitation_popup_height, input_layout_metrics,
+};
 use crate::markdown;
 use crate::render_state::{
     Card, CardKind, RenderState, SessionIdentity, StreamKind, StreamingCacheKeyRef, ThemeCacheKey,
 };
 use crate::theme::Theme;
 
+use super::draw_header;
 use super::start::short_cwd;
-use super::{INPUT_OVERLINE, draw_header};
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 
@@ -52,13 +49,9 @@ pub(crate) fn spinner(kind: SpinnerKind, tick: u64) -> &'static str {
     frames[(tick as usize / 2) % frames.len()]
 }
 
-// ── Elicitation symbols ───────────────────────────────────────────────────────
-const OUTCOME_BULLET: &str = "\u{25B8} ";
-const RADIO_SELECTED: &str = "\u{25CF} "; // ● filled circle  – single-select active
-const RADIO_UNSELECTED: &str = "\u{25CB} "; // ○ empty circle   – single-select inactive
+// ── Popup symbols ─────────────────────────────────────────────────────────────
 pub(crate) const CHECK_CHECKED: &str = "\u{2611} "; // ☑ ballot box checked   – success/done
 pub(crate) const CHECK_FAILED: &str = "\u{2612}"; // ☒ ballot box with X     – failed
-const CHECK_UNCHECKED: &str = "\u{2610} "; // ☐ ballot box unchecked – multi-select off
 
 // ── Status bar icons ──────────────────────────────────────────────────────────
 const ICON_CONTEXT: &str = "\u{1F5AA}"; // 🖪 document      – context token usage
@@ -66,9 +59,6 @@ const ICON_TOOLS: &str = "\u{2692}"; // ⚒  tools          – tool call count
 pub(crate) const ICON_DELEGATES: &str = "\u{2387}"; // ⎇  alt/fork       – delegation count
 pub(crate) const ICON_MULTI_SESSION: &str = "𐬽"; // multi-session recent activity indicator
 pub(crate) const ICON_MESH: &str = "\u{1F5A7}"; // mesh nodes (U+1F5A7)
-
-// ── General text symbols ──────────────────────────────────────────────────────
-const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 
 struct MessagesRenderInput<'a> {
     session_identity: SessionIdentity,
@@ -366,9 +356,9 @@ pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
         }
         draw_input_panel(
             f,
-            &app.composer,
             &app.chat,
             &app.sessions.agent_mode,
+            spinner(SpinnerKind::Braille, app.render.tick),
             &mut app.render,
             (chunks[3], chunks[4]),
             input_layout,
@@ -381,15 +371,7 @@ pub(super) fn draw_delegate_view(f: &mut Frame, app: &mut App) {
 pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // Both slash-completion and @-mention share one panel slot (mutually exclusive).
-    let completion_panel_height = if app.composer.slash_state.is_some()
-        || app.composer.mention_state.is_some()
-        || app.composer.file_index_loading
-        || app.composer.file_index_error.is_some()
-    {
-        6u16
-    } else {
-        0u16
-    };
+    let completion_panel_height = completion_panel_height(&app.composer);
 
     let (input_height, input_layout) = input_layout_metrics(&app.composer, &mut app.render, area);
     let elicitation_height = elicitation_popup_height(
@@ -433,11 +415,12 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
     draw_messages(f, chunks[1], input, &mut app.render);
 
     if completion_panel_height > 0 {
-        if app.composer.slash_state.is_some() {
-            draw_slash_panel(f, app, chunks[2]);
-        } else {
-            draw_mention_panel(f, app, chunks[2]);
-        }
+        draw_completion_panel(
+            f,
+            &app.composer,
+            spinner(SpinnerKind::Braille, app.render.tick),
+            chunks[2],
+        );
     }
 
     if elicitation_height > 0
@@ -448,639 +431,13 @@ pub(super) fn draw_chat(f: &mut Frame, app: &mut App) {
 
     draw_input_panel(
         f,
-        &app.composer,
         &app.chat,
         &app.sessions.agent_mode,
+        spinner(SpinnerKind::Braille, app.render.tick),
         &mut app.render,
         (chunks[4], chunks[5]),
         input_layout,
     );
-}
-
-fn input_layout_metrics(
-    composer: &ComposerState,
-    render: &mut RenderState,
-    area: Rect,
-) -> (u16, InputVisualLayout) {
-    // Compute how many visual rows the input text needs when wrapped.
-    let input_inner_width = area.width.saturating_sub(4) as usize;
-    let prefix_width = 2usize; // "> "
-    let input_layout = render.prepare_composer_input_layout(
-        &composer.input,
-        composer.input_cursor,
-        input_inner_width,
-        prefix_width,
-    );
-    let max_input_lines: u16 = 5;
-    let input_height = (input_layout.total_rows() as u16).clamp(1, max_input_lines) + 1; // +1 bottom padding
-
-    (input_height, input_layout)
-}
-
-fn wrap_elicitation_message(text: &str, width: u16) -> Vec<String> {
-    let width = width.max(1) as usize;
-    let mut rows = Vec::new();
-
-    for logical_line in text.lines() {
-        let mut row = String::new();
-        let mut row_width = 0;
-        for word in logical_line.split_whitespace() {
-            let word_width = UnicodeWidthStr::width(word);
-            if !row.is_empty() && row_width + 1 + word_width > width {
-                rows.push(std::mem::take(&mut row));
-                row_width = 0;
-            }
-
-            if word_width > width {
-                if !row.is_empty() {
-                    rows.push(std::mem::take(&mut row));
-                    row_width = 0;
-                }
-                for ch in word.chars() {
-                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if row_width > 0 && row_width + ch_width > width {
-                        rows.push(std::mem::take(&mut row));
-                        row_width = 0;
-                    }
-                    row.push(ch);
-                    row_width += ch_width;
-                }
-            } else {
-                if !row.is_empty() {
-                    row.push(' ');
-                    row_width += 1;
-                }
-                row.push_str(word);
-                row_width += word_width;
-            }
-        }
-        rows.push(row);
-    }
-
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
-fn wrapped_text_rows(text: &str, width: u16) -> u16 {
-    wrap_elicitation_message(text, width)
-        .len()
-        .min(u16::MAX as usize) as u16
-}
-
-fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
-    description
-        .map(|description| format!("{label}  {description}"))
-        .unwrap_or_else(|| label.to_string())
-}
-
-fn elicitation_option_rows(state: &ElicitationState, ui: &ElicitationUiState, width: u16) -> u16 {
-    use crate::domain::elicitation::ElicitationFieldKind;
-    let schema_rows = match ui
-        .current_field_index(state.fields.len())
-        .and_then(|index| state.fields.get(index))
-        .map(|field| &field.kind)
-    {
-        Some(ElicitationFieldKind::SingleSelect { options })
-        | Some(ElicitationFieldKind::MultiSelect { options }) => options
-            .iter()
-            .map(|option| {
-                wrapped_text_rows(
-                    &elicitation_option_text(&option.label, option.description.as_deref()),
-                    width,
-                )
-            })
-            .sum(),
-        _ => 1,
-    };
-    let option_count = match ui
-        .current_field_index(state.fields.len())
-        .and_then(|index| state.fields.get(index))
-        .map(|field| &field.kind)
-    {
-        Some(ElicitationFieldKind::SingleSelect { options })
-        | Some(ElicitationFieldKind::MultiSelect { options }) => options.len(),
-        _ => 0,
-    };
-    schema_rows + u16::from(state.allow_custom && option_count > 0)
-}
-
-fn elicitation_popup_height(
-    state: Option<&ElicitationState>,
-    ui: Option<&ElicitationUiState>,
-    render: &mut RenderState,
-    area: Rect,
-) -> u16 {
-    if let (Some(state), Some(ui)) = (state, ui) {
-        let message_width = area.width.saturating_sub(4).max(1);
-        let message_rows = wrapped_text_rows(&state.message, message_width);
-        let option_width = area.width.saturating_sub(6).max(1);
-        let option_rows = elicitation_option_rows(state, ui, option_width);
-        let custom_rows = if ui.custom_active {
-            let width = area.width.saturating_sub(4) as usize;
-            render
-                .prepare_elicitation_custom_layout(&state.custom_input, ui.custom_cursor, width, 2)
-                .total_rows() as u16
-        } else {
-            0
-        };
-        // Top padding, title, wrapped message, choices/input, and hint, each separated as needed.
-        let content_rows = option_rows.max(1) + custom_rows.min(5);
-        let custom_spacing = u16::from(ui.custom_active);
-        (7 + message_rows.max(1) + content_rows + custom_spacing).min(area.height.saturating_sub(3))
-    } else {
-        0
-    }
-}
-
-fn draw_input_panel(
-    f: &mut Frame,
-    _composer: &ComposerState,
-    chat: &ChatState,
-    agent_mode: &str,
-    render: &mut RenderState,
-    areas: (Rect, Rect),
-    input_layout: InputVisualLayout,
-) {
-    let (border_area, input_area) = areas;
-    // input border line reflects active session state
-    let border_style = match &chat.activity {
-        ActivityState::SessionOp(SessionOp::Undo) => Theme::input_border_undo(),
-        ActivityState::SessionOp(SessionOp::Redo) => Theme::input_border_redo(),
-        _ if chat.cancel_confirm_active() => Theme::input_border_cancel_confirm(),
-        ActivityState::Compacting { .. } => Theme::input_border_compacting(),
-        ActivityState::Thinking | ActivityState::Streaming | ActivityState::RunningTool { .. } => {
-            Theme::input_border_thinking()
-        }
-        _ if chat.elicitation.is_some() => Theme::input_border_thinking(), // accent while waiting
-        _ => Theme::mode_border(agent_mode),
-    };
-    let border_line =
-        Paragraph::new(INPUT_OVERLINE.repeat(border_area.width as usize)).style(border_style);
-    f.render_widget(border_line, border_area);
-
-    // input area
-    let input_bg = Block::default()
-        .padding(Padding::new(2, 2, 0, 1))
-        .style(Theme::input());
-    let inner = input_bg.inner(input_area);
-    f.render_widget(input_bg, input_area);
-
-    let (label_text, label_style) = match &chat.activity {
-        ActivityState::SessionOp(SessionOp::Undo) => (
-            format!("{} undoing ", spinner(SpinnerKind::Braille, render.tick)),
-            Theme::input_undo(),
-        ),
-        ActivityState::SessionOp(SessionOp::Redo) => (
-            format!("{} redoing ", spinner(SpinnerKind::Braille, render.tick)),
-            Theme::input_redo(),
-        ),
-        _ if chat.cancel_confirm_active() => (
-            format!(
-                "{} Esc again to stop ",
-                spinner(SpinnerKind::Braille, render.tick)
-            ),
-            Theme::input_cancel_confirm(),
-        ),
-        ActivityState::Compacting { .. }
-        | ActivityState::RunningTool { .. }
-        | ActivityState::Thinking
-        | ActivityState::Streaming => (
-            format!("{} ", spinner(SpinnerKind::Braille, render.tick)),
-            Theme::input_thinking(),
-        ),
-        _ if chat.elicitation.is_some() => (
-            format!("  answer above {ARROW_UP} "),
-            Theme::input_thinking(),
-        ),
-        _ => ("> ".into(), Theme::mode_border(agent_mode)),
-    };
-    let input_style = Theme::input();
-    let hide_input_contents = chat.should_hide_input_contents();
-
-    if hide_input_contents {
-        render.ensure_composer_input_cursor_visible(inner.height, true);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(label_text, label_style))),
-            inner,
-        );
-    } else {
-        let layout = input_layout;
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for (idx, row) in layout.rows.iter().enumerate() {
-            if idx == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(label_text.clone(), label_style),
-                    Span::styled(row.text.clone(), input_style),
-                ]));
-            } else {
-                lines.push(Line::from(Span::styled(row.text.clone(), input_style)));
-            }
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled("", input_style)));
-        }
-
-        let visible = inner.height;
-        let scroll = render.ensure_composer_input_cursor_visible(visible, false);
-
-        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-
-        let visual_row = (layout.cursor_row as u16).saturating_sub(scroll);
-        if visual_row < visible {
-            f.set_cursor_position((inner.x + layout.cursor_col as u16, inner.y + visual_row));
-        }
-    }
-}
-
-// ── Elicitation popup ─────────────────────────────────────────────────────────
-
-fn draw_elicitation_popup(
-    f: &mut Frame,
-    state: &ElicitationState,
-    ui: &ElicitationUiState,
-    render: &mut RenderState,
-    area: Rect,
-) {
-    use crate::domain::elicitation::ElicitationFieldKind;
-
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    f.render_widget(Block::default().style(Theme::popup_bg()), area);
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
-    };
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let mut row = inner.y;
-    let max_y = inner.y + inner.height;
-    // Leave one row of padding before the header.
-    row = row.saturating_add(1).min(max_y);
-    if row < max_y {
-        let title_style = Theme::status_accent().add_modifier(Modifier::BOLD);
-        let title = Line::from(vec![
-            Span::styled(OUTCOME_BULLET, title_style),
-            Span::styled("Question", title_style),
-        ]);
-        f.render_widget(
-            Paragraph::new(title).style(Theme::popup_bg()),
-            Rect::new(inner.x, row, inner.width, 1),
-        );
-        row += 1;
-    }
-    // Keep the title visually separate from the question body.
-    row = row.saturating_add(1).min(max_y);
-    if row < max_y {
-        let message_area = Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), max_y - row);
-        let message_lines: Vec<Line<'static>> =
-            wrap_elicitation_message(&state.message, message_area.width)
-                .into_iter()
-                .map(|line| Line::from(Span::styled(line, Theme::fg())))
-                .collect();
-        let message_rows = message_lines.len().max(1) as u16;
-        let message = Paragraph::new(message_lines).style(Theme::popup_bg());
-        let visible_rows = message_rows.min(message_area.height);
-        f.render_widget(
-            message,
-            Rect::new(
-                message_area.x,
-                message_area.y,
-                message_area.width,
-                visible_rows,
-            ),
-        );
-        row += visible_rows;
-    }
-    // Keep the choices visually separate from the question text.
-    row = row.saturating_add(1).min(max_y);
-
-    let Some(field) = ui
-        .current_field_index(state.fields.len())
-        .and_then(|index| state.fields.get(index))
-        .cloned()
-    else {
-        return;
-    };
-    match &field.kind {
-        ElicitationFieldKind::SingleSelect { options }
-        | ElicitationFieldKind::MultiSelect { options } => {
-            let is_multi = matches!(&field.kind, ElicitationFieldKind::MultiSelect { .. });
-            let selected_vals = state.selected.get(&field.name);
-            for (idx, opt) in options.iter().enumerate() {
-                if row >= max_y {
-                    break;
-                }
-                let highlighted = !ui.custom_active && idx == ui.option_cursor;
-                let is_chosen = if is_multi {
-                    matches!(selected_vals, Some(serde_json::Value::Array(arr)) if arr.contains(&opt.value))
-                } else {
-                    selected_vals == Some(&opt.value)
-                };
-                let bullet = if is_multi {
-                    if is_chosen {
-                        CHECK_CHECKED
-                    } else {
-                        CHECK_UNCHECKED
-                    }
-                } else if highlighted {
-                    RADIO_SELECTED
-                } else {
-                    RADIO_UNSELECTED
-                };
-                let style = if highlighted {
-                    Theme::status_accent()
-                } else {
-                    Theme::status()
-                };
-                let text_width = inner.width.saturating_sub(4).max(1);
-                let option_rows = wrapped_text_rows(
-                    &elicitation_option_text(&opt.label, opt.description.as_deref()),
-                    text_width,
-                )
-                .min(max_y - row);
-                f.render_widget(
-                    Paragraph::new(Span::styled(format!("  {bullet}"), style))
-                        .style(Theme::popup_bg()),
-                    Rect::new(inner.x, row, 4.min(inner.width), option_rows),
-                );
-                let option_line = Line::from(vec![
-                    Span::styled(opt.label.clone(), style),
-                    opt.description
-                        .as_ref()
-                        .map(|desc| Span::styled(format!("  {desc}"), Theme::dim()))
-                        .unwrap_or_else(|| Span::raw("")),
-                ]);
-                f.render_widget(
-                    Paragraph::new(option_line)
-                        .style(Theme::popup_bg())
-                        .wrap(Wrap { trim: true }),
-                    Rect::new(inner.x + 4, row, text_width, option_rows),
-                );
-                row += option_rows;
-            }
-
-            if state.allow_custom && !options.is_empty() && row < max_y {
-                let highlighted = ui.option_cursor == options.len();
-                let style = if highlighted || ui.custom_active {
-                    Theme::status_accent()
-                } else {
-                    Theme::status()
-                };
-                let bullet = if is_multi {
-                    if ui.custom_active {
-                        CHECK_CHECKED
-                    } else {
-                        CHECK_UNCHECKED
-                    }
-                } else if highlighted {
-                    RADIO_SELECTED
-                } else {
-                    RADIO_UNSELECTED
-                };
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(format!("  {bullet}"), style),
-                        Span::styled("Custom answer…", style),
-                    ]))
-                    .style(Theme::popup_bg()),
-                    Rect::new(inner.x, row, inner.width, 1),
-                );
-                row += 1;
-            }
-
-            if ui.custom_active && row < max_y {
-                // Keep the custom editor visually separate from the choices.
-                row = row.saturating_add(1).min(max_y);
-                let layout = render.prepare_elicitation_custom_layout(
-                    &state.custom_input,
-                    ui.custom_cursor,
-                    inner.width.saturating_sub(2) as usize,
-                    2,
-                );
-                let total_rows = layout.total_rows() as u16;
-                // Reserve a spacer, the help row, and bottom padding below the editor.
-                let visible = total_rows.min(max_y.saturating_sub(row + 3)).min(5);
-                let scroll = render.ensure_elicitation_custom_cursor_visible(visible);
-
-                let lines: Vec<Line<'static>> = layout
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, visual_row)| {
-                        if idx == 0 {
-                            Line::from(vec![
-                                Span::styled("> ", Theme::status_accent()),
-                                Span::styled(visual_row.text.clone(), Theme::fg()),
-                            ])
-                        } else {
-                            Line::from(Span::styled(visual_row.text.clone(), Theme::fg()))
-                        }
-                    })
-                    .collect();
-                f.render_widget(
-                    Paragraph::new(lines)
-                        .style(Theme::popup_bg())
-                        .scroll((scroll, 0)),
-                    Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), visible),
-                );
-                let cursor_row = (layout.cursor_row as u16).saturating_sub(scroll);
-                if cursor_row < visible {
-                    f.set_cursor_position((
-                        inner.x + 2 + layout.cursor_col as u16,
-                        row + cursor_row,
-                    ));
-                }
-                row += visible;
-            }
-        }
-        ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-            let placeholder = if matches!(&field.kind, ElicitationFieldKind::NumberInput { .. }) {
-                "enter number..."
-            } else {
-                "enter text..."
-            };
-            let display = if state.text_input.is_empty() {
-                Span::styled(placeholder, Theme::dim())
-            } else {
-                Span::styled(state.text_input.clone(), Theme::fg())
-            };
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("  > ", Theme::status_accent()),
-                    display,
-                ]))
-                .style(Theme::popup_bg()),
-                Rect::new(inner.x, row, inner.width, 1),
-            );
-            row += 1;
-        }
-        ElicitationFieldKind::BooleanToggle => {
-            let value = state
-                .selected
-                .get(&field.name)
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        if value {
-                            format!("  {CHECK_CHECKED}Yes")
-                        } else {
-                            format!("  {CHECK_UNCHECKED}No")
-                        },
-                        Theme::status_accent(),
-                    ),
-                    Span::styled("  (Space to toggle)", Theme::dim()),
-                ]))
-                .style(Theme::popup_bg()),
-                Rect::new(inner.x, row, inner.width, 1),
-            );
-            row += 1;
-        }
-    }
-
-    // Keep controls visually separate from the answer area.
-    row = row.saturating_add(1).min(max_y);
-    if row < max_y {
-        let hint = if ui.custom_active {
-            " type answer  Shift+Enter newline  Enter submit  Esc back".to_string()
-        } else {
-            match field.kind {
-                ElicitationFieldKind::MultiSelect { .. } => format!(
-                    " {0}{1} navigate  Space toggle  Enter submit  Esc decline",
-                    super::ARROW_UP,
-                    super::ARROW_DOWN
-                ),
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                    " type answer  Enter submit  Esc decline".to_string()
-                }
-                ElicitationFieldKind::BooleanToggle => {
-                    " Space toggle  Enter submit  Esc decline".to_string()
-                }
-                ElicitationFieldKind::SingleSelect { .. } => format!(
-                    " {0}{1} navigate  Enter select  Esc decline",
-                    super::ARROW_UP,
-                    super::ARROW_DOWN
-                ),
-            }
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(hint, Theme::dim())).style(Theme::popup_bg()),
-            Rect::new(inner.x, row, inner.width, 1),
-        );
-    }
-}
-
-// ── Slash command completion panel ────────────────────────────────────────────
-
-fn draw_slash_panel(f: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let Some(state) = &app.composer.slash_state else {
-        return;
-    };
-
-    let max_name_len = state
-        .results
-        .iter()
-        .map(|cmd| cmd.name.len())
-        .max()
-        .unwrap_or(0);
-
-    let items: Vec<ListItem> = state
-        .results
-        .iter()
-        .map(|cmd| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("  /{:<width$}  ", cmd.name, width = max_name_len),
-                    Theme::status_accent(),
-                ),
-                Span::styled(cmd.description, Theme::dim()),
-            ]))
-        })
-        .collect();
-
-    let title = Line::from(vec![
-        Span::styled(" /", Theme::status_accent()),
-        Span::styled(" commands ", Theme::dim()),
-    ]);
-    let list = List::new(items)
-        .block(Block::default().title(title).style(Theme::popup_bg()))
-        .highlight_style(Theme::selected())
-        .highlight_symbol("");
-    let mut list_state = ListState::default().with_selected(Some(state.selected_index));
-    f.render_stateful_widget(list, area, &mut list_state);
-}
-
-// ── Mention panel ─────────────────────────────────────────────────────────────
-
-fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let mut items: Vec<ListItem> = Vec::new();
-    if app.composer.file_index_loading && app.composer.file_index.is_empty() {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!(
-                "{} indexing files",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            ),
-            Theme::thinking(),
-        )])));
-    } else if let Some(error) = &app.composer.file_index_error {
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("file index error: {error}"),
-            Theme::error_text(),
-        )])));
-    } else if let Some(mention) = &app.composer.mention_state {
-        if mention.results.is_empty() {
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                format!("no matches for @{}", mention.query),
-                Theme::info_text(),
-            )])));
-        } else {
-            for entry in &mention.results {
-                let icon = if entry.is_dir { "[D]" } else { "[F]" };
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled(format!("{icon} "), Theme::status()),
-                    Span::styled(entry.path.clone(), Theme::input()),
-                ])));
-            }
-        }
-    }
-
-    if items.is_empty() {
-        return;
-    }
-
-    let title = if let Some(mention) = &app.composer.mention_state {
-        format!(" @ files - {} ", mention.query)
-    } else {
-        " @ files ".into()
-    };
-    let list = List::new(items)
-        .block(Block::default().title(title).style(Theme::popup_bg()))
-        .highlight_style(Theme::selected())
-        .highlight_symbol("");
-    let selected = app
-        .composer
-        .mention_state
-        .as_ref()
-        .map(|mention| mention.selected_index)
-        .filter(|_| !app.composer.file_index_loading);
-    let mut state = ListState::default().with_selected(selected);
-    f.render_stateful_widget(list, area, &mut state);
 }
 
 // ── Streaming card (transient, not cached) ────────────────────────────────────
