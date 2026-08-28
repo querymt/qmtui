@@ -4,8 +4,8 @@ use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::chat::ElicitationResponseOutcome;
 use crate::domain::model::ModelEntry;
+use crate::features::chat::input::{ElicitationResponseEffect, handle_elicitation_key};
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -36,213 +36,6 @@ fn send_load_session_commands(
         .into_iter()
         .map(Effect::Command)
         .collect()
-}
-
-fn elicitation_response_effect(
-    elicitation_id: String,
-    action: &str,
-    content: Option<serde_json::Value>,
-    outcome: ElicitationResponseOutcome,
-) -> Effect {
-    Effect::ElicitationResponse {
-        elicitation_id,
-        action: action.into(),
-        content,
-        outcome,
-    }
-}
-
-/// Handle all keyboard input while an elicitation popup is active.
-///
-/// Returns the ordered effects for the key; the caller should return immediately
-/// afterward to avoid routing the key to the normal chat handler.
-pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    use crate::domain::elicitation::ElicitationFieldKind;
-
-    let mut effects = Vec::new();
-    let custom_line_width = app.render.elicitation_custom_line_width();
-    let (Some(state), Some(ui)) = (
-        app.chat.elicitation.as_mut(),
-        app.chat.elicitation_ui.as_mut(),
-    ) else {
-        return effects;
-    };
-    let Some(field_index) = ui.current_field_index(state.fields.len()) else {
-        return effects;
-    };
-
-    let selected_outcome = |state: &crate::domain::elicitation::ElicitationState,
-                            custom_active: bool| {
-        let field = &state.fields[field_index];
-        if custom_active {
-            return ElicitationResponseOutcome::Selected(vec![
-                state.custom_input.trim().to_string(),
-            ]);
-        }
-        match &field.kind {
-            ElicitationFieldKind::SingleSelect { options } => ElicitationResponseOutcome::Selected(
-                options
-                    .iter()
-                    .find(|option| state.selected.get(&field.name) == Some(&option.value))
-                    .map(|option| vec![option.label.clone()])
-                    .unwrap_or_default(),
-            ),
-            ElicitationFieldKind::MultiSelect { options } => {
-                let labels = state
-                    .selected
-                    .get(&field.name)
-                    .and_then(serde_json::Value::as_array)
-                    .map(|values| {
-                        options
-                            .iter()
-                            .filter(|option| values.contains(&option.value))
-                            .map(|option| option.label.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ElicitationResponseOutcome::Selected(labels)
-            }
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                ElicitationResponseOutcome::Text(state.text_input.clone())
-            }
-            ElicitationFieldKind::BooleanToggle => state
-                .selected
-                .get(&field.name)
-                .and_then(serde_json::Value::as_bool)
-                .map(ElicitationResponseOutcome::Boolean)
-                .unwrap_or_else(|| ElicitationResponseOutcome::Text(String::new())),
-        }
-    };
-
-    if ui.custom_active {
-        match key.code {
-            KeyCode::Esc => {
-                ui.custom_active = false;
-                app.render.reset_elicitation_custom_scroll();
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                ui.custom_insert(&mut state.custom_input, '\n');
-            }
-            KeyCode::Enter if state.is_valid(Some(&state.custom_input)) => {
-                let elicitation_id = state.elicitation_id.clone();
-                let content = state.build_accept_content(Some(&state.custom_input));
-                let outcome = selected_outcome(state, true);
-                effects.push(elicitation_response_effect(
-                    elicitation_id,
-                    "accept",
-                    Some(content),
-                    outcome,
-                ));
-            }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.custom_insert(&mut state.custom_input, character);
-            }
-            KeyCode::Backspace => ui.custom_backspace(&mut state.custom_input),
-            KeyCode::Delete => ui.custom_delete(&mut state.custom_input),
-            KeyCode::Left => ui.custom_left(&state.custom_input),
-            KeyCode::Right => ui.custom_right(&state.custom_input),
-            KeyCode::Home => ui.custom_home(&state.custom_input),
-            KeyCode::End => ui.custom_end(&state.custom_input),
-            KeyCode::Up => ui.custom_move_visual(&state.custom_input, custom_line_width, -1),
-            KeyCode::Down => ui.custom_move_visual(&state.custom_input, custom_line_width, 1),
-            _ => {}
-        }
-        return effects;
-    }
-
-    let field = &state.fields[field_index];
-    let option_count = match &field.kind {
-        ElicitationFieldKind::SingleSelect { options }
-        | ElicitationFieldKind::MultiSelect { options } => options.len(),
-        _ => 0,
-    };
-    let custom_available = state.allow_custom && option_count > 0;
-    let custom_option_selected = custom_available && ui.option_cursor == option_count;
-
-    match key.code {
-        KeyCode::Esc => {
-            let elicitation_id = state.elicitation_id.clone();
-            effects.push(elicitation_response_effect(
-                elicitation_id,
-                "decline",
-                None,
-                ElicitationResponseOutcome::Declined,
-            ));
-        }
-        KeyCode::Down => {
-            let max = option_count + usize::from(custom_available);
-            ui.option_cursor = (ui.option_cursor + 1).min(max.saturating_sub(1));
-        }
-        KeyCode::Up => ui.option_cursor = ui.option_cursor.saturating_sub(1),
-        KeyCode::Char(' ') => {
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::MultiSelect { .. } | ElicitationFieldKind::BooleanToggle
-            ) {
-                state.toggle_option(field_index, ui.option_cursor);
-            }
-        }
-        KeyCode::Enter => {
-            match field.kind {
-                ElicitationFieldKind::SingleSelect { .. } if custom_option_selected => {
-                    ui.custom_active = true;
-                    ui.custom_cursor = state.custom_input.len();
-                    state.clear_selection(field_index);
-                    return effects;
-                }
-                ElicitationFieldKind::SingleSelect { .. } => {
-                    state.select_option(field_index, ui.option_cursor);
-                }
-                ElicitationFieldKind::MultiSelect { .. } if custom_option_selected => {
-                    ui.custom_active = true;
-                    ui.custom_cursor = state.custom_input.len();
-                    state.clear_selection(field_index);
-                    return effects;
-                }
-                ElicitationFieldKind::MultiSelect { .. }
-                | ElicitationFieldKind::TextInput
-                | ElicitationFieldKind::NumberInput { .. }
-                | ElicitationFieldKind::BooleanToggle => {}
-            }
-
-            if state.is_valid(None) {
-                let elicitation_id = state.elicitation_id.clone();
-                let content = state.build_accept_content(None);
-                let outcome = selected_outcome(state, false);
-                effects.push(elicitation_response_effect(
-                    elicitation_id,
-                    "accept",
-                    Some(content),
-                    outcome,
-                ));
-            }
-        }
-        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
-            ) {
-                state.text_input.insert(ui.text_cursor, character);
-                ui.text_cursor += character.len_utf8();
-            }
-        }
-        KeyCode::Backspace
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
-            ) && ui.text_cursor > 0 =>
-        {
-            let previous = state.text_input[..ui.text_cursor]
-                .char_indices()
-                .last()
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            state.text_input.drain(previous..ui.text_cursor);
-            ui.text_cursor = previous;
-        }
-        _ => {}
-    }
-    effects
 }
 
 fn open_model_popup(app: &mut App) -> Vec<Effect> {
@@ -514,7 +307,22 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     }
 
     if app.chat.elicitation.is_some() {
-        return handle_elicitation_key(app, key);
+        return handle_elicitation_key(&mut app.chat, &mut app.render, key)
+            .into_iter()
+            .map(
+                |ElicitationResponseEffect {
+                     elicitation_id,
+                     action,
+                     content,
+                     outcome,
+                 }| Effect::ElicitationResponse {
+                    elicitation_id,
+                    action,
+                    content,
+                    outcome,
+                },
+            )
+            .collect();
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {

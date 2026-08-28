@@ -211,8 +211,21 @@ mod tests {
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
     use crate::domain::tool::ToolDetail;
+    use crate::features::chat::input::handle_elicitation_key as handle_feature_elicitation_key;
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+        handle_feature_elicitation_key(&mut app.chat, &mut app.render, key)
+            .into_iter()
+            .map(|response| Effect::ElicitationResponse {
+                elicitation_id: response.elicitation_id,
+                action: response.action,
+                content: response.content,
+                outcome: response.outcome,
+            })
+            .collect()
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
