@@ -2,7 +2,6 @@ mod chat;
 mod popups;
 mod start;
 
-pub(crate) use chat::CardCache;
 use chat::{draw_chat, draw_delegate_view};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
@@ -14,10 +13,14 @@ use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
-pub(crate) use crate::markdown::CardBlock;
+pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
+#[cfg(test)]
+pub(crate) use crate::render_state::{Card, CardKind};
 #[cfg(test)]
 pub(crate) use chat::{
-    Card, CardKind, ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards, spinner,
+    ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards,
+    build_message_cards_for_width, build_message_cards_for_width_at, build_streaming_card_for_test,
+    spinner,
 };
 #[cfg(test)]
 pub(crate) use popups::{
@@ -45,8 +48,6 @@ pub(crate) const ELLIPSIS: &str = "\u{2026}"; // … horizontal ellipsis – tru
 pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 pub(super) const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
-pub(crate) const MD_HRULE_CHAR: &str = "\u{2500}"; // ─ box drawings light horizontal – HR
-pub(crate) const MD_BULLET: &str = "\u{2022} "; // • bullet – unordered list item prefix
 
 // ── Connection indicators ─────────────────────────────────────────────────────
 const CONN_ONLINE: &str = "\u{25CF}"; // ● filled circle – connected / disconnected
@@ -234,7 +235,8 @@ mod tests {
     use crate::chat_state::ElicitationUiState;
     use crate::diagnostics::LogLevel;
     use crate::domain::activity::{
-        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus, SessionActivity,
+        ActivityState, DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+        SessionActivity,
     };
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
@@ -311,7 +313,7 @@ mod tests {
     }
 
     fn rendered_card_snapshot(app: &mut App, width: u16) -> Vec<(CardKind, Vec<String>, u16)> {
-        build_message_cards(app)
+        build_message_cards_for_width(app, width)
             .iter()
             .map(|card| {
                 let lines = card
@@ -2505,7 +2507,7 @@ mod tests {
         let mut app = App::new();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
     }
 
     fn elicitation_card_snapshot(
@@ -2618,7 +2620,7 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
     }
 
     #[test]
@@ -2681,12 +2683,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
 
         // Second call with no new messages — cache hit
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
     }
 
     #[test]
@@ -2711,7 +2713,7 @@ mod tests {
         let lines = rendered_card_lines(&mut app);
         assert!(!lines.iter().any(|line| line.contains("awaiting input")));
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -2721,7 +2723,6 @@ mod tests {
             requested_schema: serde_json::json!({ "properties": {} }),
             source: "builtin:question".into(),
         };
-        app.render.invalidate_card_cache();
         let lines = rendered_card_lines(&mut app);
 
         assert_eq!(
@@ -2859,13 +2860,13 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 1);
+        assert_eq!(app.render.test_card_source_entry_count(), 1);
 
         app.chat.messages.clear();
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
     }
 
     #[test]
@@ -2881,7 +2882,7 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert_eq!(app.render.test_card_source_entry_count(), 2);
 
         // Simulate retain() shrinking messages (like compaction does)
         app.chat
@@ -2890,6 +2891,509 @@ mod tests {
         let cards = build_message_cards(&mut app);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
+    }
+
+    #[test]
+    fn same_length_content_replacement_rebuilds_only_the_changed_suffix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable prefix".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "aaaa".into(),
+                thinking: None,
+                message_id: Some("assistant-1".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let changed_identity = app.render.test_card_identity(1);
+
+        let ChatEntry::Assistant { content, .. } = &mut app.chat.messages[1] else {
+            unreachable!("assistant fixture")
+        };
+        *content = "bbbb".into();
+
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), changed_identity);
+        app.render.invalidate_card_cache();
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn same_count_tool_detail_mutation_rebuilds_affected_batch_and_preserves_prefix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable prefix".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                detail: ToolDetail::Generic {
+                    input: Some("aaaa".into()),
+                    result: None,
+                },
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let tool_identity = app.render.test_card_identity(1);
+
+        let ChatEntry::ToolCall { detail, .. } = &mut app.chat.messages[1] else {
+            unreachable!("tool fixture")
+        };
+        *detail = ToolDetail::Generic {
+            input: Some("bbbb".into()),
+            result: None,
+        };
+
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), tool_identity);
+        app.render.invalidate_card_cache();
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn width_change_matches_cold_table_relayout() {
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::Assistant {
+            content:
+                "| Column one | Column two |\n| --- | --- |\n| a long value | another long value |"
+                    .into(),
+            thinking: None,
+            message_id: Some("table-1".into()),
+        });
+
+        let wide = rendered_card_snapshot(&mut app, 100);
+        let warm_narrow = rendered_card_snapshot(&mut app, 30);
+        assert_ne!(wide, warm_narrow);
+        app.render.invalidate_card_cache();
+        let cold_narrow = rendered_card_snapshot(&mut app, 30);
+        assert_eq!(warm_narrow, cold_narrow);
+    }
+
+    #[test]
+    fn shrink_truncates_stale_suffix_without_rebuilding_prefix() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "keep".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "remove".into(),
+                thinking: None,
+                message_id: Some("assistant-1".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+
+        app.chat.messages.truncate(1);
+        let cards = build_message_cards_for_width(&mut app, 80);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+    }
+
+    #[test]
+    fn out_of_order_reordering_preserves_unchanged_prefix_and_matches_cold() {
+        let mut app = App::new();
+        app.chat.messages = vec![
+            ChatEntry::User {
+                text: "stable".into(),
+                message_id: Some("user-1".into()),
+            },
+            ChatEntry::Assistant {
+                content: "second".into(),
+                thinking: None,
+                message_id: Some("assistant-2".into()),
+            },
+            ChatEntry::Assistant {
+                content: "third".into(),
+                thinking: None,
+                message_id: Some("assistant-3".into()),
+            },
+        ];
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let prefix_identity = app.render.test_card_identity(0);
+        let old_second_identity = app.render.test_card_identity(1);
+
+        app.chat.messages.swap(1, 2);
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(app.render.test_card_identity(0), prefix_identity);
+        assert_ne!(app.render.test_card_identity(1), old_second_identity);
+        app.render.invalidate_card_cache();
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn session_identity_change_rebuilds_equal_content_and_matches_cold() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("session-a".into());
+        app.chat.messages.push(ChatEntry::User {
+            text: "same content".into(),
+            message_id: Some("user-1".into()),
+        });
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let old_identity = app.render.test_card_identity(0);
+
+        app.sessions.session_id = Some("session-b".into());
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), old_identity);
+        app.render.invalidate_card_cache();
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn streaming_keys_rebuild_exact_content_ids_and_visibility_axes() {
+        let mut app = App::new();
+        app.sessions.session_id = Some("session-1".into());
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "aaaa".into();
+        app.chat.streaming_content_message_id = Some("content-1".into());
+        app.chat.streaming_thinking = "plan".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-1".into());
+
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        let thinking_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            content_identity
+        );
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity
+        );
+
+        app.chat.streaming_content = "bbbb".into();
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let replaced_content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        assert_ne!(replaced_content_identity, content_identity);
+        assert_eq!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity,
+            "the thinking key does not include the other stream's content"
+        );
+
+        app.chat.streaming_content_message_id = Some("content-2".into());
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            replaced_content_identity
+        );
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity,
+            "the paired content ID participates in the thinking key"
+        );
+
+        let visible_content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        app.chat.show_thinking = false;
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            visible_content_identity
+        );
+    }
+
+    #[test]
+    fn thinking_visibility_regroups_finalized_tools_without_manual_invalidation() {
+        let mut app = App::new();
+        app.chat.show_thinking = false;
+        app.chat.messages = vec![
+            tool_call("glob"),
+            ChatEntry::Thinking {
+                content: "visible when enabled".into(),
+                message_id: Some("thinking-1".into()),
+            },
+            tool_call("read_tool"),
+        ];
+
+        let hidden = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].0, CardKind::Tool { compact: false });
+
+        app.chat.show_thinking = true;
+        let warm_visible = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(
+            warm_visible
+                .iter()
+                .map(|card| card.0.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                CardKind::Tool { compact: false },
+                CardKind::Thinking,
+                CardKind::Tool { compact: true },
+            ]
+        );
+        app.render.invalidate_card_cache();
+        let cold_visible = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm_visible, cold_visible);
+    }
+
+    #[test]
+    fn delegate_duration_and_status_rekey_tool_batch_without_manual_invalidation() {
+        let mut app = App::new();
+        app.chat
+            .messages
+            .push(delegate_tool_call("tool-1", "coder", "Fix cache bug"));
+        app.delegates.delegate_entries.push(DelegateEntry {
+            delegation_id: "delegation-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: Some("tool-1".into()),
+            target_agent_id: Some("coder".into()),
+            objective: "Fix cache bug".into(),
+            status: DelegateStatus::InProgress,
+            stats: DelegateStats::default(),
+            started_at: Some(90),
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        });
+
+        let _ = build_message_cards_for_width_at(&mut app, 80, 100);
+        let running_identity = app.render.test_card_identity(0);
+        let running_lines = app.render.cards()[0]
+            .lines_for(76)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(running_lines.iter().any(|line| line.contains("coder:10s")));
+
+        let _ = build_message_cards_for_width_at(&mut app, 80, 101);
+        let duration_identity = app.render.test_card_identity(0);
+        assert_ne!(duration_identity, running_identity);
+
+        app.delegates.delegate_entries[0].status = DelegateStatus::Completed;
+        app.delegates.delegate_entries[0].ended_at = Some(101);
+        let warm = {
+            let cards = build_message_cards_for_width_at(&mut app, 80, 101);
+            cards[0]
+                .lines_for(76)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(warm.iter().any(|line| line.contains("done")));
+        assert_ne!(app.render.test_card_identity(0), duration_identity);
+        app.render.invalidate_card_cache();
+        let cold = {
+            let cards = build_message_cards_for_width_at(&mut app, 80, 101);
+            cards[0]
+                .lines_for(76)
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    #[serial]
+    fn theme_revision_rekeys_finalized_and_both_streaming_caches_without_invalidation() {
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+        let mut app = App::new();
+        app.chat.messages.push(ChatEntry::User {
+            text: "styled".into(),
+            message_id: Some("user-1".into()),
+        });
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "content".into();
+        app.chat.streaming_content_message_id = Some("content-1".into());
+        app.chat.streaming_thinking = "thinking".into();
+        app.chat.streaming_thinking_message_id = Some("thinking-1".into());
+
+        let _ = build_message_cards_for_width(&mut app, 80);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        let card_identity = app.render.test_card_identity(0);
+        let content_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Content);
+        let thinking_identity = app
+            .render
+            .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking);
+
+        Theme::set_by_index(2);
+        Theme::begin_frame();
+        let _ = build_message_cards_for_width(&mut app, 80);
+        let _ = build_streaming_card_for_test(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), card_identity);
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Content),
+            content_identity
+        );
+        assert_ne!(
+            app.render
+                .test_streaming_cache_identity(crate::render_state::StreamKind::Thinking),
+            thinking_identity
+        );
+
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+    }
+
+    #[test]
+    #[serial]
+    fn stable_key_axes_match_cold_rebuild_table() {
+        for axis in [
+            "content",
+            "tool",
+            "delegate",
+            "width",
+            "theme",
+            "session",
+            "visibility",
+        ] {
+            Theme::set_by_index(0);
+            Theme::begin_frame();
+            let mut app = App::new();
+            app.sessions.session_id = Some("session-a".into());
+            app.chat.show_thinking = false;
+            app.chat.messages = vec![
+                ChatEntry::User {
+                    text: "prefix".into(),
+                    message_id: Some("user-1".into()),
+                },
+                ChatEntry::Assistant {
+                    content: "aaaa".into(),
+                    thinking: None,
+                    message_id: Some("assistant-1".into()),
+                },
+                ChatEntry::ToolCall {
+                    tool_call_id: Some("tool-1".into()),
+                    name: "shell".into(),
+                    is_error: false,
+                    detail: ToolDetail::Generic {
+                        input: Some("first".into()),
+                        result: None,
+                    },
+                },
+                ChatEntry::Thinking {
+                    content: "hidden".into(),
+                    message_id: Some("thinking-1".into()),
+                },
+                delegate_tool_call("delegate-1", "coder", "task"),
+            ];
+            app.delegates.delegate_entries.push(DelegateEntry {
+                delegation_id: "delegation-1".into(),
+                child_session_id: Some("child-1".into()),
+                delegate_tool_call_id: Some("delegate-1".into()),
+                target_agent_id: Some("coder".into()),
+                objective: "task".into(),
+                status: DelegateStatus::InProgress,
+                stats: DelegateStats::default(),
+                started_at: None,
+                ended_at: None,
+                child_state: DelegateChildState::None,
+            });
+            let mut width = 80;
+            let _ = rendered_card_snapshot(&mut app, width);
+
+            match axis {
+                "content" => {
+                    let ChatEntry::Assistant { content, .. } = &mut app.chat.messages[1] else {
+                        unreachable!("assistant fixture")
+                    };
+                    *content = "bbbb".into();
+                }
+                "tool" => {
+                    let ChatEntry::ToolCall { detail, .. } = &mut app.chat.messages[2] else {
+                        unreachable!("tool fixture")
+                    };
+                    *detail = ToolDetail::Generic {
+                        input: Some("second".into()),
+                        result: None,
+                    };
+                }
+                "delegate" => app.delegates.delegate_entries[0].status = DelegateStatus::Completed,
+                "width" => width = 40,
+                "theme" => {
+                    Theme::set_by_index(2);
+                    Theme::begin_frame();
+                }
+                "session" => app.sessions.session_id = Some("session-b".into()),
+                "visibility" => app.chat.show_thinking = true,
+                _ => unreachable!("known stable-key axis"),
+            }
+
+            let warm = rendered_card_snapshot(&mut app, width);
+            app.render.invalidate_card_cache();
+            let cold = rendered_card_snapshot(&mut app, width);
+            assert_eq!(warm, cold, "warm/cold mismatch for {axis}");
+        }
+
+        Theme::set_by_index(0);
+        Theme::begin_frame();
+    }
+
+    #[test]
+    fn effective_cwd_change_rekeys_replace_symbol_title() {
+        let mut app = App::new();
+        app.connection.launch_cwd = Some("/workspace/one".into());
+        app.chat.messages.push(ChatEntry::ToolCall {
+            tool_call_id: Some("replace-1".into()),
+            name: "replace_symbol".into(),
+            is_error: false,
+            detail: ToolDetail::ReplaceSymbolInput {
+                replacements: vec![SymbolReplacement {
+                    path: "/workspace/one/src/deep/lib.rs".into(),
+                    symbol: "run".into(),
+                    new_text: "fn run() {}".into(),
+                }],
+            },
+        });
+
+        let _ = rendered_card_snapshot(&mut app, 80);
+        let old_identity = app.render.test_card_identity(0);
+        app.connection.launch_cwd = Some("/workspace/two".into());
+        let warm = rendered_card_snapshot(&mut app, 80);
+        assert_ne!(app.render.test_card_identity(0), old_identity);
+        app.render.invalidate_card_cache();
+        let cold = rendered_card_snapshot(&mut app, 80);
+        assert_eq!(warm, cold);
     }
 
     #[test]
@@ -2920,11 +3424,12 @@ mod tests {
             ChatEntry::ToolCall { is_error: true, .. }
         ));
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "cache must invalidate"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let lines = rebuilt_from_warm_update
@@ -2954,7 +3459,7 @@ mod tests {
         assert!(warm_lines.iter().any(|line| line.contains("$ cargo test")));
         assert!(!warm_lines.iter().any(|line| line.contains("tail sentinel")));
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -2975,11 +3480,12 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "semantic update should invalidate the warm card"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let rebuilt_lines = &rebuilt_from_warm_update[0].1;
@@ -3021,7 +3527,7 @@ mod tests {
                 .any(|line| line.contains("  1 ") && line.contains("- before"))
         );
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len()
         );
 
@@ -3042,11 +3548,12 @@ mod tests {
             "tool detail update should be in place"
         );
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "semantic update should invalidate the warm card"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let rebuilt_lines = &rebuilt_from_warm_update[0].1;
@@ -3099,10 +3606,10 @@ mod tests {
                 ),
             },
         );
-        assert_eq!(app.render.card_cache.processed_messages, 0);
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
 
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 34);
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 34);
 
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
@@ -3149,7 +3656,7 @@ mod tests {
         );
 
         let warm_reconciled = rendered_card_snapshot(&mut app, 42);
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
         assert_eq!(warm_reconciled, cold_full_rebuild);
 
@@ -3218,7 +3725,7 @@ mod tests {
         });
         let incremental = rendered_card_snapshot(&mut app, 42);
 
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
 
         assert_eq!(incremental, cold_full_rebuild);
@@ -3253,12 +3760,12 @@ mod tests {
             message_id: None,
         });
         build_message_cards(&mut app);
-        assert_eq!(app.render.card_cache.processed_messages, 2);
+        assert_eq!(app.render.test_card_source_entry_count(), 2);
 
         load_session(&mut app, "delegate-session", "agent-2");
         assert!(app.chat.messages.is_empty());
-        assert_eq!(app.render.card_cache.processed_messages, 0);
-        assert!(app.render.card_cache.cards.is_empty());
+        assert_eq!(app.render.test_card_source_entry_count(), 0);
+        assert!(app.render.cards().is_empty());
 
         replay_session(
             &mut app,
@@ -4558,14 +5065,14 @@ mod tests {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let incremental_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
+        let incremental_tool_lines = app.render.cards()[0].lines_for(80).len();
 
-        app.render.card_cache.invalidate();
+        app.render.invalidate_card_cache();
         let full_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()
         };
-        let full_tool_lines = app.render.card_cache.cards[0].lines_for(80).len();
+        let full_tool_lines = app.render.cards()[0].lines_for(80).len();
 
         assert_eq!(incremental_kinds, full_kinds);
         assert_eq!(incremental_kinds, vec![CardKind::Tool { compact: false }]);

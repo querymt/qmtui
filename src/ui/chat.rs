@@ -1,7 +1,4 @@
-use std::{
-    cell::{Cell, Ref, RefCell},
-    path::Path,
-};
+use std::path::Path;
 
 use ratatui::{
     Frame,
@@ -21,6 +18,11 @@ use crate::domain::tool::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::markdown;
+use crate::render_state::{
+    Card, CardKind, DelegatePresentationKeyRef, FinalizedCardKeyRef, FinalizedMessageKeyRef,
+    FinalizedRenderContextKey, RenderState, SessionIdentity, StreamKind, StreamingCacheKeyRef,
+    ThemeCacheKey,
+};
 use crate::theme::Theme;
 
 use super::start::short_cwd;
@@ -71,228 +73,144 @@ pub(crate) const ICON_MESH: &str = "\u{1F5A7}"; // mesh nodes (U+1F5A7)
 // ── General text symbols ──────────────────────────────────────────────────────
 const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 
-// ── Card types ────────────────────────────────────────────────────────────────
-
-/// Cache for cards built from finalized messages.
-/// Auto-invalidates when `messages` shrinks (clear/retain).
-pub(crate) struct CardCache {
-    pub(crate) cards: Vec<Card>,
-    pub(crate) processed_messages: usize,
-}
-
-impl CardCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            cards: Vec::new(),
-            processed_messages: 0,
-        }
-    }
-
-    pub(crate) fn invalidate(&mut self) {
-        self.cards.clear();
-        self.processed_messages = 0;
-    }
-}
-
-// -- message cards: background color only, no borders --
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CardKind {
-    User,
-    Assistant,
-    Tool { compact: bool }, // compact=true: no top padding (follows assistant)
-    Streaming,
-    Thinking,
-    Compaction,
-    Error,
-    Info,
-    Elicitation,
-}
-
-pub(crate) struct Card {
-    pub(crate) kind: CardKind,
-    pub(crate) blocks: Vec<crate::markdown::CardBlock>,
-    top_pad: u16,
-    bottom_pad: u16,
-    cached_width: Cell<Option<u16>>,
-    cached_lines: RefCell<Vec<Line<'static>>>,
-}
-
-impl Card {
-    pub(crate) fn new(kind: CardKind, blocks: Vec<crate::markdown::CardBlock>) -> Self {
-        let (top_pad, bottom_pad): (u16, u16) = match kind {
-            CardKind::Tool { compact: true } => (0, 0),
-            CardKind::Tool { compact: false } => (1, 0),
-            _ => (1, 1),
-        };
-        Self {
-            kind,
-            blocks,
-            top_pad,
-            bottom_pad,
-            cached_width: Cell::new(None),
-            cached_lines: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// Rebuild cached lines if the width has changed, then return a borrow.
-    pub(crate) fn lines_for(&self, inner_w: u16) -> Ref<'_, Vec<Line<'static>>> {
-        if self.cached_width.get() != Some(inner_w) {
-            let mut lines = Vec::new();
-            for block in &self.blocks {
-                match block {
-                    crate::markdown::CardBlock::Text(line) => lines.push(line.clone()),
-                    crate::markdown::CardBlock::Table(table) => {
-                        lines.extend(table.layout(inner_w as usize));
-                    }
-                }
-            }
-            *self.cached_lines.borrow_mut() = lines;
-            self.cached_width.set(Some(inner_w));
-        }
-        self.cached_lines.borrow()
-    }
-
-    /// Compute the visual height of this card given the full card render width.
-    /// Each logical line is wrapped at `(width - 4)` columns (the 2+2 horizontal
-    /// padding used by `render()`), and the result is rounded up.
-    pub(crate) fn height(&self, width: u16) -> u16 {
-        let inner_w = width.saturating_sub(4);
-        let lines = self.lines_for(inner_w);
-        let line_rows: u16 = lines
-            .iter()
-            .map(|l| {
-                let w = l.width();
-                let iw = inner_w as usize;
-                if iw == 0 || w == 0 {
-                    1
-                } else {
-                    w.div_ceil(iw) as u16
-                }
-            })
-            .sum::<u16>()
-            .max(1);
-        self.top_pad + line_rows + self.bottom_pad
-    }
-
-    /// `clip_top`: number of rows clipped off the top of this card
-    fn render(&self, f: &mut Frame, area: Rect, clip_top: u16) {
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-
-        let (bg_style, text_style) = match self.kind {
-            CardKind::User => (Theme::user_card(), Theme::user_text()),
-            CardKind::Assistant | CardKind::Streaming => {
-                (Theme::assistant_card(), Theme::assistant_text())
-            }
-            CardKind::Tool { .. } => (Theme::assistant_card(), Theme::tool_text()),
-            CardKind::Thinking => (Theme::assistant_card(), Theme::thinking()),
-            CardKind::Compaction => (Theme::assistant_card(), Theme::status_accent()),
-            CardKind::Error => (Theme::assistant_card(), Theme::error_text()),
-            CardKind::Info => (Theme::assistant_card(), Theme::info_text()),
-            CardKind::Elicitation => (Theme::assistant_card(), Theme::status_accent()),
-        };
-
-        // fill background
-        f.render_widget(Block::default().style(bg_style), area);
-
-        // the card has: 1 row top padding, N content lines, 1 row bottom padding
-        // when clipped, we skip the top padding first, then content lines
-        let has_top_pad = !matches!(self.kind, CardKind::Tool { compact: true });
-        let pad_top_visible = if clip_top == 0 && has_top_pad {
-            1u16
-        } else {
-            0
-        };
-        let content_skip = clip_top.saturating_sub(1); // rows of content to skip
-
-        let content_y = area.y + pad_top_visible;
-        let content_h = area.height.saturating_sub(pad_top_visible);
-
-        if content_h == 0 {
-            return;
-        }
-
-        let content_area = Rect {
-            x: area.x + 2,
-            y: content_y,
-            width: area.width.saturating_sub(4),
-            height: content_h,
-        };
-
-        let inner_w = area.width.saturating_sub(4);
-        let lines = self.lines_for(inner_w);
-        let styled_lines: Vec<Line<'static>> = lines
-            .iter()
-            .map(|l| {
-                Line::from(
-                    l.spans
-                        .iter()
-                        .map(|s| {
-                            let style = if s.style.fg.is_some() {
-                                s.style.bg(bg_style.bg.unwrap_or(Theme::bg()))
-                            } else {
-                                text_style
-                            };
-                            Span::styled(s.content.clone(), style)
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        f.render_widget(
-            Paragraph::new(styled_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((content_skip, 0)),
-            content_area,
-        );
-    }
-}
-
 // ── Build message cards (cached) ──────────────────────────────────────────────
 
 /// Build cards for finalized messages incrementally (cached).
 /// Does NOT include the streaming/thinking card — that's built separately.
-pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
-    let cache = &app.render.card_cache;
+pub(crate) struct FinalizedRenderInput<'a> {
+    pub(crate) session_identity: SessionIdentity,
+    pub(crate) messages: &'a [ChatEntry],
+    pub(crate) delegates: &'a [DelegateEntry],
+    pub(crate) effective_cwd: Option<String>,
+    pub(crate) show_thinking: bool,
+    pub(crate) full_width: u16,
+    pub(crate) theme: ThemeCacheKey,
+    pub(crate) now_unix_secs: i64,
+}
 
-    // Auto-invalidate if messages shrank (clear/retain)
-    if app.chat.messages.len() < cache.processed_messages {
-        app.render.card_cache.invalidate();
+struct PlannedFinalizedCard<'a> {
+    key: FinalizedCardKeyRef<'a>,
+    source_start: usize,
+}
+
+fn flush_tool_plan<'a>(
+    planned: &mut Vec<PlannedFinalizedCard<'a>>,
+    pending: &mut Vec<FinalizedMessageKeyRef<'a>>,
+    source_start: &mut Option<usize>,
+) {
+    if pending.is_empty() {
+        return;
     }
+    let compact = matches!(
+        planned.last().map(|card| card.key.kind()),
+        Some(CardKind::Assistant | CardKind::Streaming | CardKind::Thinking)
+    );
+    planned.push(PlannedFinalizedCard {
+        key: FinalizedCardKeyRef::new(CardKind::Tool { compact }, std::mem::take(pending)),
+        source_start: source_start.take().expect("tool plan source"),
+    });
+}
 
-    // Cache hit — nothing new
-    if app.chat.messages.len() == app.render.card_cache.processed_messages {
-        return &app.render.card_cache.cards;
-    }
+fn plan_finalized_cards<'a>(input: &'a FinalizedRenderInput<'a>) -> Vec<PlannedFinalizedCard<'a>> {
+    let mut planned = Vec::new();
+    let mut pending_tools = Vec::new();
+    let mut tool_source_start = None;
+    let mut delegate_idx = 0;
 
-    // Determine where to start processing. If the last cached card is a tool
-    // batch, we need to pop it and re-process from the batch start, because
-    // new tool messages might need to merge into that batch.
-    let start_idx = if matches!(
-        app.render.card_cache.cards.last().map(|c| &c.kind),
-        Some(CardKind::Tool { .. })
-    ) {
-        app.render.card_cache.cards.pop();
-        // Scan backwards to find where the tool batch started. Hidden thinking
-        // entries are transparent and should not split a tool batch.
-        let mut idx = app.render.card_cache.processed_messages;
-        while idx > 0 {
-            match app.chat.messages.get(idx - 1) {
-                Some(ChatEntry::ToolCall { .. }) => idx -= 1,
-                Some(ChatEntry::Thinking { .. }) if !app.chat.show_thinking => idx -= 1,
-                _ => break,
+    for (ordinal, entry) in input.messages.iter().enumerate() {
+        let delegate = if let ChatEntry::ToolCall {
+            name, tool_call_id, ..
+        } = entry
+            && name == "delegate"
+        {
+            let matched = tool_call_id
+                .as_deref()
+                .and_then(|id| {
+                    input
+                        .delegates
+                        .iter()
+                        .find(|entry| entry.delegate_tool_call_id.as_deref() == Some(id))
+                })
+                .or_else(|| input.delegates.get(delegate_idx));
+            delegate_idx += 1;
+            Some(DelegatePresentationKeyRef::from_entry(
+                matched,
+                input.now_unix_secs,
+            ))
+        } else {
+            None
+        };
+        let message_key = FinalizedMessageKeyRef::new(ordinal, entry, delegate);
+
+        match entry {
+            ChatEntry::ToolCall { .. } => {
+                tool_source_start.get_or_insert(ordinal);
+                pending_tools.push(message_key);
+            }
+            ChatEntry::Thinking { .. } if !input.show_thinking => {}
+            _ => {
+                flush_tool_plan(&mut planned, &mut pending_tools, &mut tool_source_start);
+                let kind = match entry {
+                    ChatEntry::User { .. } => CardKind::User,
+                    ChatEntry::Assistant { .. } => CardKind::Assistant,
+                    ChatEntry::Thinking { .. } => CardKind::Thinking,
+                    ChatEntry::CompactionStart { .. } | ChatEntry::CompactionEnd { .. } => {
+                        CardKind::Compaction
+                    }
+                    ChatEntry::Info(_) => CardKind::Info,
+                    ChatEntry::Error(_) => CardKind::Error,
+                    ChatEntry::Elicitation { .. } => CardKind::Elicitation,
+                    ChatEntry::ToolCall { .. } => unreachable!("tool calls are batched"),
+                };
+                planned.push(PlannedFinalizedCard {
+                    key: FinalizedCardKeyRef::new(kind, vec![message_key]),
+                    source_start: ordinal,
+                });
             }
         }
-        idx
-    } else {
-        app.render.card_cache.processed_messages
-    };
+    }
+    flush_tool_plan(&mut planned, &mut pending_tools, &mut tool_source_start);
+    planned
+}
 
-    // Process new messages from start_idx
+pub(crate) fn build_finalized_cards<'a>(
+    input: FinalizedRenderInput<'_>,
+    render: &'a mut RenderState,
+) -> &'a [Card] {
+    let session = render.observe_session(&input.session_identity);
+    let context = FinalizedRenderContextKey::new(
+        session,
+        input.full_width,
+        input.theme,
+        input.show_thinking,
+        input.effective_cwd.clone(),
+    );
+    let planned = plan_finalized_cards(&input);
+    let desired: Vec<_> = planned.iter().map(|card| card.key.clone()).collect();
+    let mismatch = render.prepare_finalized_cards(context, &desired);
+
+    if let Some(first) = planned.get(mismatch) {
+        let prior_kind = render.cards().last().map(|card| card.kind.clone());
+        let rebuilt =
+            render_card_suffix(&input, render.highlighter(), first.source_start, prior_kind);
+        debug_assert_eq!(rebuilt.len(), planned.len() - mismatch);
+        for (planned_card, card) in planned[mismatch..].iter().zip(rebuilt) {
+            render.push_finalized_card(&planned_card.key, card);
+        }
+    }
+    render.finish_finalized_cards(input.messages.len());
+    render.cards()
+}
+
+fn render_card_suffix(
+    input: &FinalizedRenderInput<'_>,
+    highlighter: &crate::highlight::Highlighter,
+    start_idx: usize,
+    prior_kind: Option<CardKind>,
+) -> Vec<Card> {
+    let mut cards = Vec::new();
     let mut pending_tools: Vec<Line<'static>> = Vec::new();
-    let current_cwd = app.current_session_cwd();
+    let current_cwd = input.effective_cwd.as_deref();
 
     let flush_tools = |tools: &mut Vec<Line<'static>>, cards: &mut Vec<Card>| {
         if !tools.is_empty() {
@@ -301,16 +219,12 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 .into_iter()
                 .map(crate::markdown::CardBlock::Text)
                 .collect();
-            let prev_is_assistant = matches!(
-                cards.last().map(|c| &c.kind),
+            let previous_kind = cards.last().map(|card| &card.kind).or(prior_kind.as_ref());
+            let compact = matches!(
+                previous_kind,
                 Some(CardKind::Assistant | CardKind::Streaming | CardKind::Thinking)
             );
-            cards.push(Card::new(
-                CardKind::Tool {
-                    compact: prev_is_assistant,
-                },
-                blocks,
-            ));
+            cards.push(Card::new(CardKind::Tool { compact }, blocks));
         }
     };
 
@@ -318,41 +232,35 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
         |tool_call_id: Option<&String>, sequential_idx: usize| -> Option<&DelegateEntry> {
             tool_call_id
                 .and_then(|id| {
-                    app.delegates
-                        .delegate_entries
+                    input
+                        .delegates
                         .iter()
                         .find(|entry| entry.delegate_tool_call_id.as_deref() == Some(id.as_str()))
                 })
-                .or_else(|| app.delegates.delegate_entries.get(sequential_idx))
+                .or_else(|| input.delegates.get(sequential_idx))
         };
-    let mut delegate_idx = app.chat.messages[..start_idx]
+    let mut delegate_idx = input.messages[..start_idx]
         .iter()
         .filter(|entry| matches!(entry, ChatEntry::ToolCall { name, .. } if name == "delegate"))
         .count();
 
-    for entry in &app.chat.messages[start_idx..] {
+    for entry in &input.messages[start_idx..] {
         match entry {
             ChatEntry::User { text, .. } => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
-                let blocks = markdown::render(text, Theme::user_text(), &app.render.highlighter);
-                app.render
-                    .card_cache
-                    .cards
-                    .push(Card::new(CardKind::User, blocks));
+                flush_tools(&mut pending_tools, &mut cards);
+                let blocks = markdown::render(text, Theme::user_text(), highlighter);
+                cards.push(Card::new(CardKind::User, blocks));
             }
             ChatEntry::Assistant {
                 content, thinking, ..
             } => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
+                flush_tools(&mut pending_tools, &mut cards);
                 let mut blocks = Vec::new();
-                if app.chat.show_thinking
+                if input.show_thinking
                     && let Some(thinking_text) = thinking
                 {
-                    let mut rendered = markdown::render(
-                        thinking_text,
-                        Theme::thinking_text(),
-                        &app.render.highlighter,
-                    );
+                    let mut rendered =
+                        markdown::render(thinking_text, Theme::thinking_text(), highlighter);
                     markdown::prepend_span_to_first_text(
                         &mut rendered,
                         Span::styled("\u{25CF} ", Theme::thinking()),
@@ -363,26 +271,19 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 blocks.extend(markdown::render(
                     content,
                     Theme::assistant_text(),
-                    &app.render.highlighter,
+                    highlighter,
                 ));
-                app.render
-                    .card_cache
-                    .cards
-                    .push(Card::new(CardKind::Assistant, blocks));
+                cards.push(Card::new(CardKind::Assistant, blocks));
             }
             ChatEntry::Thinking { content, .. } => {
-                if app.chat.show_thinking {
-                    flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
-                    let mut blocks =
-                        markdown::render(content, Theme::thinking_text(), &app.render.highlighter);
+                if input.show_thinking {
+                    flush_tools(&mut pending_tools, &mut cards);
+                    let mut blocks = markdown::render(content, Theme::thinking_text(), highlighter);
                     markdown::prepend_span_to_first_text(
                         &mut blocks,
                         Span::styled("\u{25CF} ", Theme::thinking()),
                     );
-                    app.render
-                        .card_cache
-                        .cards
-                        .push(Card::new(CardKind::Thinking, blocks));
+                    cards.push(Card::new(CardKind::Thinking, blocks));
                 }
             }
             ChatEntry::ToolCall {
@@ -409,12 +310,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 let delegate_duration = delegate_entry
                     .and_then(|entry| {
                         let start = entry.started_at?;
-                        let end = entry.ended_at.unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|duration| duration.as_secs() as i64)
-                                .unwrap_or(start)
-                        });
+                        let end = entry.ended_at.unwrap_or(input.now_unix_secs);
                         let secs = (end - start).max(0) as u64;
                         Some(if secs < 60 {
                             format!(":{secs}s")
@@ -451,7 +347,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         pending_tools.extend(build_multiedit_lines(sections, 6));
                     }
                     ToolDetail::ReplaceSymbolInput { replacements } => {
-                        let title = replace_symbol_title(replacements, &[], current_cwd.as_deref());
+                        let title = replace_symbol_title(replacements, &[], current_cwd);
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(title, Theme::diff_file()),
@@ -461,8 +357,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         replacements,
                         sections,
                     } => {
-                        let title =
-                            replace_symbol_title(replacements, sections, current_cwd.as_deref());
+                        let title = replace_symbol_title(replacements, sections, current_cwd);
                         pending_tools.push(Line::from(vec![
                             Span::styled(format!("{sym} {name} "), style),
                             Span::styled(title, Theme::diff_file()),
@@ -658,9 +553,9 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 }
             }
             ChatEntry::CompactionStart { token_estimate } => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
+                flush_tools(&mut pending_tools, &mut cards);
                 let token_str = format!("~{} tokens", token_estimate);
-                app.render.card_cache.cards.push(Card::new(
+                cards.push(Card::new(
                     CardKind::Compaction,
                     vec![
                         crate::markdown::CardBlock::Text(Line::from(vec![
@@ -682,7 +577,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 summary,
                 summary_len,
             } => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
+                flush_tools(&mut pending_tools, &mut cards);
                 let mut blocks = vec![crate::markdown::CardBlock::Text(Line::from(vec![
                     Span::styled("[compact] ", Theme::status_accent()),
                     Span::styled("Conversation summarized", Theme::status_accent()),
@@ -702,23 +597,20 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 blocks.extend(markdown::render(
                     summary,
                     Theme::assistant_text(),
-                    &app.render.highlighter,
+                    highlighter,
                 ));
-                app.render
-                    .card_cache
-                    .cards
-                    .push(Card::new(CardKind::Compaction, blocks));
+                cards.push(Card::new(CardKind::Compaction, blocks));
             }
             ChatEntry::Info(text) => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
-                app.render.card_cache.cards.push(Card::new(
+                flush_tools(&mut pending_tools, &mut cards);
+                cards.push(Card::new(
                     CardKind::Info,
                     vec![crate::markdown::CardBlock::Text(Line::from(text.clone()))],
                 ));
             }
             ChatEntry::Error(text) => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
-                app.render.card_cache.cards.push(Card::new(
+                flush_tools(&mut pending_tools, &mut cards);
+                cards.push(Card::new(
                     CardKind::Error,
                     vec![crate::markdown::CardBlock::Text(Line::from(text.clone()))],
                 ));
@@ -729,7 +621,7 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                 outcome,
                 ..
             } => {
-                flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
+                flush_tools(&mut pending_tools, &mut cards);
                 let header = crate::markdown::CardBlock::Text(Line::from(vec![
                     Span::styled("[?] ", Theme::status_accent()),
                     Span::styled(message.clone(), Theme::status_accent()),
@@ -749,18 +641,63 @@ pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
                         }
                     }
                 }
-                app.render
-                    .card_cache
-                    .cards
-                    .push(Card::new(CardKind::Elicitation, card_blocks));
+                cards.push(Card::new(CardKind::Elicitation, card_blocks));
             }
         }
     }
 
-    flush_tools(&mut pending_tools, &mut app.render.card_cache.cards);
-    app.render.card_cache.processed_messages = app.chat.messages.len();
+    flush_tools(&mut pending_tools, &mut cards);
+    cards
+}
 
-    &app.render.card_cache.cards
+fn render_session_identity(app: &App) -> SessionIdentity {
+    let session_id = app.sessions.session_id.clone();
+    let remote_node_id = session_id
+        .as_deref()
+        .and_then(|id| app.sessions.session_remote_node_id(id))
+        .map(str::to_string);
+    let is_remote = session_id
+        .as_deref()
+        .is_some_and(|id| app.sessions.is_remote_session_id(id));
+    SessionIdentity::new(session_id, remote_node_id, is_remote)
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn build_message_cards(app: &mut App) -> &[Card] {
+    build_message_cards_for_width(app, 120)
+}
+
+#[cfg(test)]
+pub(crate) fn build_message_cards_for_width(app: &mut App, full_width: u16) -> &[Card] {
+    build_message_cards_for_width_at(app, full_width, now_unix_secs())
+}
+
+#[cfg(test)]
+pub(crate) fn build_message_cards_for_width_at(
+    app: &mut App,
+    full_width: u16,
+    now_unix_secs: i64,
+) -> &[Card] {
+    let session_identity = render_session_identity(app);
+    let effective_cwd = app.current_session_cwd();
+    let input = FinalizedRenderInput {
+        session_identity,
+        messages: &app.chat.messages,
+        delegates: &app.delegates.delegate_entries,
+        effective_cwd,
+        show_thinking: app.chat.show_thinking,
+        full_width,
+        theme: ThemeCacheKey::current_frame(),
+        now_unix_secs,
+    };
+    build_finalized_cards(input, &mut app.render)
 }
 
 // ── Shared header builder ─────────────────────────────────────────────────────
@@ -1704,54 +1641,66 @@ fn draw_mention_panel(f: &mut Frame, app: &App, area: Rect) {
 // ── Streaming card (transient, not cached) ────────────────────────────────────
 
 /// Build the transient streaming/thinking card (not cached, rebuilt every frame).
-fn build_streaming_card(app: &mut App) -> Option<Card> {
-    let activity_text = match &app.chat.activity {
+pub(crate) struct StreamingRenderInput<'a> {
+    pub(crate) session_identity: SessionIdentity,
+    pub(crate) fallback_ordinal: usize,
+    pub(crate) activity: &'a ActivityState,
+    pub(crate) is_turn_active: bool,
+    pub(crate) content: &'a str,
+    pub(crate) content_message_id: Option<&'a str>,
+    pub(crate) thinking: &'a str,
+    pub(crate) thinking_message_id: Option<&'a str>,
+    pub(crate) show_thinking: bool,
+    pub(crate) full_width: u16,
+    pub(crate) theme: ThemeCacheKey,
+    pub(crate) tick: u64,
+}
+
+/// Build the transient card while caching only its markdown blocks.
+pub(crate) fn build_streaming_card(
+    input: StreamingRenderInput<'_>,
+    render: &mut RenderState,
+) -> Option<Card> {
+    let activity_text = match input.activity {
         ActivityState::RunningTool { name } => {
-            format!(
-                "{} tool: {name}",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            )
+            format!("{} tool: {name}", spinner(SpinnerKind::Braille, input.tick))
         }
         ActivityState::Compacting { .. } => {
-            format!(
-                "{} compacting",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            )
+            format!("{} compacting", spinner(SpinnerKind::Braille, input.tick))
         }
         ActivityState::Streaming => {
-            format!(
-                "{} streaming",
-                spinner(SpinnerKind::Braille, app.render.tick)
-            )
+            format!("{} streaming", spinner(SpinnerKind::Braille, input.tick))
         }
-        _ => format!(
-            "{} thinking",
-            spinner(SpinnerKind::Braille, app.render.tick)
-        ),
+        _ => format!("{} thinking", spinner(SpinnerKind::Braille, input.tick)),
     };
 
-    let has_thinking = app.chat.show_thinking && !app.chat.streaming_thinking.is_empty();
-    let has_content = !app.chat.streaming_content.is_empty();
+    let session = render.observe_session(&input.session_identity);
+    let has_thinking = input.show_thinking && !input.thinking.is_empty();
+    let has_content = !input.content.is_empty();
 
     if has_thinking || has_content {
         let mut blocks = Vec::new();
 
         if has_thinking {
-            let thinking_len = app.chat.streaming_thinking.len();
-            let mut thinking_blocks =
-                if let Some(cached) = app.render.streaming_thinking_cache.get(thinking_len) {
-                    cached.to_vec()
-                } else {
-                    let rendered = markdown::render(
-                        &app.chat.streaming_thinking,
-                        Theme::thinking_text(),
-                        &app.render.highlighter,
-                    );
-                    app.render
-                        .streaming_thinking_cache
-                        .store(thinking_len, rendered.clone());
-                    rendered
-                };
+            let key = StreamingCacheKeyRef::new(
+                &session,
+                StreamKind::Thinking,
+                input.thinking_message_id,
+                input.content_message_id,
+                input.fallback_ordinal,
+                input.thinking,
+                input.full_width,
+                input.theme,
+                input.show_thinking,
+            );
+            let mut thinking_blocks = if let Some(cached) = render.streaming_blocks(key) {
+                cached.to_vec()
+            } else {
+                let rendered =
+                    markdown::render(input.thinking, Theme::thinking_text(), render.highlighter());
+                render.store_streaming_blocks(key, rendered.clone());
+                rendered
+            };
             markdown::prepend_span_to_first_text(
                 &mut thinking_blocks,
                 Span::styled("\u{25CF} ", Theme::thinking()),
@@ -1763,18 +1712,23 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
         }
 
         if has_content {
-            let content_len = app.chat.streaming_content.len();
-            let content_blocks = if let Some(cached) = app.render.streaming_cache.get(content_len) {
+            let key = StreamingCacheKeyRef::new(
+                &session,
+                StreamKind::Content,
+                input.content_message_id,
+                input.thinking_message_id,
+                input.fallback_ordinal,
+                input.content,
+                input.full_width,
+                input.theme,
+                input.show_thinking,
+            );
+            let content_blocks = if let Some(cached) = render.streaming_blocks(key) {
                 cached.to_vec()
             } else {
-                let rendered = markdown::render(
-                    &app.chat.streaming_content,
-                    Theme::assistant_text(),
-                    &app.render.highlighter,
-                );
-                app.render
-                    .streaming_cache
-                    .store(content_len, rendered.clone());
+                let rendered =
+                    markdown::render(input.content, Theme::assistant_text(), render.highlighter());
+                render.store_streaming_blocks(key, rendered.clone());
                 rendered
             };
             blocks.extend(content_blocks);
@@ -1785,7 +1739,7 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
             Theme::thinking(),
         ))));
         Some(Card::new(CardKind::Streaming, blocks))
-    } else if app.chat.is_turn_active() {
+    } else if input.is_turn_active {
         Some(Card::new(
             CardKind::Thinking,
             vec![crate::markdown::CardBlock::Text(Line::from(Span::styled(
@@ -1796,6 +1750,25 @@ fn build_streaming_card(app: &mut App) -> Option<Card> {
     } else {
         None
     }
+}
+
+#[cfg(test)]
+pub(crate) fn build_streaming_card_for_test(app: &mut App, full_width: u16) -> Option<Card> {
+    let input = StreamingRenderInput {
+        session_identity: render_session_identity(app),
+        fallback_ordinal: app.chat.messages.len(),
+        activity: &app.chat.activity,
+        is_turn_active: app.chat.is_turn_active(),
+        content: &app.chat.streaming_content,
+        content_message_id: app.chat.streaming_content_message_id.as_deref(),
+        thinking: &app.chat.streaming_thinking,
+        thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
+        show_thinking: app.chat.show_thinking,
+        full_width,
+        theme: ThemeCacheKey::current_frame(),
+        tick: app.render.tick,
+    };
+    build_streaming_card(input, &mut app.render)
 }
 
 // ── Diff / write helpers ──────────────────────────────────────────────────────
@@ -2289,42 +2262,60 @@ pub(crate) fn build_write_lines(content: &str) -> Vec<Line<'static>> {
 fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Block::default().style(Theme::base()), area);
 
-    // Update cached message cards incrementally, then build transient card
-    build_message_cards(app);
-    let streaming_card = build_streaming_card(app);
-
-    // Compute total_height in a temporary scope so we can mutably access app
-    // for scroll compensation before borrowing card_cache again for rendering.
-    let total_height: u16 = {
-        let cards = app
-            .render
-            .card_cache
-            .cards
-            .iter()
-            .chain(streaming_card.iter());
-        cards.map(|c| c.height(area.width)).sum()
+    let session_identity = render_session_identity(app);
+    let effective_cwd = app.current_session_cwd();
+    let theme = ThemeCacheKey::current_frame();
+    let finalized_input = FinalizedRenderInput {
+        session_identity: session_identity.clone(),
+        messages: &app.chat.messages,
+        delegates: &app.delegates.delegate_entries,
+        effective_cwd,
+        show_thinking: app.chat.show_thinking,
+        full_width: area.width,
+        theme,
+        now_unix_secs: now_unix_secs(),
     };
+    build_finalized_cards(finalized_input, &mut app.render);
 
-    if total_height == 0 && app.render.card_cache.cards.is_empty() && streaming_card.is_none() {
+    let streaming_input = StreamingRenderInput {
+        session_identity,
+        fallback_ordinal: app.chat.messages.len(),
+        activity: &app.chat.activity,
+        is_turn_active: app.chat.is_turn_active(),
+        content: &app.chat.streaming_content,
+        content_message_id: app.chat.streaming_content_message_id.as_deref(),
+        thinking: &app.chat.streaming_thinking,
+        thinking_message_id: app.chat.streaming_thinking_message_id.as_deref(),
+        show_thinking: app.chat.show_thinking,
+        full_width: area.width,
+        theme,
+        tick: app.render.tick,
+    };
+    let streaming_card = build_streaming_card(streaming_input, &mut app.render);
+
+    let total_height: u16 = app
+        .render
+        .cards()
+        .iter()
+        .chain(streaming_card.iter())
+        .map(|card| card.height(area.width))
+        .sum();
+
+    if total_height == 0 && app.render.cards().is_empty() && streaming_card.is_none() {
         return;
     }
 
-    // When the user is scrolled up, bump scroll_offset by however much
-    // content grew so the viewport stays at the same absolute position.
+    // Keep the existing viewport growth compensation and scroll ownership unchanged.
     app.render
         .compensate_scroll_for_growth(total_height, &mut app.chat.scroll_offset);
 
-    // max scroll = how far we can scroll from the bottom
     let max_scroll = total_height.saturating_sub(area.height);
-    // clamp so we never scroll past the top
     app.chat.scroll_offset = app.chat.scroll_offset.min(max_scroll);
-    // scroll_offset 0 = pinned to bottom, higher = scrolled up
     let scroll = max_scroll.saturating_sub(app.chat.scroll_offset);
 
     let all_cards: Vec<&Card> = app
         .render
-        .card_cache
-        .cards
+        .cards()
         .iter()
         .chain(streaming_card.iter())
         .collect();
@@ -2338,7 +2329,7 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
         if card_bottom > 0 && card_top < area.height as i32 {
             let render_y = card_top.max(0) as u16;
             let visible_h = (card_bottom.min(area.height as i32) - render_y as i32) as u16;
-            let clip_top = (-card_top).max(0) as u16; // rows clipped off top
+            let clip_top = (-card_top).max(0) as u16;
 
             card.render(
                 f,

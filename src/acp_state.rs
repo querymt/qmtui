@@ -28,6 +28,7 @@ use crate::domain::session::{
 use crate::models_state::{ModelAction, ModelContext, ModelCoordination, ModelOutcome};
 use crate::navigation_state::{Popup, Screen};
 use crate::profiles_state::{ProfileAction, ProfileOutcome};
+use crate::render_state::SessionIdentity;
 use crate::session_state::{SessionAction, SessionCoordination, SessionOutcome};
 use crate::tool_detail;
 
@@ -719,6 +720,19 @@ impl crate::app::App {
 
     fn reset_active_session_view(&mut self) {
         self.chat.reset_for_session_switch();
+        let session_id = self.sessions.session_id.clone();
+        let remote_node_id = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.session_remote_node_id(id))
+            .map(str::to_string);
+        let is_remote = session_id
+            .as_deref()
+            .is_some_and(|id| self.sessions.is_remote_session_id(id));
+        self.render.advance_session_epoch(SessionIdentity::new(
+            session_id,
+            remote_node_id,
+            is_remote,
+        ));
         self.render.invalidate_content_cache();
         self.render.invalidate_thinking_cache();
         self.render.invalidate_card_cache();
@@ -2538,6 +2552,26 @@ mod tests {
                 && agent_id.as_deref() == Some("agent-1")
                 && profile_id == "code"
         ));
+    }
+
+    #[test]
+    fn same_id_session_reload_advances_render_epoch() {
+        let mut app = App::new();
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "same-session".into(),
+            profile_id: None,
+        });
+        let first_epoch = app.render.test_session_epoch();
+
+        app.handle_acp_event(AcpAppEvent::SessionLoaded {
+            agent_id: "agent-1".into(),
+            session_id: "same-session".into(),
+            profile_id: None,
+        });
+
+        assert!(app.render.test_session_epoch() > first_epoch);
     }
 
     #[test]

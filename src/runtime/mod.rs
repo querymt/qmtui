@@ -202,6 +202,8 @@ impl TestEffects {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
     use crate::command::PromptBlock;
     use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
@@ -837,6 +839,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn invalidate_theme_caches_clears_all_render_caches() {
         use crate::theme::Theme;
 
@@ -873,23 +876,21 @@ mod tests {
             })
             .expect("edit preview should contain a styled file span");
 
-        app.render.streaming_cache.store(
-            5,
-            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
-                "stream",
-            ))],
-        );
-        app.render.streaming_thinking_cache.store(
-            3,
-            vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
-                "think",
-            ))],
-        );
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Content);
+        app.render
+            .test_seed_streaming_cache(crate::render_state::StreamKind::Thinking);
 
-        assert!(app.render.streaming_cache.get(5).is_some());
-        assert!(app.render.streaming_thinking_cache.get(3).is_some());
+        assert!(
+            app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Content)
+        );
+        assert!(
+            app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Thinking)
+        );
         assert_eq!(
-            app.render.card_cache.processed_messages,
+            app.render.test_card_source_entry_count(),
             app.chat.messages.len(),
             "card_cache should be populated"
         );
@@ -902,15 +903,18 @@ mod tests {
         app.render.invalidate_theme_caches();
 
         assert_eq!(
-            app.render.card_cache.processed_messages, 0,
+            app.render.test_card_source_entry_count(),
+            0,
             "card_cache should be invalidated"
         );
         assert!(
-            app.render.streaming_cache.get(5).is_none(),
+            !app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Content),
             "streaming_cache should be invalidated"
         );
         assert!(
-            app.render.streaming_thinking_cache.get(3).is_none(),
+            !app.render
+                .test_streaming_cache_populated(crate::render_state::StreamKind::Thinking),
             "streaming_thinking_cache should be invalidated"
         );
         assert!(matches!(
