@@ -1,16 +1,21 @@
 mod popups;
 
+use crate::features::auth::view::draw_auth_popup;
 use crate::features::chat::view::{
     ChatScreenInput, draw_chat as draw_chat_screen, draw_delegate_view as draw_delegate_screen,
 };
+use crate::features::mesh::view::{
+    draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
+};
+use crate::features::models::view::{ModelPopupInput, draw_model_popup};
+use crate::features::profiles::view::{ProfilePopupInput, draw_profile_popup};
 use crate::features::sessions::view::{
     StartScreenInput, draw_new_session_popup, draw_session_popup, draw_start as draw_start_screen,
     short_cwd,
 };
 use popups::{
-    draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
-    draw_log_popup, draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
-    draw_model_popup, draw_profile_popup, draw_theme_popup,
+    draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup, draw_log_popup,
+    draw_theme_popup,
 };
 
 // Re-exports used only by the test module (via `use super::*`).
@@ -122,10 +127,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.navigation.popup {
         Popup::CommandPalette => draw_command_palette_popup(f, app),
-        Popup::Mesh => draw_mesh_popup(f, app),
-        Popup::MeshInvite => draw_mesh_invite_popup(f, app),
-        Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, app),
-        Popup::ModelSelect => draw_model_popup(f, app),
+        Popup::Mesh => draw_mesh_popup(f, &app.mesh),
+        Popup::MeshInvite => draw_mesh_invite_popup(f, &app.mesh),
+        Popup::MeshInviteQr => draw_mesh_invite_qr_popup(f, &app.mesh),
+        Popup::ModelSelect => {
+            let input = ModelPopupInput {
+                models: &app.models,
+                delegate_preference_profile_id: app.delegate_preference_profile_id(),
+            };
+            draw_model_popup(f, input);
+        }
         Popup::SessionSelect => {
             draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render)
         }
@@ -133,9 +144,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::ThemeSelect => draw_theme_popup(f, app),
         Popup::Help => draw_help_popup(f, app),
         Popup::Log => draw_log_popup(f, app),
-        Popup::ProviderAuth => draw_auth_popup(f, app),
+        Popup::ProviderAuth => draw_auth_popup(f, &app.auth),
         Popup::ForkTurnSelect => draw_fork_turn_popup(f, app),
-        Popup::ProfileSelect => draw_profile_popup(f, app),
+        Popup::ProfileSelect => {
+            let input = ProfilePopupInput {
+                profiles: &app.profiles,
+                current_session_profile_id: app.current_session_profile_id(),
+            };
+            draw_profile_popup(f, input);
+        }
         Popup::None => {}
     }
 }
@@ -280,6 +297,16 @@ mod tests {
         draw_session_popup(f, &app.sessions, &app.delegates, &mut app.render);
     }
 
+    fn draw_model_popup_for_test(f: &mut Frame, app: &App) {
+        draw_model_popup(
+            f,
+            ModelPopupInput {
+                models: &app.models,
+                delegate_preference_profile_id: app.delegate_preference_profile_id(),
+            },
+        );
+    }
+
     fn session_draw_snapshot(app: &App) -> String {
         format!(
             "groups={:?};cursor={};filter={:?};tab={};collapsed={:?};popup_collapsed={:?};discovery={};discovery_cursors={:?};pending_groups={:?};hydrated={:?};expanded={:?};pending_children={:?};session={:?};agent={:?};mode={:?};review={:?};new_path={:?};new_cursor={};completion={:?};activity={:?};remote={:?}",
@@ -336,7 +363,7 @@ mod tests {
     ) -> (ratatui::buffer::Buffer, Position) {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_auth_popup(f, app)).unwrap();
+        terminal.draw(|f| draw_auth_popup(f, &app.auth)).unwrap();
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
         (terminal.backend().buffer().clone(), cursor)
     }
@@ -2409,7 +2436,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_model_popup_for_test(f, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
@@ -2440,7 +2469,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_model_popup_for_test(f, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let (esc_x, esc_y) = find_buffer_text(&buffer, "esc").expect("esc hint missing");
@@ -2487,7 +2518,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_model_popup_for_test(f, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (model_x, model_y) =
             find_buffer_text(&buffer, "Claude Sonnet").expect("live model missing");
@@ -2537,7 +2570,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_model_popup_for_test(f, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let (_, local_y) = find_buffer_text(&buffer, "codex").expect("local header");
         let (_, remote_y) = find_buffer_text(&buffer, "framework").expect("remote node label");
@@ -2577,7 +2612,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_mesh_popup(f, &app)).unwrap();
+        terminal.draw(|f| draw_mesh_popup(f, &app.mesh)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         assert!(find_buffer_text(&buffer, "framework").is_some());
@@ -2593,7 +2628,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_mesh_invite_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_mesh_invite_popup(f, &app.mesh))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         assert!(find_buffer_text(&buffer, "Create Invite").is_some());
@@ -2619,7 +2656,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_mesh_invite_qr_popup(f, &app))
+            .draw(|f| draw_mesh_invite_qr_popup(f, &app.mesh))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
 
@@ -2629,6 +2666,31 @@ mod tests {
         assert!(find_buffer_text(&buffer, "QR-LINE").is_some());
         assert!(find_buffer_text(&buffer, "qmt://mesh/join/token").is_none());
         assert!(find_buffer_text(&buffer, "show URL").is_some());
+    }
+
+    #[test]
+    fn draw_mesh_popup_shows_clipboard_fallback_url() {
+        let mut app = App::new();
+        app.mesh.mesh_invite = Some(crate::domain::mesh::MeshInviteCreatedInfo {
+            invite_id: "invite-1".into(),
+            url: "qmt://mesh/join/token".into(),
+            qr_code: Some("QR-LINE".into()),
+            expires_at: 1,
+            max_uses: 1,
+            mesh_name: None,
+        });
+        app.mesh.mesh_clipboard_fallback = Some("qmt://mesh/join/token".into());
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_mesh_invite_qr_popup(f, &app.mesh))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert!(find_buffer_text(&buffer, "Clipboard not available").is_some());
+        assert!(find_buffer_text(&buffer, "qmt://mesh/join/token").is_some());
+        assert!(find_buffer_text(&buffer, "press any key to dismiss").is_some());
     }
 
     #[test]
@@ -2710,7 +2772,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_model_popup(f, &app)).unwrap();
+        terminal
+            .draw(|f| draw_model_popup_for_test(f, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rendered = buffer
             .content()
