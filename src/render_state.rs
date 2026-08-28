@@ -46,6 +46,17 @@ impl SessionIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderChange {
+    SessionChanged(SessionIdentity),
+    FinalizedMessagesChanged,
+    StreamingContentChanged,
+    StreamingThinkingChanged,
+    DelegatePresentationChanged,
+    ThemeChanged,
+    ExternalEditorReturned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionCacheKey {
     epoch: u64,
     identity: SessionIdentity,
@@ -857,6 +868,16 @@ pub(crate) struct RenderState {
     session_epoch: u64,
     pub(crate) prev_total_height: u16,
     pub(crate) tick: u64,
+    #[cfg(test)]
+    invalidation_order: Vec<CacheInvalidation>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheInvalidation {
+    Finalized,
+    Content,
+    Thinking,
 }
 
 impl RenderState {
@@ -870,6 +891,8 @@ impl RenderState {
             session_epoch: 0,
             prev_total_height: 0,
             tick: 0,
+            #[cfg(test)]
+            invalidation_order: Vec::new(),
         }
     }
 
@@ -888,7 +911,28 @@ impl RenderState {
         self.session_cache_key(identity)
     }
 
-    pub(crate) fn advance_session_epoch(&mut self, identity: SessionIdentity) {
+    pub(crate) fn apply_change(&mut self, change: RenderChange) {
+        match change {
+            RenderChange::SessionChanged(identity) => {
+                self.advance_session_epoch(identity);
+                self.invalidate_content_cache();
+                self.invalidate_thinking_cache();
+                self.invalidate_card_cache();
+            }
+            RenderChange::FinalizedMessagesChanged | RenderChange::DelegatePresentationChanged => {
+                self.invalidate_card_cache()
+            }
+            RenderChange::StreamingContentChanged => self.invalidate_content_cache(),
+            RenderChange::StreamingThinkingChanged => self.invalidate_thinking_cache(),
+            RenderChange::ThemeChanged => self.invalidate_theme_caches(),
+            RenderChange::ExternalEditorReturned => {
+                self.invalidate_card_cache();
+                self.invalidate_content_cache();
+            }
+        }
+    }
+
+    fn advance_session_epoch(&mut self, identity: SessionIdentity) {
         self.session_identity = Some(identity);
         self.session_epoch = self.session_epoch.saturating_add(1);
     }
@@ -944,19 +988,25 @@ impl RenderState {
         }
     }
 
-    pub(crate) fn invalidate_card_cache(&mut self) {
+    fn invalidate_card_cache(&mut self) {
         self.card_cache.invalidate();
+        #[cfg(test)]
+        self.invalidation_order.push(CacheInvalidation::Finalized);
     }
 
-    pub(crate) fn invalidate_content_cache(&mut self) {
+    fn invalidate_content_cache(&mut self) {
         self.streaming_cache.invalidate();
+        #[cfg(test)]
+        self.invalidation_order.push(CacheInvalidation::Content);
     }
 
-    pub(crate) fn invalidate_thinking_cache(&mut self) {
+    fn invalidate_thinking_cache(&mut self) {
         self.streaming_thinking_cache.invalidate();
+        #[cfg(test)]
+        self.invalidation_order.push(CacheInvalidation::Thinking);
     }
 
-    pub(crate) fn invalidate_theme_caches(&mut self) {
+    fn invalidate_theme_caches(&mut self) {
         self.invalidate_card_cache();
         self.invalidate_content_cache();
         self.invalidate_thinking_cache();
@@ -1192,84 +1242,112 @@ mod tests {
         assert!(!state.test_streaming_cache_populated(StreamKind::Content));
     }
 
-    #[test]
-    fn individual_invalidations_clear_only_selected_storage() {
+    fn seeded_caches() -> RenderState {
         let mut state = RenderState::new();
         state.test_seed_card_cache(2);
         state.test_seed_streaming_cache(StreamKind::Content);
         state.test_seed_streaming_cache(StreamKind::Thinking);
+        state
+    }
 
-        state.invalidate_content_cache();
-        assert_eq!(state.test_card_source_entry_count(), 2);
-        assert!(!state.test_streaming_cache_populated(StreamKind::Content));
-        assert!(state.test_streaming_cache_populated(StreamKind::Thinking));
-
-        state.invalidate_thinking_cache();
-        assert_eq!(state.test_card_source_entry_count(), 2);
-        assert!(!state.test_streaming_cache_populated(StreamKind::Thinking));
-
-        state.invalidate_card_cache();
-        assert_eq!(state.test_card_source_entry_count(), 0);
+    fn assert_cache_scope(
+        state: &RenderState,
+        cards: bool,
+        content: bool,
+        thinking: bool,
+        order: &[CacheInvalidation],
+    ) {
+        assert_eq!(state.test_card_source_entry_count() > 0, cards);
+        assert_eq!(
+            state.test_streaming_cache_populated(StreamKind::Content),
+            content
+        );
+        assert_eq!(
+            state.test_streaming_cache_populated(StreamKind::Thinking),
+            thinking
+        );
+        assert_eq!(state.invalidation_order, order);
     }
 
     #[test]
-    fn session_switch_invalidation_keeps_new_stream_storage_isolated() {
-        let mut state = RenderState::new();
+    fn session_change_advances_epoch_and_clears_content_thinking_then_cards() {
+        let mut state = seeded_caches();
+        let session = identity("same", None, false);
+        let expected_order = [
+            CacheInvalidation::Content,
+            CacheInvalidation::Thinking,
+            CacheInvalidation::Finalized,
+        ];
+
+        state.apply_change(RenderChange::SessionChanged(session.clone()));
+        assert_eq!(state.test_session_epoch(), 1);
+        assert_cache_scope(&state, false, false, false, &expected_order);
+
         state.test_seed_card_cache(2);
         state.test_seed_streaming_cache(StreamKind::Content);
         state.test_seed_streaming_cache(StreamKind::Thinking);
-
-        state.invalidate_content_cache();
-        state.invalidate_thinking_cache();
-        state.invalidate_card_cache();
-        state.test_seed_streaming_cache(StreamKind::Content);
-
-        assert_eq!(state.test_card_source_entry_count(), 0);
-        assert!(state.test_streaming_cache_populated(StreamKind::Content));
-        assert!(!state.test_streaming_cache_populated(StreamKind::Thinking));
+        state.invalidation_order.clear();
+        state.apply_change(RenderChange::SessionChanged(session));
+        assert_eq!(state.test_session_epoch(), 2);
+        assert_cache_scope(&state, false, false, false, &expected_order);
     }
 
     #[test]
-    fn external_editor_invalidation_retains_thinking_cache() {
-        let mut state = RenderState::new();
-        state.test_seed_card_cache(2);
-        state.test_seed_streaming_cache(StreamKind::Content);
-        state.test_seed_streaming_cache(StreamKind::Thinking);
-
-        state.invalidate_card_cache();
-        state.invalidate_content_cache();
-
-        assert_eq!(state.test_card_source_entry_count(), 0);
-        assert!(!state.test_streaming_cache_populated(StreamKind::Content));
-        assert!(state.test_streaming_cache_populated(StreamKind::Thinking));
+    fn finalized_message_change_clears_only_cards() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::FinalizedMessagesChanged);
+        assert_cache_scope(&state, false, true, true, &[CacheInvalidation::Finalized]);
     }
 
     #[test]
-    fn delegate_invalidation_clears_only_finalized_cards() {
-        let mut state = RenderState::new();
-        state.test_seed_card_cache(2);
-        state.test_seed_streaming_cache(StreamKind::Content);
-        state.test_seed_streaming_cache(StreamKind::Thinking);
-
-        state.invalidate_card_cache();
-
-        assert_eq!(state.test_card_source_entry_count(), 0);
-        assert!(state.test_streaming_cache_populated(StreamKind::Content));
-        assert!(state.test_streaming_cache_populated(StreamKind::Thinking));
+    fn streaming_content_change_clears_only_content() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::StreamingContentChanged);
+        assert_cache_scope(&state, true, false, true, &[CacheInvalidation::Content]);
     }
 
     #[test]
-    fn theme_invalidation_clears_all_three_caches() {
-        let mut state = RenderState::new();
-        state.test_seed_card_cache(2);
-        state.test_seed_streaming_cache(StreamKind::Content);
-        state.test_seed_streaming_cache(StreamKind::Thinking);
+    fn streaming_thinking_change_clears_only_thinking() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::StreamingThinkingChanged);
+        assert_cache_scope(&state, true, true, false, &[CacheInvalidation::Thinking]);
+    }
 
-        state.invalidate_theme_caches();
+    #[test]
+    fn delegate_presentation_change_clears_only_cards() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::DelegatePresentationChanged);
+        assert_cache_scope(&state, false, true, true, &[CacheInvalidation::Finalized]);
+    }
 
-        assert_eq!(state.test_card_source_entry_count(), 0);
-        assert!(!state.test_streaming_cache_populated(StreamKind::Content));
-        assert!(!state.test_streaming_cache_populated(StreamKind::Thinking));
+    #[test]
+    fn theme_change_clears_cards_content_then_thinking() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::ThemeChanged);
+        assert_cache_scope(
+            &state,
+            false,
+            false,
+            false,
+            &[
+                CacheInvalidation::Finalized,
+                CacheInvalidation::Content,
+                CacheInvalidation::Thinking,
+            ],
+        );
+    }
+
+    #[test]
+    fn external_editor_return_clears_cards_and_content_but_retains_thinking() {
+        let mut state = seeded_caches();
+        state.apply_change(RenderChange::ExternalEditorReturned);
+        assert_cache_scope(
+            &state,
+            false,
+            false,
+            true,
+            &[CacheInvalidation::Finalized, CacheInvalidation::Content],
+        );
     }
 
     #[test]

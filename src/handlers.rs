@@ -7,6 +7,7 @@ use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::chat::ElicitationResponseOutcome;
 use crate::domain::model::ModelEntry;
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
+use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn popup_page_step(visible_rows: usize) -> usize {
@@ -1284,7 +1285,7 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
             {
                 theme::Theme::set_by_index(idx);
                 theme::Theme::begin_frame();
-                app.render.invalidate_theme_caches();
+                app.render.apply_change(RenderChange::ThemeChanged);
                 app.navigation.popup = Popup::None;
                 return vec![Effect::PersistConfig];
             }

@@ -205,7 +205,7 @@ pub(crate) enum ToolStartPreparationTransition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolStartInsertionTransition {
     Reconciled,
-    Inserted,
+    Inserted { moved_thinking: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +320,6 @@ pub(crate) enum HistoryTransition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HistoryCoordination {
-    InvalidateContentCache,
     Status {
         level: LogLevel,
         target: &'static str,
@@ -335,9 +334,6 @@ pub(crate) enum HistoryCoordination {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChatCoordination {
-    InvalidateContentCache,
-    InvalidateThinkingCache,
-    InvalidateCardCache,
     Log {
         level: LogLevel,
         target: &'static str,
@@ -419,15 +415,11 @@ impl ChatState {
                 self.begin_turn(is_replay);
                 (
                     ChatTransition::TurnStarted,
-                    vec![
-                        ChatCoordination::InvalidateContentCache,
-                        ChatCoordination::InvalidateThinkingCache,
-                        ChatCoordination::Status {
-                            level: LogLevel::Debug,
-                            target: "activity",
-                            message: "thinking...".into(),
-                        },
-                    ],
+                    vec![ChatCoordination::Status {
+                        level: LogLevel::Debug,
+                        target: "activity",
+                        message: "thinking...".into(),
+                    }],
                 )
             }
             ChatAction::UserMessage {
@@ -436,21 +428,16 @@ impl ChatState {
                 is_replay,
             } => {
                 let transition = self.push_user_message(text, message_id, is_replay);
-                let coordination = matches!(transition, UserMessageTransition::Reconciled)
-                    .then_some(ChatCoordination::InvalidateCardCache)
-                    .into_iter()
-                    .collect();
-                (ChatTransition::UserMessage(transition), coordination)
+                (ChatTransition::UserMessage(transition), Vec::new())
             }
             ChatAction::AssistantContentDelta {
                 content,
                 message_id,
             } => {
                 let transition = self.append_streaming_content(&content, message_id);
-                let coordination = Self::stream_boundary_coordination(transition);
                 (
                     ChatTransition::AssistantContentDelta(transition),
-                    coordination,
+                    Vec::new(),
                 )
             }
             ChatAction::AssistantThinkingDelta {
@@ -459,10 +446,9 @@ impl ChatState {
                 is_replay,
             } => {
                 let transition = self.append_streaming_thinking(&content, message_id, is_replay);
-                let coordination = Self::stream_boundary_coordination(transition);
                 (
                     ChatTransition::AssistantThinkingDelta(transition),
-                    coordination,
+                    Vec::new(),
                 )
             }
             ChatAction::AssistantMessage {
@@ -471,14 +457,7 @@ impl ChatState {
                 message_id,
             } => {
                 let transition = self.push_assistant_message(content, thinking, message_id);
-                let mut coordination = vec![
-                    ChatCoordination::InvalidateContentCache,
-                    ChatCoordination::InvalidateThinkingCache,
-                ];
-                if transition == AssistantMessageTransition::ReplacedThinking {
-                    coordination.push(ChatCoordination::InvalidateCardCache);
-                }
-                (ChatTransition::AssistantMessage(transition), coordination)
+                (ChatTransition::AssistantMessage(transition), Vec::new())
             }
             ChatAction::AcpError { message } => {
                 self.end_llm_request_span(None);
@@ -501,39 +480,29 @@ impl ChatState {
                         prompt_rolled_back,
                         error_inserted,
                     },
-                    vec![
-                        ChatCoordination::InvalidateCardCache,
-                        ChatCoordination::Status {
-                            level: LogLevel::Error,
-                            target: "acp",
-                            message: format!("error: {message}"),
-                        },
-                    ],
+                    vec![ChatCoordination::Status {
+                        level: LogLevel::Error,
+                        target: "acp",
+                        message: format!("error: {message}"),
+                    }],
                 )
             }
             ChatAction::RuntimePromptDispatchFailed { local_id } => {
                 let prompt_rolled_back = self.rollback_pending_prompt(&local_id);
                 (
                     ChatTransition::RuntimePromptDispatchFailed { prompt_rolled_back },
-                    prompt_rolled_back
-                        .then_some(ChatCoordination::InvalidateCardCache)
-                        .into_iter()
-                        .collect(),
+                    Vec::new(),
                 )
             }
             ChatAction::Cancelled { is_replay } => {
                 self.cancel_turn(is_replay);
                 (
                     ChatTransition::Cancelled,
-                    vec![
-                        ChatCoordination::InvalidateContentCache,
-                        ChatCoordination::InvalidateThinkingCache,
-                        ChatCoordination::Status {
-                            level: LogLevel::Warn,
-                            target: "activity",
-                            message: "cancelled".into(),
-                        },
-                    ],
+                    vec![ChatCoordination::Status {
+                        level: LogLevel::Warn,
+                        target: "activity",
+                        message: "cancelled".into(),
+                    }],
                 )
             }
             ChatAction::Finished {
@@ -543,15 +512,11 @@ impl ChatState {
                 self.finish_turn(is_replay);
                 (
                     ChatTransition::Finished,
-                    vec![
-                        ChatCoordination::InvalidateContentCache,
-                        ChatCoordination::InvalidateThinkingCache,
-                        ChatCoordination::Status {
-                            level: LogLevel::Debug,
-                            target: "activity",
-                            message: format!("finished: {finish_reason}"),
-                        },
-                    ],
+                    vec![ChatCoordination::Status {
+                        level: LogLevel::Debug,
+                        target: "activity",
+                        message: format!("finished: {finish_reason}"),
+                    }],
                 )
             }
         };
@@ -590,7 +555,6 @@ impl ChatState {
                         (
                             HistoryTransition::UndoApplied,
                             vec![
-                                HistoryCoordination::InvalidateContentCache,
                                 HistoryCoordination::Status {
                                     level: LogLevel::Info,
                                     target: "session",
@@ -723,18 +687,11 @@ impl ChatState {
 
                 self.activity = ActivityState::RunningTool { name: name.clone() };
                 let finalized_streaming = self.finalize_streaming_segment();
-                let mut coordination = vec![ChatCoordination::Status {
+                let coordination = vec![ChatCoordination::Status {
                     level: LogLevel::Debug,
                     target: "tool",
                     message: format!("tool: {name}"),
                 }];
-                if finalized_streaming {
-                    coordination.extend([
-                        ChatCoordination::InvalidateContentCache,
-                        ChatCoordination::InvalidateThinkingCache,
-                        ChatCoordination::InvalidateCardCache,
-                    ]);
-                }
                 let preparation = if name == "question" {
                     ToolStartPreparationTransition::QuestionOnly {
                         finalized_streaming,
@@ -755,21 +712,17 @@ impl ChatState {
                     self.clear_streaming_thinking();
                     (
                         ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled),
-                        vec![
-                            ChatCoordination::InvalidateThinkingCache,
-                            ChatCoordination::InvalidateCardCache,
-                        ],
+                        Vec::new(),
                     )
                 } else {
                     self.record_tool_call();
                     let moved_thinking = self.push_streaming_thinking_entry();
                     self.push_tool_call(tool_call_id, name, false, detail);
                     (
-                        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted),
-                        moved_thinking
-                            .then_some(ChatCoordination::InvalidateThinkingCache)
-                            .into_iter()
-                            .collect(),
+                        ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted {
+                            moved_thinking,
+                        }),
+                        Vec::new(),
                     )
                 }
             }
@@ -803,7 +756,7 @@ impl ChatState {
                 } else {
                     false
                 };
-                if is_error && failure_before.is_none() {
+                let transition = if is_error && failure_before.is_none() {
                     self.push_tool_call(
                         tool_call_id,
                         format!("{name} (failed)"),
@@ -815,24 +768,16 @@ impl ChatState {
                             })
                             .unwrap_or(ToolDetail::None),
                     );
-                    (
-                        ChatToolTransition::Ended(ToolEndTransition::FallbackInserted),
-                        vec![ChatCoordination::InvalidateCardCache],
-                    )
+                    ToolEndTransition::FallbackInserted
                 } else if detail_updated || marked_failed {
-                    (
-                        ChatToolTransition::Ended(ToolEndTransition::Updated {
-                            detail_updated,
-                            marked_failed,
-                        }),
-                        vec![ChatCoordination::InvalidateCardCache],
-                    )
+                    ToolEndTransition::Updated {
+                        detail_updated,
+                        marked_failed,
+                    }
                 } else {
-                    (
-                        ChatToolTransition::Ended(ToolEndTransition::NoOp),
-                        Vec::new(),
-                    )
-                }
+                    ToolEndTransition::NoOp
+                };
+                (ChatToolTransition::Ended(transition), Vec::new())
             }
         };
         ChatToolOutcome {
@@ -937,15 +882,6 @@ impl ChatState {
                 });
                 self.scroll_offset = 0;
 
-                let mut coordination = if finalized_streaming {
-                    vec![
-                        ChatCoordination::InvalidateContentCache,
-                        ChatCoordination::InvalidateThinkingCache,
-                        ChatCoordination::InvalidateCardCache,
-                    ]
-                } else {
-                    Vec::new()
-                };
                 let (transition, status) = if supported {
                     (
                         ElicitationTransition::InsertedSupported {
@@ -971,8 +907,7 @@ impl ChatState {
                         },
                     )
                 };
-                coordination.push(status);
-                (transition, coordination)
+                (transition, vec![status])
             }
             ElicitationAction::ResponseAcknowledged {
                 elicitation_id,
@@ -1003,16 +938,10 @@ impl ChatState {
                     self.elicitation_ui = None;
                     (
                         ElicitationTransition::ResolvedActive,
-                        vec![
-                            ChatCoordination::InvalidateCardCache,
-                            ChatCoordination::RefreshTransientStatus,
-                        ],
+                        vec![ChatCoordination::RefreshTransientStatus],
                     )
                 } else {
-                    (
-                        ElicitationTransition::ResolvedStale,
-                        vec![ChatCoordination::InvalidateCardCache],
-                    )
+                    (ElicitationTransition::ResolvedStale, Vec::new())
                 }
             }
         };
@@ -1020,18 +949,6 @@ impl ChatState {
             transition,
             coordination,
             effects: Vec::new(),
-        }
-    }
-
-    fn stream_boundary_coordination(transition: StreamingDeltaTransition) -> Vec<ChatCoordination> {
-        if transition.finalized_previous {
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::InvalidateCardCache,
-            ]
-        } else {
-            Vec::new()
         }
     }
 
@@ -2365,7 +2282,6 @@ mod tests {
             HistoryOutcome {
                 transition: HistoryTransition::UndoApplied,
                 coordination: vec![
-                    HistoryCoordination::InvalidateContentCache,
                     HistoryCoordination::Status {
                         level: LogLevel::Info,
                         target: "session",
@@ -2909,16 +2825,11 @@ mod tests {
         );
         assert_eq!(
             first.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::InvalidateCardCache,
-                ChatCoordination::Status {
-                    level: LogLevel::Info,
-                    target: "elicitation",
-                    message: "question - answer in the panel above input".into(),
-                },
-            ]
+            vec![ChatCoordination::Status {
+                level: LogLevel::Info,
+                target: "elicitation",
+                message: "question - answer in the panel above input".into(),
+            },]
         );
         assert!(first.effects.is_empty());
         assert!(matches!(
@@ -3012,10 +2923,7 @@ mod tests {
             outcome: ElicitationResponseOutcome::Declined,
         });
         assert_eq!(stale.transition, ElicitationTransition::ResolvedStale);
-        assert_eq!(
-            stale.coordination,
-            vec![ChatCoordination::InvalidateCardCache]
-        );
+        assert_eq!(stale.coordination, Vec::new());
         assert!(stale.effects.is_empty());
         assert_eq!(
             chat.elicitation
@@ -3032,10 +2940,7 @@ mod tests {
         assert_eq!(active.transition, ElicitationTransition::ResolvedActive);
         assert_eq!(
             active.coordination,
-            vec![
-                ChatCoordination::InvalidateCardCache,
-                ChatCoordination::RefreshTransientStatus,
-            ]
+            vec![ChatCoordination::RefreshTransientStatus,]
         );
         assert!(active.effects.is_empty());
         assert!(chat.elicitation.is_none());
@@ -3046,10 +2951,7 @@ mod tests {
             outcome: ElicitationResponseOutcome::Text("accepted".into()),
         });
         assert_eq!(duplicate.transition, ElicitationTransition::ResolvedStale);
-        assert_eq!(
-            duplicate.coordination,
-            vec![ChatCoordination::InvalidateCardCache]
-        );
+        assert_eq!(duplicate.coordination, Vec::new());
         assert!(duplicate.effects.is_empty());
         assert!(matches!(
             chat.messages.as_slice(),
@@ -3170,16 +3072,11 @@ mod tests {
                         finalized_streaming: true,
                     },
                 ),
-                coordination: vec![
-                    ChatCoordination::Status {
-                        level: LogLevel::Debug,
-                        target: "tool",
-                        message: "tool: shell".into(),
-                    },
-                    ChatCoordination::InvalidateContentCache,
-                    ChatCoordination::InvalidateThinkingCache,
-                    ChatCoordination::InvalidateCardCache,
-                ],
+                coordination: vec![ChatCoordination::Status {
+                    level: LogLevel::Debug,
+                    target: "tool",
+                    message: "tool: shell".into(),
+                },],
                 effects: Vec::new(),
             }
         );
@@ -3250,12 +3147,11 @@ mod tests {
 
         assert_eq!(
             outcome.transition,
-            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted)
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted {
+                moved_thinking: true,
+            })
         );
-        assert_eq!(
-            outcome.coordination,
-            vec![ChatCoordination::InvalidateThinkingCache]
-        );
+        assert!(outcome.coordination.is_empty());
         assert!(outcome.effects.is_empty());
         assert_eq!(chat.session_stats.total_tool_calls, 8);
         assert!(matches!(
@@ -3277,7 +3173,9 @@ mod tests {
         });
         assert_eq!(
             saturated.transition,
-            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted)
+            ChatToolTransition::StartInserted(ToolStartInsertionTransition::Inserted {
+                moved_thinking: false,
+            })
         );
         assert_eq!(chat.session_stats.total_tool_calls, u32::MAX);
     }
@@ -3312,13 +3210,7 @@ mod tests {
             outcome.transition,
             ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled)
         );
-        assert_eq!(
-            outcome.coordination,
-            vec![
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::InvalidateCardCache,
-            ]
-        );
+        assert_eq!(outcome.coordination, vec![]);
         assert!(outcome.effects.is_empty());
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.session_stats.total_tool_calls, 7);
@@ -3345,10 +3237,7 @@ mod tests {
             inserted.transition,
             ChatToolTransition::Ended(ToolEndTransition::FallbackInserted)
         );
-        assert_eq!(
-            inserted.coordination,
-            vec![ChatCoordination::InvalidateCardCache]
-        );
+        assert_eq!(inserted.coordination, Vec::new());
         assert!(inserted.effects.is_empty());
 
         let repeated = chat.reduce_tool(failed);
@@ -3434,10 +3323,7 @@ mod tests {
                 marked_failed: true,
             })
         );
-        assert_eq!(
-            updated.coordination,
-            vec![ChatCoordination::InvalidateCardCache]
-        );
+        assert_eq!(updated.coordination, Vec::new());
         assert!(updated.effects.is_empty());
         assert!(matches!(
             chat.messages.as_slice(),
@@ -3541,14 +3427,11 @@ mod tests {
                     prompt_rolled_back: true,
                     error_inserted: true,
                 },
-                coordination: vec![
-                    ChatCoordination::InvalidateCardCache,
-                    ChatCoordination::Status {
-                        level: LogLevel::Error,
-                        target: "acp",
-                        message: "error: backend rejected prompt".into(),
-                    },
-                ],
+                coordination: vec![ChatCoordination::Status {
+                    level: LogLevel::Error,
+                    target: "acp",
+                    message: "error: backend rejected prompt".into(),
+                },],
                 effects: Vec::new(),
             }
         );
@@ -3603,7 +3486,7 @@ mod tests {
                 transition: ChatTransition::RuntimePromptDispatchFailed {
                     prompt_rolled_back: true,
                 },
-                coordination: vec![ChatCoordination::InvalidateCardCache],
+                coordination: Vec::new(),
                 effects: Vec::new(),
             }
         );
@@ -3649,15 +3532,11 @@ mod tests {
         assert_eq!(outcome.transition, ChatTransition::TurnStarted);
         assert_eq!(
             outcome.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::Status {
-                    level: LogLevel::Debug,
-                    target: "activity",
-                    message: "thinking...".into(),
-                },
-            ]
+            vec![ChatCoordination::Status {
+                level: LogLevel::Debug,
+                target: "activity",
+                message: "thinking...".into(),
+            },]
         );
         assert!(outcome.effects.is_empty());
         assert_eq!(live.activity, ActivityState::Thinking);
@@ -3703,10 +3582,7 @@ mod tests {
             reconciled.transition,
             ChatTransition::UserMessage(UserMessageTransition::Reconciled)
         );
-        assert_eq!(
-            reconciled.coordination,
-            vec![ChatCoordination::InvalidateCardCache]
-        );
+        assert_eq!(reconciled.coordination, Vec::new());
         assert!(matches!(
             &chat.messages[0],
             ChatEntry::User { message_id: Some(id), .. } if id == "server-1"
@@ -3797,14 +3673,7 @@ mod tests {
                 ignored_duplicate: false,
             })
         );
-        assert_eq!(
-            boundary.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::InvalidateCardCache,
-            ]
-        );
+        assert_eq!(boundary.coordination, vec![]);
         assert!(matches!(
             chat.messages.as_slice(),
             [ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }]
@@ -3816,10 +3685,7 @@ mod tests {
 
     #[test]
     fn reducer_final_assistant_merges_replaces_and_deduplicates_exactly() {
-        let expected_base_coordination = vec![
-            ChatCoordination::InvalidateContentCache,
-            ChatCoordination::InvalidateThinkingCache,
-        ];
+        let expected_base_coordination = vec![];
         let mut chat = ChatState::new();
         chat.streaming_content = "partial".into();
         chat.streaming_content_message_id = Some("assistant-1".into());
@@ -3868,14 +3734,7 @@ mod tests {
             replaced.transition,
             ChatTransition::AssistantMessage(AssistantMessageTransition::ReplacedThinking)
         );
-        assert_eq!(
-            replaced.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::InvalidateCardCache,
-            ]
-        );
+        assert_eq!(replaced.coordination, vec![]);
         assert!(matches!(
             &chat.messages[1],
             ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }
@@ -3894,15 +3753,11 @@ mod tests {
         assert_eq!(outcome.transition, ChatTransition::Cancelled);
         assert_eq!(
             outcome.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::Status {
-                    level: LogLevel::Warn,
-                    target: "activity",
-                    message: "cancelled".into(),
-                },
-            ]
+            vec![ChatCoordination::Status {
+                level: LogLevel::Warn,
+                target: "activity",
+                message: "cancelled".into(),
+            },]
         );
         assert_eq!(cancelled.activity, ActivityState::Idle);
         assert!(cancelled.session_stats.open_llm_request_instant.is_none());
@@ -3921,15 +3776,11 @@ mod tests {
         assert_eq!(outcome.transition, ChatTransition::Finished);
         assert_eq!(
             outcome.coordination,
-            vec![
-                ChatCoordination::InvalidateContentCache,
-                ChatCoordination::InvalidateThinkingCache,
-                ChatCoordination::Status {
-                    level: LogLevel::Debug,
-                    target: "activity",
-                    message: "finished: EndTurn".into(),
-                },
-            ]
+            vec![ChatCoordination::Status {
+                level: LogLevel::Debug,
+                target: "activity",
+                message: "finished: EndTurn".into(),
+            },]
         );
         assert_eq!(finished.activity, ActivityState::Idle);
         assert!(finished.session_stats.open_llm_request_instant.is_none());

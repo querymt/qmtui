@@ -200,8 +200,8 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             ClipboardTarget::MeshInvite => app.apply_mesh_clipboard_result(success),
         },
         RuntimeEvent::ExternalEditorFinished { outcome } => {
-            app.render.invalidate_card_cache();
-            app.render.invalidate_content_cache();
+            app.render
+                .apply_change(crate::render_state::RenderChange::ExternalEditorReturned);
             match outcome {
                 ExternalEditorOutcome::Completed(updated_input) => {
                     app.composer.replace_input_from_editor(updated_input);
@@ -1412,6 +1412,27 @@ mod tests {
             ChatEntry::Assistant { content, thinking: Some(thinking), message_id: Some(id) }
                 if content == "final" && thinking == "second plan" && id == "assistant-2"
         ));
+
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 13);
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::SessionUpdate {
+                session_id: "active".into(),
+                update: crate::acp_state::AcpSessionUpdate::AssistantMessage {
+                    content: "duplicate final".into(),
+                    thinking: Some("duplicate thinking".into()),
+                    message_id: Some("assistant-2".into()),
+                },
+                is_replay: false,
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 13);
+        assert_eq!(app.chat.messages.len(), 2);
     }
 
     #[test]
@@ -1600,6 +1621,21 @@ mod tests {
         assert_eq!(diagnostics[0].message, "error: backend rejected prompt");
         assert_eq!(app.composer.input, "preserved input");
         assert_eq!(app.mesh.mesh_invite_name, "preserved invite");
+
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
+        seed_card_cache(&mut app, 11);
+        let effects = update(
+            &mut app,
+            AppEvent::Acp(AcpAppEvent::PromptFailed {
+                local_id: "missing".into(),
+                message: "backend rejected prompt".into(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
+        assert_eq!(card_cache_count(&app), 0);
     }
 
     #[test]
@@ -3131,6 +3167,8 @@ mod tests {
         let mut app = App::new();
         app.composer.input = "draft".into();
         seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
 
         let effects = update(
             &mut app,
@@ -3142,6 +3180,8 @@ mod tests {
         assert_eq!(app.composer.input, "revised");
         assert_eq!(app.composer.input_cursor, "revised".len());
         assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "loaded prompt from external editor");
         assert_eq!(effects, vec![Effect::Terminal(TerminalAction::Redraw)]);
     }
@@ -3150,6 +3190,9 @@ mod tests {
     fn editor_cancel_and_failure_preserve_input_and_request_redraw() {
         let mut app = App::new();
         app.composer.input = "draft".into();
+        seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
 
         let effects = update(
             &mut app,
@@ -3158,9 +3201,15 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(app.diagnostics.status, "external editor cancelled");
         assert_eq!(effects, vec![Effect::Terminal(TerminalAction::Redraw)]);
 
+        seed_card_cache(&mut app, 2);
+        seed_content_cache(&mut app);
+        seed_thinking_cache(&mut app);
         let effects = update(
             &mut app,
             AppEvent::Runtime(RuntimeEvent::ExternalEditorFinished {
@@ -3168,6 +3217,9 @@ mod tests {
             }),
         );
         assert_eq!(app.composer.input, "draft");
+        assert_eq!(card_cache_count(&app), 0);
+        assert!(!content_cache_populated(&app));
+        assert!(thinking_cache_populated(&app));
         assert_eq!(
             app.diagnostics.status,
             "external editor failed: editor exited"

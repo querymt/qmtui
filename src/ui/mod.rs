@@ -15,7 +15,7 @@ use start::draw_start;
 #[cfg(test)]
 pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
 #[cfg(test)]
-pub(crate) use crate::render_state::{Card, CardKind};
+pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
 #[cfg(test)]
 pub(crate) use chat::{
     ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards,
@@ -2782,7 +2782,8 @@ mod tests {
                 child_state: DelegateChildState::None,
             },
         ];
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
 
         let lines = rendered_card_lines(&mut app);
         let first = lines
@@ -2863,7 +2864,8 @@ mod tests {
         assert_eq!(app.render.test_card_source_entry_count(), 1);
 
         app.chat.messages.clear();
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cards = build_message_cards(&mut app);
         assert!(cards.is_empty());
         assert_eq!(app.render.test_card_source_entry_count(), 0);
@@ -2919,7 +2921,8 @@ mod tests {
         let warm = rendered_card_snapshot(&mut app, 80);
         assert_eq!(app.render.test_card_identity(0), prefix_identity);
         assert_ne!(app.render.test_card_identity(1), changed_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm, cold);
     }
@@ -2957,7 +2960,8 @@ mod tests {
         let warm = rendered_card_snapshot(&mut app, 80);
         assert_eq!(app.render.test_card_identity(0), prefix_identity);
         assert_ne!(app.render.test_card_identity(1), tool_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm, cold);
     }
@@ -2976,7 +2980,8 @@ mod tests {
         let wide = rendered_card_snapshot(&mut app, 100);
         let warm_narrow = rendered_card_snapshot(&mut app, 30);
         assert_ne!(wide, warm_narrow);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_narrow = rendered_card_snapshot(&mut app, 30);
         assert_eq!(warm_narrow, cold_narrow);
     }
@@ -3031,7 +3036,8 @@ mod tests {
         let warm = rendered_card_snapshot(&mut app, 80);
         assert_eq!(app.render.test_card_identity(0), prefix_identity);
         assert_ne!(app.render.test_card_identity(1), old_second_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm, cold);
     }
@@ -3050,7 +3056,8 @@ mod tests {
         app.sessions.session_id = Some("session-b".into());
         let warm = rendered_card_snapshot(&mut app, 80);
         assert_ne!(app.render.test_card_identity(0), old_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm, cold);
     }
@@ -3153,7 +3160,8 @@ mod tests {
                 CardKind::Tool { compact: true },
             ]
         );
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_visible = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm_visible, cold_visible);
     }
@@ -3212,7 +3220,8 @@ mod tests {
         };
         assert!(warm.iter().any(|line| line.contains("done")));
         assert_ne!(app.render.test_card_identity(0), duration_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = {
             let cards = build_message_cards_for_width_at(&mut app, 80, 101);
             cards[0]
@@ -3360,7 +3369,8 @@ mod tests {
             }
 
             let warm = rendered_card_snapshot(&mut app, width);
-            app.render.invalidate_card_cache();
+            app.render
+                .apply_change(RenderChange::FinalizedMessagesChanged);
             let cold = rendered_card_snapshot(&mut app, width);
             assert_eq!(warm, cold, "warm/cold mismatch for {axis}");
         }
@@ -3391,7 +3401,8 @@ mod tests {
         app.connection.launch_cwd = Some("/workspace/two".into());
         let warm = rendered_card_snapshot(&mut app, 80);
         assert_ne!(app.render.test_card_identity(0), old_identity);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold = rendered_card_snapshot(&mut app, 80);
         assert_eq!(warm, cold);
     }
@@ -3429,7 +3440,8 @@ mod tests {
             "cache must invalidate"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let lines = rebuilt_from_warm_update
@@ -3485,7 +3497,8 @@ mod tests {
             "semantic update should invalidate the warm card"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let rebuilt_lines = &rebuilt_from_warm_update[0].1;
@@ -3553,7 +3566,8 @@ mod tests {
             "semantic update should invalidate the warm card"
         );
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 80);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 80);
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
         let rebuilt_lines = &rebuilt_from_warm_update[0].1;
@@ -3609,7 +3623,8 @@ mod tests {
         assert_eq!(app.render.test_card_source_entry_count(), 0);
 
         let rebuilt_from_warm_update = rendered_card_snapshot(&mut app, 34);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 34);
 
         assert_eq!(rebuilt_from_warm_update, cold_full_rebuild);
@@ -3656,7 +3671,8 @@ mod tests {
         );
 
         let warm_reconciled = rendered_card_snapshot(&mut app, 42);
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
         assert_eq!(warm_reconciled, cold_full_rebuild);
 
@@ -3725,7 +3741,8 @@ mod tests {
         });
         let incremental = rendered_card_snapshot(&mut app, 42);
 
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let cold_full_rebuild = rendered_card_snapshot(&mut app, 42);
 
         assert_eq!(incremental, cold_full_rebuild);
@@ -5067,7 +5084,8 @@ mod tests {
         };
         let incremental_tool_lines = app.render.cards()[0].lines_for(80).len();
 
-        app.render.invalidate_card_cache();
+        app.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         let full_kinds: Vec<_> = {
             let cards = build_message_cards(&mut app);
             cards.iter().map(|card| card.kind.clone()).collect()

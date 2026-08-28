@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn invalidate_theme_caches_clears_all_render_caches() {
+    fn theme_selection_clears_all_render_caches() {
         use crate::theme::Theme;
 
         Theme::set_by_index(0);
@@ -895,12 +895,13 @@ mod tests {
             "card_cache should be populated"
         );
 
-        // Match the production order: snapshot the selected theme, then clear styled caches.
-        Theme::set_by_index(2);
-        Theme::begin_frame();
+        app.navigation.popup = crate::navigation_state::Popup::ThemeSelect;
+        app.navigation.theme_cursor = 2;
+        let effects = handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::PersistConfig]);
+        assert_eq!(app.navigation.popup, crate::navigation_state::Popup::None);
         let current_preview_fg = Theme::diff_file().fg.expect("diff_file should define fg");
         assert_ne!(old_preview_fg, current_preview_fg);
-        app.render.invalidate_theme_caches();
 
         assert_eq!(
             app.render.test_card_source_entry_count(),

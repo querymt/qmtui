@@ -9,7 +9,7 @@ use crate::mesh_state::MeshState;
 use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
 use crate::profiles_state::ProfilesState;
-use crate::render_state::RenderState;
+use crate::render_state::{RenderChange, RenderState};
 use crate::session_state::SessionsState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +198,8 @@ impl App {
 
     pub fn push_pending_prompt(&mut self, text: String) -> String {
         let local_id = self.chat.push_pending_prompt(text);
-        self.render.invalidate_card_cache();
+        self.render
+            .apply_change(RenderChange::FinalizedMessagesChanged);
         local_id
     }
 
