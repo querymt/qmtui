@@ -7,6 +7,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, short_cwd};
+use super::{ARROW_DOWN, ARROW_UP, COLOR_SWATCH, ELLIPSIS, relative_time};
 use crate::app::App;
 use crate::auth_state::AuthPanel;
 use crate::delegates_state::DelegatesState;
@@ -19,10 +21,7 @@ use crate::models_state::ModelPopupItem;
 use crate::render_state::RenderState;
 use crate::session_state::{SessionsState, session_group_count_text};
 use crate::theme::Theme;
-
-use super::chat::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
-use super::start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, short_cwd};
-use super::{ARROW_DOWN, ARROW_UP, COLOR_SWATCH, ELLIPSIS, relative_time};
+use crate::view_shared::{CHECK_CHECKED, CHECK_FAILED, SpinnerKind, spinner};
 
 // ── Single-line input scroll helper ──────────────────────────────────────────
 

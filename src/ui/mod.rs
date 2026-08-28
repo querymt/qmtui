@@ -1,8 +1,9 @@
-mod chat;
 mod popups;
 mod start;
 
-use chat::{draw_chat, draw_delegate_view};
+use crate::features::chat::view::{
+    ChatScreenInput, draw_chat as draw_chat_screen, draw_delegate_view as draw_delegate_screen,
+};
 use popups::{
     draw_auth_popup, draw_command_palette_popup, draw_fork_turn_popup, draw_help_popup,
     draw_log_popup, draw_mesh_invite_popup, draw_mesh_invite_qr_popup, draw_mesh_popup,
@@ -13,15 +14,16 @@ use start::draw_start;
 
 // Re-exports used only by the test module (via `use super::*`).
 #[cfg(test)]
+pub(crate) use crate::features::chat::view::{
+    ICON_DELEGATES, ICON_MULTI_SESSION, build_message_cards, build_message_cards_for_width,
+    build_message_cards_for_width_at, build_streaming_card_for_test,
+};
+#[cfg(test)]
 pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
 #[cfg(test)]
 pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
 #[cfg(test)]
-pub(crate) use chat::{
-    ICON_DELEGATES, ICON_MULTI_SESSION, SpinnerKind, build_message_cards,
-    build_message_cards_for_width, build_message_cards_for_width_at, build_streaming_card_for_test,
-    spinner,
-};
+pub(crate) use crate::view_shared::{SpinnerKind, spinner};
 #[cfg(test)]
 pub(crate) use popups::{
     build_theme_list_item, scroll_input, scroll_input_chars, shortcut_sections,
@@ -30,17 +32,17 @@ pub(crate) use popups::{
 #[cfg(test)]
 pub(crate) use start::build_start_page_rows;
 
-use ratatui::{
-    Frame,
-    layout::Rect,
-    text::{Line, Span},
-    widgets::{Block, Paragraph},
-};
+#[cfg(test)]
+use ratatui::text::Line;
+use ratatui::{Frame, layout::Rect, text::Span, widgets::Block};
 
 use crate::app::App;
+#[cfg(test)]
 use crate::connection_state::ConnState;
 use crate::navigation_state::{Popup, Screen};
+use crate::render_state::ThemeCacheKey;
 use crate::theme::Theme;
+use crate::view_shared;
 
 // ── Symbols shared across sub-modules ──────────────────────────────────────────
 pub(super) const COLOR_SWATCH: &str = "\u{25A0}"; // ■ black square  – theme palette colour preview
@@ -49,9 +51,8 @@ pub(super) const ARROW_UP: &str = "\u{2191}"; // ↑ upwards arrow
 pub(super) const ARROW_DOWN: &str = "\u{2193}"; // ↓ downwards arrow
 pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
 
-// ── Connection indicators ─────────────────────────────────────────────────────
-const CONN_ONLINE: &str = "\u{25CF}"; // ● filled circle – connected / disconnected
-const CONN_OFFLINE: &str = "\u{25CB}"; // ○ empty circle  – connecting
+#[cfg(test)]
+use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE};
 
 /// Parse an ISO 8601 timestamp and return a human-readable relative time.
 pub(super) fn relative_time(iso: &str) -> String {
@@ -141,6 +142,50 @@ pub(super) fn relative_time(iso: &str) -> String {
     format!("{years}y ago")
 }
 
+fn draw_chat_app(f: &mut Frame, app: &mut App) {
+    let effective_cwd = app.current_session_cwd();
+    let cwd_label = effective_cwd
+        .as_deref()
+        .map(|cwd| start::short_cwd(cwd, 20));
+    let input = ChatScreenInput {
+        chat: &app.chat,
+        composer: &app.composer,
+        sessions: &app.sessions,
+        delegates: &app.delegates,
+        models: &app.models,
+        profiles: &app.profiles,
+        effective_cwd,
+        cwd_label,
+        mesh_node_count: app.mesh.mesh_node_count,
+        chord: app.navigation.chord,
+        connection: app.connection.conn,
+        theme: ThemeCacheKey::current_frame(),
+    };
+    draw_chat_screen(f, input, &mut app.render);
+}
+
+fn draw_delegate_app(f: &mut Frame, app: &mut App) {
+    let effective_cwd = app.current_session_cwd();
+    let cwd_label = effective_cwd
+        .as_deref()
+        .map(|cwd| start::short_cwd(cwd, 20));
+    let input = ChatScreenInput {
+        chat: &app.chat,
+        composer: &app.composer,
+        sessions: &app.sessions,
+        delegates: &app.delegates,
+        models: &app.models,
+        profiles: &app.profiles,
+        effective_cwd,
+        cwd_label,
+        mesh_node_count: app.mesh.mesh_node_count,
+        chord: app.navigation.chord,
+        connection: app.connection.conn,
+        theme: ThemeCacheKey::current_frame(),
+    };
+    draw_delegate_screen(f, input, &mut app.render);
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     // Snapshot the theme index once per frame to avoid repeated atomic loads.
     Theme::begin_frame();
@@ -151,8 +196,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.navigation.screen {
         Screen::Sessions => draw_start(f, app),
-        Screen::Chat => draw_chat(f, app),
-        Screen::Delegate => draw_delegate_view(f, app),
+        Screen::Chat => draw_chat_app(f, app),
+        Screen::Delegate => draw_delegate_app(f, app),
     }
 
     match app.navigation.popup {
@@ -175,26 +220,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+#[cfg(test)]
 fn conn_indicator(app: &App) -> Span<'static> {
-    let (sym, color) = match app.connection.conn {
-        ConnState::Connected => (CONN_ONLINE, Theme::ok()),
-        ConnState::Connecting => (CONN_OFFLINE, Theme::warn()),
-        ConnState::Disconnected => (CONN_ONLINE, Theme::err()),
-    };
-    Span::styled(
-        format!("{sym} "),
-        ratatui::style::Style::default()
-            .fg(color)
-            .bg(Theme::bg_dim()),
-    )
+    view_shared::connection_indicator(app.connection.conn)
 }
 
 pub(crate) fn mesh_header_span(app: &App) -> Option<Span<'static>> {
-    let n = app.mesh.mesh_node_count.filter(|&n| n > 0)?;
-    Some(Span::styled(
-        format!(" {} {n} ", chat::ICON_MESH),
-        Theme::status(),
-    ))
+    view_shared::mesh_header_span(app.mesh.mesh_node_count)
 }
 
 fn draw_header(
@@ -204,29 +236,20 @@ fn draw_header(
     left: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
 ) {
-    let mut spans = vec![
-        Span::styled(" query", Theme::title()),
-        Span::styled("mt", Theme::title_accent()),
-    ];
-    if app.navigation.chord {
-        spans.push(Span::styled(" C-x", Theme::status_accent()));
-    }
-    spans.extend(left);
-
-    let conn = conn_indicator(app);
-    let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_len: usize = right.iter().map(|s| s.content.chars().count()).sum();
-    let conn_len = conn.content.chars().count();
-    let gap = (area.width as usize).saturating_sub(left_len + right_len + conn_len);
-    spans.push(Span::styled(" ".repeat(gap), Theme::status()));
-    spans.extend(right);
-    spans.push(conn);
-
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Theme::status()),
+    view_shared::draw_header(
+        f,
         area,
+        left,
+        right,
+        app.navigation.chord,
+        app.connection.conn,
     );
 }
+
+#[cfg(test)]
+use draw_chat_app as draw_chat;
+#[cfg(test)]
+use draw_delegate_app as draw_delegate_view;
 
 #[cfg(test)]
 mod tests {

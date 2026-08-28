@@ -35,3 +35,4 @@ mod theme;
 mod themes_gen;
 mod tool_detail;
 mod ui;
+mod view_shared;
