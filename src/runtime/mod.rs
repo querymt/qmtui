@@ -2295,6 +2295,27 @@ mod sessions_key_tests {
     }
 
     #[test]
+    fn enter_on_known_remote_emits_only_exact_attach_command() {
+        let mut app = App::new();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.sessions.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.sessions.session_cursor = 1;
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::AttachRemoteSession { node_id, session_id })
+                if node_id == "node-1" && session_id == "remote-1"
+        ));
+        assert!(effects.next_command().is_none());
+    }
+
+    #[test]
     fn enter_on_remote_label_without_node_id_is_noop() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
@@ -2304,6 +2325,10 @@ mod sessions_key_tests {
         let action = apply_sessions_key(&mut app, KeyCode::Enter);
 
         assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(
+            app.diagnostics.status,
+            "remote session is missing node id; refresh sessions and try again"
+        );
     }
 
     #[test]
@@ -3201,6 +3226,27 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn disconnected_new_session_submit_keeps_popup_and_sends_no_command() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::NewSession;
+        app.sessions.new_session_path = "project".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_new_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+        assert!(effects.next_command().is_none());
+    }
+
+    #[test]
     fn new_session_popup_enter_normalizes_relative_path_to_absolute() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
@@ -3488,6 +3534,10 @@ mod delegate_popup_key_tests {
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(
+            app.diagnostics.status,
+            "delegation still pending — no session to load"
+        );
     }
 
     #[test]

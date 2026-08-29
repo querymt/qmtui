@@ -219,7 +219,7 @@ impl App {
         if selected.is_dir && !normalized.ends_with('/') {
             normalized.push('/');
         }
-        self.sessions.accept_new_session_completion(normalized);
+        crate::features::sessions::input::accept_completion(&mut self.sessions, normalized);
         true
     }
 }

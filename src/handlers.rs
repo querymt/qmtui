@@ -11,6 +11,18 @@ use crate::features::chat::input::{
     build_prompt_submission, chat_command_intent, handle_completion_key, handle_composer_key,
     handle_coordination_key, handle_elicitation_key,
 };
+use crate::features::delegates::input::{
+    DelegateInputContext, DelegateInputResult, DelegateViewportIntent,
+    handle_popup_key as handle_delegate_input_key,
+    handle_view_key as handle_delegate_view_input_key,
+};
+use crate::features::sessions::input::{
+    NewSessionInputResult, SessionPopupInputResult, SessionsInputResult,
+    handle_new_session_key as handle_new_session_input_key,
+    handle_session_popup_key as handle_session_popup_input_key,
+    handle_sessions_key as handle_sessions_input_key, switch_session_popup_tab,
+    toggle_popup_session_children, toggle_start_session_children,
+};
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -592,37 +604,137 @@ fn session_action_effects(app: &mut App, action: SessionKeyAction) -> Vec<Effect
     }
 }
 
+fn resolve_session_selection(
+    app: &mut App,
+    session_id: String,
+    cwd: Option<String>,
+) -> SessionKeyAction {
+    if let Some(node_id) = app
+        .sessions
+        .session_remote_node_id(&session_id)
+        .map(str::to_string)
+    {
+        app.sessions
+            .remember_remote_session_node(&session_id, &node_id);
+        return SessionKeyAction::AttachRemoteSession {
+            node_id,
+            session_id,
+        };
+    }
+    if app.sessions.is_remote_session_id(&session_id) {
+        app.set_status(
+            LogLevel::Warn,
+            "session",
+            "remote session is missing node id; refresh sessions and try again",
+        );
+        return SessionKeyAction::None;
+    }
+    SessionKeyAction::LoadSession {
+        session_id,
+        agent_id: None,
+        cwd,
+    }
+}
+
+fn apply_sessions_input_result(app: &mut App, result: SessionsInputResult) -> SessionKeyAction {
+    match result {
+        SessionsInputResult::Moved {
+            keep_visible_from_above,
+        } => {
+            if keep_visible_from_above {
+                app.render
+                    .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
+            }
+            SessionKeyAction::None
+        }
+        SessionsInputResult::Filtered => {
+            app.render.reset_start_page_scroll();
+            SessionKeyAction::None
+        }
+        SessionsInputResult::OpenSession { session_id, cwd } => {
+            resolve_session_selection(app, session_id, cwd)
+        }
+        SessionsInputResult::DeleteSession { session_id } => {
+            SessionKeyAction::DeleteSession { session_id }
+        }
+        SessionsInputResult::DismissRemoteSession { session_id } => {
+            SessionKeyAction::DismissRemoteSession { session_id }
+        }
+        SessionsInputResult::OpenSessionPopup => {
+            app.navigation.popup = Popup::SessionSelect;
+            SessionKeyAction::None
+        }
+        SessionsInputResult::OpenNewSession => SessionKeyAction::NewSession,
+        SessionsInputResult::LoadMore {
+            group_idx,
+            parent_path,
+        } => SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        },
+        SessionsInputResult::NotHandled | SessionsInputResult::ToggledGroup => {
+            SessionKeyAction::None
+        }
+    }
+}
+
+fn apply_session_popup_input_result(
+    app: &mut App,
+    result: SessionPopupInputResult,
+) -> SessionKeyAction {
+    match result {
+        SessionPopupInputResult::OpenSession { session_id, cwd } => {
+            app.navigation.popup = Popup::None;
+            resolve_session_selection(app, session_id, cwd)
+        }
+        SessionPopupInputResult::DeleteSession { session_id } => {
+            SessionKeyAction::DeleteSession { session_id }
+        }
+        SessionPopupInputResult::DismissRemoteSession { session_id } => {
+            SessionKeyAction::DismissRemoteSession { session_id }
+        }
+        SessionPopupInputResult::LoadMore {
+            group_idx,
+            parent_path,
+        } => SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        },
+        SessionPopupInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::None
+        }
+        SessionPopupInputResult::NotHandled
+        | SessionPopupInputResult::Moved
+        | SessionPopupInputResult::Filtered
+        | SessionPopupInputResult::ToggledGroup => SessionKeyAction::None,
+    }
+}
+
 pub(crate) fn handle_sessions_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
         return vec![Effect::Quit];
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        if let SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path,
-        } = apply_session_fork_toggle_key(app, false)
-            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
-        {
-            return vec![Effect::Command(request)];
-        }
-        return Vec::new();
+        let result = toggle_start_session_children(&mut app.sessions);
+        let action = apply_sessions_input_result(app, result);
+        return session_action_effects(app, action);
     }
 
-    let action = apply_sessions_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let result = handle_sessions_input_key(&mut app.sessions, key);
+    let action = apply_sessions_input_result(app, result);
     session_action_effects(app, action)
 }
 
 pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        app.sessions.switch_session_popup_tab();
+        switch_session_popup_tab(&mut app.sessions);
         return Vec::new();
     }
 
@@ -638,274 +750,135 @@ pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        if let SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path,
-        } = apply_session_fork_toggle_key(app, true)
-            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
-        {
-            return vec![Effect::Command(request)];
-        }
-        return Vec::new();
+        let result = toggle_popup_session_children(&mut app.sessions);
+        let action = apply_session_popup_input_result(app, result);
+        return session_action_effects(app, action);
     }
 
-    let action = apply_popup_session_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let page_step = app.render.session_popup_page_step();
+    let result = handle_session_popup_input_key(&mut app.sessions, key, page_step);
+    let action = apply_session_popup_input_result(app, result);
     session_action_effects(app, action)
 }
 
-/// Pure key-handler for the session popup. Returns a [`SessionKeyAction`] that
-/// the caller should forward to the server.
-///
-/// Uses [`App::visible_popup_items`] (grouped, no caps) and
-/// [`App::popup_collapsed_groups`] so its collapse state is fully independent
-/// of the start-page.
+/// Adapt session-popup input into the existing root-owned session action.
 pub(crate) fn apply_popup_session_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::session_state::PopupItem;
-
-    match key {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => app.sessions.move_popup_cursor_up(),
-        KeyCode::Down => app.sessions.move_popup_cursor_down(),
-        KeyCode::PageUp => {
-            let step = app.render.session_popup_page_step();
-            app.sessions.move_popup_cursor_page(step, false);
-        }
-        KeyCode::PageDown => {
-            let step = app.render.session_popup_page_step();
-            app.sessions.move_popup_cursor_page(step, true);
-        }
-        KeyCode::Enter => {
-            let items = app.sessions.visible_popup_items();
-            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
-                match item {
-                    PopupItem::GroupHeader { cwd, .. } => {
-                        app.sessions.toggle_popup_group_collapse(cwd.as_deref());
-                        app.sessions.clamp_popup_cursor();
-                    }
-                    PopupItem::Session {
-                        group_idx, path, ..
-                    } => {
-                        let session = app.sessions.session_by_path(group_idx, &path).cloned();
-                        if let Some(session) = session {
-                            app.navigation.popup = Popup::None;
-                            let session_id = session.session_id;
-                            if let Some(node_id) = app
-                                .sessions
-                                .session_remote_node_id(&session_id)
-                                .map(str::to_string)
-                            {
-                                app.sessions
-                                    .remember_remote_session_node(&session_id, &node_id);
-                                return SessionKeyAction::AttachRemoteSession {
-                                    node_id,
-                                    session_id,
-                                };
-                            }
-                            if app.sessions.is_remote_session_id(&session_id) {
-                                app.set_status(
-                                    LogLevel::Warn,
-                                    "session",
-                                    "remote session is missing node id; refresh sessions and try again",
-                                );
-                                return SessionKeyAction::None;
-                            }
-                            return SessionKeyAction::LoadSession {
-                                session_id,
-                                agent_id: None,
-                                cwd: session
-                                    .cwd
-                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
-                            };
-                        }
-                    }
-                    PopupItem::LoadMore {
-                        group_idx,
-                        parent_path,
-                    } => {
-                        return SessionKeyAction::LoadMoreSessions {
-                            group_idx,
-                            parent_path,
-                        };
-                    }
-                }
-            }
-        }
-        KeyCode::Delete => {
-            let items = app.sessions.visible_popup_items();
-            if let Some(PopupItem::Session {
-                group_idx, path, ..
-            }) = items.get(app.sessions.session_cursor).cloned()
-            {
-                let Some((session, is_remote)) =
-                    app.sessions.remove_session_at(group_idx, &path, true)
-                else {
-                    return SessionKeyAction::None;
-                };
-                let sid = session.session_id;
-                return if is_remote {
-                    SessionKeyAction::DismissRemoteSession { session_id: sid }
-                } else {
-                    SessionKeyAction::DeleteSession { session_id: sid }
-                };
-            }
-            // Delete on a GroupHeader: no-op
-        }
-        KeyCode::Backspace => app.sessions.popup_filter_backspace(),
-        KeyCode::Char(c) => app.sessions.popup_filter_insert(c),
-        _ => {}
-    }
-    SessionKeyAction::None
+    let page_step = app.render.session_popup_page_step();
+    let result = handle_session_popup_input_key(&mut app.sessions, key, page_step);
+    apply_session_popup_input_result(app, result)
 }
 
 pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
-    use crate::session_state::{PopupItem, StartPageItem};
-
-    let selected = if popup_items {
-        app.sessions
-            .visible_popup_items()
-            .get(app.sessions.session_cursor)
-            .cloned()
-            .and_then(|item| match item {
-                PopupItem::Session {
-                    group_idx, path, ..
-                } => Some((group_idx, path)),
-                _ => None,
-            })
+    if popup_items {
+        let result = toggle_popup_session_children(&mut app.sessions);
+        apply_session_popup_input_result(app, result)
     } else {
-        app.sessions
-            .visible_start_items()
-            .get(app.sessions.session_cursor)
-            .cloned()
-            .and_then(|item| match item {
-                StartPageItem::Session {
-                    group_idx, path, ..
-                } => Some((group_idx, path)),
-                _ => None,
-            })
-    };
-
-    let Some((group_idx, path)) = selected else {
-        return SessionKeyAction::None;
-    };
-
-    let should_load = app.sessions.toggle_session_children(group_idx, &path);
-    if should_load {
-        SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path: path,
-        }
-    } else {
-        SessionKeyAction::None
+        let result = toggle_start_session_children(&mut app.sessions);
+        apply_sessions_input_result(app, result)
     }
 }
 
 // ── Delegate view key handler (read-only child session) ──────────────────────
 
-fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Up => app.render.scroll_chat_up(1),
-        KeyCode::Down => app.render.scroll_chat_down(1),
-        KeyCode::PageUp => app.render.scroll_chat_up(10),
-        KeyCode::PageDown => app.render.scroll_chat_down(10),
-        KeyCode::Home => app.render.scroll_chat_to_top(),
-        KeyCode::End => app.render.scroll_chat_to_bottom(),
-        KeyCode::Esc => {
-            if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
-                return send_load_session_commands(
-                    parent_sid,
-                    app.current_session_cwd(),
-                    app.sessions.agent_id.clone(),
-                );
+fn apply_delegate_viewport_intent(app: &mut App, intent: DelegateViewportIntent) {
+    match intent {
+        DelegateViewportIntent::UpOne => app.render.scroll_chat_up(1),
+        DelegateViewportIntent::DownOne => app.render.scroll_chat_down(1),
+        DelegateViewportIntent::UpTen => app.render.scroll_chat_up(10),
+        DelegateViewportIntent::DownTen => app.render.scroll_chat_down(10),
+        DelegateViewportIntent::Top => app.render.scroll_chat_to_top(),
+        DelegateViewportIntent::Bottom => app.render.scroll_chat_to_bottom(),
+    }
+}
+
+fn apply_delegate_popup_input_result(
+    app: &mut App,
+    result: DelegateInputResult,
+) -> SessionKeyAction {
+    match result {
+        DelegateInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::None
+        }
+        DelegateInputResult::LoadChild {
+            session_id,
+            target_agent_id,
+            current_session_id,
+            parent_session_id,
+            cwd,
+        } => {
+            debug_assert_eq!(current_session_id, app.sessions.session_id);
+            debug_assert_eq!(parent_session_id, app.delegates.parent_session_id);
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::LoadSession {
+                session_id,
+                agent_id: target_agent_id,
+                cwd,
             }
         }
-        _ => {}
+        DelegateInputResult::PendingChild => {
+            app.set_status(
+                LogLevel::Warn,
+                "delegates",
+                "delegation still pending — no session to load",
+            );
+            SessionKeyAction::None
+        }
+        DelegateInputResult::NotHandled
+        | DelegateInputResult::Moved
+        | DelegateInputResult::Filtered
+        | DelegateInputResult::Viewport(_)
+        | DelegateInputResult::NavigateParent { .. } => SessionKeyAction::None,
     }
-    Vec::new()
+}
+
+fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    match handle_delegate_view_input_key(&app.delegates, key.code) {
+        DelegateInputResult::Viewport(intent) => {
+            apply_delegate_viewport_intent(app, intent);
+            Vec::new()
+        }
+        DelegateInputResult::NavigateParent { session_id } => send_load_session_commands(
+            session_id,
+            app.current_session_cwd(),
+            app.sessions.agent_id.clone(),
+        ),
+        _ => Vec::new(),
+    }
 }
 
 // ── Delegate popup key handler ────────────────────────────────────────────────
 
 pub(crate) fn handle_delegate_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let action = apply_delegate_popup_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let action = apply_delegate_popup_key(app, key);
     session_action_effects(app, action)
 }
 
-/// Pure key-handler for the delegate popup. Returns a [`SessionKeyAction`]
-/// that the caller should forward to the server.
-///
-/// Delegation entries are built from the parent session's event stream, not
-/// from the session list. Enter loads the child session if its ID is known.
+/// Adapt delegate-popup input into the existing root-owned session action.
 pub(crate) fn apply_delegate_popup_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    match key {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => app.delegates.move_cursor_up(),
-        KeyCode::Down => app.delegates.move_cursor_down(),
-        KeyCode::PageUp => {
-            let step = app.render.delegate_popup_page_step();
-            app.delegates.move_cursor_page(step, false);
-        }
-        KeyCode::PageDown => {
-            let step = app.render.delegate_popup_page_step();
-            app.delegates.move_cursor_page(step, true);
-        }
-        KeyCode::Enter => {
-            let selected = app.delegates.selected_entry().map(|entry| {
-                (
-                    entry.child_session_id.clone(),
-                    entry.target_agent_id.clone(),
-                )
-            });
-            if let Some((child_session_id, target_agent_id)) = selected {
-                if let Some(sid) = child_session_id {
-                    // Use the real parent when navigating between siblings.
-                    app.delegates.stage_parent_for_child_navigation(
-                        app.delegates.parent_session_id.clone(),
-                        app.sessions.session_id.clone(),
-                    );
-                    app.navigation.popup = Popup::None;
-                    return SessionKeyAction::LoadSession {
-                        session_id: sid,
-                        agent_id: target_agent_id,
-                        cwd: app.current_session_cwd(),
-                    };
-                } else {
-                    app.set_status(
-                        LogLevel::Warn,
-                        "delegates",
-                        "delegation still pending — no session to load",
-                    );
-                }
-            }
-        }
-        KeyCode::Backspace => app.delegates.filter_backspace(),
-        KeyCode::Char(c) => app.delegates.filter_insert(c),
-        _ => {}
-    }
-    SessionKeyAction::None
+    let context = DelegateInputContext {
+        page_step: app.render.delegate_popup_page_step(),
+        current_session_id: app.sessions.session_id.clone(),
+        cwd: app.current_session_cwd(),
+    };
+    let result = handle_delegate_input_key(&mut app.delegates, key, context);
+    apply_delegate_popup_input_result(app, result)
 }
 
 fn begin_fork_session(app: &mut App, message_id: String) -> Vec<Effect> {
@@ -1040,49 +1013,24 @@ pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
 }
 
 pub(crate) fn handle_new_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.sessions.move_new_session_completion_selection(-1),
-        KeyCode::Down => app.sessions.move_new_session_completion_selection(1),
-        KeyCode::Tab => {
+    match handle_new_session_input_key(&mut app.sessions, key) {
+        NewSessionInputResult::Edited => app.refresh_new_session_completion(),
+        NewSessionInputResult::AcceptCompletion => {
             app.accept_selected_new_session_completion();
         }
-        KeyCode::Left => {
-            app.sessions.move_new_session_cursor_left();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Right => {
-            app.sessions.move_new_session_cursor_right();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Home => {
-            app.sessions.move_new_session_cursor_home();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::End => {
-            app.sessions.move_new_session_cursor_end();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Backspace => {
-            app.sessions.new_session_backspace();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.sessions.new_session_insert(c);
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Enter => {
+        NewSessionInputResult::Cancel => app.navigation.popup = Popup::None,
+        NewSessionInputResult::Submit { raw_path } => {
             if !can_send_server_commands(app) {
                 return Vec::new();
             }
-            let cwd = app.normalize_new_session_path(&app.sessions.new_session_path);
+            let cwd = app.normalize_new_session_path(&raw_path);
             app.navigation.popup = Popup::None;
             return vec![Effect::Command(Command::NewSession {
                 cwd,
                 profile_id: app.profiles.active_profile_id.clone(),
             })];
         }
-        _ => {}
+        NewSessionInputResult::NotHandled | NewSessionInputResult::MovedCompletion => {}
     }
     Vec::new()
 }
@@ -1923,11 +1871,7 @@ pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
     effects
 }
 
-// ── Pure key logic for the sessions screen ────────────────────────────────────
-//
-// `apply_sessions_key` returns the `Command`(s) that should be sent to the
-// server (if any).  Keeping the mutation separate from the channel send makes
-// it fully unit-testable without a real channel.
+// ── Sessions screen result adapter ───────────────────────────────────────────
 
 /// Result of handling a sessions-screen key.
 #[derive(Debug, PartialEq)]
@@ -1955,107 +1899,13 @@ pub(crate) enum SessionKeyAction {
     },
 }
 
-/// Apply a key event on the sessions screen, mutate `app`, and return the
-/// action (if any) that the caller should forward to the server.
+/// Adapt sessions-screen input into the existing root-owned session action.
 pub(crate) fn apply_sessions_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::session_state::StartPageItem;
-
-    match key {
-        KeyCode::Up => {
-            app.sessions.move_start_cursor_up();
-            app.render
-                .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
-        }
-        KeyCode::Down => app.sessions.move_start_cursor_down(),
-        KeyCode::Enter => {
-            let items = app.sessions.visible_start_items();
-            // Cursor on the button slot (one past the last item)?
-            if app.sessions.session_cursor == items.len() {
-                return SessionKeyAction::NewSession;
-            }
-            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
-                match item {
-                    StartPageItem::GroupHeader { cwd, .. } => {
-                        app.sessions.toggle_group_collapse(cwd.as_deref());
-                        app.sessions.clamp_start_cursor();
-                    }
-                    StartPageItem::Session {
-                        group_idx, path, ..
-                    } => {
-                        if let Some(session) =
-                            app.sessions.session_by_path(group_idx, &path).cloned()
-                        {
-                            let session_id = session.session_id;
-                            if let Some(node_id) = app
-                                .sessions
-                                .session_remote_node_id(&session_id)
-                                .map(str::to_string)
-                            {
-                                app.sessions
-                                    .remember_remote_session_node(&session_id, &node_id);
-                                return SessionKeyAction::AttachRemoteSession {
-                                    node_id,
-                                    session_id,
-                                };
-                            }
-                            if app.sessions.is_remote_session_id(&session_id) {
-                                app.set_status(
-                                    LogLevel::Warn,
-                                    "session",
-                                    "remote session is missing node id; refresh sessions and try again",
-                                );
-                                return SessionKeyAction::None;
-                            }
-                            return SessionKeyAction::LoadSession {
-                                session_id,
-                                agent_id: None,
-                                cwd: session
-                                    .cwd
-                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
-                            };
-                        }
-                    }
-                    StartPageItem::ShowMore { .. } => {
-                        app.navigation.popup = Popup::SessionSelect;
-                        app.sessions.reset_browser_for_open();
-                    }
-                }
-            }
-        }
-        KeyCode::Delete => {
-            let items = app.sessions.visible_start_items();
-            if let Some(StartPageItem::Session {
-                group_idx, path, ..
-            }) = items.get(app.sessions.session_cursor).cloned()
-            {
-                let Some((session, is_remote)) =
-                    app.sessions.remove_session_at(group_idx, &path, false)
-                else {
-                    return SessionKeyAction::None;
-                };
-                let sid = session.session_id;
-                return if is_remote {
-                    SessionKeyAction::DismissRemoteSession { session_id: sid }
-                } else {
-                    SessionKeyAction::DeleteSession { session_id: sid }
-                };
-            }
-            // Delete on a GroupHeader: no-op
-        }
-        KeyCode::Backspace => {
-            app.sessions.start_filter_backspace();
-            app.render.reset_start_page_scroll();
-        }
-        KeyCode::Char(c) => {
-            app.sessions.start_filter_insert(c);
-            app.render.reset_start_page_scroll();
-        }
-        _ => {}
-    }
-    SessionKeyAction::None
+    let result = handle_sessions_input_key(&mut app.sessions, key);
+    apply_sessions_input_result(app, result)
 }
 
 // ── model popup tests ─────────────────────────────────────────────────────────
