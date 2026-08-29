@@ -359,20 +359,49 @@ mod tests {
     }
 
     #[test]
-    fn effect_executor_persists_current_app_settings() {
-        let _guard = crate::config::TestPersistenceGuard::new("effect-executor-persist");
-        let (tx, _rx) = mpsc::unbounded_channel();
+    #[serial]
+    fn effect_executor_persists_handler_settings_only_to_guarded_path() {
+        let guard = crate::config::TestPersistenceGuard::new("effect-executor-persist");
+        let guarded_path = guard.path().to_path_buf();
+        assert_eq!(config::TuiConfig::config_path(), guarded_path);
+        assert_ne!(
+            guarded_path,
+            crate::config::TestPersistenceGuard::user_config_path()
+        );
+        assert!(!guarded_path.exists());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut executor = EffectExecutor::new(&tx);
         let mut terminal = test_terminal();
         let mut app = App::new();
-        app.profiles.active_profile_id = Some("fast".into());
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::ProfileSelect;
+        app.profiles.profiles = vec![crate::domain::profile::ProfileInfo {
+            id: "fast".into(),
+            name: "Fast".into(),
+            ..Default::default()
+        }];
         app.chat.show_thinking = false;
 
-        executor
-            .execute(&mut terminal, &mut app, vec![Effect::PersistConfig])
-            .unwrap();
+        let effects = handle_profile_popup_key(&mut app, key(KeyCode::Enter));
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Command(Command::ListProfileAgents { profile_id }),
+                Effect::PersistConfig,
+            ] if profile_id == "fast"
+        ));
+        executor.execute(&mut terminal, &mut app, effects).unwrap();
 
-        let persisted = config::TuiConfig::load();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Command::ListProfileAgents {
+                profile_id: "fast".into()
+            })
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(guarded_path.exists());
+        let persisted = config::TuiConfig::load_from_path(&guarded_path);
         assert_eq!(persisted.profile.id.as_deref(), Some("fast"));
         assert_eq!(persisted.show_thinking, Some(false));
     }
