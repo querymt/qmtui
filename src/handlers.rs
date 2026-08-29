@@ -1,10 +1,8 @@
 use crate::app::App;
 use crate::application::{ClipboardTarget, Effect};
-use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
-use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::model::ModelEntry;
+use crate::features::auth::input::{AuthInputResult, handle_key as handle_auth_input_key};
 use crate::features::chat::input::{
     CancelIntent, ChatCommandIntent, ChatInputContext, ChatInputResult, ChatViewportIntent,
     CompletionResult, ComposerKeyResult, ElicitationResponseEffect, PromptSubmission,
@@ -15,6 +13,17 @@ use crate::features::delegates::input::{
     DelegateInputContext, DelegateInputResult, DelegateViewportIntent,
     handle_popup_key as handle_delegate_input_key,
     handle_view_key as handle_delegate_view_input_key,
+};
+use crate::features::mesh::input::{
+    MeshInputResult, handle_invite_key as handle_mesh_invite_input_key,
+    handle_invite_qr_key as handle_mesh_invite_qr_input_key,
+    handle_popup_key as handle_mesh_input_key,
+};
+use crate::features::models::input::{
+    ModelInputResult, ModelTab, handle_key as handle_model_input_key,
+};
+use crate::features::profiles::input::{
+    ProfileInputResult, handle_key as handle_profile_input_key,
 };
 use crate::features::sessions::input::{
     NewSessionInputResult, SessionPopupInputResult, SessionsInputResult,
@@ -152,66 +161,66 @@ fn execute_command_palette_action(app: &mut App, action: CommandPaletteAction) -
 }
 
 pub(crate) fn handle_mesh_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.mesh.toggle_focus(),
-        KeyCode::Up => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                if let Some(node_id) = app.mesh.move_mesh_node_cursor(-1) {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id,
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(-1),
-        },
-        KeyCode::Down => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                if let Some(node_id) = app.mesh.move_mesh_node_cursor(1) {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id,
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(1),
-        },
-        KeyCode::Char('r') => effects.push(Effect::Command(Command::ListRemoteNodes)),
-        KeyCode::Enter => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                app.mesh.focus_sessions();
-                if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id: node_id.to_string(),
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => {
-                if let Some(session) = app.mesh.selected_remote_session() {
-                    effects.push(Effect::Command(Command::AttachRemoteSession {
-                        node_id: session.node_id.clone(),
-                        session_id: session.id.clone(),
-                    }));
-                }
-            }
-        },
-        KeyCode::Char('n') => {
-            if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                effects.push(Effect::Command(Command::CreateRemoteSession {
-                    node_id: node_id.to_string(),
-                    cwd: None,
-                }));
-            }
+    match handle_mesh_input_key(&mut app.mesh, key) {
+        MeshInputResult::Close => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
         }
-        _ => {}
+        MeshInputResult::MoveNode {
+            refresh_node_id: Some(node_id),
+        }
+        | MeshInputResult::FocusSessions {
+            node_id: Some(node_id),
+        } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ListRemoteSessions {
+                node_id,
+                offset: 0,
+                limit: 50,
+            })]
+        }
+        MeshInputResult::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::AttachRemoteSession {
+                node_id,
+                session_id,
+            })]
+        }
+        MeshInputResult::CreateRemoteSession { node_id } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::CreateRemoteSession {
+                node_id,
+                cwd: None,
+            })]
+        }
+        MeshInputResult::RefreshNodes => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ListRemoteNodes)]
+        }
+        MeshInputResult::NotHandled
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode {
+            refresh_node_id: None,
+        }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { node_id: None }
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::SubmitInvite
+        | MeshInputResult::BackToInviteForm
+        | MeshInputResult::ShowInviteUrl
+        | MeshInputResult::CopyInviteUrl { .. } => Vec::new(),
     }
-    effects
 }
 
 pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -219,24 +228,31 @@ pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<
         return Vec::new();
     }
 
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.mesh.move_invite_form_field(-1),
-        KeyCode::Down | KeyCode::Tab => app.mesh.move_invite_form_field(1),
-        KeyCode::Backspace => app.mesh.invite_form_backspace(),
-        KeyCode::Enter => {
+    match handle_mesh_invite_input_key(&mut app.mesh, key) {
+        MeshInputResult::Close => app.navigation.popup = Popup::None,
+        MeshInputResult::SubmitInvite => {
             if let Some(command) = app.mesh_invite_form_command() {
-                effects.push(Effect::Command(command));
+                if !can_send_server_commands(app) {
+                    return Vec::new();
+                }
                 app.set_status(LogLevel::Info, "mesh", "creating invite...");
+                return vec![Effect::Command(command)];
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.mesh.invite_form_insert(c);
-        }
-        _ => {}
+        MeshInputResult::NotHandled
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode { .. }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { .. }
+        | MeshInputResult::AttachRemoteSession { .. }
+        | MeshInputResult::CreateRemoteSession { .. }
+        | MeshInputResult::RefreshNodes
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::BackToInviteForm
+        | MeshInputResult::ShowInviteUrl
+        | MeshInputResult::CopyInviteUrl { .. } => {}
     }
-    effects
+    Vec::new()
 }
 
 pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -244,20 +260,28 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> V
         return Vec::new();
     }
 
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::MeshInvite,
-        KeyCode::Char('u') => {
+    match handle_mesh_invite_qr_input_key(&mut app.mesh, key) {
+        MeshInputResult::BackToInviteForm => app.navigation.popup = Popup::MeshInvite,
+        MeshInputResult::ShowInviteUrl => {
             app.mesh.show_invite_url_fallback();
         }
-        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(text) = app.mesh.invite_url().map(str::to_string) {
-                return vec![Effect::CopyToClipboard {
-                    target: ClipboardTarget::MeshInvite,
-                    text,
-                }];
-            }
+        MeshInputResult::CopyInviteUrl { url } => {
+            return vec![Effect::CopyToClipboard {
+                target: ClipboardTarget::MeshInvite,
+                text: url,
+            }];
         }
-        _ => {}
+        MeshInputResult::NotHandled
+        | MeshInputResult::Close
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode { .. }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { .. }
+        | MeshInputResult::AttachRemoteSession { .. }
+        | MeshInputResult::CreateRemoteSession { .. }
+        | MeshInputResult::RefreshNodes
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::SubmitInvite => {}
     }
     Vec::new()
 }
@@ -967,49 +991,38 @@ pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Resu
 }
 
 pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.profiles.move_profile_cursor(-1),
-        KeyCode::Down => app.profiles.move_profile_cursor(1),
-        KeyCode::Backspace => {
-            app.profiles.profile_filter.pop();
-            app.profiles.profile_cursor = 0;
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.profiles.profile_filter.push(c);
-            app.profiles.profile_cursor = 0;
-        }
-        KeyCode::Enter => {
-            if !can_send_server_commands(app) {
-                return effects;
-            }
-            if let Some(profile_id) = app
-                .profiles
-                .selected_profile()
-                .map(|profile| profile.id.clone())
-            {
-                app.profiles.active_profile_id = Some(profile_id.clone());
-                if app.current_session_profile_id().is_none() {
-                    app.models.clear_profile_agents();
-                    effects.push(Effect::Command(Command::ListProfileAgents {
-                        profile_id: profile_id.clone(),
-                    }));
-                }
-                app.navigation.popup = Popup::None;
-                app.set_status(
-                    LogLevel::Info,
-                    "profile",
-                    format!("new sessions will use {profile_id}"),
-                );
-                effects.push(Effect::PersistConfig);
-            } else {
-                app.set_status(LogLevel::Warn, "profile", "no matching profile");
-            }
-        }
-        _ => {}
+    if key.code == KeyCode::Enter && !can_send_server_commands(app) {
+        return Vec::new();
     }
-    effects
+
+    match handle_profile_input_key(&mut app.profiles, key) {
+        ProfileInputResult::Close => app.navigation.popup = Popup::None,
+        ProfileInputResult::SelectProfile { profile_id } => {
+            app.profiles.active_profile_id = Some(profile_id.clone());
+            let mut effects = Vec::new();
+            if app.current_session_profile_id().is_none() {
+                app.models.clear_profile_agents();
+                effects.push(Effect::Command(Command::ListProfileAgents {
+                    profile_id: profile_id.clone(),
+                }));
+            }
+            app.navigation.popup = Popup::None;
+            app.set_status(
+                LogLevel::Info,
+                "profile",
+                format!("new sessions will use {profile_id}"),
+            );
+            effects.push(Effect::PersistConfig);
+            return effects;
+        }
+        ProfileInputResult::NoMatchingProfile => {
+            app.set_status(LogLevel::Warn, "profile", "no matching profile");
+        }
+        ProfileInputResult::NotHandled
+        | ProfileInputResult::Moved
+        | ProfileInputResult::Filtered => {}
+    }
+    Vec::new()
 }
 
 pub(crate) fn handle_new_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -1524,351 +1537,174 @@ pub(crate) fn handle_auth_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect>
         return Vec::new();
     }
 
-    let mut effects = Vec::new();
-    match app.auth.panel {
-        AuthPanel::List => match key.code {
-            KeyCode::Esc => {
-                if app.auth.selected.is_some() {
-                    app.auth.close_detail();
-                } else {
-                    app.navigation.popup = Popup::None;
+    match handle_auth_input_key(&mut app.auth, key) {
+        AuthInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
+        }
+        AuthInputResult::StartOAuth { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::StartOAuthLogin { provider })]
+        }
+        AuthInputResult::DisconnectOAuth { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::DisconnectOAuth { provider })]
+        }
+        AuthInputResult::ClearApiToken { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ClearApiToken { provider })]
+        }
+        AuthInputResult::SetApiToken { provider, api_key } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::SetApiToken { provider, api_key })]
+        }
+        AuthInputResult::CopyOAuthUrl { provider, url } => {
+            app.auth.ui_notice = None;
+            app.auth.clipboard_fallback = None;
+            vec![Effect::CopyToClipboard {
+                target: ClipboardTarget::Auth { provider },
+                text: url,
+            }]
+        }
+        AuthInputResult::CompleteOAuth { flow_id, response } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::CompleteOAuthLogin {
+                flow_id,
+                response,
+            })]
+        }
+        AuthInputResult::NotHandled
+        | AuthInputResult::Moved
+        | AuthInputResult::Filtered
+        | AuthInputResult::Edited
+        | AuthInputResult::SelectedProvider
+        | AuthInputResult::ToggledApiKeyMask
+        | AuthInputResult::CloseDetail
+        | AuthInputResult::BackToList
+        | AuthInputResult::EnterApiKeyPanel => Vec::new(),
+    }
+}
+
+fn apply_model_input_result(app: &mut App, result: ModelInputResult) -> Vec<Effect> {
+    match result {
+        ModelInputResult::Close => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
+        }
+        ModelInputResult::SelectModel {
+            model,
+            tab: ModelTab::Session,
+        } => {
+            let mut effects = Vec::new();
+            if !app.sessions.current_session_is_remote() {
+                let sends_server_command =
+                    app.sessions.session_id.is_some() || app.models.reasoning_effort.is_some();
+                if sends_server_command && !can_send_server_commands(app) {
+                    return Vec::new();
                 }
-            }
-            KeyCode::Up => {
-                let max = app.auth.filtered_providers().len().saturating_sub(1);
-                app.auth.cursor = app.auth.cursor.saturating_sub(1).min(max);
-            }
-            KeyCode::Down => {
-                let max = app.auth.filtered_providers().len().saturating_sub(1);
-                app.auth.cursor = (app.auth.cursor + 1).min(max);
-            }
-            KeyCode::Enter => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    app.auth.last_result = None;
-                    app.auth.ui_notice = None;
-                    if provider.is_unconfigurable() {
-                        app.auth.selected = Some(real_idx);
-                    } else if provider.is_api_key_only() {
-                        app.auth.selected = Some(real_idx);
-                        app.auth.panel = AuthPanel::ApiKeyInput;
-                        app.auth.api_key_input.clear();
-                        app.auth.api_key_cursor = 0;
-                    } else if provider.is_oauth_only()
-                        && provider.oauth_status != Some(OAuthStatus::Connected)
-                    {
-                        app.auth.selected = Some(real_idx);
-                        effects.push(Effect::Command(Command::StartOAuthLogin {
-                            provider: provider.provider.clone(),
-                        }));
-                    } else {
-                        app.auth.selected = Some(real_idx);
-                    }
+                if let Some(session_id) = app.sessions.session_id.clone() {
+                    effects.push(Effect::Command(Command::SetSessionModel {
+                        session_id,
+                        model_id: model.id.clone(),
+                        node_id: model.node_id.clone(),
+                    }));
                 }
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(idx) = app.auth.selected {
-                    let provider = &app.auth.providers[idx];
-                    if provider.oauth_status == Some(OAuthStatus::Connected) {
-                        effects.push(Effect::Command(Command::DisconnectOAuth {
-                            provider: provider.provider.clone(),
-                        }));
-                    } else if provider.has_stored_api_key {
-                        effects.push(Effect::Command(Command::ClearApiToken {
-                            provider: provider.provider.clone(),
-                        }));
-                    }
-                }
-            }
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    if provider.env_var_name.is_some() || provider.has_stored_api_key {
-                        app.auth.ui_notice = None;
-                        app.auth.selected = Some(real_idx);
-                        app.auth.panel = AuthPanel::ApiKeyInput;
-                        app.auth.api_key_input.clear();
-                        app.auth.api_key_cursor = 0;
-                    }
-                }
-            }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    if provider.supports_oauth {
-                        app.auth.ui_notice = None;
-                        app.auth.selected = Some(real_idx);
-                        effects.push(Effect::Command(Command::StartOAuthLogin {
-                            provider: provider.provider.clone(),
-                        }));
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                app.auth.filter.pop();
-                app.auth.cursor = 0;
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth.filter.push(c);
-                app.auth.cursor = 0;
-            }
-            _ => {}
-        },
-        AuthPanel::ApiKeyInput => match key.code {
-            KeyCode::Esc => {
-                app.auth.panel = AuthPanel::List;
-                app.auth.api_key_input.clear();
-                app.auth.api_key_cursor = 0;
-            }
-            KeyCode::Enter => {
-                if let Some(idx) = app.auth.selected {
-                    let trimmed = app.auth.api_key_input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        effects.push(Effect::Command(Command::SetApiToken {
-                            provider: app.auth.providers[idx].provider.clone(),
-                            api_key: trimmed,
-                        }));
-                    }
-                }
-            }
-            KeyCode::Tab => app.auth.api_key_masked = !app.auth.api_key_masked,
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(idx) = app.auth.selected {
-                    effects.push(Effect::Command(Command::ClearApiToken {
-                        provider: app.auth.providers[idx].provider.clone(),
+                app.models.apply_model_selection_from_entry(&model);
+                if app.models.reasoning_effort.is_some() {
+                    app.models.reasoning_effort = None;
+                    effects.push(Effect::Command(Command::SetReasoningEffort {
+                        reasoning_effort: "auto".into(),
                     }));
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth.api_key_input.insert(app.auth.api_key_cursor, c);
-                app.auth.api_key_cursor += c.len_utf8();
-            }
-            KeyCode::Backspace if app.auth.api_key_cursor > 0 => {
-                let cursor = app.auth.api_key_cursor;
-                let ch = app.auth.api_key_input[..cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.api_key_input.remove(cursor - ch.len_utf8());
-                app.auth.api_key_cursor -= ch.len_utf8();
-            }
-            KeyCode::Left if app.auth.api_key_cursor > 0 => {
-                let ch = app.auth.api_key_input[..app.auth.api_key_cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.api_key_cursor -= ch.len_utf8();
-            }
-            KeyCode::Right if app.auth.api_key_cursor < app.auth.api_key_input.len() => {
-                let ch = app.auth.api_key_input[app.auth.api_key_cursor..]
-                    .chars()
-                    .next()
-                    .unwrap();
-                app.auth.api_key_cursor += ch.len_utf8();
-            }
-            _ => {}
-        },
-        AuthPanel::OAuthFlow => match key.code {
-            KeyCode::Esc => {
-                app.auth.oauth_flow = None;
-                app.auth.panel = AuthPanel::List;
-                app.auth.oauth_response.clear();
-                app.auth.oauth_response_cursor = 0;
-            }
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ref flow) = app.auth.oauth_flow {
-                    app.auth.ui_notice = None;
-                    app.auth.clipboard_fallback = None;
-                    effects.push(Effect::CopyToClipboard {
-                        target: ClipboardTarget::Auth {
-                            provider: flow.provider.clone(),
-                        },
-                        text: flow.authorization_url.clone(),
-                    });
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(ref flow) = app.auth.oauth_flow {
-                    let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
-                    let response = if is_device_poll {
-                        String::new()
-                    } else {
-                        app.auth.oauth_response.trim().to_string()
-                    };
-                    if is_device_poll || !response.is_empty() {
-                        effects.push(Effect::Command(Command::CompleteOAuthLogin {
-                            flow_id: flow.flow_id.clone(),
-                            response,
-                        }));
-                    }
-                }
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth
-                    .oauth_response
-                    .insert(app.auth.oauth_response_cursor, c);
-                app.auth.oauth_response_cursor += c.len_utf8();
-            }
-            KeyCode::Backspace if app.auth.oauth_response_cursor > 0 => {
-                let cursor = app.auth.oauth_response_cursor;
-                let ch = app.auth.oauth_response[..cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.oauth_response.remove(cursor - ch.len_utf8());
-                app.auth.oauth_response_cursor -= ch.len_utf8();
-            }
-            KeyCode::Left if app.auth.oauth_response_cursor > 0 => {
-                let ch = app.auth.oauth_response[..app.auth.oauth_response_cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.oauth_response_cursor -= ch.len_utf8();
-            }
-            KeyCode::Right if app.auth.oauth_response_cursor < app.auth.oauth_response.len() => {
-                let ch = app.auth.oauth_response[app.auth.oauth_response_cursor..]
-                    .chars()
-                    .next()
-                    .unwrap();
-                app.auth.oauth_response_cursor += ch.len_utf8();
-            }
-            _ => {}
-        },
-    }
-    effects
-}
-
-pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Tab | KeyCode::BackTab => {
-            if !app.models.model_popup_has_tabs() {
-                return effects;
-            }
-            let agent_id = app
-                .models
-                .switch_model_popup_tab(key.code == KeyCode::BackTab);
-            app.models.model_cursor = if app
-                .models
-                .model_popup_is_session_tab(app.models.model_popup_agent_tab)
-            {
-                app.models.model_popup_open_cursor()
-            } else if let Some(agent_id) = agent_id {
-                app.delegate_model_cursor(&agent_id)
-            } else {
-                0
-            };
+            app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        KeyCode::Up => app.models.move_model_cursor_up(),
-        KeyCode::Down => app.models.move_model_cursor_down(),
-        KeyCode::Enter => {
-            let selected: Option<ModelEntry> = app
-                .models
-                .visible_model_popup_items()
-                .get(app.models.model_cursor)
-                .and_then(|item| match item {
-                    crate::models_state::ModelPopupItem::Model { model_idx } => {
-                        app.models.models.get(*model_idx)
-                    }
-                    crate::models_state::ModelPopupItem::ProviderHeader { .. } => None,
-                })
-                .cloned();
-            if let Some(model) = selected {
-                let tab_label = app
-                    .models
-                    .model_popup_tab_label(app.models.model_popup_agent_tab)
-                    .to_string();
-                if app
-                    .models
-                    .model_popup_is_session_tab(app.models.model_popup_agent_tab)
-                {
-                    if !app.sessions.current_session_is_remote() {
-                        if let Some(session_id) = app.sessions.session_id.clone() {
-                            effects.push(Effect::Command(Command::SetSessionModel {
-                                session_id,
-                                model_id: model.id.clone(),
-                                node_id: model.node_id.clone(),
-                            }));
-                        }
-                        app.models.apply_model_selection_from_entry(&model);
-                        if app.models.reasoning_effort.is_some() {
-                            app.models.reasoning_effort = None;
-                            effects.push(Effect::Command(Command::SetReasoningEffort {
-                                reasoning_effort: "auto".into(),
-                            }));
-                        }
-                    }
-                    app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
-                } else if let Some(agent_id) = app
-                    .models
-                    .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
-                    .map(str::to_string)
-                    && let Some(profile_id) =
-                        app.delegate_preference_profile_id().map(str::to_string)
-                {
-                    app.models
-                        .set_delegate_model_preference(&profile_id, &agent_id, &model);
-                    if app.delegates.parent_session_id.is_none()
-                        && let Some(session_id) = app.sessions.session_id.clone()
-                    {
-                        effects.push(Effect::Command(Command::SetDelegateModel {
-                            session_id,
-                            agent_id,
-                            model_id: Some(model.id.clone()),
-                            node_id: model.node_id.clone(),
-                        }));
-                    }
-                    app.set_status(
-                        LogLevel::Info,
-                        "model",
-                        format!("{tab_label}: {}", model.label),
-                    );
-                }
-                effects.push(Effect::PersistConfig);
+        ModelInputResult::SelectModel {
+            model,
+            tab: ModelTab::Delegate { agent_id, label },
+        } => {
+            let profile_id = app.delegate_preference_profile_id().map(str::to_string);
+            let root_session_id = app
+                .delegates
+                .parent_session_id
+                .is_none()
+                .then(|| app.sessions.session_id.clone())
+                .flatten();
+            if profile_id.is_some() && root_session_id.is_some() && !can_send_server_commands(app) {
+                return Vec::new();
             }
-        }
-        KeyCode::Delete
-            if !app
-                .models
-                .model_popup_is_session_tab(app.models.model_popup_agent_tab) =>
-        {
-            if let Some(agent_id) = app
-                .models
-                .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
-                .map(str::to_string)
-                && let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string)
-            {
+            let mut effects = Vec::new();
+            if let Some(profile_id) = profile_id {
                 app.models
-                    .clear_delegate_model_preference(&profile_id, &agent_id);
-                if app.delegates.parent_session_id.is_none()
-                    && let Some(session_id) = app.sessions.session_id.clone()
-                {
+                    .set_delegate_model_preference(&profile_id, &agent_id, &model);
+                if let Some(session_id) = root_session_id {
                     effects.push(Effect::Command(Command::SetDelegateModel {
                         session_id,
                         agent_id,
-                        model_id: None,
-                        node_id: None,
+                        model_id: Some(model.id.clone()),
+                        node_id: model.node_id.clone(),
                     }));
                 }
-                app.set_status(
-                    LogLevel::Info,
-                    "model",
-                    "delegate model uses profile default",
-                );
-                effects.push(Effect::PersistConfig);
+                app.set_status(LogLevel::Info, "model", format!("{label}: {}", model.label));
             }
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        KeyCode::Backspace => app.models.model_filter_backspace(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.models.model_filter_insert(c);
+        ModelInputResult::ClearDelegatePreference { agent_id } => {
+            let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string) else {
+                return Vec::new();
+            };
+            let root_session_id = app
+                .delegates
+                .parent_session_id
+                .is_none()
+                .then(|| app.sessions.session_id.clone())
+                .flatten();
+            if root_session_id.is_some() && !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            app.models
+                .clear_delegate_model_preference(&profile_id, &agent_id);
+            let mut effects = Vec::new();
+            if let Some(session_id) = root_session_id {
+                effects.push(Effect::Command(Command::SetDelegateModel {
+                    session_id,
+                    agent_id,
+                    model_id: None,
+                    node_id: None,
+                }));
+            }
+            app.set_status(
+                LogLevel::Info,
+                "model",
+                "delegate model uses profile default",
+            );
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        _ => {}
+        ModelInputResult::NotHandled
+        | ModelInputResult::Moved
+        | ModelInputResult::SwitchedTab
+        | ModelInputResult::Filtered => Vec::new(),
     }
-    effects
+}
+
+pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let delegate_profile_id = app.delegate_preference_profile_id().map(str::to_string);
+    let result = handle_model_input_key(&mut app.models, key, delegate_profile_id.as_deref());
+    apply_model_input_result(app, result)
 }
 
 // ── Sessions screen result adapter ───────────────────────────────────────────
@@ -2306,6 +2142,7 @@ mod model_popup_tests {
     #[test]
     fn mesh_popup_enter_on_session_attaches_remote_session() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.mesh.mesh_focus = crate::mesh_state::MeshFocus::Sessions;
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
@@ -2333,8 +2170,35 @@ mod model_popup_tests {
     }
 
     #[test]
+    fn mesh_node_movement_refreshes_exact_selected_node_page() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::Mesh;
+        app.mesh.mesh_nodes = vec![
+            crate::domain::mesh::RemoteNodeInfo {
+                id: "node-1".into(),
+                ..Default::default()
+            },
+            crate::domain::mesh::RemoteNodeInfo {
+                id: "node-2".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            handle_mesh_popup_key(&mut app, key(KeyCode::Down)),
+            vec![Effect::Command(Command::ListRemoteSessions {
+                node_id: "node-2".into(),
+                offset: 0,
+                limit: 50,
+            })]
+        );
+    }
+
+    #[test]
     fn mesh_popup_create_remote_session_does_not_forward_local_cwd() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.connection.launch_cwd = Some("/local/launch".into());
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
@@ -2352,6 +2216,26 @@ mod model_popup_tests {
                 cwd: None,
             }
         );
+    }
+
+    #[test]
+    fn disconnected_mesh_command_intents_are_gated() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::Mesh;
+        app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+            id: "node-1".into(),
+            ..Default::default()
+        }];
+
+        assert!(handle_mesh_popup_key(&mut app, key(KeyCode::Char('r'))).is_empty());
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+
+        app.open_mesh_invite_form();
+        assert!(handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.navigation.popup, Popup::MeshInvite);
     }
 
     #[test]
@@ -2432,6 +2316,7 @@ mod model_popup_tests {
     #[test]
     fn mesh_invite_form_enter_sends_create_invite() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.open_mesh_invite_form();
         app.mesh.mesh_invite_name = "Team Mesh".into();
@@ -2544,20 +2429,34 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ProfileSelect;
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.profile_cursor = 1;
-        let mut effects = TestEffects::default();
-        effects.extend(handle_profile_popup_key(&mut app, key(KeyCode::Enter)));
+        let effects = handle_profile_popup_key(&mut app, key(KeyCode::Enter));
 
         assert!(matches!(app.navigation.popup, Popup::None));
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
-        ));
-        assert!(effects.next_command().is_none());
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::ListProfileAgents {
+                    profile_id: "deep".into(),
+                }),
+                Effect::PersistConfig,
+            ]
+        );
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::PersistConfig))
+    }
+
+    #[test]
+    fn disconnected_profile_submit_preserves_selection_and_popup() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ProfileSelect;
+        app.profiles.profiles = vec![make_profile("fast", "Fast")];
+        app.profiles.active_profile_id = Some("old".into());
+
+        assert!(handle_profile_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("old"));
+        assert_eq!(app.navigation.popup, Popup::ProfileSelect);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
         );
     }
 
@@ -2601,6 +2500,7 @@ mod model_popup_tests {
     fn select_model_on_delegate_tab_saves_pref_not_session_model() {
         let _guard = TestPersistenceGuard::new("delegate-tab");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
@@ -2652,6 +2552,7 @@ mod model_popup_tests {
     fn delete_on_delegate_tab_resets_parent_override() {
         let _guard = TestPersistenceGuard::new("delegate-reset");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
@@ -2716,6 +2617,7 @@ mod model_popup_tests {
     fn select_model_on_session_tab_applies_set_session_model() {
         let _guard = TestPersistenceGuard::new("active-mode");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
@@ -2759,6 +2661,7 @@ mod model_popup_tests {
     fn select_remote_model_on_local_session_sends_node_id() {
         let _guard = TestPersistenceGuard::new("remote-mesh-model");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
@@ -2828,9 +2731,39 @@ mod model_popup_tests {
             .iter()
             .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
-        let mut effects = TestEffects::default();
-        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
-        assert!(effects.next_command().is_none());
+        let effects = handle_model_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::PersistConfig]);
+        assert_eq!(app.diagnostics.status, "session: claude-sonnet");
+    }
+
+    #[test]
+    fn model_header_enter_is_noop_without_persistence() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ModelSelect;
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_cursor = 0;
+
+        assert!(handle_model_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.models.current_model, None);
+    }
+
+    #[test]
+    fn disconnected_local_model_selection_is_gated_before_mutation() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ModelSelect;
+        app.sessions.session_id = Some("session-1".into());
+        app.models.current_provider = Some("old-provider".into());
+        app.models.current_model = Some("old-model".into());
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_cursor = 1;
+
+        assert!(handle_model_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.models.current_provider.as_deref(), Some("old-provider"));
+        assert_eq!(app.models.current_model.as_deref(), Some("old-model"));
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
     }
 
     #[test]

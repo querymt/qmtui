@@ -4290,12 +4290,48 @@ mod auth_tests {
         assert_eq!(app.auth.api_key_cursor, 2);
 
         effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(
-            msg,
-            Command::SetApiToken { provider, api_key }
-            if provider == "groq" && api_key == "sk"
-        ));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Command(Command::SetApiToken {
+                provider: "groq".into(),
+                api_key: "sk".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn auth_api_key_submit_trims_payload_without_mutating_input() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "  secret  ".into();
+        app.auth.api_key_cursor = app.auth.api_key_input.len();
+
+        assert_eq!(
+            handle_auth_popup_key(&mut app, key(KeyCode::Enter)),
+            vec![Effect::Command(Command::SetApiToken {
+                provider: "groq".into(),
+                api_key: "secret".into(),
+            })]
+        );
+        assert_eq!(app.auth.api_key_input, "  secret  ");
+    }
+
+    #[test]
+    fn disconnected_auth_submit_is_gated_before_dispatch() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.connection.conn = ConnState::Disconnected;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "secret".into();
+        app.auth.api_key_cursor = app.auth.api_key_input.len();
+
+        assert!(handle_auth_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.auth.api_key_input, "secret");
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
     }
 
     #[test]
@@ -4770,6 +4806,8 @@ mod auth_tests {
 
         effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('x'))));
         assert!(app.auth.clipboard_fallback.is_none());
+        assert!(app.auth.filter.is_empty());
+        assert!(effects.is_empty());
     }
 
     // ── Chord binding test ────────────────────────────────────────────────────
