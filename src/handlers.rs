@@ -14,6 +14,9 @@ use crate::features::delegates::input::{
     handle_popup_key as handle_delegate_input_key,
     handle_view_key as handle_delegate_view_input_key,
 };
+use crate::features::diagnostics::input::{
+    DiagnosticsInputResult, handle_key as handle_diagnostics_input_key,
+};
 use crate::features::mesh::input::{
     MeshInputResult, handle_invite_key as handle_mesh_invite_input_key,
     handle_invite_qr_key as handle_mesh_invite_qr_input_key,
@@ -21,6 +24,10 @@ use crate::features::mesh::input::{
 };
 use crate::features::models::input::{
     ModelInputResult, ModelTab, handle_key as handle_model_input_key,
+};
+use crate::features::navigation::input::{
+    HelpInputResult, PaletteInputResult, ThemeInputResult, handle_help_key, handle_palette_key,
+    handle_theme_key,
 };
 use crate::features::profiles::input::{
     ProfileInputResult, handle_key as handle_profile_input_key,
@@ -287,20 +294,12 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> V
 }
 
 pub(crate) fn handle_command_palette_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.navigation.move_command_palette_cursor(-1),
-        KeyCode::Down => app.navigation.move_command_palette_cursor(1),
-        KeyCode::Backspace => app.navigation.command_palette_filter_backspace(),
-        KeyCode::Enter => {
-            if let Some(action) = app.navigation.selected_command_palette_action() {
-                return execute_command_palette_action(app, action);
-            }
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.navigation.command_palette_filter_insert(c);
-        }
-        _ => {}
+    match handle_palette_key(&mut app.navigation, key) {
+        PaletteInputResult::Close => app.navigation.popup = Popup::None,
+        PaletteInputResult::Execute(action) => return execute_command_palette_action(app, action),
+        PaletteInputResult::NotHandled
+        | PaletteInputResult::Moved
+        | PaletteInputResult::Filtered => {}
     }
     Vec::new()
 }
@@ -417,16 +416,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         Popup::NewSession => return handle_new_session_popup_key(app, key),
         Popup::ThemeSelect => return handle_theme_popup_key(app, key),
         Popup::Help => {
-            match key.code {
-                KeyCode::Esc => app.navigation.popup = Popup::None,
-                KeyCode::Up => app.navigation.scroll_help_up(),
-                KeyCode::Down => app.navigation.scroll_help_down(),
-                _ => {}
+            match handle_help_key(&mut app.navigation, key) {
+                HelpInputResult::Close => app.navigation.popup = Popup::None,
+                HelpInputResult::NotHandled | HelpInputResult::Scroll { .. } => {}
             }
             return Vec::new();
         }
         Popup::Log => {
-            let _ = handle_log_popup_key(app, key);
+            handle_log_popup_key(app, key);
             return Vec::new();
         }
         Popup::ProviderAuth => return handle_auth_popup_key(app, key),
@@ -948,46 +945,17 @@ pub(crate) fn handle_fork_turn_popup_key(app: &mut App, key: KeyEvent) -> Vec<Ef
     Vec::new()
 }
 
-pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => {
-            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            let max = app.filtered_logs().len().saturating_sub(1);
-            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 1).min(max);
-        }
-        KeyCode::PageUp => {
-            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            let max = app.filtered_logs().len().saturating_sub(1);
-            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 10).min(max);
-        }
-        KeyCode::Home => {
-            app.diagnostics.log_cursor = 0;
-        }
-        KeyCode::End => {
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Backspace => {
-            app.diagnostics.log_filter.pop();
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Tab => {
-            app.cycle_log_level_filter();
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.diagnostics.log_filter.push(c);
-            app.diagnostics.log_cursor = 0;
-        }
-        _ => {}
+pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) {
+    match handle_diagnostics_input_key(&mut app.diagnostics, key) {
+        DiagnosticsInputResult::Close => app.navigation.popup = Popup::None,
+        DiagnosticsInputResult::NotHandled
+        | DiagnosticsInputResult::Moved
+        | DiagnosticsInputResult::Paged
+        | DiagnosticsInputResult::ToStart
+        | DiagnosticsInputResult::ToEnd
+        | DiagnosticsInputResult::Filtered
+        | DiagnosticsInputResult::CycledLevel => {}
     }
-    Ok(())
 }
 
 pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -1049,33 +1017,16 @@ pub(crate) fn handle_new_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<
 }
 
 pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.navigation.move_theme_cursor_up(),
-        KeyCode::Down => {
-            let filtered_len = app
-                .navigation
-                .filtered_themes(theme::Theme::available_themes())
-                .len();
-            app.navigation.move_theme_cursor_down(filtered_len);
+    match handle_theme_key(&mut app.navigation, theme::Theme::available_themes(), key) {
+        ThemeInputResult::Close => app.navigation.popup = Popup::None,
+        ThemeInputResult::Apply { index } => {
+            theme::Theme::set_by_index(index);
+            theme::Theme::begin_frame();
+            app.render.apply_change(RenderChange::ThemeChanged);
+            app.navigation.popup = Popup::None;
+            return vec![Effect::PersistConfig];
         }
-        KeyCode::Enter => {
-            if let Some(idx) = app
-                .navigation
-                .selected_theme_index(theme::Theme::available_themes())
-            {
-                theme::Theme::set_by_index(idx);
-                theme::Theme::begin_frame();
-                app.render.apply_change(RenderChange::ThemeChanged);
-                app.navigation.popup = Popup::None;
-                return vec![Effect::PersistConfig];
-            }
-        }
-        KeyCode::Backspace => app.navigation.theme_filter_backspace(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.navigation.theme_filter_insert(c);
-        }
-        _ => {}
+        ThemeInputResult::NotHandled | ThemeInputResult::Moved | ThemeInputResult::Filtered => {}
     }
     Vec::new()
 }
@@ -2094,9 +2045,9 @@ mod model_popup_tests {
         app.navigation.theme_filter = "no theme matches this".into();
         app.navigation.theme_cursor = 8;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Down));
+        assert!(handle_theme_popup_key(&mut app, key(KeyCode::Down)).is_empty());
         assert_eq!(app.navigation.theme_cursor, 0);
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        assert!(handle_theme_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
         assert_eq!(app.navigation.popup, Popup::ThemeSelect);
     }
 
@@ -2107,9 +2058,10 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ThemeSelect;
         app.navigation.theme_cursor = theme::Theme::available_themes().len() + 10;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        let effects = handle_theme_popup_key(&mut app, key(KeyCode::Enter));
 
         assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(effects, vec![Effect::PersistConfig]);
     }
 
     #[test]
@@ -2137,6 +2089,21 @@ mod model_popup_tests {
             effects.next_command(),
             Some(Command::ListRemoteNodes)
         ));
+    }
+
+    #[test]
+    fn disconnected_command_palette_action_keeps_popup_and_emits_no_command() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Disconnected;
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "open mesh".into();
+
+        assert!(handle_command_palette_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.navigation.popup, Popup::CommandPalette);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
     }
 
     #[test]

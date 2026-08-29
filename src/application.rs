@@ -764,6 +764,36 @@ mod tests {
         assert_eq!(popup_app.sessions.agent_mode, "build");
         assert_eq!(popup_app.composer.input, "underlying-chat");
 
+        let mut log_popup_app = App::new();
+        log_popup_app.connection.conn = ConnState::Connected;
+        log_popup_app.navigation.screen = Screen::Chat;
+        log_popup_app.navigation.popup = Popup::Log;
+        log_popup_app.sessions.agent_mode = "build".into();
+        log_popup_app
+            .composer
+            .replace_input("underlying-chat".into());
+        assert!(
+            update(
+                &mut log_popup_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(log_popup_app.navigation.popup, Popup::Log);
+        assert_eq!(log_popup_app.sessions.agent_mode, "build");
+        assert_eq!(log_popup_app.composer.input, "underlying-chat");
+        assert_eq!(log_popup_app.diagnostics.log_level_filter, LogLevel::Warn);
+        assert!(
+            update(
+                &mut log_popup_app,
+                AppEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            )
+            .is_empty()
+        );
+        assert_eq!(log_popup_app.diagnostics.log_filter, "x");
+        assert_eq!(log_popup_app.diagnostics.log_cursor, 0);
+        assert_eq!(log_popup_app.composer.input, "underlying-chat");
+
         let mut global_tab_app = App::new();
         global_tab_app.connection.conn = ConnState::Connected;
         global_tab_app.sessions.agent_mode = "build".into();
