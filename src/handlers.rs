@@ -6,8 +6,10 @@ use crate::domain::activity::{ActivityState, SessionOp};
 use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
 use crate::domain::model::ModelEntry;
 use crate::features::chat::input::{
-    CompletionResult, ComposerKeyResult, ElicitationResponseEffect, handle_completion_key,
-    handle_composer_key, handle_elicitation_key,
+    CancelIntent, ChatCommandIntent, ChatInputContext, ChatInputResult, ChatViewportIntent,
+    CompletionResult, ComposerKeyResult, ElicitationResponseEffect, PromptSubmission,
+    build_prompt_submission, chat_command_intent, handle_completion_key, handle_composer_key,
+    handle_coordination_key, handle_elicitation_key,
 };
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
@@ -293,18 +295,19 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.navigation.chord {
         app.navigation.chord = false;
         app.set_status(LogLevel::Debug, "input", "ready");
-        if key.code == KeyCode::Char('e') {
-            if app.navigation.screen != Screen::Chat {
-                app.set_status(
-                    LogLevel::Warn,
-                    "editor",
-                    "external editor is only available in chat",
-                );
-                return Vec::new();
+        if app.navigation.screen == Screen::Chat {
+            if let Some(ChatCommandIntent::OpenExternalEditor { initial_text }) =
+                chat_command_intent(&app.composer, key)
+            {
+                return vec![Effect::OpenExternalEditor { initial_text }];
             }
-            return vec![Effect::OpenExternalEditor {
-                initial_text: app.composer.input.clone(),
-            }];
+        } else if key.code == KeyCode::Char('e') {
+            app.set_status(
+                LogLevel::Warn,
+                "editor",
+                "external editor is only available in chat",
+            );
+            return Vec::new();
         }
         return handle_chord(app, key);
     }
@@ -1116,29 +1119,55 @@ pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect
     Vec::new()
 }
 
+fn apply_chat_input_result(app: &mut App, result: ChatInputResult) -> Option<Vec<Effect>> {
+    match result {
+        ChatInputResult::NotHandled => None,
+        ChatInputResult::CompletionDismissed => {
+            app.chat.clear_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Cancel(CancelIntent::ArmConfirmation) => {
+            app.arm_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Cancel(CancelIntent::ConfirmCancellation) => {
+            app.chat.clear_cancel_confirm();
+            app.set_status(LogLevel::Warn, "activity", "stopping...");
+            Some(vec![Effect::Command(Command::CancelSession)])
+        }
+        ChatInputResult::Cancel(CancelIntent::ClearConfirmation) => {
+            app.chat.clear_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ScrollUp { rows }) => {
+            app.render.scroll_chat_up(rows);
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ScrollDown { rows }) => {
+            app.render.scroll_chat_down(rows);
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ToBottom) => {
+            app.render.scroll_chat_to_bottom();
+            Some(Vec::new())
+        }
+    }
+}
+
 pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     let input_blocked = app.chat.input_blocked_by_activity();
+    let context = ChatInputContext {
+        editable: !input_blocked,
+        has_cancellable_activity: app.chat.has_cancellable_activity(),
+        cancel_confirmation_active: app.chat.cancel_confirm_active(),
+    };
+    let result = handle_coordination_key(&mut app.composer, &mut app.render, key, context);
+    if let Some(effects) = apply_chat_input_result(app, result) {
+        return effects;
+    }
+
     let mut effects = Vec::new();
     match key.code {
-        KeyCode::Esc => {
-            if handle_completion_key(&mut app.composer, key, !input_blocked)
-                == CompletionResult::Dismissed
-            {
-                app.chat.clear_cancel_confirm();
-                return effects;
-            }
-            if app.chat.has_cancellable_activity() {
-                if app.chat.cancel_confirm_active() {
-                    app.chat.clear_cancel_confirm();
-                    app.set_status(LogLevel::Warn, "activity", "stopping...");
-                    effects.push(Effect::Command(Command::CancelSession));
-                } else {
-                    app.arm_cancel_confirm();
-                }
-            } else {
-                app.chat.clear_cancel_confirm();
-            }
-        }
         KeyCode::Enter => {
             let completion = handle_completion_key(&mut app.composer, key, !input_blocked);
             if completion == CompletionResult::SlashAccepted
@@ -1168,10 +1197,10 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 if input_blocked || !can_send_server_commands(app) {
                     return effects;
                 }
-                let (text, links) = app
-                    .composer
-                    .build_prompt_text_and_links(&app.composer.input);
-                let text = text.trim().to_string();
+                let Some(PromptSubmission { text, links }) = build_prompt_submission(&app.composer)
+                else {
+                    return effects;
+                };
                 let _ = app.take_input();
                 if text.is_empty() {
                     return effects;
@@ -1209,16 +1238,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         {
             handle_composer_key(&mut app.composer, &mut app.render, key, true);
         }
-        KeyCode::PageUp => app.render.scroll_chat_up(10),
-        KeyCode::PageDown => app.render.scroll_chat_down(10),
         KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right | KeyCode::Home => {
             handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked);
-        }
-        KeyCode::End
-            if handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked)
-                == ComposerKeyResult::NotHandled =>
-        {
-            app.render.scroll_chat_to_bottom();
         }
         _ => {}
     }

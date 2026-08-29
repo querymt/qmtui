@@ -1033,10 +1033,11 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn chat_pageup_pagedown_still_scroll_history() {
+    fn chat_pageup_pagedown_still_scroll_history_while_input_is_blocked() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.render.set_chat_scroll_offset(3);
 
         effects.extend(handle_chat_key(
@@ -1253,6 +1254,59 @@ mod external_editor_tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::User { text, .. }] if text == "first line\nsecond line"
+        ));
+    }
+
+    #[test]
+    fn disconnected_chat_submit_retains_prompt() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "retained @src/main.rs".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ));
+
+        assert!(effects.next_command().is_none());
+        assert_eq!(app.composer.input, "retained @src/main.rs");
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_submit_preserves_resource_link_order_after_text() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.connection.conn = ConnState::Connected;
+        app.composer.input = "  inspect @src/main.rs then @src/lib.rs and @src/main.rs  ".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ));
+
+        assert!(matches!(
+            effects.next_command().expect("prompt sent"),
+            Command::Prompt { prompt, .. }
+                if matches!(prompt.as_slice(), [
+                    PromptBlock::Text { text },
+                    PromptBlock::ResourceLink { name: first_name, uri: first_uri },
+                    PromptBlock::ResourceLink { name: second_name, uri: second_uri },
+                ] if text == "inspect @src/main.rs then @src/lib.rs and @src/main.rs"
+                    && first_name == "src/main.rs"
+                    && first_uri == "src/main.rs"
+                    && second_name == "src/lib.rs"
+                    && second_uri == "src/lib.rs")
+        ));
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "inspect @src/main.rs then @src/lib.rs and @src/main.rs"
+                    && message_id.starts_with("local:pending:")
         ));
     }
 
@@ -1802,13 +1856,23 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn chat_double_esc_cancels_running_tool_phase() {
+    fn chat_completion_dismissal_precedes_double_esc_cancellation() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
+        app.composer.input = "/mo".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.refresh_slash_state();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        ));
+        assert!(app.composer.slash_state.is_none());
+        assert!(!app.chat.cancel_confirm_active());
 
         effects.extend(handle_chat_key(
             &mut app,
