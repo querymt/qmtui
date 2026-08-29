@@ -32,28 +32,56 @@ pub fn test_set_config_path_override(path: Option<PathBuf>) {
 #[cfg(test)]
 pub struct TestPersistenceGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
+    path: PathBuf,
+    dir: PathBuf,
+    previous_override: Option<PathBuf>,
 }
 
 #[cfg(test)]
 impl TestPersistenceGuard {
     pub fn new(label: &str) -> Self {
-        let lock = test_persistence_lock().lock().unwrap();
+        let lock = test_persistence_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("qmt-persistence-tests-{label}-{pid}-{nanos}"));
+        let path = dir.join("qmtui.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        test_set_config_path_override(Some(dir.join("qmtui.toml")));
-        Self { _lock: lock }
+        let previous_override = config_path_override()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(path.clone());
+        Self {
+            _lock: lock,
+            path,
+            dir,
+            previous_override,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn user_config_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".qmt")
+            .join("qmtui.toml")
     }
 }
 
 #[cfg(test)]
 impl Drop for TestPersistenceGuard {
     fn drop(&mut self) {
-        test_set_config_path_override(None);
+        *config_path_override()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous_override.take();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -117,6 +145,12 @@ impl TuiConfig {
 
     /// Load from the default path (`~/.qmt/qmtui.toml`).
     pub fn load() -> Self {
+        #[cfg(test)]
+        assert!(
+            config_path_override().lock().unwrap().is_some(),
+            "TuiConfig::load() called in test without config path override! \
+             Use TestPersistenceGuard to avoid reading the real ~/.qmt/qmtui.toml."
+        );
         Self::load_from_path(&Self::config_path())
     }
 
@@ -201,6 +235,10 @@ mod tests {
     impl TestPathGuard {
         fn new(label: &str) -> Self {
             Self(TestPersistenceGuard::new(label))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
         }
     }
 
@@ -308,8 +346,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_default_load_save_respects_override_path() {
-        let _guard = TestPathGuard::new("cfg-override");
+    fn config_default_load_save_respects_isolated_override_path() {
+        let guard = TestPathGuard::new("cfg-override");
+        let guarded_path = guard.path().to_path_buf();
+        assert_eq!(TuiConfig::config_path(), guarded_path);
+        assert_ne!(guarded_path, TestPersistenceGuard::user_config_path());
+        assert!(guarded_path.starts_with(std::env::temp_dir()));
+        assert!(!guarded_path.exists());
+
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
@@ -317,8 +361,66 @@ mod tests {
             ..Default::default()
         };
         cfg.save();
-        let loaded = TuiConfig::load();
-        assert_eq!(loaded, cfg);
+
+        assert!(guarded_path.exists());
+        assert_eq!(TuiConfig::load(), cfg);
+        assert_eq!(TuiConfig::load(), cfg);
+    }
+
+    #[test]
+    fn config_default_io_without_guard_panics_before_real_path_access() {
+        let _lock = test_persistence_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(config_path_override().lock().unwrap().is_none());
+        assert_eq!(
+            TuiConfig::config_path(),
+            TestPersistenceGuard::user_config_path()
+        );
+
+        let load_result = std::panic::catch_unwind(TuiConfig::load);
+        let save_result = std::panic::catch_unwind(|| TuiConfig::default().save());
+
+        assert!(load_result.is_err());
+        assert!(save_result.is_err());
+        assert!(config_path_override().lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn persistence_guard_restores_override_after_normal_and_panicking_scopes() {
+        let first_path = {
+            let guard = TestPersistenceGuard::new("guard-restore-normal");
+            assert_eq!(TuiConfig::config_path(), guard.path());
+            guard.path().to_path_buf()
+        };
+        {
+            let _lock = test_persistence_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(config_path_override().lock().unwrap().is_none());
+        }
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let guard = TestPersistenceGuard::new("guard-restore-panic");
+            assert_eq!(TuiConfig::config_path(), guard.path());
+            panic!("exercise persistence guard unwind");
+        });
+        assert!(panic_result.is_err());
+        {
+            let _lock = test_persistence_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(config_path_override().lock().unwrap().is_none());
+            assert_eq!(
+                TuiConfig::config_path(),
+                TestPersistenceGuard::user_config_path()
+            );
+        }
+
+        let next_guard = TestPersistenceGuard::new("guard-restore-next");
+        assert_ne!(next_guard.path(), first_path);
+        assert_eq!(TuiConfig::config_path(), next_guard.path());
     }
 
     #[test]
