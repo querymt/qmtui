@@ -1,11 +1,44 @@
 use crate::app::App;
 use crate::application::{ClipboardTarget, Effect};
-use crate::auth_state::AuthPanel;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::{ActivityState, SessionOp};
-use crate::domain::auth::{OAuthFlowKind, OAuthStatus};
-use crate::domain::chat::ElicitationResponseOutcome;
-use crate::domain::model::ModelEntry;
+use crate::features::auth::input::{AuthInputResult, handle_key as handle_auth_input_key};
+use crate::features::chat::input::{
+    CancelIntent, ChatCommandIntent, ChatInputContext, ChatInputResult, ChatViewportIntent,
+    CompletionResult, ComposerKeyResult, ElicitationResponseEffect, PromptSubmission,
+    build_prompt_submission, chat_command_intent, handle_completion_key, handle_composer_key,
+    handle_coordination_key, handle_elicitation_key,
+};
+use crate::features::delegates::input::{
+    DelegateInputContext, DelegateInputResult, DelegateViewportIntent,
+    handle_popup_key as handle_delegate_input_key,
+    handle_view_key as handle_delegate_view_input_key,
+};
+use crate::features::diagnostics::input::{
+    DiagnosticsInputResult, handle_key as handle_diagnostics_input_key,
+};
+use crate::features::mesh::input::{
+    MeshInputResult, handle_invite_key as handle_mesh_invite_input_key,
+    handle_invite_qr_key as handle_mesh_invite_qr_input_key,
+    handle_popup_key as handle_mesh_input_key,
+};
+use crate::features::models::input::{
+    ModelInputResult, ModelTab, handle_key as handle_model_input_key,
+};
+use crate::features::navigation::input::{
+    HelpInputResult, PaletteInputResult, ThemeInputResult, handle_help_key, handle_palette_key,
+    handle_theme_key,
+};
+use crate::features::profiles::input::{
+    ProfileInputResult, handle_key as handle_profile_input_key,
+};
+use crate::features::sessions::input::{
+    NewSessionInputResult, SessionPopupInputResult, SessionsInputResult,
+    handle_new_session_key as handle_new_session_input_key,
+    handle_session_popup_key as handle_session_popup_input_key,
+    handle_sessions_key as handle_sessions_input_key, switch_session_popup_tab,
+    toggle_popup_session_children, toggle_start_session_children,
+};
 use crate::navigation_state::{CommandPaletteAction, Popup, Screen};
 use crate::render_state::RenderChange;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -36,213 +69,6 @@ fn send_load_session_commands(
         .into_iter()
         .map(Effect::Command)
         .collect()
-}
-
-fn elicitation_response_effect(
-    elicitation_id: String,
-    action: &str,
-    content: Option<serde_json::Value>,
-    outcome: ElicitationResponseOutcome,
-) -> Effect {
-    Effect::ElicitationResponse {
-        elicitation_id,
-        action: action.into(),
-        content,
-        outcome,
-    }
-}
-
-/// Handle all keyboard input while an elicitation popup is active.
-///
-/// Returns the ordered effects for the key; the caller should return immediately
-/// afterward to avoid routing the key to the normal chat handler.
-pub(crate) fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    use crate::domain::elicitation::ElicitationFieldKind;
-
-    let mut effects = Vec::new();
-    let custom_line_width = app.render.elicitation_custom_line_width();
-    let (Some(state), Some(ui)) = (
-        app.chat.elicitation.as_mut(),
-        app.chat.elicitation_ui.as_mut(),
-    ) else {
-        return effects;
-    };
-    let Some(field_index) = ui.current_field_index(state.fields.len()) else {
-        return effects;
-    };
-
-    let selected_outcome = |state: &crate::domain::elicitation::ElicitationState,
-                            custom_active: bool| {
-        let field = &state.fields[field_index];
-        if custom_active {
-            return ElicitationResponseOutcome::Selected(vec![
-                state.custom_input.trim().to_string(),
-            ]);
-        }
-        match &field.kind {
-            ElicitationFieldKind::SingleSelect { options } => ElicitationResponseOutcome::Selected(
-                options
-                    .iter()
-                    .find(|option| state.selected.get(&field.name) == Some(&option.value))
-                    .map(|option| vec![option.label.clone()])
-                    .unwrap_or_default(),
-            ),
-            ElicitationFieldKind::MultiSelect { options } => {
-                let labels = state
-                    .selected
-                    .get(&field.name)
-                    .and_then(serde_json::Value::as_array)
-                    .map(|values| {
-                        options
-                            .iter()
-                            .filter(|option| values.contains(&option.value))
-                            .map(|option| option.label.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                ElicitationResponseOutcome::Selected(labels)
-            }
-            ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
-                ElicitationResponseOutcome::Text(state.text_input.clone())
-            }
-            ElicitationFieldKind::BooleanToggle => state
-                .selected
-                .get(&field.name)
-                .and_then(serde_json::Value::as_bool)
-                .map(ElicitationResponseOutcome::Boolean)
-                .unwrap_or_else(|| ElicitationResponseOutcome::Text(String::new())),
-        }
-    };
-
-    if ui.custom_active {
-        match key.code {
-            KeyCode::Esc => {
-                ui.custom_active = false;
-                app.render.reset_elicitation_custom_scroll();
-            }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                ui.custom_insert(&mut state.custom_input, '\n');
-            }
-            KeyCode::Enter if state.is_valid(Some(&state.custom_input)) => {
-                let elicitation_id = state.elicitation_id.clone();
-                let content = state.build_accept_content(Some(&state.custom_input));
-                let outcome = selected_outcome(state, true);
-                effects.push(elicitation_response_effect(
-                    elicitation_id,
-                    "accept",
-                    Some(content),
-                    outcome,
-                ));
-            }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.custom_insert(&mut state.custom_input, character);
-            }
-            KeyCode::Backspace => ui.custom_backspace(&mut state.custom_input),
-            KeyCode::Delete => ui.custom_delete(&mut state.custom_input),
-            KeyCode::Left => ui.custom_left(&state.custom_input),
-            KeyCode::Right => ui.custom_right(&state.custom_input),
-            KeyCode::Home => ui.custom_home(&state.custom_input),
-            KeyCode::End => ui.custom_end(&state.custom_input),
-            KeyCode::Up => ui.custom_move_visual(&state.custom_input, custom_line_width, -1),
-            KeyCode::Down => ui.custom_move_visual(&state.custom_input, custom_line_width, 1),
-            _ => {}
-        }
-        return effects;
-    }
-
-    let field = &state.fields[field_index];
-    let option_count = match &field.kind {
-        ElicitationFieldKind::SingleSelect { options }
-        | ElicitationFieldKind::MultiSelect { options } => options.len(),
-        _ => 0,
-    };
-    let custom_available = state.allow_custom && option_count > 0;
-    let custom_option_selected = custom_available && ui.option_cursor == option_count;
-
-    match key.code {
-        KeyCode::Esc => {
-            let elicitation_id = state.elicitation_id.clone();
-            effects.push(elicitation_response_effect(
-                elicitation_id,
-                "decline",
-                None,
-                ElicitationResponseOutcome::Declined,
-            ));
-        }
-        KeyCode::Down => {
-            let max = option_count + usize::from(custom_available);
-            ui.option_cursor = (ui.option_cursor + 1).min(max.saturating_sub(1));
-        }
-        KeyCode::Up => ui.option_cursor = ui.option_cursor.saturating_sub(1),
-        KeyCode::Char(' ') => {
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::MultiSelect { .. } | ElicitationFieldKind::BooleanToggle
-            ) {
-                state.toggle_option(field_index, ui.option_cursor);
-            }
-        }
-        KeyCode::Enter => {
-            match field.kind {
-                ElicitationFieldKind::SingleSelect { .. } if custom_option_selected => {
-                    ui.custom_active = true;
-                    ui.custom_cursor = state.custom_input.len();
-                    state.clear_selection(field_index);
-                    return effects;
-                }
-                ElicitationFieldKind::SingleSelect { .. } => {
-                    state.select_option(field_index, ui.option_cursor);
-                }
-                ElicitationFieldKind::MultiSelect { .. } if custom_option_selected => {
-                    ui.custom_active = true;
-                    ui.custom_cursor = state.custom_input.len();
-                    state.clear_selection(field_index);
-                    return effects;
-                }
-                ElicitationFieldKind::MultiSelect { .. }
-                | ElicitationFieldKind::TextInput
-                | ElicitationFieldKind::NumberInput { .. }
-                | ElicitationFieldKind::BooleanToggle => {}
-            }
-
-            if state.is_valid(None) {
-                let elicitation_id = state.elicitation_id.clone();
-                let content = state.build_accept_content(None);
-                let outcome = selected_outcome(state, false);
-                effects.push(elicitation_response_effect(
-                    elicitation_id,
-                    "accept",
-                    Some(content),
-                    outcome,
-                ));
-            }
-        }
-        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
-            ) {
-                state.text_input.insert(ui.text_cursor, character);
-                ui.text_cursor += character.len_utf8();
-            }
-        }
-        KeyCode::Backspace
-            if matches!(
-                field.kind,
-                ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. }
-            ) && ui.text_cursor > 0 =>
-        {
-            let previous = state.text_input[..ui.text_cursor]
-                .char_indices()
-                .last()
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            state.text_input.drain(previous..ui.text_cursor);
-            ui.text_cursor = previous;
-        }
-        _ => {}
-    }
-    effects
 }
 
 fn open_model_popup(app: &mut App) -> Vec<Effect> {
@@ -342,66 +168,66 @@ fn execute_command_palette_action(app: &mut App, action: CommandPaletteAction) -
 }
 
 pub(crate) fn handle_mesh_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.mesh.toggle_focus(),
-        KeyCode::Up => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                if let Some(node_id) = app.mesh.move_mesh_node_cursor(-1) {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id,
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(-1),
-        },
-        KeyCode::Down => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                if let Some(node_id) = app.mesh.move_mesh_node_cursor(1) {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id,
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => app.mesh.move_remote_session_cursor(1),
-        },
-        KeyCode::Char('r') => effects.push(Effect::Command(Command::ListRemoteNodes)),
-        KeyCode::Enter => match app.mesh.mesh_focus {
-            crate::mesh_state::MeshFocus::Nodes => {
-                app.mesh.focus_sessions();
-                if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                    effects.push(Effect::Command(Command::ListRemoteSessions {
-                        node_id: node_id.to_string(),
-                        offset: 0,
-                        limit: 50,
-                    }));
-                }
-            }
-            crate::mesh_state::MeshFocus::Sessions => {
-                if let Some(session) = app.mesh.selected_remote_session() {
-                    effects.push(Effect::Command(Command::AttachRemoteSession {
-                        node_id: session.node_id.clone(),
-                        session_id: session.id.clone(),
-                    }));
-                }
-            }
-        },
-        KeyCode::Char('n') => {
-            if let Some(node_id) = app.mesh.selected_mesh_node_id() {
-                effects.push(Effect::Command(Command::CreateRemoteSession {
-                    node_id: node_id.to_string(),
-                    cwd: None,
-                }));
-            }
+    match handle_mesh_input_key(&mut app.mesh, key) {
+        MeshInputResult::Close => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
         }
-        _ => {}
+        MeshInputResult::MoveNode {
+            refresh_node_id: Some(node_id),
+        }
+        | MeshInputResult::FocusSessions {
+            node_id: Some(node_id),
+        } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ListRemoteSessions {
+                node_id,
+                offset: 0,
+                limit: 50,
+            })]
+        }
+        MeshInputResult::AttachRemoteSession {
+            node_id,
+            session_id,
+        } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::AttachRemoteSession {
+                node_id,
+                session_id,
+            })]
+        }
+        MeshInputResult::CreateRemoteSession { node_id } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::CreateRemoteSession {
+                node_id,
+                cwd: None,
+            })]
+        }
+        MeshInputResult::RefreshNodes => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ListRemoteNodes)]
+        }
+        MeshInputResult::NotHandled
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode {
+            refresh_node_id: None,
+        }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { node_id: None }
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::SubmitInvite
+        | MeshInputResult::BackToInviteForm
+        | MeshInputResult::ShowInviteUrl
+        | MeshInputResult::CopyInviteUrl { .. } => Vec::new(),
     }
-    effects
 }
 
 pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -409,24 +235,31 @@ pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<
         return Vec::new();
     }
 
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.mesh.move_invite_form_field(-1),
-        KeyCode::Down | KeyCode::Tab => app.mesh.move_invite_form_field(1),
-        KeyCode::Backspace => app.mesh.invite_form_backspace(),
-        KeyCode::Enter => {
+    match handle_mesh_invite_input_key(&mut app.mesh, key) {
+        MeshInputResult::Close => app.navigation.popup = Popup::None,
+        MeshInputResult::SubmitInvite => {
             if let Some(command) = app.mesh_invite_form_command() {
-                effects.push(Effect::Command(command));
+                if !can_send_server_commands(app) {
+                    return Vec::new();
+                }
                 app.set_status(LogLevel::Info, "mesh", "creating invite...");
+                return vec![Effect::Command(command)];
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.mesh.invite_form_insert(c);
-        }
-        _ => {}
+        MeshInputResult::NotHandled
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode { .. }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { .. }
+        | MeshInputResult::AttachRemoteSession { .. }
+        | MeshInputResult::CreateRemoteSession { .. }
+        | MeshInputResult::RefreshNodes
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::BackToInviteForm
+        | MeshInputResult::ShowInviteUrl
+        | MeshInputResult::CopyInviteUrl { .. } => {}
     }
-    effects
+    Vec::new()
 }
 
 pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -434,39 +267,39 @@ pub(crate) fn handle_mesh_invite_qr_popup_key(app: &mut App, key: KeyEvent) -> V
         return Vec::new();
     }
 
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::MeshInvite,
-        KeyCode::Char('u') => {
+    match handle_mesh_invite_qr_input_key(&mut app.mesh, key) {
+        MeshInputResult::BackToInviteForm => app.navigation.popup = Popup::MeshInvite,
+        MeshInputResult::ShowInviteUrl => {
             app.mesh.show_invite_url_fallback();
         }
-        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(text) = app.mesh.invite_url().map(str::to_string) {
-                return vec![Effect::CopyToClipboard {
-                    target: ClipboardTarget::MeshInvite,
-                    text,
-                }];
-            }
+        MeshInputResult::CopyInviteUrl { url } => {
+            return vec![Effect::CopyToClipboard {
+                target: ClipboardTarget::MeshInvite,
+                text: url,
+            }];
         }
-        _ => {}
+        MeshInputResult::NotHandled
+        | MeshInputResult::Close
+        | MeshInputResult::ToggleFocus
+        | MeshInputResult::MoveNode { .. }
+        | MeshInputResult::MoveRemoteSession
+        | MeshInputResult::FocusSessions { .. }
+        | MeshInputResult::AttachRemoteSession { .. }
+        | MeshInputResult::CreateRemoteSession { .. }
+        | MeshInputResult::RefreshNodes
+        | MeshInputResult::InviteEdited
+        | MeshInputResult::SubmitInvite => {}
     }
     Vec::new()
 }
 
 pub(crate) fn handle_command_palette_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.navigation.move_command_palette_cursor(-1),
-        KeyCode::Down => app.navigation.move_command_palette_cursor(1),
-        KeyCode::Backspace => app.navigation.command_palette_filter_backspace(),
-        KeyCode::Enter => {
-            if let Some(action) = app.navigation.selected_command_palette_action() {
-                return execute_command_palette_action(app, action);
-            }
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.navigation.command_palette_filter_insert(c);
-        }
-        _ => {}
+    match handle_palette_key(&mut app.navigation, key) {
+        PaletteInputResult::Close => app.navigation.popup = Popup::None,
+        PaletteInputResult::Execute(action) => return execute_command_palette_action(app, action),
+        PaletteInputResult::NotHandled
+        | PaletteInputResult::Moved
+        | PaletteInputResult::Filtered => {}
     }
     Vec::new()
 }
@@ -497,24 +330,40 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if app.navigation.chord {
         app.navigation.chord = false;
         app.set_status(LogLevel::Debug, "input", "ready");
-        if key.code == KeyCode::Char('e') {
-            if app.navigation.screen != Screen::Chat {
-                app.set_status(
-                    LogLevel::Warn,
-                    "editor",
-                    "external editor is only available in chat",
-                );
-                return Vec::new();
+        if app.navigation.screen == Screen::Chat {
+            if let Some(ChatCommandIntent::OpenExternalEditor { initial_text }) =
+                chat_command_intent(&app.composer, key)
+            {
+                return vec![Effect::OpenExternalEditor { initial_text }];
             }
-            return vec![Effect::OpenExternalEditor {
-                initial_text: app.composer.input.clone(),
-            }];
+        } else if key.code == KeyCode::Char('e') {
+            app.set_status(
+                LogLevel::Warn,
+                "editor",
+                "external editor is only available in chat",
+            );
+            return Vec::new();
         }
         return handle_chord(app, key);
     }
 
     if app.chat.elicitation.is_some() {
-        return handle_elicitation_key(app, key);
+        return handle_elicitation_key(&mut app.chat, &mut app.render, key)
+            .into_iter()
+            .map(
+                |ElicitationResponseEffect {
+                     elicitation_id,
+                     action,
+                     content,
+                     outcome,
+                 }| Effect::ElicitationResponse {
+                    elicitation_id,
+                    action,
+                    content,
+                    outcome,
+                },
+            )
+            .collect();
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
@@ -567,16 +416,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         Popup::NewSession => return handle_new_session_popup_key(app, key),
         Popup::ThemeSelect => return handle_theme_popup_key(app, key),
         Popup::Help => {
-            match key.code {
-                KeyCode::Esc => app.navigation.popup = Popup::None,
-                KeyCode::Up => app.navigation.scroll_help_up(),
-                KeyCode::Down => app.navigation.scroll_help_down(),
-                _ => {}
+            match handle_help_key(&mut app.navigation, key) {
+                HelpInputResult::Close => app.navigation.popup = Popup::None,
+                HelpInputResult::NotHandled | HelpInputResult::Scroll { .. } => {}
             }
             return Vec::new();
         }
         Popup::Log => {
-            let _ = handle_log_popup_key(app, key);
+            handle_log_popup_key(app, key);
             return Vec::new();
         }
         Popup::ProviderAuth => return handle_auth_popup_key(app, key),
@@ -778,37 +625,137 @@ fn session_action_effects(app: &mut App, action: SessionKeyAction) -> Vec<Effect
     }
 }
 
+fn resolve_session_selection(
+    app: &mut App,
+    session_id: String,
+    cwd: Option<String>,
+) -> SessionKeyAction {
+    if let Some(node_id) = app
+        .sessions
+        .session_remote_node_id(&session_id)
+        .map(str::to_string)
+    {
+        app.sessions
+            .remember_remote_session_node(&session_id, &node_id);
+        return SessionKeyAction::AttachRemoteSession {
+            node_id,
+            session_id,
+        };
+    }
+    if app.sessions.is_remote_session_id(&session_id) {
+        app.set_status(
+            LogLevel::Warn,
+            "session",
+            "remote session is missing node id; refresh sessions and try again",
+        );
+        return SessionKeyAction::None;
+    }
+    SessionKeyAction::LoadSession {
+        session_id,
+        agent_id: None,
+        cwd,
+    }
+}
+
+fn apply_sessions_input_result(app: &mut App, result: SessionsInputResult) -> SessionKeyAction {
+    match result {
+        SessionsInputResult::Moved {
+            keep_visible_from_above,
+        } => {
+            if keep_visible_from_above {
+                app.render
+                    .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
+            }
+            SessionKeyAction::None
+        }
+        SessionsInputResult::Filtered => {
+            app.render.reset_start_page_scroll();
+            SessionKeyAction::None
+        }
+        SessionsInputResult::OpenSession { session_id, cwd } => {
+            resolve_session_selection(app, session_id, cwd)
+        }
+        SessionsInputResult::DeleteSession { session_id } => {
+            SessionKeyAction::DeleteSession { session_id }
+        }
+        SessionsInputResult::DismissRemoteSession { session_id } => {
+            SessionKeyAction::DismissRemoteSession { session_id }
+        }
+        SessionsInputResult::OpenSessionPopup => {
+            app.navigation.popup = Popup::SessionSelect;
+            SessionKeyAction::None
+        }
+        SessionsInputResult::OpenNewSession => SessionKeyAction::NewSession,
+        SessionsInputResult::LoadMore {
+            group_idx,
+            parent_path,
+        } => SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        },
+        SessionsInputResult::NotHandled | SessionsInputResult::ToggledGroup => {
+            SessionKeyAction::None
+        }
+    }
+}
+
+fn apply_session_popup_input_result(
+    app: &mut App,
+    result: SessionPopupInputResult,
+) -> SessionKeyAction {
+    match result {
+        SessionPopupInputResult::OpenSession { session_id, cwd } => {
+            app.navigation.popup = Popup::None;
+            resolve_session_selection(app, session_id, cwd)
+        }
+        SessionPopupInputResult::DeleteSession { session_id } => {
+            SessionKeyAction::DeleteSession { session_id }
+        }
+        SessionPopupInputResult::DismissRemoteSession { session_id } => {
+            SessionKeyAction::DismissRemoteSession { session_id }
+        }
+        SessionPopupInputResult::LoadMore {
+            group_idx,
+            parent_path,
+        } => SessionKeyAction::LoadMoreSessions {
+            group_idx,
+            parent_path,
+        },
+        SessionPopupInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::None
+        }
+        SessionPopupInputResult::NotHandled
+        | SessionPopupInputResult::Moved
+        | SessionPopupInputResult::Filtered
+        | SessionPopupInputResult::ToggledGroup => SessionKeyAction::None,
+    }
+}
+
 pub(crate) fn handle_sessions_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
         return vec![Effect::Quit];
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        if let SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path,
-        } = apply_session_fork_toggle_key(app, false)
-            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
-        {
-            return vec![Effect::Command(request)];
-        }
-        return Vec::new();
+        let result = toggle_start_session_children(&mut app.sessions);
+        let action = apply_sessions_input_result(app, result);
+        return session_action_effects(app, action);
     }
 
-    let action = apply_sessions_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let result = handle_sessions_input_key(&mut app.sessions, key);
+    let action = apply_sessions_input_result(app, result);
     session_action_effects(app, action)
 }
 
 pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        app.sessions.switch_session_popup_tab();
+        switch_session_popup_tab(&mut app.sessions);
         return Vec::new();
     }
 
@@ -824,274 +771,135 @@ pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        if let SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path,
-        } = apply_session_fork_toggle_key(app, true)
-            && let Some(request) = app.session_child_page_request(group_idx, &parent_path)
-        {
-            return vec![Effect::Command(request)];
-        }
-        return Vec::new();
+        let result = toggle_popup_session_children(&mut app.sessions);
+        let action = apply_session_popup_input_result(app, result);
+        return session_action_effects(app, action);
     }
 
-    let action = apply_popup_session_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let page_step = app.render.session_popup_page_step();
+    let result = handle_session_popup_input_key(&mut app.sessions, key, page_step);
+    let action = apply_session_popup_input_result(app, result);
     session_action_effects(app, action)
 }
 
-/// Pure key-handler for the session popup. Returns a [`SessionKeyAction`] that
-/// the caller should forward to the server.
-///
-/// Uses [`App::visible_popup_items`] (grouped, no caps) and
-/// [`App::popup_collapsed_groups`] so its collapse state is fully independent
-/// of the start-page.
+/// Adapt session-popup input into the existing root-owned session action.
 pub(crate) fn apply_popup_session_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::session_state::PopupItem;
-
-    match key {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => app.sessions.move_popup_cursor_up(),
-        KeyCode::Down => app.sessions.move_popup_cursor_down(),
-        KeyCode::PageUp => {
-            let step = app.render.session_popup_page_step();
-            app.sessions.move_popup_cursor_page(step, false);
-        }
-        KeyCode::PageDown => {
-            let step = app.render.session_popup_page_step();
-            app.sessions.move_popup_cursor_page(step, true);
-        }
-        KeyCode::Enter => {
-            let items = app.sessions.visible_popup_items();
-            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
-                match item {
-                    PopupItem::GroupHeader { cwd, .. } => {
-                        app.sessions.toggle_popup_group_collapse(cwd.as_deref());
-                        app.sessions.clamp_popup_cursor();
-                    }
-                    PopupItem::Session {
-                        group_idx, path, ..
-                    } => {
-                        let session = app.sessions.session_by_path(group_idx, &path).cloned();
-                        if let Some(session) = session {
-                            app.navigation.popup = Popup::None;
-                            let session_id = session.session_id;
-                            if let Some(node_id) = app
-                                .sessions
-                                .session_remote_node_id(&session_id)
-                                .map(str::to_string)
-                            {
-                                app.sessions
-                                    .remember_remote_session_node(&session_id, &node_id);
-                                return SessionKeyAction::AttachRemoteSession {
-                                    node_id,
-                                    session_id,
-                                };
-                            }
-                            if app.sessions.is_remote_session_id(&session_id) {
-                                app.set_status(
-                                    LogLevel::Warn,
-                                    "session",
-                                    "remote session is missing node id; refresh sessions and try again",
-                                );
-                                return SessionKeyAction::None;
-                            }
-                            return SessionKeyAction::LoadSession {
-                                session_id,
-                                agent_id: None,
-                                cwd: session
-                                    .cwd
-                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
-                            };
-                        }
-                    }
-                    PopupItem::LoadMore {
-                        group_idx,
-                        parent_path,
-                    } => {
-                        return SessionKeyAction::LoadMoreSessions {
-                            group_idx,
-                            parent_path,
-                        };
-                    }
-                }
-            }
-        }
-        KeyCode::Delete => {
-            let items = app.sessions.visible_popup_items();
-            if let Some(PopupItem::Session {
-                group_idx, path, ..
-            }) = items.get(app.sessions.session_cursor).cloned()
-            {
-                let Some((session, is_remote)) =
-                    app.sessions.remove_session_at(group_idx, &path, true)
-                else {
-                    return SessionKeyAction::None;
-                };
-                let sid = session.session_id;
-                return if is_remote {
-                    SessionKeyAction::DismissRemoteSession { session_id: sid }
-                } else {
-                    SessionKeyAction::DeleteSession { session_id: sid }
-                };
-            }
-            // Delete on a GroupHeader: no-op
-        }
-        KeyCode::Backspace => app.sessions.popup_filter_backspace(),
-        KeyCode::Char(c) => app.sessions.popup_filter_insert(c),
-        _ => {}
-    }
-    SessionKeyAction::None
+    let page_step = app.render.session_popup_page_step();
+    let result = handle_session_popup_input_key(&mut app.sessions, key, page_step);
+    apply_session_popup_input_result(app, result)
 }
 
 pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
-    use crate::session_state::{PopupItem, StartPageItem};
-
-    let selected = if popup_items {
-        app.sessions
-            .visible_popup_items()
-            .get(app.sessions.session_cursor)
-            .cloned()
-            .and_then(|item| match item {
-                PopupItem::Session {
-                    group_idx, path, ..
-                } => Some((group_idx, path)),
-                _ => None,
-            })
+    if popup_items {
+        let result = toggle_popup_session_children(&mut app.sessions);
+        apply_session_popup_input_result(app, result)
     } else {
-        app.sessions
-            .visible_start_items()
-            .get(app.sessions.session_cursor)
-            .cloned()
-            .and_then(|item| match item {
-                StartPageItem::Session {
-                    group_idx, path, ..
-                } => Some((group_idx, path)),
-                _ => None,
-            })
-    };
-
-    let Some((group_idx, path)) = selected else {
-        return SessionKeyAction::None;
-    };
-
-    let should_load = app.sessions.toggle_session_children(group_idx, &path);
-    if should_load {
-        SessionKeyAction::LoadMoreSessions {
-            group_idx,
-            parent_path: path,
-        }
-    } else {
-        SessionKeyAction::None
+        let result = toggle_start_session_children(&mut app.sessions);
+        apply_sessions_input_result(app, result)
     }
 }
 
 // ── Delegate view key handler (read-only child session) ──────────────────────
 
-fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Up => app.render.scroll_chat_up(1),
-        KeyCode::Down => app.render.scroll_chat_down(1),
-        KeyCode::PageUp => app.render.scroll_chat_up(10),
-        KeyCode::PageDown => app.render.scroll_chat_down(10),
-        KeyCode::Home => app.render.scroll_chat_to_top(),
-        KeyCode::End => app.render.scroll_chat_to_bottom(),
-        KeyCode::Esc => {
-            if let Some(parent_sid) = app.delegates.parent_session_id.clone() {
-                return send_load_session_commands(
-                    parent_sid,
-                    app.current_session_cwd(),
-                    app.sessions.agent_id.clone(),
-                );
+fn apply_delegate_viewport_intent(app: &mut App, intent: DelegateViewportIntent) {
+    match intent {
+        DelegateViewportIntent::UpOne => app.render.scroll_chat_up(1),
+        DelegateViewportIntent::DownOne => app.render.scroll_chat_down(1),
+        DelegateViewportIntent::UpTen => app.render.scroll_chat_up(10),
+        DelegateViewportIntent::DownTen => app.render.scroll_chat_down(10),
+        DelegateViewportIntent::Top => app.render.scroll_chat_to_top(),
+        DelegateViewportIntent::Bottom => app.render.scroll_chat_to_bottom(),
+    }
+}
+
+fn apply_delegate_popup_input_result(
+    app: &mut App,
+    result: DelegateInputResult,
+) -> SessionKeyAction {
+    match result {
+        DelegateInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::None
+        }
+        DelegateInputResult::LoadChild {
+            session_id,
+            target_agent_id,
+            current_session_id,
+            parent_session_id,
+            cwd,
+        } => {
+            debug_assert_eq!(current_session_id, app.sessions.session_id);
+            debug_assert_eq!(parent_session_id, app.delegates.parent_session_id);
+            app.navigation.popup = Popup::None;
+            SessionKeyAction::LoadSession {
+                session_id,
+                agent_id: target_agent_id,
+                cwd,
             }
         }
-        _ => {}
+        DelegateInputResult::PendingChild => {
+            app.set_status(
+                LogLevel::Warn,
+                "delegates",
+                "delegation still pending — no session to load",
+            );
+            SessionKeyAction::None
+        }
+        DelegateInputResult::NotHandled
+        | DelegateInputResult::Moved
+        | DelegateInputResult::Filtered
+        | DelegateInputResult::Viewport(_)
+        | DelegateInputResult::NavigateParent { .. } => SessionKeyAction::None,
     }
-    Vec::new()
+}
+
+fn handle_delegate_view_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    match handle_delegate_view_input_key(&app.delegates, key.code) {
+        DelegateInputResult::Viewport(intent) => {
+            apply_delegate_viewport_intent(app, intent);
+            Vec::new()
+        }
+        DelegateInputResult::NavigateParent { session_id } => send_load_session_commands(
+            session_id,
+            app.current_session_cwd(),
+            app.sessions.agent_id.clone(),
+        ),
+        _ => Vec::new(),
+    }
 }
 
 // ── Delegate popup key handler ────────────────────────────────────────────────
 
 pub(crate) fn handle_delegate_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let action = apply_delegate_popup_key(
-        app,
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            KeyCode::Null
-        } else {
-            key.code
-        },
-    );
+    let key = if key.modifiers.contains(KeyModifiers::CONTROL) {
+        KeyCode::Null
+    } else {
+        key.code
+    };
+    let action = apply_delegate_popup_key(app, key);
     session_action_effects(app, action)
 }
 
-/// Pure key-handler for the delegate popup. Returns a [`SessionKeyAction`]
-/// that the caller should forward to the server.
-///
-/// Delegation entries are built from the parent session's event stream, not
-/// from the session list. Enter loads the child session if its ID is known.
+/// Adapt delegate-popup input into the existing root-owned session action.
 pub(crate) fn apply_delegate_popup_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    match key {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => app.delegates.move_cursor_up(),
-        KeyCode::Down => app.delegates.move_cursor_down(),
-        KeyCode::PageUp => {
-            let step = app.render.delegate_popup_page_step();
-            app.delegates.move_cursor_page(step, false);
-        }
-        KeyCode::PageDown => {
-            let step = app.render.delegate_popup_page_step();
-            app.delegates.move_cursor_page(step, true);
-        }
-        KeyCode::Enter => {
-            let selected = app.delegates.selected_entry().map(|entry| {
-                (
-                    entry.child_session_id.clone(),
-                    entry.target_agent_id.clone(),
-                )
-            });
-            if let Some((child_session_id, target_agent_id)) = selected {
-                if let Some(sid) = child_session_id {
-                    // Use the real parent when navigating between siblings.
-                    app.delegates.stage_parent_for_child_navigation(
-                        app.delegates.parent_session_id.clone(),
-                        app.sessions.session_id.clone(),
-                    );
-                    app.navigation.popup = Popup::None;
-                    return SessionKeyAction::LoadSession {
-                        session_id: sid,
-                        agent_id: target_agent_id,
-                        cwd: app.current_session_cwd(),
-                    };
-                } else {
-                    app.set_status(
-                        LogLevel::Warn,
-                        "delegates",
-                        "delegation still pending — no session to load",
-                    );
-                }
-            }
-        }
-        KeyCode::Backspace => app.delegates.filter_backspace(),
-        KeyCode::Char(c) => app.delegates.filter_insert(c),
-        _ => {}
-    }
-    SessionKeyAction::None
+    let context = DelegateInputContext {
+        page_step: app.render.delegate_popup_page_step(),
+        current_session_id: app.sessions.session_id.clone(),
+        cwd: app.current_session_cwd(),
+    };
+    let result = handle_delegate_input_key(&mut app.delegates, key, context);
+    apply_delegate_popup_input_result(app, result)
 }
 
 fn begin_fork_session(app: &mut App, message_id: String) -> Vec<Effect> {
@@ -1137,200 +945,147 @@ pub(crate) fn handle_fork_turn_popup_key(app: &mut App, key: KeyEvent) -> Vec<Ef
     Vec::new()
 }
 
-pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Esc => {
-            app.navigation.popup = Popup::None;
-        }
-        KeyCode::Up => {
-            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(1);
-        }
-        KeyCode::Down => {
-            let max = app.filtered_logs().len().saturating_sub(1);
-            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 1).min(max);
-        }
-        KeyCode::PageUp => {
-            app.diagnostics.log_cursor = app.diagnostics.log_cursor.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            let max = app.filtered_logs().len().saturating_sub(1);
-            app.diagnostics.log_cursor = (app.diagnostics.log_cursor + 10).min(max);
-        }
-        KeyCode::Home => {
-            app.diagnostics.log_cursor = 0;
-        }
-        KeyCode::End => {
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Backspace => {
-            app.diagnostics.log_filter.pop();
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Tab => {
-            app.cycle_log_level_filter();
-            app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.diagnostics.log_filter.push(c);
-            app.diagnostics.log_cursor = 0;
-        }
-        _ => {}
+pub(crate) fn handle_log_popup_key(app: &mut App, key: KeyEvent) {
+    match handle_diagnostics_input_key(&mut app.diagnostics, key) {
+        DiagnosticsInputResult::Close => app.navigation.popup = Popup::None,
+        DiagnosticsInputResult::NotHandled
+        | DiagnosticsInputResult::Moved
+        | DiagnosticsInputResult::Paged
+        | DiagnosticsInputResult::ToStart
+        | DiagnosticsInputResult::ToEnd
+        | DiagnosticsInputResult::Filtered
+        | DiagnosticsInputResult::CycledLevel => {}
     }
-    Ok(())
 }
 
 pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.profiles.move_profile_cursor(-1),
-        KeyCode::Down => app.profiles.move_profile_cursor(1),
-        KeyCode::Backspace => {
-            app.profiles.profile_filter.pop();
-            app.profiles.profile_cursor = 0;
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.profiles.profile_filter.push(c);
-            app.profiles.profile_cursor = 0;
-        }
-        KeyCode::Enter => {
-            if !can_send_server_commands(app) {
-                return effects;
-            }
-            if let Some(profile_id) = app
-                .profiles
-                .selected_profile()
-                .map(|profile| profile.id.clone())
-            {
-                app.profiles.active_profile_id = Some(profile_id.clone());
-                if app.current_session_profile_id().is_none() {
-                    app.models.clear_profile_agents();
-                    effects.push(Effect::Command(Command::ListProfileAgents {
-                        profile_id: profile_id.clone(),
-                    }));
-                }
-                app.navigation.popup = Popup::None;
-                app.set_status(
-                    LogLevel::Info,
-                    "profile",
-                    format!("new sessions will use {profile_id}"),
-                );
-                effects.push(Effect::PersistConfig);
-            } else {
-                app.set_status(LogLevel::Warn, "profile", "no matching profile");
-            }
-        }
-        _ => {}
+    if key.code == KeyCode::Enter && !can_send_server_commands(app) {
+        return Vec::new();
     }
-    effects
+
+    match handle_profile_input_key(&mut app.profiles, key) {
+        ProfileInputResult::Close => app.navigation.popup = Popup::None,
+        ProfileInputResult::SelectProfile { profile_id } => {
+            app.profiles.active_profile_id = Some(profile_id.clone());
+            let mut effects = Vec::new();
+            if app.current_session_profile_id().is_none() {
+                app.models.clear_profile_agents();
+                effects.push(Effect::Command(Command::ListProfileAgents {
+                    profile_id: profile_id.clone(),
+                }));
+            }
+            app.navigation.popup = Popup::None;
+            app.set_status(
+                LogLevel::Info,
+                "profile",
+                format!("new sessions will use {profile_id}"),
+            );
+            effects.push(Effect::PersistConfig);
+            return effects;
+        }
+        ProfileInputResult::NoMatchingProfile => {
+            app.set_status(LogLevel::Warn, "profile", "no matching profile");
+        }
+        ProfileInputResult::NotHandled
+        | ProfileInputResult::Moved
+        | ProfileInputResult::Filtered => {}
+    }
+    Vec::new()
 }
 
 pub(crate) fn handle_new_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.sessions.move_new_session_completion_selection(-1),
-        KeyCode::Down => app.sessions.move_new_session_completion_selection(1),
-        KeyCode::Tab => {
+    match handle_new_session_input_key(&mut app.sessions, key) {
+        NewSessionInputResult::Edited => app.refresh_new_session_completion(),
+        NewSessionInputResult::AcceptCompletion => {
             app.accept_selected_new_session_completion();
         }
-        KeyCode::Left => {
-            app.sessions.move_new_session_cursor_left();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Right => {
-            app.sessions.move_new_session_cursor_right();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Home => {
-            app.sessions.move_new_session_cursor_home();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::End => {
-            app.sessions.move_new_session_cursor_end();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Backspace => {
-            app.sessions.new_session_backspace();
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.sessions.new_session_insert(c);
-            app.refresh_new_session_completion();
-        }
-        KeyCode::Enter => {
+        NewSessionInputResult::Cancel => app.navigation.popup = Popup::None,
+        NewSessionInputResult::Submit { raw_path } => {
             if !can_send_server_commands(app) {
                 return Vec::new();
             }
-            let cwd = app.normalize_new_session_path(&app.sessions.new_session_path);
+            let cwd = app.normalize_new_session_path(&raw_path);
             app.navigation.popup = Popup::None;
             return vec![Effect::Command(Command::NewSession {
                 cwd,
                 profile_id: app.profiles.active_profile_id.clone(),
             })];
         }
-        _ => {}
+        NewSessionInputResult::NotHandled | NewSessionInputResult::MovedCompletion => {}
     }
     Vec::new()
 }
 
 pub(crate) fn handle_theme_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Up => app.navigation.move_theme_cursor_up(),
-        KeyCode::Down => {
-            let filtered_len = app
-                .navigation
-                .filtered_themes(theme::Theme::available_themes())
-                .len();
-            app.navigation.move_theme_cursor_down(filtered_len);
+    match handle_theme_key(&mut app.navigation, theme::Theme::available_themes(), key) {
+        ThemeInputResult::Close => app.navigation.popup = Popup::None,
+        ThemeInputResult::Apply { index } => {
+            theme::Theme::set_by_index(index);
+            theme::Theme::begin_frame();
+            app.render.apply_change(RenderChange::ThemeChanged);
+            app.navigation.popup = Popup::None;
+            return vec![Effect::PersistConfig];
         }
-        KeyCode::Enter => {
-            if let Some(idx) = app
-                .navigation
-                .selected_theme_index(theme::Theme::available_themes())
-            {
-                theme::Theme::set_by_index(idx);
-                theme::Theme::begin_frame();
-                app.render.apply_change(RenderChange::ThemeChanged);
-                app.navigation.popup = Popup::None;
-                return vec![Effect::PersistConfig];
-            }
-        }
-        KeyCode::Backspace => app.navigation.theme_filter_backspace(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.navigation.theme_filter_insert(c);
-        }
-        _ => {}
+        ThemeInputResult::NotHandled | ThemeInputResult::Moved | ThemeInputResult::Filtered => {}
     }
     Vec::new()
 }
 
+fn apply_chat_input_result(app: &mut App, result: ChatInputResult) -> Option<Vec<Effect>> {
+    match result {
+        ChatInputResult::NotHandled => None,
+        ChatInputResult::CompletionDismissed => {
+            app.chat.clear_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Cancel(CancelIntent::ArmConfirmation) => {
+            app.arm_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Cancel(CancelIntent::ConfirmCancellation) => {
+            app.chat.clear_cancel_confirm();
+            app.set_status(LogLevel::Warn, "activity", "stopping...");
+            Some(vec![Effect::Command(Command::CancelSession)])
+        }
+        ChatInputResult::Cancel(CancelIntent::ClearConfirmation) => {
+            app.chat.clear_cancel_confirm();
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ScrollUp { rows }) => {
+            app.render.scroll_chat_up(rows);
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ScrollDown { rows }) => {
+            app.render.scroll_chat_down(rows);
+            Some(Vec::new())
+        }
+        ChatInputResult::Viewport(ChatViewportIntent::ToBottom) => {
+            app.render.scroll_chat_to_bottom();
+            Some(Vec::new())
+        }
+    }
+}
+
 pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     let input_blocked = app.chat.input_blocked_by_activity();
+    let context = ChatInputContext {
+        editable: !input_blocked,
+        has_cancellable_activity: app.chat.has_cancellable_activity(),
+        cancel_confirmation_active: app.chat.cancel_confirm_active(),
+    };
+    let result = handle_coordination_key(&mut app.composer, &mut app.render, key, context);
+    if let Some(effects) = apply_chat_input_result(app, result) {
+        return effects;
+    }
+
     let mut effects = Vec::new();
     match key.code {
-        KeyCode::Esc => {
-            if app.composer.mention_state.is_some() || app.composer.slash_state.is_some() {
-                app.composer.mention_state = None;
-                app.composer.slash_state = None;
-                app.chat.clear_cancel_confirm();
-            } else if app.chat.has_cancellable_activity() {
-                if app.chat.cancel_confirm_active() {
-                    app.chat.clear_cancel_confirm();
-                    app.set_status(LogLevel::Warn, "activity", "stopping...");
-                    effects.push(Effect::Command(Command::CancelSession));
-                } else {
-                    app.arm_cancel_confirm();
-                }
-            } else {
-                app.chat.clear_cancel_confirm();
-            }
-        }
         KeyCode::Enter => {
-            if app.composer.slash_state.is_some() {
-                app.composer.accept_selected_slash_completion();
-            }
-            if !app.composer.input.is_empty() && app.composer.input.trim_start().starts_with('/') {
+            let completion = handle_completion_key(&mut app.composer, key, !input_blocked);
+            if completion == CompletionResult::SlashAccepted
+                || (!app.composer.input.is_empty()
+                    && app.composer.input.trim_start().starts_with('/'))
+            {
                 let (result, slash_effects) = try_execute_slash_command(app);
                 effects.extend(slash_effects);
                 match result {
@@ -1344,8 +1099,8 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                     SlashResult::NotACommand => {}
                 }
             }
-            if app.composer.mention_state.is_some() && app.composer.accept_selected_mention() {
-                if app.composer.prepare_file_index_request() {
+            if let CompletionResult::MentionAccepted { request_file_index } = completion {
+                if request_file_index {
                     effects.push(Effect::Command(Command::GetFileIndex));
                 }
                 return effects;
@@ -1354,10 +1109,10 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 if input_blocked || !can_send_server_commands(app) {
                     return effects;
                 }
-                let (text, links) = app
-                    .composer
-                    .build_prompt_text_and_links(&app.composer.input);
-                let text = text.trim().to_string();
+                let Some(PromptSubmission { text, links }) = build_prompt_submission(&app.composer)
+                else {
+                    return effects;
+                };
                 let _ = app.take_input();
                 if text.is_empty() {
                     return effects;
@@ -1374,60 +1129,29 @@ pub(crate) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             }
         }
         KeyCode::Tab if !input_blocked => {
-            if app.composer.slash_state.is_some() {
-                app.composer.accept_selected_slash_completion();
-            } else if app.composer.mention_state.is_some()
-                && app.composer.accept_selected_mention()
-                && app.composer.prepare_file_index_request()
+            if let CompletionResult::MentionAccepted { request_file_index } =
+                handle_completion_key(&mut app.composer, key, true)
+                && request_file_index
             {
                 effects.push(Effect::Command(Command::GetFileIndex));
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !input_blocked => {
-            app.composer.input_insert(c);
-            if app.composer.prepare_file_index_request() {
-                effects.push(Effect::Command(Command::GetFileIndex));
-            }
+        KeyCode::Char(_)
+            if handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked)
+                == ComposerKeyResult::Edited
+                && app.composer.prepare_file_index_request() =>
+        {
+            effects.push(Effect::Command(Command::GetFileIndex));
         }
-        KeyCode::Up => {
-            if input_blocked {
-                return effects;
-            }
-            if app.composer.slash_state.is_some() {
-                app.composer.move_slash_selection(-1);
-            } else if app.composer.mention_state.is_some() {
-                app.composer.move_mention_selection(-1);
-            } else {
-                let line_width = app.render.composer_input_line_width();
-                app.composer.input_up_visual(line_width, 2);
-            }
+        KeyCode::Up | KeyCode::Down
+            if !input_blocked
+                && handle_completion_key(&mut app.composer, key, true)
+                    == CompletionResult::NoOp =>
+        {
+            handle_composer_key(&mut app.composer, &mut app.render, key, true);
         }
-        KeyCode::Down => {
-            if input_blocked {
-                return effects;
-            }
-            if app.composer.slash_state.is_some() {
-                app.composer.move_slash_selection(1);
-            } else if app.composer.mention_state.is_some() {
-                app.composer.move_mention_selection(1);
-            } else {
-                let line_width = app.render.composer_input_line_width();
-                app.composer.input_down_visual(line_width, 2);
-            }
-        }
-        KeyCode::PageUp => app.render.scroll_chat_up(10),
-        KeyCode::PageDown => app.render.scroll_chat_down(10),
-        KeyCode::Backspace if !input_blocked => app.composer.input_backspace(),
-        KeyCode::Delete if !input_blocked => app.composer.input_delete(),
-        KeyCode::Left if !input_blocked => app.composer.input_left(),
-        KeyCode::Right if !input_blocked => app.composer.input_right(),
-        KeyCode::Home if !input_blocked => app.composer.input_home(),
-        KeyCode::End => {
-            if input_blocked || app.composer.input.is_empty() {
-                app.render.scroll_chat_to_bottom();
-            } else {
-                app.composer.input_end();
-            }
+        KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right | KeyCode::Home => {
+            handle_composer_key(&mut app.composer, &mut app.render, key, !input_blocked);
         }
         _ => {}
     }
@@ -1764,358 +1488,177 @@ pub(crate) fn handle_auth_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect>
         return Vec::new();
     }
 
-    let mut effects = Vec::new();
-    match app.auth.panel {
-        AuthPanel::List => match key.code {
-            KeyCode::Esc => {
-                if app.auth.selected.is_some() {
-                    app.auth.close_detail();
-                } else {
-                    app.navigation.popup = Popup::None;
+    match handle_auth_input_key(&mut app.auth, key) {
+        AuthInputResult::ClosePopup => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
+        }
+        AuthInputResult::StartOAuth { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::StartOAuthLogin { provider })]
+        }
+        AuthInputResult::DisconnectOAuth { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::DisconnectOAuth { provider })]
+        }
+        AuthInputResult::ClearApiToken { provider } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::ClearApiToken { provider })]
+        }
+        AuthInputResult::SetApiToken { provider, api_key } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::SetApiToken { provider, api_key })]
+        }
+        AuthInputResult::CopyOAuthUrl { provider, url } => {
+            app.auth.ui_notice = None;
+            app.auth.clipboard_fallback = None;
+            vec![Effect::CopyToClipboard {
+                target: ClipboardTarget::Auth { provider },
+                text: url,
+            }]
+        }
+        AuthInputResult::CompleteOAuth { flow_id, response } => {
+            if !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            vec![Effect::Command(Command::CompleteOAuthLogin {
+                flow_id,
+                response,
+            })]
+        }
+        AuthInputResult::NotHandled
+        | AuthInputResult::Moved
+        | AuthInputResult::Filtered
+        | AuthInputResult::Edited
+        | AuthInputResult::SelectedProvider
+        | AuthInputResult::ToggledApiKeyMask
+        | AuthInputResult::CloseDetail
+        | AuthInputResult::BackToList
+        | AuthInputResult::EnterApiKeyPanel => Vec::new(),
+    }
+}
+
+fn apply_model_input_result(app: &mut App, result: ModelInputResult) -> Vec<Effect> {
+    match result {
+        ModelInputResult::Close => {
+            app.navigation.popup = Popup::None;
+            Vec::new()
+        }
+        ModelInputResult::SelectModel {
+            model,
+            tab: ModelTab::Session,
+        } => {
+            let mut effects = Vec::new();
+            if !app.sessions.current_session_is_remote() {
+                let sends_server_command =
+                    app.sessions.session_id.is_some() || app.models.reasoning_effort.is_some();
+                if sends_server_command && !can_send_server_commands(app) {
+                    return Vec::new();
                 }
-            }
-            KeyCode::Up => {
-                let max = app.auth.filtered_providers().len().saturating_sub(1);
-                app.auth.cursor = app.auth.cursor.saturating_sub(1).min(max);
-            }
-            KeyCode::Down => {
-                let max = app.auth.filtered_providers().len().saturating_sub(1);
-                app.auth.cursor = (app.auth.cursor + 1).min(max);
-            }
-            KeyCode::Enter => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    app.auth.last_result = None;
-                    app.auth.ui_notice = None;
-                    if provider.is_unconfigurable() {
-                        app.auth.selected = Some(real_idx);
-                    } else if provider.is_api_key_only() {
-                        app.auth.selected = Some(real_idx);
-                        app.auth.panel = AuthPanel::ApiKeyInput;
-                        app.auth.api_key_input.clear();
-                        app.auth.api_key_cursor = 0;
-                    } else if provider.is_oauth_only()
-                        && provider.oauth_status != Some(OAuthStatus::Connected)
-                    {
-                        app.auth.selected = Some(real_idx);
-                        effects.push(Effect::Command(Command::StartOAuthLogin {
-                            provider: provider.provider.clone(),
-                        }));
-                    } else {
-                        app.auth.selected = Some(real_idx);
-                    }
+                if let Some(session_id) = app.sessions.session_id.clone() {
+                    effects.push(Effect::Command(Command::SetSessionModel {
+                        session_id,
+                        model_id: model.id.clone(),
+                        node_id: model.node_id.clone(),
+                    }));
                 }
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(idx) = app.auth.selected {
-                    let provider = &app.auth.providers[idx];
-                    if provider.oauth_status == Some(OAuthStatus::Connected) {
-                        effects.push(Effect::Command(Command::DisconnectOAuth {
-                            provider: provider.provider.clone(),
-                        }));
-                    } else if provider.has_stored_api_key {
-                        effects.push(Effect::Command(Command::ClearApiToken {
-                            provider: provider.provider.clone(),
-                        }));
-                    }
-                }
-            }
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    if provider.env_var_name.is_some() || provider.has_stored_api_key {
-                        app.auth.ui_notice = None;
-                        app.auth.selected = Some(real_idx);
-                        app.auth.panel = AuthPanel::ApiKeyInput;
-                        app.auth.api_key_input.clear();
-                        app.auth.api_key_cursor = 0;
-                    }
-                }
-            }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let filtered = app.auth.filtered_providers();
-                if let Some(&(real_idx, _)) = filtered.get(app.auth.cursor) {
-                    let provider = &app.auth.providers[real_idx];
-                    if provider.supports_oauth {
-                        app.auth.ui_notice = None;
-                        app.auth.selected = Some(real_idx);
-                        effects.push(Effect::Command(Command::StartOAuthLogin {
-                            provider: provider.provider.clone(),
-                        }));
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                app.auth.filter.pop();
-                app.auth.cursor = 0;
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth.filter.push(c);
-                app.auth.cursor = 0;
-            }
-            _ => {}
-        },
-        AuthPanel::ApiKeyInput => match key.code {
-            KeyCode::Esc => {
-                app.auth.panel = AuthPanel::List;
-                app.auth.api_key_input.clear();
-                app.auth.api_key_cursor = 0;
-            }
-            KeyCode::Enter => {
-                if let Some(idx) = app.auth.selected {
-                    let trimmed = app.auth.api_key_input.trim().to_string();
-                    if !trimmed.is_empty() {
-                        effects.push(Effect::Command(Command::SetApiToken {
-                            provider: app.auth.providers[idx].provider.clone(),
-                            api_key: trimmed,
-                        }));
-                    }
-                }
-            }
-            KeyCode::Tab => app.auth.api_key_masked = !app.auth.api_key_masked,
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(idx) = app.auth.selected {
-                    effects.push(Effect::Command(Command::ClearApiToken {
-                        provider: app.auth.providers[idx].provider.clone(),
+                app.models.apply_model_selection_from_entry(&model);
+                if app.models.reasoning_effort.is_some() {
+                    app.models.reasoning_effort = None;
+                    effects.push(Effect::Command(Command::SetReasoningEffort {
+                        reasoning_effort: "auto".into(),
                     }));
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth.api_key_input.insert(app.auth.api_key_cursor, c);
-                app.auth.api_key_cursor += c.len_utf8();
-            }
-            KeyCode::Backspace if app.auth.api_key_cursor > 0 => {
-                let cursor = app.auth.api_key_cursor;
-                let ch = app.auth.api_key_input[..cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.api_key_input.remove(cursor - ch.len_utf8());
-                app.auth.api_key_cursor -= ch.len_utf8();
-            }
-            KeyCode::Left if app.auth.api_key_cursor > 0 => {
-                let ch = app.auth.api_key_input[..app.auth.api_key_cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.api_key_cursor -= ch.len_utf8();
-            }
-            KeyCode::Right if app.auth.api_key_cursor < app.auth.api_key_input.len() => {
-                let ch = app.auth.api_key_input[app.auth.api_key_cursor..]
-                    .chars()
-                    .next()
-                    .unwrap();
-                app.auth.api_key_cursor += ch.len_utf8();
-            }
-            _ => {}
-        },
-        AuthPanel::OAuthFlow => match key.code {
-            KeyCode::Esc => {
-                app.auth.oauth_flow = None;
-                app.auth.panel = AuthPanel::List;
-                app.auth.oauth_response.clear();
-                app.auth.oauth_response_cursor = 0;
-            }
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(ref flow) = app.auth.oauth_flow {
-                    app.auth.ui_notice = None;
-                    app.auth.clipboard_fallback = None;
-                    effects.push(Effect::CopyToClipboard {
-                        target: ClipboardTarget::Auth {
-                            provider: flow.provider.clone(),
-                        },
-                        text: flow.authorization_url.clone(),
-                    });
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(ref flow) = app.auth.oauth_flow {
-                    let is_device_poll = flow.flow_kind == OAuthFlowKind::DevicePoll;
-                    let response = if is_device_poll {
-                        String::new()
-                    } else {
-                        app.auth.oauth_response.trim().to_string()
-                    };
-                    if is_device_poll || !response.is_empty() {
-                        effects.push(Effect::Command(Command::CompleteOAuthLogin {
-                            flow_id: flow.flow_id.clone(),
-                            response,
-                        }));
-                    }
-                }
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.auth
-                    .oauth_response
-                    .insert(app.auth.oauth_response_cursor, c);
-                app.auth.oauth_response_cursor += c.len_utf8();
-            }
-            KeyCode::Backspace if app.auth.oauth_response_cursor > 0 => {
-                let cursor = app.auth.oauth_response_cursor;
-                let ch = app.auth.oauth_response[..cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.oauth_response.remove(cursor - ch.len_utf8());
-                app.auth.oauth_response_cursor -= ch.len_utf8();
-            }
-            KeyCode::Left if app.auth.oauth_response_cursor > 0 => {
-                let ch = app.auth.oauth_response[..app.auth.oauth_response_cursor]
-                    .chars()
-                    .next_back()
-                    .unwrap();
-                app.auth.oauth_response_cursor -= ch.len_utf8();
-            }
-            KeyCode::Right if app.auth.oauth_response_cursor < app.auth.oauth_response.len() => {
-                let ch = app.auth.oauth_response[app.auth.oauth_response_cursor..]
-                    .chars()
-                    .next()
-                    .unwrap();
-                app.auth.oauth_response_cursor += ch.len_utf8();
-            }
-            _ => {}
-        },
-    }
-    effects
-}
-
-pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    match key.code {
-        KeyCode::Esc => app.navigation.popup = Popup::None,
-        KeyCode::Tab | KeyCode::BackTab => {
-            if !app.models.model_popup_has_tabs() {
-                return effects;
-            }
-            let agent_id = app
-                .models
-                .switch_model_popup_tab(key.code == KeyCode::BackTab);
-            app.models.model_cursor = if app
-                .models
-                .model_popup_is_session_tab(app.models.model_popup_agent_tab)
-            {
-                app.models.model_popup_open_cursor()
-            } else if let Some(agent_id) = agent_id {
-                app.delegate_model_cursor(&agent_id)
-            } else {
-                0
-            };
+            app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        KeyCode::Up => app.models.move_model_cursor_up(),
-        KeyCode::Down => app.models.move_model_cursor_down(),
-        KeyCode::Enter => {
-            let selected: Option<ModelEntry> = app
-                .models
-                .visible_model_popup_items()
-                .get(app.models.model_cursor)
-                .and_then(|item| match item {
-                    crate::models_state::ModelPopupItem::Model { model_idx } => {
-                        app.models.models.get(*model_idx)
-                    }
-                    crate::models_state::ModelPopupItem::ProviderHeader { .. } => None,
-                })
-                .cloned();
-            if let Some(model) = selected {
-                let tab_label = app
-                    .models
-                    .model_popup_tab_label(app.models.model_popup_agent_tab)
-                    .to_string();
-                if app
-                    .models
-                    .model_popup_is_session_tab(app.models.model_popup_agent_tab)
-                {
-                    if !app.sessions.current_session_is_remote() {
-                        if let Some(session_id) = app.sessions.session_id.clone() {
-                            effects.push(Effect::Command(Command::SetSessionModel {
-                                session_id,
-                                model_id: model.id.clone(),
-                                node_id: model.node_id.clone(),
-                            }));
-                        }
-                        app.models.apply_model_selection_from_entry(&model);
-                        if app.models.reasoning_effort.is_some() {
-                            app.models.reasoning_effort = None;
-                            effects.push(Effect::Command(Command::SetReasoningEffort {
-                                reasoning_effort: "auto".into(),
-                            }));
-                        }
-                    }
-                    app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
-                } else if let Some(agent_id) = app
-                    .models
-                    .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
-                    .map(str::to_string)
-                    && let Some(profile_id) =
-                        app.delegate_preference_profile_id().map(str::to_string)
-                {
-                    app.models
-                        .set_delegate_model_preference(&profile_id, &agent_id, &model);
-                    if app.delegates.parent_session_id.is_none()
-                        && let Some(session_id) = app.sessions.session_id.clone()
-                    {
-                        effects.push(Effect::Command(Command::SetDelegateModel {
-                            session_id,
-                            agent_id,
-                            model_id: Some(model.id.clone()),
-                            node_id: model.node_id.clone(),
-                        }));
-                    }
-                    app.set_status(
-                        LogLevel::Info,
-                        "model",
-                        format!("{tab_label}: {}", model.label),
-                    );
-                }
-                effects.push(Effect::PersistConfig);
+        ModelInputResult::SelectModel {
+            model,
+            tab: ModelTab::Delegate { agent_id, label },
+        } => {
+            let profile_id = app.delegate_preference_profile_id().map(str::to_string);
+            let root_session_id = app
+                .delegates
+                .parent_session_id
+                .is_none()
+                .then(|| app.sessions.session_id.clone())
+                .flatten();
+            if profile_id.is_some() && root_session_id.is_some() && !can_send_server_commands(app) {
+                return Vec::new();
             }
-        }
-        KeyCode::Delete
-            if !app
-                .models
-                .model_popup_is_session_tab(app.models.model_popup_agent_tab) =>
-        {
-            if let Some(agent_id) = app
-                .models
-                .model_popup_tab_agent_id(app.models.model_popup_agent_tab)
-                .map(str::to_string)
-                && let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string)
-            {
+            let mut effects = Vec::new();
+            if let Some(profile_id) = profile_id {
                 app.models
-                    .clear_delegate_model_preference(&profile_id, &agent_id);
-                if app.delegates.parent_session_id.is_none()
-                    && let Some(session_id) = app.sessions.session_id.clone()
-                {
+                    .set_delegate_model_preference(&profile_id, &agent_id, &model);
+                if let Some(session_id) = root_session_id {
                     effects.push(Effect::Command(Command::SetDelegateModel {
                         session_id,
                         agent_id,
-                        model_id: None,
-                        node_id: None,
+                        model_id: Some(model.id.clone()),
+                        node_id: model.node_id.clone(),
                     }));
                 }
-                app.set_status(
-                    LogLevel::Info,
-                    "model",
-                    "delegate model uses profile default",
-                );
-                effects.push(Effect::PersistConfig);
+                app.set_status(LogLevel::Info, "model", format!("{label}: {}", model.label));
             }
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        KeyCode::Backspace => app.models.model_filter_backspace(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.models.model_filter_insert(c);
+        ModelInputResult::ClearDelegatePreference { agent_id } => {
+            let Some(profile_id) = app.delegate_preference_profile_id().map(str::to_string) else {
+                return Vec::new();
+            };
+            let root_session_id = app
+                .delegates
+                .parent_session_id
+                .is_none()
+                .then(|| app.sessions.session_id.clone())
+                .flatten();
+            if root_session_id.is_some() && !can_send_server_commands(app) {
+                return Vec::new();
+            }
+            app.models
+                .clear_delegate_model_preference(&profile_id, &agent_id);
+            let mut effects = Vec::new();
+            if let Some(session_id) = root_session_id {
+                effects.push(Effect::Command(Command::SetDelegateModel {
+                    session_id,
+                    agent_id,
+                    model_id: None,
+                    node_id: None,
+                }));
+            }
+            app.set_status(
+                LogLevel::Info,
+                "model",
+                "delegate model uses profile default",
+            );
+            effects.push(Effect::PersistConfig);
+            effects
         }
-        _ => {}
+        ModelInputResult::NotHandled
+        | ModelInputResult::Moved
+        | ModelInputResult::SwitchedTab
+        | ModelInputResult::Filtered => Vec::new(),
     }
-    effects
 }
 
-// ── Pure key logic for the sessions screen ────────────────────────────────────
-//
-// `apply_sessions_key` returns the `Command`(s) that should be sent to the
-// server (if any).  Keeping the mutation separate from the channel send makes
-// it fully unit-testable without a real channel.
+pub(crate) fn handle_model_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let delegate_profile_id = app.delegate_preference_profile_id().map(str::to_string);
+    let result = handle_model_input_key(&mut app.models, key, delegate_profile_id.as_deref());
+    apply_model_input_result(app, result)
+}
+
+// ── Sessions screen result adapter ───────────────────────────────────────────
 
 /// Result of handling a sessions-screen key.
 #[derive(Debug, PartialEq)]
@@ -2143,107 +1686,13 @@ pub(crate) enum SessionKeyAction {
     },
 }
 
-/// Apply a key event on the sessions screen, mutate `app`, and return the
-/// action (if any) that the caller should forward to the server.
+/// Adapt sessions-screen input into the existing root-owned session action.
 pub(crate) fn apply_sessions_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
 ) -> SessionKeyAction {
-    use crate::session_state::StartPageItem;
-
-    match key {
-        KeyCode::Up => {
-            app.sessions.move_start_cursor_up();
-            app.render
-                .keep_start_page_cursor_visible_from_above(app.sessions.session_cursor);
-        }
-        KeyCode::Down => app.sessions.move_start_cursor_down(),
-        KeyCode::Enter => {
-            let items = app.sessions.visible_start_items();
-            // Cursor on the button slot (one past the last item)?
-            if app.sessions.session_cursor == items.len() {
-                return SessionKeyAction::NewSession;
-            }
-            if let Some(item) = items.get(app.sessions.session_cursor).cloned() {
-                match item {
-                    StartPageItem::GroupHeader { cwd, .. } => {
-                        app.sessions.toggle_group_collapse(cwd.as_deref());
-                        app.sessions.clamp_start_cursor();
-                    }
-                    StartPageItem::Session {
-                        group_idx, path, ..
-                    } => {
-                        if let Some(session) =
-                            app.sessions.session_by_path(group_idx, &path).cloned()
-                        {
-                            let session_id = session.session_id;
-                            if let Some(node_id) = app
-                                .sessions
-                                .session_remote_node_id(&session_id)
-                                .map(str::to_string)
-                            {
-                                app.sessions
-                                    .remember_remote_session_node(&session_id, &node_id);
-                                return SessionKeyAction::AttachRemoteSession {
-                                    node_id,
-                                    session_id,
-                                };
-                            }
-                            if app.sessions.is_remote_session_id(&session_id) {
-                                app.set_status(
-                                    LogLevel::Warn,
-                                    "session",
-                                    "remote session is missing node id; refresh sessions and try again",
-                                );
-                                return SessionKeyAction::None;
-                            }
-                            return SessionKeyAction::LoadSession {
-                                session_id,
-                                agent_id: None,
-                                cwd: session
-                                    .cwd
-                                    .or_else(|| app.sessions.session_groups[group_idx].cwd.clone()),
-                            };
-                        }
-                    }
-                    StartPageItem::ShowMore { .. } => {
-                        app.navigation.popup = Popup::SessionSelect;
-                        app.sessions.reset_browser_for_open();
-                    }
-                }
-            }
-        }
-        KeyCode::Delete => {
-            let items = app.sessions.visible_start_items();
-            if let Some(StartPageItem::Session {
-                group_idx, path, ..
-            }) = items.get(app.sessions.session_cursor).cloned()
-            {
-                let Some((session, is_remote)) =
-                    app.sessions.remove_session_at(group_idx, &path, false)
-                else {
-                    return SessionKeyAction::None;
-                };
-                let sid = session.session_id;
-                return if is_remote {
-                    SessionKeyAction::DismissRemoteSession { session_id: sid }
-                } else {
-                    SessionKeyAction::DeleteSession { session_id: sid }
-                };
-            }
-            // Delete on a GroupHeader: no-op
-        }
-        KeyCode::Backspace => {
-            app.sessions.start_filter_backspace();
-            app.render.reset_start_page_scroll();
-        }
-        KeyCode::Char(c) => {
-            app.sessions.start_filter_insert(c);
-            app.render.reset_start_page_scroll();
-        }
-        _ => {}
-    }
-    SessionKeyAction::None
+    let result = handle_sessions_input_key(&mut app.sessions, key);
+    apply_sessions_input_result(app, result)
 }
 
 // ── model popup tests ─────────────────────────────────────────────────────────
@@ -2596,9 +2045,9 @@ mod model_popup_tests {
         app.navigation.theme_filter = "no theme matches this".into();
         app.navigation.theme_cursor = 8;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Down));
+        assert!(handle_theme_popup_key(&mut app, key(KeyCode::Down)).is_empty());
         assert_eq!(app.navigation.theme_cursor, 0);
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        assert!(handle_theme_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
         assert_eq!(app.navigation.popup, Popup::ThemeSelect);
     }
 
@@ -2609,9 +2058,10 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ThemeSelect;
         app.navigation.theme_cursor = theme::Theme::available_themes().len() + 10;
 
-        handle_theme_popup_key(&mut app, key(KeyCode::Enter));
+        let effects = handle_theme_popup_key(&mut app, key(KeyCode::Enter));
 
         assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(effects, vec![Effect::PersistConfig]);
     }
 
     #[test]
@@ -2642,8 +2092,24 @@ mod model_popup_tests {
     }
 
     #[test]
+    fn disconnected_command_palette_action_keeps_popup_and_emits_no_command() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Disconnected;
+        app.navigation.popup = Popup::CommandPalette;
+        app.navigation.command_palette_filter = "open mesh".into();
+
+        assert!(handle_command_palette_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.navigation.popup, Popup::CommandPalette);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+    }
+
+    #[test]
     fn mesh_popup_enter_on_session_attaches_remote_session() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.mesh.mesh_focus = crate::mesh_state::MeshFocus::Sessions;
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
@@ -2671,8 +2137,35 @@ mod model_popup_tests {
     }
 
     #[test]
+    fn mesh_node_movement_refreshes_exact_selected_node_page() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::Mesh;
+        app.mesh.mesh_nodes = vec![
+            crate::domain::mesh::RemoteNodeInfo {
+                id: "node-1".into(),
+                ..Default::default()
+            },
+            crate::domain::mesh::RemoteNodeInfo {
+                id: "node-2".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            handle_mesh_popup_key(&mut app, key(KeyCode::Down)),
+            vec![Effect::Command(Command::ListRemoteSessions {
+                node_id: "node-2".into(),
+                offset: 0,
+                limit: 50,
+            })]
+        );
+    }
+
+    #[test]
     fn mesh_popup_create_remote_session_does_not_forward_local_cwd() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.connection.launch_cwd = Some("/local/launch".into());
         app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
@@ -2690,6 +2183,26 @@ mod model_popup_tests {
                 cwd: None,
             }
         );
+    }
+
+    #[test]
+    fn disconnected_mesh_command_intents_are_gated() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::Mesh;
+        app.mesh.mesh_nodes = vec![crate::domain::mesh::RemoteNodeInfo {
+            id: "node-1".into(),
+            ..Default::default()
+        }];
+
+        assert!(handle_mesh_popup_key(&mut app, key(KeyCode::Char('r'))).is_empty());
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+
+        app.open_mesh_invite_form();
+        assert!(handle_mesh_invite_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.navigation.popup, Popup::MeshInvite);
     }
 
     #[test]
@@ -2770,6 +2283,7 @@ mod model_popup_tests {
     #[test]
     fn mesh_invite_form_enter_sends_create_invite() {
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::Mesh;
         app.open_mesh_invite_form();
         app.mesh.mesh_invite_name = "Team Mesh".into();
@@ -2882,20 +2396,34 @@ mod model_popup_tests {
         app.navigation.popup = Popup::ProfileSelect;
         app.profiles.profiles = vec![make_profile("fast", "Fast"), make_profile("deep", "Deep")];
         app.profiles.profile_cursor = 1;
-        let mut effects = TestEffects::default();
-        effects.extend(handle_profile_popup_key(&mut app, key(KeyCode::Enter)));
+        let effects = handle_profile_popup_key(&mut app, key(KeyCode::Enter));
 
         assert!(matches!(app.navigation.popup, Popup::None));
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::ListProfileAgents { profile_id }) if profile_id == "deep"
-        ));
-        assert!(effects.next_command().is_none());
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::ListProfileAgents {
+                    profile_id: "deep".into(),
+                }),
+                Effect::PersistConfig,
+            ]
+        );
         assert_eq!(app.profiles.active_profile_id.as_deref(), Some("deep"));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::PersistConfig))
+    }
+
+    #[test]
+    fn disconnected_profile_submit_preserves_selection_and_popup() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ProfileSelect;
+        app.profiles.profiles = vec![make_profile("fast", "Fast")];
+        app.profiles.active_profile_id = Some("old".into());
+
+        assert!(handle_profile_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.profiles.active_profile_id.as_deref(), Some("old"));
+        assert_eq!(app.navigation.popup, Popup::ProfileSelect);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
         );
     }
 
@@ -2939,6 +2467,7 @@ mod model_popup_tests {
     fn select_model_on_delegate_tab_saves_pref_not_session_model() {
         let _guard = TestPersistenceGuard::new("delegate-tab");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
@@ -2990,6 +2519,7 @@ mod model_popup_tests {
     fn delete_on_delegate_tab_resets_parent_override() {
         let _guard = TestPersistenceGuard::new("delegate-reset");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.profiles.active_profile_id = Some("profile".into());
@@ -3054,6 +2584,7 @@ mod model_popup_tests {
     fn select_model_on_session_tab_applies_set_session_model() {
         let _guard = TestPersistenceGuard::new("active-mode");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
@@ -3097,6 +2628,7 @@ mod model_popup_tests {
     fn select_remote_model_on_local_session_sends_node_id() {
         let _guard = TestPersistenceGuard::new("remote-mesh-model");
         let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::ModelSelect;
         app.sessions.session_id = Some("s1".into());
         app.sessions.agent_mode = "build".into();
@@ -3166,9 +2698,39 @@ mod model_popup_tests {
             .iter()
             .position(|i| matches!(i, crate::models_state::ModelPopupItem::Model { .. }))
             .unwrap();
-        let mut effects = TestEffects::default();
-        effects.extend(handle_model_popup_key(&mut app, key(KeyCode::Enter)));
-        assert!(effects.next_command().is_none());
+        let effects = handle_model_popup_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::PersistConfig]);
+        assert_eq!(app.diagnostics.status, "session: claude-sonnet");
+    }
+
+    #[test]
+    fn model_header_enter_is_noop_without_persistence() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ModelSelect;
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_cursor = 0;
+
+        assert!(handle_model_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.models.current_model, None);
+    }
+
+    #[test]
+    fn disconnected_local_model_selection_is_gated_before_mutation() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::ModelSelect;
+        app.sessions.session_id = Some("session-1".into());
+        app.models.current_provider = Some("old-provider".into());
+        app.models.current_model = Some("old-model".into());
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.model_cursor = 1;
+
+        assert!(handle_model_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.models.current_provider.as_deref(), Some("old-provider"));
+        assert_eq!(app.models.current_model.as_deref(), Some("old-model"));
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
     }
 
     #[test]

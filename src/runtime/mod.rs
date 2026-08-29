@@ -211,8 +211,21 @@ mod tests {
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
     use crate::domain::tool::ToolDetail;
+    use crate::features::chat::input::handle_elicitation_key as handle_feature_elicitation_key;
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn handle_elicitation_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+        handle_feature_elicitation_key(&mut app.chat, &mut app.render, key)
+            .into_iter()
+            .map(|response| Effect::ElicitationResponse {
+                elicitation_id: response.elicitation_id,
+                action: response.action,
+                content: response.content,
+                outcome: response.outcome,
+            })
+            .collect()
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -1020,10 +1033,11 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn chat_pageup_pagedown_still_scroll_history() {
+    fn chat_pageup_pagedown_still_scroll_history_while_input_is_blocked() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
+        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         app.render.set_chat_scroll_offset(3);
 
         effects.extend(handle_chat_key(
@@ -1240,6 +1254,59 @@ mod external_editor_tests {
         assert!(matches!(
             app.chat.messages.as_slice(),
             [ChatEntry::User { text, .. }] if text == "first line\nsecond line"
+        ));
+    }
+
+    #[test]
+    fn disconnected_chat_submit_retains_prompt() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.composer.input = "retained @src/main.rs".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ));
+
+        assert!(effects.next_command().is_none());
+        assert_eq!(app.composer.input, "retained @src/main.rs");
+        assert!(app.chat.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_submit_preserves_resource_link_order_after_text() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Chat;
+        app.connection.conn = ConnState::Connected;
+        app.composer.input = "  inspect @src/main.rs then @src/lib.rs and @src/main.rs  ".into();
+        app.composer.input_cursor = app.composer.input.len();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ));
+
+        assert!(matches!(
+            effects.next_command().expect("prompt sent"),
+            Command::Prompt { prompt, .. }
+                if matches!(prompt.as_slice(), [
+                    PromptBlock::Text { text },
+                    PromptBlock::ResourceLink { name: first_name, uri: first_uri },
+                    PromptBlock::ResourceLink { name: second_name, uri: second_uri },
+                ] if text == "inspect @src/main.rs then @src/lib.rs and @src/main.rs"
+                    && first_name == "src/main.rs"
+                    && first_uri == "src/main.rs"
+                    && second_name == "src/lib.rs"
+                    && second_uri == "src/lib.rs")
+        ));
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "inspect @src/main.rs then @src/lib.rs and @src/main.rs"
+                    && message_id.starts_with("local:pending:")
         ));
     }
 
@@ -1789,13 +1856,23 @@ mod external_editor_tests {
     }
 
     #[test]
-    fn chat_double_esc_cancels_running_tool_phase() {
+    fn chat_completion_dismissal_precedes_double_esc_cancellation() {
         let mut effects = TestEffects::default();
         let mut app = App::new();
         app.navigation.screen = Screen::Chat;
         app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
         };
+        app.composer.input = "/mo".into();
+        app.composer.input_cursor = app.composer.input.len();
+        app.composer.refresh_slash_state();
+
+        effects.extend(handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        ));
+        assert!(app.composer.slash_state.is_none());
+        assert!(!app.chat.cancel_confirm_active());
 
         effects.extend(handle_chat_key(
             &mut app,
@@ -2218,6 +2295,27 @@ mod sessions_key_tests {
     }
 
     #[test]
+    fn enter_on_known_remote_emits_only_exact_attach_command() {
+        let mut app = App::new();
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.sessions.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.sessions.session_cursor = 1;
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::AttachRemoteSession { node_id, session_id })
+                if node_id == "node-1" && session_id == "remote-1"
+        ));
+        assert!(effects.next_command().is_none());
+    }
+
+    #[test]
     fn enter_on_remote_label_without_node_id_is_noop() {
         let mut app = App::new();
         app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
@@ -2227,6 +2325,10 @@ mod sessions_key_tests {
         let action = apply_sessions_key(&mut app, KeyCode::Enter);
 
         assert_eq!(action, SessionKeyAction::None);
+        assert_eq!(
+            app.diagnostics.status,
+            "remote session is missing node id; refresh sessions and try again"
+        );
     }
 
     #[test]
@@ -3124,6 +3226,27 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn disconnected_new_session_submit_keeps_popup_and_sends_no_command() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::NewSession;
+        app.sessions.new_session_path = "project".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
+        let mut effects = TestEffects::default();
+
+        effects.extend(handle_new_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+        assert!(effects.next_command().is_none());
+    }
+
+    #[test]
     fn new_session_popup_enter_normalizes_relative_path_to_absolute() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
@@ -3192,6 +3315,42 @@ mod session_popup_key_tests {
         assert!(app.sessions.new_session_completion.is_none());
         assert_eq!(app.sessions.agent_mode, "build");
         assert!(effects.next_command().is_none());
+    }
+
+    #[test]
+    fn root_router_keeps_session_popup_tab_and_backtab_ahead_of_tab_handlers() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.agent_mode = "build".into();
+        app.sessions.session_filter = "sessions-owner".into();
+        app.sessions.session_cursor = 3;
+        app.delegates.delegate_filter = "delegates-owner".into();
+        app.delegates.delegate_cursor = 4;
+
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),).is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 1);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.session_filter, "sessions-owner");
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.delegates.delegate_filter, "delegates-owner");
+        assert_eq!(app.delegates.delegate_cursor, 4);
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 0);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.sessions.session_filter, "sessions-owner");
+        assert_eq!(app.sessions.session_cursor, 3);
+        assert_eq!(app.delegates.delegate_filter, "delegates-owner");
+        assert_eq!(app.delegates.delegate_cursor, 4);
     }
 
     #[test]
@@ -3375,6 +3534,10 @@ mod delegate_popup_key_tests {
         let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
         assert_eq!(action, SessionKeyAction::None);
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(
+            app.diagnostics.status,
+            "delegation still pending — no session to load"
+        );
     }
 
     #[test]
@@ -3546,7 +3709,7 @@ mod chord_reasoning_effort_tests {
 #[cfg(test)]
 mod reasoning_effort_integration_tests {
     use super::*;
-    use crate::domain::model::ModelEntry;
+    use crate::domain::{model::ModelEntry, profile::AgentInfo};
     use crate::handlers::handle_key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
@@ -3623,6 +3786,60 @@ mod reasoning_effort_integration_tests {
                 .any(|m| matches!(m, Command::SetReasoningEffort { .. })),
             "no effort restore on mode switch: {msgs:?}"
         );
+    }
+
+    #[test]
+    fn root_router_cycles_model_backtab_but_has_no_global_backtab_mode_switch() {
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.navigation.popup = Popup::ModelSelect;
+        app.sessions.agent_mode = "build".into();
+        app.models.models = vec![make_model("anthropic", "claude-sonnet")];
+        app.models.agents = vec![
+            AgentInfo {
+                id: "primary".into(),
+                name: "Primary".into(),
+                description: None,
+                capabilities: Vec::new(),
+            },
+            AgentInfo {
+                id: "coder".into(),
+                name: "Coder".into(),
+                description: None,
+                capabilities: Vec::new(),
+            },
+        ];
+        app.models.model_popup_agent_tab = 0;
+        let expected_delegate_cursor = app.delegate_model_cursor("coder");
+        app.models.model_filter = "clear-on-tab-change".into();
+        app.models.model_cursor = 9;
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::ModelSelect);
+        assert_eq!(app.models.model_popup_agent_tab, 1);
+        assert!(app.models.model_filter.is_empty());
+        assert_eq!(app.models.model_cursor, expected_delegate_cursor);
+        assert_eq!(app.sessions.agent_mode, "build");
+
+        app.navigation.popup = Popup::None;
+        app.models.model_filter = "unchanged-without-popup".into();
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            )
+            .is_empty()
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.sessions.agent_mode, "build");
+        assert_eq!(app.models.model_popup_agent_tab, 1);
+        assert_eq!(app.models.model_filter, "unchanged-without-popup");
     }
 
     #[test]
@@ -4073,12 +4290,48 @@ mod auth_tests {
         assert_eq!(app.auth.api_key_cursor, 2);
 
         effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Enter)));
-        let msg = effects.next_command().expect("message sent");
-        assert!(matches!(
-            msg,
-            Command::SetApiToken { provider, api_key }
-            if provider == "groq" && api_key == "sk"
-        ));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Command(Command::SetApiToken {
+                provider: "groq".into(),
+                api_key: "sk".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn auth_api_key_submit_trims_payload_without_mutating_input() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "  secret  ".into();
+        app.auth.api_key_cursor = app.auth.api_key_input.len();
+
+        assert_eq!(
+            handle_auth_popup_key(&mut app, key(KeyCode::Enter)),
+            vec![Effect::Command(Command::SetApiToken {
+                provider: "groq".into(),
+                api_key: "secret".into(),
+            })]
+        );
+        assert_eq!(app.auth.api_key_input, "  secret  ");
+    }
+
+    #[test]
+    fn disconnected_auth_submit_is_gated_before_dispatch() {
+        let mut app = make_app_with_providers(vec![make_api_key_only("Groq")]);
+        app.connection.conn = ConnState::Disconnected;
+        app.auth.selected = Some(0);
+        app.auth.panel = AuthPanel::ApiKeyInput;
+        app.auth.api_key_input = "secret".into();
+        app.auth.api_key_cursor = app.auth.api_key_input.len();
+
+        assert!(handle_auth_popup_key(&mut app, key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.auth.api_key_input, "secret");
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
     }
 
     #[test]
@@ -4553,6 +4806,8 @@ mod auth_tests {
 
         effects.extend(handle_auth_popup_key(&mut app, key(KeyCode::Char('x'))));
         assert!(app.auth.clipboard_fallback.is_none());
+        assert!(app.auth.filter.is_empty());
+        assert!(effects.is_empty());
     }
 
     // ── Chord binding test ────────────────────────────────────────────────────
