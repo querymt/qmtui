@@ -40,12 +40,25 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  architecture:
+    name: Architecture boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Check architecture
+        run: python3 tools/check_architecture.py
+
+      - name: Test architecture checker
+        run: python3 tools/test_check_architecture.py
 
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
-    needs: [format, clippy]
+    needs: [format, clippy, architecture]
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -57,7 +70,7 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --all-features
 
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --all-targets --all-features
