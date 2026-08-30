@@ -2317,6 +2317,107 @@ mod sessions_key_tests {
         );
     }
 
+    #[test]
+    fn ctrl_o_on_expandable_root_emits_exact_child_list_command() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.sessions.session_groups[0].sessions[0].fork_count = 1;
+        app.sessions.session_cursor = 1;
+
+        let effects = handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+
+        assert!(app.sessions.expanded_session_children.contains("root"));
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::ListSessionChildren {
+                parent_session_id: "root".into(),
+                cursor: None,
+                limit: 10,
+            })]
+        );
+    }
+
+    #[test]
+    fn ctrl_o_on_expanded_root_collapses_without_effects() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
+        app.sessions.session_groups[0].sessions[0].fork_count = 1;
+        app.sessions.expanded_session_children.insert("root".into());
+        app.sessions.session_cursor = 1;
+
+        let effects = handle_sessions_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+
+        assert!(!app.sessions.expanded_session_children.contains("root"));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn delete_on_remote_session_emits_exact_dismiss_and_updates_projection() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1", "local-1"])];
+        app.sessions.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_sessions_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::DismissRemoteSession {
+                session_id: "remote-1".into(),
+            })]
+        );
+        assert_eq!(app.sessions.session_groups[0].sessions.len(), 1);
+        assert_eq!(
+            app.sessions.session_groups[0].sessions[0].session_id,
+            "local-1"
+        );
+    }
+
+    #[test]
+    fn delete_on_local_session_emits_exact_delete_and_updates_projection() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["local-1", "local-2"])];
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_sessions_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::DeleteSession {
+                session_id: "local-1".into(),
+            })]
+        );
+        assert_eq!(app.sessions.session_groups[0].sessions.len(), 1);
+        assert_eq!(
+            app.sessions.session_groups[0].sessions[0].session_id,
+            "local-2"
+        );
+    }
+
+    #[test]
+    fn enter_on_empty_start_page_button_opens_new_session_without_effects() {
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+
+        let effects =
+            handle_sessions_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert!(effects.is_empty());
+    }
+
     // ── ShowMore Enter opens session popup ────────────────────────────────────
 
     #[test]
