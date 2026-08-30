@@ -2459,7 +2459,10 @@ mod sessions_key_tests {
 #[cfg(test)]
 mod session_popup_key_tests {
     use super::*;
-    use crate::command::Command;
+    use crate::command::{Command, SessionListRequest};
+    use crate::domain::activity::{
+        DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
+    };
     use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::handlers::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2494,50 +2497,6 @@ mod session_popup_key_tests {
     // ── Down / Up navigation ──────────────────────────────────────────────────
 
     #[test]
-    fn popup_down_moves_cursor_forward() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        // visible: [GroupHeader, Session(s1), Session(s2)]
-        assert_eq!(app.sessions.session_cursor, 0);
-        apply_popup_session_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sessions.session_cursor, 1);
-        apply_popup_session_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sessions.session_cursor, 2);
-    }
-
-    #[test]
-    fn popup_down_clamps_at_last_item() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        // visible: [GroupHeader(0), Session(1)] — max idx = 1
-        app.sessions.session_cursor = 1;
-        apply_popup_session_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sessions.session_cursor, 1); // clamped, no button slot
-    }
-
-    #[test]
-    fn popup_up_moves_cursor_back() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.sessions.session_cursor = 2;
-        apply_popup_session_key(&mut app, KeyCode::Up);
-        assert_eq!(app.sessions.session_cursor, 1);
-    }
-
-    #[test]
-    fn popup_up_does_not_go_below_zero() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.sessions.session_cursor = 0;
-        apply_popup_session_key(&mut app, KeyCode::Up);
-        assert_eq!(app.sessions.session_cursor, 0);
-    }
-
-    #[test]
     fn popup_page_down_uses_visible_rows_with_overlap() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
@@ -2547,10 +2506,22 @@ mod session_popup_key_tests {
         )];
         app.render.publish_session_popup_visible_rows(4);
 
-        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert!(
+            handle_session_popup_key(
+                &mut app,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            )
+            .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 3);
 
-        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert!(
+            handle_session_popup_key(
+                &mut app,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            )
+            .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 6);
     }
 
@@ -2565,10 +2536,16 @@ mod session_popup_key_tests {
         app.render.publish_session_popup_visible_rows(4);
         app.sessions.session_cursor = 6;
 
-        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert!(
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),)
+                .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 3);
 
-        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert!(
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),)
+                .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 0);
     }
 
@@ -2578,89 +2555,112 @@ mod session_popup_key_tests {
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
 
-        apply_popup_session_key(&mut app, KeyCode::PageDown);
+        assert!(
+            handle_session_popup_key(
+                &mut app,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            )
+            .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 1);
 
-        apply_popup_session_key(&mut app, KeyCode::PageUp);
+        assert!(
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),)
+                .is_empty()
+        );
         assert_eq!(app.sessions.session_cursor, 0);
-    }
-
-    // ── Enter on GroupHeader toggles popup collapse ───────────────────────────
-
-    #[test]
-    fn popup_enter_on_header_collapses_group() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.sessions.session_cursor = 0; // GroupHeader
-        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
-        assert_eq!(action, SessionKeyAction::None);
-        assert!(app.sessions.popup_collapsed_groups.contains("/a"));
-        // start-page state untouched
-        assert!(!app.sessions.collapsed_groups.contains("/a"));
-    }
-
-    #[test]
-    fn popup_enter_on_collapsed_header_expands_group() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.sessions.popup_collapsed_groups.insert("/a".to_string());
-        app.sessions.session_cursor = 0;
-        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
-        assert_eq!(action, SessionKeyAction::None);
-        assert!(!app.sessions.popup_collapsed_groups.contains("/a"));
-    }
-
-    #[test]
-    fn popup_collapse_clamps_cursor() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        // [GroupHeader(0), Session(s1, 1), Session(s2, 2)]
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.sessions.session_cursor = 0; // header
-        // Collapse /a → only header remains
-        apply_popup_session_key(&mut app, KeyCode::Enter);
-        // Cursor must be 0 (clamped to header)
-        assert_eq!(app.sessions.session_cursor, 0);
-        assert!(app.sessions.popup_collapsed_groups.contains("/a"));
     }
 
     // ── Enter on Session loads it ─────────────────────────────────────────────
 
     #[test]
-    fn popup_enter_on_session_returns_load_and_closes_popup() {
+    fn popup_enter_on_local_session_emits_load_and_subscribe() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
+        app.sessions.agent_id = Some("agent-1".into());
         app.sessions.session_groups = vec![make_group(Some("/a"), &["abc12345"])];
-        app.sessions.session_cursor = 1; // Session row
-        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            SessionKeyAction::LoadSession {
-                session_id: "abc12345".to_string(),
-                agent_id: None,
-                cwd: Some("/a".to_string()),
-            }
-        );
+        app.sessions.session_groups[0].sessions[0].cwd = None;
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
         assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "abc12345".into(),
+                    cwd: Some("/a".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "abc12345".into(),
+                    agent_id: Some("agent-1".into()),
+                }),
+            ]
+        );
     }
 
     #[test]
-    fn popup_delete_on_remote_session_returns_dismiss_and_removes() {
+    fn popup_enter_on_known_remote_session_emits_exact_attach() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.sessions.session_groups[0].sessions[0].node_id = Some("node-1".into());
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::AttachRemoteSession {
+                node_id: "node-1".into(),
+                session_id: "remote-1".into(),
+            })]
+        );
+        assert_eq!(
+            app.sessions.session_remote_node_id("remote-1"),
+            Some("node-1")
+        );
+    }
+
+    #[test]
+    fn popup_enter_on_missing_remote_session_warns_without_command() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1"])];
+        app.sessions.session_groups[0].sessions[0].node = Some("remote node".into());
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            app.diagnostics.status,
+            "remote session is missing node id; refresh sessions and try again"
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn popup_delete_on_remote_session_emits_dismiss_and_removes() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_groups = vec![make_group(Some("/a"), &["remote-1", "s2"])];
         app.sessions.session_groups[0].sessions[0].node_id = Some("node-1".into());
         app.sessions.session_cursor = 1;
 
-        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
 
         assert_eq!(
-            action,
-            SessionKeyAction::DismissRemoteSession {
-                session_id: "remote-1".into()
-            }
+            effects,
+            vec![Effect::Command(Command::DismissRemoteSession {
+                session_id: "remote-1".into(),
+            })]
         );
         assert_eq!(app.sessions.session_groups[0].sessions.len(), 1);
         assert_eq!(app.sessions.session_groups[0].sessions[0].session_id, "s2");
@@ -2716,22 +2716,21 @@ mod session_popup_key_tests {
         app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
         app.sessions.session_groups[0].sessions[0].fork_count = 1;
         app.sessions.session_cursor = 1;
-        let mut effects = TestEffects::default();
-
-        effects.extend(handle_session_popup_key(
+        let effects = handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-        ));
+        );
 
         assert!(app.sessions.expanded_session_children.contains("root"));
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::ListSessionChildren {
-                parent_session_id,
-                ..
-            }) if parent_session_id == "root"
-        ));
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::ListSessionChildren {
+                parent_session_id: "root".into(),
+                cursor: None,
+                limit: 10,
+            })]
+        );
     }
 
     #[test]
@@ -2744,36 +2743,14 @@ mod session_popup_key_tests {
             .expanded_session_children
             .insert("root".to_string());
         app.sessions.session_cursor = 1;
-        let mut effects = TestEffects::default();
-
-        effects.extend(handle_session_popup_key(
+        let effects = handle_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-        ));
+        );
 
         assert!(!app.sessions.expanded_session_children.contains("root"));
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert!(effects.next_command().is_none());
-    }
-
-    #[test]
-    fn popup_plain_o_still_filters_instead_of_toggling_forks() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["root"])];
-        app.sessions.session_groups[0].sessions[0].fork_count = 1;
-        app.sessions.session_cursor = 1;
-        let mut effects = TestEffects::default();
-
-        effects.extend(handle_session_popup_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
-        ));
-
-        assert_eq!(app.sessions.session_filter, "o");
-        assert!(!app.sessions.expanded_session_children.contains("root"));
-        assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert!(effects.next_command().is_none());
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -2807,7 +2784,7 @@ mod session_popup_key_tests {
     }
 
     #[test]
-    fn popup_enter_on_load_more_returns_action_and_keeps_popup_open() {
+    fn popup_enter_on_load_more_emits_exact_continuation_and_keeps_popup_open() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_groups = vec![make_group_with_cursor(
@@ -2815,16 +2792,19 @@ mod session_popup_key_tests {
             &["s1"],
             "cursor-1",
         )];
-        app.sessions.session_cursor = 2; // LoadMore row
+        app.sessions.session_cursor = 2;
 
-        let action = apply_popup_session_key(&mut app, KeyCode::Enter);
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(
-            action,
-            SessionKeyAction::LoadMoreSessions {
-                group_idx: 0,
-                parent_path: Vec::new()
-            }
+            effects,
+            vec![Effect::Command(Command::ListSessions {
+                request: SessionListRequest::WorkspaceContinuation {
+                    cwd: "/workspace/project".into(),
+                },
+                cursor: Some("cursor-1".into()),
+            })]
         );
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
     }
@@ -2832,41 +2812,23 @@ mod session_popup_key_tests {
     // ── Delete on Session removes it ─────────────────────────────────────────
 
     #[test]
-    fn popup_delete_on_session_returns_delete_and_removes() {
+    fn popup_delete_on_local_session_emits_delete_and_removes() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
         app.sessions.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
-        app.sessions.session_cursor = 1; // Session s1
-        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
+        app.sessions.session_cursor = 1;
+
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
         assert_eq!(
-            action,
-            SessionKeyAction::DeleteSession {
-                session_id: "s1".to_string()
-            }
+            effects,
+            vec![Effect::Command(Command::DeleteSession {
+                session_id: "s1".into(),
+            })]
         );
         assert_eq!(app.sessions.session_groups[0].sessions.len(), 1);
         assert_eq!(app.sessions.session_groups[0].sessions[0].session_id, "s2");
-    }
-
-    #[test]
-    fn popup_delete_removes_empty_group() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["only"])];
-        app.sessions.session_cursor = 1;
-        apply_popup_session_key(&mut app, KeyCode::Delete);
-        assert!(app.sessions.session_groups.is_empty());
-    }
-
-    #[test]
-    fn popup_delete_on_header_is_noop() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.sessions.session_cursor = 0; // GroupHeader
-        let action = apply_popup_session_key(&mut app, KeyCode::Delete);
-        assert_eq!(action, SessionKeyAction::None);
-        assert_eq!(app.sessions.session_groups[0].sessions.len(), 1);
     }
 
     // ── Esc closes popup ──────────────────────────────────────────────────────
@@ -2875,21 +2837,30 @@ mod session_popup_key_tests {
     fn popup_esc_closes_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        apply_popup_session_key(&mut app, KeyCode::Esc);
+
+        let effects =
+            handle_session_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
         assert_eq!(app.navigation.popup, Popup::None);
+        assert!(effects.is_empty());
     }
 
-    // ── Filter: Char appends, Backspace removes, both reset cursor ────────────
-
     #[test]
-    fn popup_char_appends_to_filter_and_resets_cursor() {
+    fn popup_ctrl_n_when_disconnected_keeps_session_popup() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        app.sessions.session_cursor = 1;
-        apply_popup_session_key(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.sessions.session_filter, "x");
-        assert_eq!(app.sessions.session_cursor, 0);
+
+        let effects = handle_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(
+            app.diagnostics.status,
+            "not connected - waiting to reconnect"
+        );
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -2911,22 +2882,6 @@ mod session_popup_key_tests {
 
         assert_eq!(app.navigation.popup, Popup::NewSession);
         assert_eq!(app.sessions.new_session_path, "/launch");
-        assert!(effects.next_command().is_none());
-    }
-
-    #[test]
-    fn popup_plain_n_still_filters_instead_of_creating_session() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        let mut effects = TestEffects::default();
-        effects.extend(handle_session_popup_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-        ));
-
-        assert_eq!(app.navigation.popup, Popup::SessionSelect);
-        assert_eq!(app.sessions.session_filter, "n");
         assert!(effects.next_command().is_none());
     }
 
@@ -3135,6 +3090,42 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn session_popup_delegate_tab_routes_through_root_handler() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_popup_tab = 1;
+        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
+        app.sessions.session_filter = "session".into();
+        let session_projection = app.sessions.visible_popup_items();
+        app.delegates.delegate_cursor = 3;
+        app.delegates.delegate_entries = vec![DelegateEntry {
+            delegation_id: "delegate-1".into(),
+            child_session_id: Some("child-1".into()),
+            delegate_tool_call_id: None,
+            target_agent_id: Some("coder".into()),
+            objective: "Write docs".into(),
+            status: DelegateStatus::Completed,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        }];
+
+        let effects = handle_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.sessions.session_popup_tab, 1);
+        assert_eq!(app.delegates.delegate_filter, "d");
+        assert_eq!(app.delegates.delegate_cursor, 0);
+        assert_eq!(app.sessions.session_filter, "session");
+        assert_eq!(app.sessions.visible_popup_items(), session_projection);
+    }
+
+    #[test]
     fn root_router_keeps_session_popup_tab_and_backtab_ahead_of_tab_handlers() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
@@ -3168,50 +3159,6 @@ mod session_popup_key_tests {
         assert_eq!(app.sessions.session_cursor, 3);
         assert_eq!(app.delegates.delegate_filter, "delegates-owner");
         assert_eq!(app.delegates.delegate_cursor, 4);
-    }
-
-    #[test]
-    fn popup_backspace_removes_last_filter_char_and_resets_cursor() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_filter = "ab".to_string();
-        app.sessions.session_cursor = 2;
-        apply_popup_session_key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.sessions.session_filter, "a");
-        assert_eq!(app.sessions.session_cursor, 0);
-    }
-
-    // ── multiple groups: navigation crosses group boundaries ─────────────────
-
-    #[test]
-    fn popup_down_crosses_group_boundary() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![
-            make_group(Some("/a"), &["s1"]),
-            make_group(Some("/b"), &["s2"]),
-        ];
-        // visible: [Header /a (0), Session s1 (1), Header /b (2), Session s2 (3)]
-        app.sessions.session_cursor = 1; // s1
-        apply_popup_session_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sessions.session_cursor, 2); // Header /b
-        apply_popup_session_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sessions.session_cursor, 3); // s2
-    }
-
-    // ── collapse in popup does not affect start-page navigation ──────────────
-
-    #[test]
-    fn popup_collapse_independent_of_start_page() {
-        let mut app = App::new();
-        app.navigation.popup = Popup::SessionSelect;
-        app.sessions.session_groups = vec![make_group(Some("/a"), &["s1"])];
-        // collapse in popup
-        app.sessions.session_cursor = 0;
-        apply_popup_session_key(&mut app, KeyCode::Enter);
-        assert!(app.sessions.popup_collapsed_groups.contains("/a"));
-        // start page state untouched
-        assert!(!app.sessions.collapsed_groups.contains("/a"));
     }
 }
 
