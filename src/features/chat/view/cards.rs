@@ -409,6 +409,23 @@ fn elicitation_outcome_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::tool::{TodoItem, ToolDetail};
+
+    fn build_cards<'a>(messages: &'a [ChatEntry], render: &'a mut RenderState) -> &'a [Card] {
+        build_finalized_cards(
+            FinalizedRenderInput {
+                session_identity: SessionIdentity::new(Some("session-1".into()), None, false),
+                messages,
+                delegates: &[],
+                effective_cwd: Some("/workspace/project".into()),
+                show_thinking: true,
+                full_width: 120,
+                theme: ThemeCacheKey::new(0, 0),
+                now_unix_secs: 0,
+            },
+            render,
+        )
+    }
 
     #[test]
     fn representative_finalized_card_build_uses_narrow_inputs() {
@@ -417,21 +434,160 @@ mod tests {
             message_id: Some("user-1".into()),
         }];
         let mut render = RenderState::new();
-        let cards = build_finalized_cards(
-            FinalizedRenderInput {
-                session_identity: SessionIdentity::new(Some("session-1".into()), None, false),
-                messages: &messages,
-                delegates: &[],
-                effective_cwd: None,
-                show_thinking: true,
-                full_width: 80,
-                theme: ThemeCacheKey::new(0, 0),
-                now_unix_secs: 0,
-            },
-            &mut render,
-        );
+        let cards = build_cards(&messages, &mut render);
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].kind, CardKind::User);
+    }
+
+    #[test]
+    fn summary_tool_detail_families_preserve_exact_visible_lines_and_styles() {
+        let messages = [
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "mystery".into(),
+                is_error: false,
+                detail: ToolDetail::None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "browse".into(),
+                is_error: false,
+                detail: ToolDetail::Browse {
+                    url: "https://例.test/文档…".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "todowrite".into(),
+                is_error: false,
+                detail: ToolDetail::Todo {
+                    items: vec![
+                        TodoItem {
+                            content: "done".into(),
+                            status: "completed".into(),
+                        },
+                        TodoItem {
+                            content: "next".into(),
+                            status: "pending".into(),
+                        },
+                    ],
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "inspect".into(),
+                is_error: false,
+                detail: ToolDetail::Generic {
+                    input: Some("src/lib.rs".into()),
+                    result: Some("language: rust\nsymbols: 3".into()),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "read_tool".into(),
+                is_error: false,
+                detail: ToolDetail::ReadTool {
+                    path: "/workspace/project/src/lib.rs".into(),
+                    start_line: Some(7),
+                    end_line: Some(9),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "glob".into(),
+                is_error: false,
+                detail: ToolDetail::Glob {
+                    pattern: "*.rs".into(),
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "ls".into(),
+                is_error: false,
+                detail: ToolDetail::List {
+                    path: "project/src".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "delete_file".into(),
+                is_error: false,
+                detail: ToolDetail::DeleteFile {
+                    path: "tmp/out.txt".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "language_query".into(),
+                is_error: false,
+                detail: ToolDetail::LanguageQuery {
+                    action: "definition".into(),
+                    uri: "src/lib.rs".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "question".into(),
+                is_error: false,
+                detail: ToolDetail::Question {
+                    prompt: "Which option?".into(),
+                },
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: None,
+                name: "apply_patch".into(),
+                is_error: false,
+                detail: ToolDetail::ApplyPatch {
+                    patch: "*** Begin Patch\n*** End Patch".into(),
+                },
+            },
+        ];
+        let mut render = RenderState::new();
+        let cards = build_cards(&messages, &mut render);
+
+        assert_eq!(cards.len(), 1);
+        let lines = cards[0].lines_for(120);
+        let visible_lines = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_lines,
+            [
+                "> mystery",
+                "> browse https://例.test/文档…",
+                "> todowrite",
+                "  [x] done",
+                "  [ ] next",
+                "> inspect src/lib.rs",
+                "  language: rust",
+                "  symbols: 3",
+                "> read_tool src/lib.rs:7-9",
+                "> glob *.rs in project/src",
+                "> ls project/src",
+                "> delete_file tmp/out.txt",
+                "> language_query definition src/lib.rs",
+                "> question asking...",
+                "> apply_patch patch",
+            ]
+        );
+        assert_eq!(cards[0].kind, CardKind::Tool { compact: false });
+        assert_eq!(lines[1].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[3].spans[0].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[5].spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(lines[6].spans[0].style.fg, Theme::tool_output().fg);
+        assert_eq!(lines[8].spans[3].style.fg, Theme::status_accent().fg);
+        for line in &lines[9..=14] {
+            assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        }
+        drop(lines);
+        assert_eq!(cards[0].height(20), 25, "narrow Unicode rows must wrap");
     }
 }
