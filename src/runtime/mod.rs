@@ -1613,20 +1613,21 @@ fn log_server_binary_discovery(
         return;
     }
     if let Some(path) = discovery.configured_path.as_deref() {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
     } else if cfg.acp.binary_path.is_none() {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(LogLevel::Info, "acp", "qmtcode not found on PATH");
+        app.diagnostics
+            .push_log(LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1694,7 +1695,7 @@ pub async fn run() -> anyhow::Result<()> {
         ..
     } = &selection
     {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             format!("found ACP WebSocket server at {url}"),
@@ -1723,7 +1724,7 @@ pub async fn run() -> anyhow::Result<()> {
         ..
     } = &selection
     {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Warn,
             "acp",
             format!("qmtcode unavailable; waiting for ACP WebSocket at {url}"),

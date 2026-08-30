@@ -4,7 +4,7 @@ use crate::command::Command;
 use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
 use crate::delegates_state::DelegatesState;
-use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
+use crate::diagnostics::{DiagnosticsState, LogLevel};
 use crate::mesh_state::MeshState;
 use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
@@ -161,34 +161,10 @@ impl App {
         self.profiles.reset_for_open();
     }
 
-    // phase 11 compatibility forward
-    pub fn push_log(&mut self, level: LogLevel, target: &'static str, message: impl Into<String>) {
-        self.diagnostics.push_log(level, target, message);
-    }
-
-    // phase 11 compatibility forward
-    pub fn set_status(
-        &mut self,
-        level: LogLevel,
-        target: &'static str,
-        message: impl Into<String>,
-    ) {
-        self.diagnostics.set_status(level, target, message);
-    }
-
-    // phase 11 compatibility forward
-    pub fn filtered_logs(&self) -> Vec<&AppLogEntry> {
-        self.diagnostics.filtered_logs()
-    }
-
-    // phase 11 compatibility forward
-    pub fn cycle_log_level_filter(&mut self) {
-        self.diagnostics.cycle_log_level_filter();
-    }
-
     pub fn arm_cancel_confirm(&mut self) {
         self.chat.arm_cancel_confirm();
-        self.set_status(LogLevel::Warn, "input", "press Esc again to stop");
+        self.diagnostics
+            .set_status(LogLevel::Warn, "input", "press Esc again to stop");
     }
 
     pub fn open_fork_turn_popup(&mut self) {
@@ -209,15 +185,17 @@ impl App {
             return;
         }
         if self.chat.elicitation.is_some() {
-            self.set_status(
+            self.diagnostics.set_status(
                 LogLevel::Debug,
                 "elicitation",
                 "question - answer in the panel above input",
             );
         } else if let Some(activity_status) = self.chat.activity_status_text() {
-            self.set_status(LogLevel::Debug, "activity", activity_status);
+            self.diagnostics
+                .set_status(LogLevel::Debug, "activity", activity_status);
         } else if self.connection.conn == ConnState::Connected {
-            self.set_status(LogLevel::Debug, "activity", "ready");
+            self.diagnostics
+                .set_status(LogLevel::Debug, "activity", "ready");
         }
     }
 
@@ -233,7 +211,7 @@ impl App {
             ConnectionEvent::Connecting { attempt, delay_ms } => {
                 self.connection.apply_connecting(attempt, delay_ms);
                 let secs = delay_ms as f64 / 1000.0;
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Warn,
                     "connection",
                     format!("waiting for server - retry {attempt} in {secs:.1}s"),
@@ -241,7 +219,7 @@ impl App {
             }
             ConnectionEvent::Connected => {
                 self.connection.apply_connected();
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Info,
                     "connection",
                     if self.sessions.session_id.is_some() {
@@ -255,7 +233,7 @@ impl App {
                 self.connection.apply_disconnected();
                 self.sessions.session_discovery_in_progress = false;
                 self.sessions.pending_session_group_loads.clear();
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Warn,
                     "connection",
                     format!("connection lost - {reason}"),
@@ -934,7 +912,8 @@ mod tests {
     fn refresh_transient_status_preserves_connection_and_operation_precedence() {
         let mut app = App::new();
         app.connection.conn = ConnState::Disconnected;
-        app.set_status(LogLevel::Warn, "connection", "connection lost - retrying");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "connection", "connection lost - retrying");
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "connection lost - retrying");
 

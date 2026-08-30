@@ -704,7 +704,12 @@ impl ChatState {
                 name,
                 detail,
             } => {
-                if self.reconcile_tool_call_start(tool_call_id.as_deref(), &name, detail.clone()) {
+                if tool_detail::reconcile_tool_call_start(
+                    &mut self.messages,
+                    tool_call_id.as_deref(),
+                    &name,
+                    detail.clone(),
+                ) {
                     self.clear_streaming_thinking();
                     (
                         ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled),
@@ -1692,42 +1697,6 @@ impl ChatState {
             });
         }
         AssistantMessageTransition::Appended
-    }
-
-    pub(crate) fn reconcile_tool_call_start(
-        &mut self,
-        tool_call_id: Option<&str>,
-        tool_name: &str,
-        detail: ToolDetail,
-    ) -> bool {
-        let Some(tool_call_id) = tool_call_id else {
-            return false;
-        };
-        let fallback_name = format!("{tool_name} (failed)");
-        for entry in self.messages.iter_mut().rev() {
-            if let ChatEntry::ToolCall {
-                tool_call_id: Some(existing),
-                name,
-                detail: existing_detail,
-                ..
-            } = entry
-            {
-                if existing != tool_call_id {
-                    continue;
-                }
-                let is_failed_fallback = name == &fallback_name;
-                if is_failed_fallback {
-                    *name = tool_name.to_string();
-                }
-                if (is_failed_fallback || matches!(existing_detail, ToolDetail::None))
-                    && !matches!(detail, ToolDetail::None)
-                {
-                    *existing_detail = detail;
-                }
-                return true;
-            }
-        }
-        false
     }
 
     fn tool_call_detail(&self, tool_call_id: Option<&str>) -> Option<&ToolDetail> {
