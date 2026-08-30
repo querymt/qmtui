@@ -13,7 +13,8 @@ impl App {
     pub fn open_mesh_popup(&mut self) {
         self.navigation.popup = Popup::Mesh;
         self.mesh.reset_for_popup();
-        self.set_status(LogLevel::Debug, "mesh", "refreshing mesh");
+        self.diagnostics
+            .set_status(LogLevel::Debug, "mesh", "refreshing mesh");
     }
 
     pub fn open_mesh_invite_form(&mut self) {
@@ -91,10 +92,10 @@ impl App {
         for coordination in outcome.coordination {
             match coordination {
                 MeshCoordination::Log { level, message } => {
-                    self.push_log(level, "mesh", message);
+                    self.diagnostics.push_log(level, "mesh", message);
                 }
                 MeshCoordination::Status { level, message } => {
-                    self.set_status(level, "mesh", message);
+                    self.diagnostics.set_status(level, "mesh", message);
                 }
                 MeshCoordination::SetPopup(popup) => self.navigation.popup = popup,
                 MeshCoordination::RememberRemoteSession {

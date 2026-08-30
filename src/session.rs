@@ -258,29 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn current_profile_label_uses_binding_active_fallback_and_remote_fallback() {
-        let mut app = App::new();
-        app.profiles.profiles = vec![crate::domain::profile::ProfileInfo {
-            id: "fast".into(),
-            name: "Fast".into(),
-            ..Default::default()
-        }];
-        app.profiles.active_profile_id = Some("fast".into());
-        app.sessions.session_id = Some("local".into());
-
-        assert_eq!(app.current_profile_label(), "Fast");
-
-        app.profiles
-            .bind_session_profile("local".into(), "unknown".into());
-        assert_eq!(app.current_profile_label(), "unknown");
-
-        app.sessions.session_id = Some("remote".into());
-        app.sessions
-            .remember_remote_session_node("remote", "node-1");
-        assert_eq!(app.current_profile_label(), "remote");
-    }
-
-    #[test]
     fn session_parent_id_finds_explicit_parent_at_any_depth() {
         let mut app = App::new();
         let mut grandchild = session("grandchild");

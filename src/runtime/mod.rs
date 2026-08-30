@@ -211,15 +211,11 @@ mod tests {
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
     use crate::domain::tool::ToolDetail;
-    use crate::handlers::*;
+    use crate::handlers::{handle_profile_popup_key, handle_theme_popup_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
-    }
-
-    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
     }
 
     fn test_terminal() -> AppTerminal {
@@ -508,7 +504,7 @@ mod tests {
             },
         });
 
-        let old_preview_fg = crate::ui::build_message_cards(&mut app)
+        let old_preview_fg = crate::features::chat::view::build_message_cards(&mut app)
             .iter()
             .find_map(|card| {
                 let lines = card.lines_for(120);
@@ -570,7 +566,7 @@ mod tests {
             } if old == "aaa" && new == "bbb"
         ));
 
-        let rebuilt_preview_fg = crate::ui::build_message_cards(&mut app)
+        let rebuilt_preview_fg = crate::features::chat::view::build_message_cards(&mut app)
             .iter()
             .find_map(|card| {
                 let lines = card.lines_for(120);
@@ -597,7 +593,7 @@ mod external_editor_tests {
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::domain::activity::{ActivityState, SessionOp};
     use crate::domain::chat::ChatEntry;
-    use crate::handlers::*;
+    use crate::handlers::{handle_chat_key, handle_fork_turn_popup_key, handle_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
 
@@ -1613,20 +1609,21 @@ fn log_server_binary_discovery(
         return;
     }
     if let Some(path) = discovery.configured_path.as_deref() {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             format!("configured qmtcode path not found: {path}; checking PATH"),
         );
     } else if cfg.acp.binary_path.is_none() {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             "acp.binary_path not set; checking qmtcode on PATH",
         );
     }
     if discovery.binary.is_none() {
-        app.push_log(LogLevel::Info, "acp", "qmtcode not found on PATH");
+        app.diagnostics
+            .push_log(LogLevel::Info, "acp", "qmtcode not found on PATH");
     }
 }
 
@@ -1694,7 +1691,7 @@ pub async fn run() -> anyhow::Result<()> {
         ..
     } = &selection
     {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Info,
             "acp",
             format!("found ACP WebSocket server at {url}"),
@@ -1712,7 +1709,7 @@ pub async fn run() -> anyhow::Result<()> {
             } | EndpointSelection::Endpoint {
                 missing_binary_fallback: true,
                 ..
-            } | EndpointSelection::BinaryNotFound
+            }
         ) {
             log_server_binary_discovery(&mut app, &cfg, &discovery);
         }
@@ -1723,7 +1720,7 @@ pub async fn run() -> anyhow::Result<()> {
         ..
     } = &selection
     {
-        app.push_log(
+        app.diagnostics.push_log(
             LogLevel::Warn,
             "acp",
             format!("qmtcode unavailable; waiting for ACP WebSocket at {url}"),
@@ -1737,10 +1734,6 @@ pub async fn run() -> anyhow::Result<()> {
             discovered_ws: _,
             missing_binary_fallback: _,
         } => (Some(endpoint), state),
-        EndpointSelection::BinaryNotFound => {
-            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            (None, ServerState::BinaryNotFound)
-        }
         EndpointSelection::Disabled => (None, ServerState::Disabled),
     };
 
@@ -1785,12 +1778,16 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 #[cfg(test)]
-struct PersistenceGuard(config::TestPersistenceGuard);
+struct PersistenceGuard {
+    _guard: config::TestPersistenceGuard,
+}
 
 #[cfg(test)]
 impl PersistenceGuard {
     fn new(label: &str) -> Self {
-        Self(config::TestPersistenceGuard::new(label))
+        Self {
+            _guard: config::TestPersistenceGuard::new(label),
+        }
     }
 }
 
@@ -1799,7 +1796,7 @@ mod sessions_key_tests {
     use super::*;
     use crate::command::Command;
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::handlers::*;
+    use crate::handlers::{SessionKeyAction, apply_sessions_key, handle_sessions_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2064,7 +2061,10 @@ mod session_popup_key_tests {
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     };
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::handlers::*;
+    use crate::handlers::{
+        SessionKeyAction, apply_popup_session_key, handle_key, handle_new_session_popup_key,
+        handle_session_popup_key,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2947,7 +2947,7 @@ mod delegate_popup_key_tests {
     use crate::domain::activity::{
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     };
-    use crate::handlers::*;
+    use crate::handlers::{handle_delegate_popup_key, handle_key, handle_session_popup_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_entry(id: &str, objective: &str, child_sid: Option<&str>) -> DelegateEntry {
@@ -3279,10 +3279,6 @@ mod reasoning_effort_integration_tests {
         }
     }
 
-    fn chord_key(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-    }
-
     fn tab_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
@@ -3362,7 +3358,9 @@ mod reasoning_effort_integration_tests {
             },
         ];
         app.models.model_popup_agent_tab = 0;
-        let expected_delegate_cursor = app.delegate_model_cursor("coder");
+        let expected_delegate_cursor = app
+            .models
+            .delegate_model_cursor(app.delegate_preference_profile_id(), "coder");
         app.models.model_filter = "clear-on-tab-change".into();
         app.models.model_cursor = 9;
 
@@ -3564,7 +3562,7 @@ mod auth_tests {
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
-    use crate::handlers::*;
+    use crate::handlers::{handle_auth_popup_key, handle_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {

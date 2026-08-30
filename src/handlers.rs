@@ -51,7 +51,7 @@ pub(crate) fn can_send_server_commands(app: &mut App) -> bool {
     if app.connection.conn == ConnState::Connected {
         true
     } else {
-        app.set_status(
+        app.diagnostics.set_status(
             LogLevel::Warn,
             "connection",
             "not connected - waiting to reconnect",
@@ -73,7 +73,7 @@ fn send_load_session_commands(
 
 fn open_model_popup(app: &mut App) -> Vec<Effect> {
     if app.navigation.screen != Screen::Chat {
-        app.set_status(
+        app.diagnostics.set_status(
             LogLevel::Warn,
             "model",
             "model select is only available in chat",
@@ -101,7 +101,7 @@ fn open_session_popup(app: &mut App) -> Vec<Effect> {
 
 fn open_log_popup(app: &mut App) {
     app.navigation.popup = Popup::Log;
-    app.diagnostics.log_cursor = app.filtered_logs().len().saturating_sub(1);
+    app.diagnostics.log_cursor = app.diagnostics.filtered_logs().len().saturating_sub(1);
     app.diagnostics.log_filter.clear();
 }
 
@@ -242,7 +242,8 @@ pub(crate) fn handle_mesh_invite_popup_key(app: &mut App, key: KeyEvent) -> Vec<
                 if !can_send_server_commands(app) {
                     return Vec::new();
                 }
-                app.set_status(LogLevel::Info, "mesh", "creating invite...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "mesh", "creating invite...");
                 return vec![Effect::Command(command)];
             }
         }
@@ -329,7 +330,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
 
     if app.navigation.chord {
         app.navigation.chord = false;
-        app.set_status(LogLevel::Debug, "input", "ready");
+        app.diagnostics
+            .set_status(LogLevel::Debug, "input", "ready");
         if app.navigation.screen == Screen::Chat {
             if let Some(ChatCommandIntent::OpenExternalEditor { initial_text }) =
                 chat_command_intent(&app.composer, key)
@@ -337,7 +339,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 return vec![Effect::OpenExternalEditor { initial_text }];
             }
         } else if key.code == KeyCode::Char('e') {
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Warn,
                 "editor",
                 "external editor is only available in chat",
@@ -372,7 +374,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         }
         return match app.cycle_reasoning_effort() {
             Some(command) => {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Info,
                     "model",
                     format!("thinking: {}", app.models.reasoning_effort_label()),
@@ -380,7 +382,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 vec![Effect::Command(command)]
             }
             None => {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "model",
                     format!(
@@ -402,7 +404,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         app.navigation.chord = true;
-        app.set_status(LogLevel::Debug, "input", "C-x ...");
+        app.diagnostics
+            .set_status(LogLevel::Debug, "input", "C-x ...");
         return Vec::new();
     }
 
@@ -472,7 +475,11 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Char('q') => effects.push(Effect::Quit),
         KeyCode::Char('e') => {
-            app.set_status(LogLevel::Warn, "editor", "external editor unavailable here");
+            app.diagnostics.set_status(
+                LogLevel::Warn,
+                "editor",
+                "external editor unavailable here",
+            );
         }
         KeyCode::Char('t') => app
             .navigation
@@ -494,7 +501,7 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         }
         KeyCode::Char('j') => {
             if !matches!(app.navigation.screen, Screen::Chat | Screen::Delegate) {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "session",
                     "parent jump only available in chat",
@@ -511,13 +518,14 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                     app.sessions.agent_id.clone(),
                 ));
             } else {
-                app.set_status(LogLevel::Info, "session", "no parent session");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "session", "no parent session");
             }
         }
         KeyCode::Char('?') => app.navigation.open_help(),
         KeyCode::Char('f') => {
             if app.navigation.screen != Screen::Chat {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "fork",
                     "fork selector is only available in chat",
@@ -531,13 +539,14 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 return effects;
             }
             if app.chat.is_turn_active() {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
             } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
-                app.set_status(LogLevel::Warn, "session", "undo already pending");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
@@ -545,12 +554,14 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
-                app.set_status(LogLevel::Info, "session", "undoing...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "session", "undoing...");
                 effects.push(Effect::Command(Command::Undo {
                     message_id: turn.message_id,
                 }));
             } else {
-                app.set_status(LogLevel::Warn, "session", "nothing to undo");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "nothing to undo");
             }
         }
         KeyCode::Char('r') => {
@@ -558,22 +569,27 @@ pub(crate) fn handle_chord(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 return effects;
             }
             if app.chat.is_turn_active() {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
             } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
-                app.set_status(LogLevel::Warn, "session", "undo already pending");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "undo already pending");
             } else if app.chat.can_redo() {
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
-                app.set_status(LogLevel::Info, "session", "redoing...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "session", "redoing...");
                 effects.push(Effect::Command(Command::Redo));
             } else {
-                app.set_status(LogLevel::Warn, "session", "nothing to redo");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
-        _ => app.set_status(LogLevel::Debug, "input", "unknown chord"),
+        _ => app
+            .diagnostics
+            .set_status(LogLevel::Debug, "input", "unknown chord"),
     }
     effects
 }
@@ -643,7 +659,7 @@ fn resolve_session_selection(
         };
     }
     if app.sessions.is_remote_session_id(&session_id) {
-        app.set_status(
+        app.diagnostics.set_status(
             LogLevel::Warn,
             "session",
             "remote session is missing node id; refresh sessions and try again",
@@ -788,6 +804,7 @@ pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
 }
 
 /// Adapt session-popup input into the existing root-owned session action.
+#[cfg(test)]
 pub(crate) fn apply_popup_session_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
@@ -797,6 +814,7 @@ pub(crate) fn apply_popup_session_key(
     apply_session_popup_input_result(app, result)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
     if popup_items {
         let result = toggle_popup_session_children(&mut app.sessions);
@@ -846,7 +864,7 @@ fn apply_delegate_popup_input_result(
             }
         }
         DelegateInputResult::PendingChild => {
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Warn,
                 "delegates",
                 "delegation still pending — no session to load",
@@ -904,24 +922,29 @@ pub(crate) fn apply_delegate_popup_key(
 
 fn begin_fork_session(app: &mut App, message_id: String) -> Vec<Effect> {
     if app.chat.pending_fork_message_id.is_some() {
-        app.set_status(LogLevel::Warn, "fork", "fork already pending");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "fork", "fork already pending");
         return Vec::new();
     }
     if app.chat.is_turn_active() {
-        app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
         return Vec::new();
     }
     if app.chat.has_pending_session_op() {
-        app.set_status(LogLevel::Warn, "fork", "session operation already pending");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "fork", "session operation already pending");
         return Vec::new();
     }
     if message_id.is_empty() {
-        app.set_status(LogLevel::Warn, "fork", "selected turn has no message id");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "fork", "selected turn has no message id");
         return Vec::new();
     }
 
     app.chat.pending_fork_message_id = Some(message_id.clone());
-    app.set_status(LogLevel::Info, "fork", "forking session...");
+    app.diagnostics
+        .set_status(LogLevel::Info, "fork", "forking session...");
     vec![Effect::Command(Command::ForkSession { message_id })]
 }
 
@@ -935,7 +958,8 @@ pub(crate) fn handle_fork_turn_popup_key(app: &mut App, key: KeyEvent) -> Vec<Ef
             if let Some(turn) = app.chat.selected_fork_turn() {
                 return begin_fork_session(app, turn.message_id);
             }
-            app.set_status(LogLevel::Warn, "fork", "no forkable turns");
+            app.diagnostics
+                .set_status(LogLevel::Warn, "fork", "no forkable turns");
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.chat.fork_filter_insert(c);
@@ -975,7 +999,7 @@ pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
                 }));
             }
             app.navigation.popup = Popup::None;
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Info,
                 "profile",
                 format!("new sessions will use {profile_id}"),
@@ -984,7 +1008,8 @@ pub(crate) fn handle_profile_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
             return effects;
         }
         ProfileInputResult::NoMatchingProfile => {
-            app.set_status(LogLevel::Warn, "profile", "no matching profile");
+            app.diagnostics
+                .set_status(LogLevel::Warn, "profile", "no matching profile");
         }
         ProfileInputResult::NotHandled
         | ProfileInputResult::Moved
@@ -1044,7 +1069,8 @@ fn apply_chat_input_result(app: &mut App, result: ChatInputResult) -> Option<Vec
         }
         ChatInputResult::Cancel(CancelIntent::ConfirmCancellation) => {
             app.chat.clear_cancel_confirm();
-            app.set_status(LogLevel::Warn, "activity", "stopping...");
+            app.diagnostics
+                .set_status(LogLevel::Warn, "activity", "stopping...");
             Some(vec![Effect::Command(Command::CancelSession)])
         }
         ChatInputResult::Cancel(CancelIntent::ClearConfirmation) => {
@@ -1211,7 +1237,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
         "model" => {
             app.take_input();
             if app.navigation.screen != Screen::Chat {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "model",
                     "model select is only available in chat",
@@ -1240,7 +1266,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                 match arg.as_str() {
                     "build" | "plan" => {
                         if app.sessions.agent_mode == arg {
-                            app.set_status(
+                            app.diagnostics.set_status(
                                 LogLevel::Info,
                                 "mode",
                                 format!("already in {} mode", arg),
@@ -1249,7 +1275,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                             effects.extend(switch_mode(app, &arg));
                         }
                     }
-                    _ => app.set_status(
+                    _ => app.diagnostics.set_status(
                         LogLevel::Warn,
                         "mode",
                         format!("unknown mode: {} (try build or plan)", arg),
@@ -1263,7 +1289,8 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                 return (SlashResult::Handled, effects);
             }
             if app.sessions.agent_mode == "review" {
-                app.set_status(LogLevel::Info, "mode", "already in review mode");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "mode", "already in review mode");
             } else {
                 effects.extend(switch_mode(app, "review"));
             }
@@ -1271,7 +1298,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
         "thinking" => {
             app.take_input();
             if arg.is_empty() {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Info,
                     "model",
                     format!("thinking: {}", app.models.reasoning_effort_label()),
@@ -1279,7 +1306,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
             } else {
                 let level = arg.to_lowercase();
                 if crate::models_state::validate_reasoning_effort(Some(&level)).is_none() {
-                    app.set_status(
+                    app.diagnostics.set_status(
                         LogLevel::Warn,
                         "model",
                         format!(
@@ -1294,7 +1321,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                     effects.push(Effect::Command(
                         app.set_reasoning_effort(Some(&level)).unwrap(),
                     ));
-                    app.set_status(
+                    app.diagnostics.set_status(
                         LogLevel::Info,
                         "model",
                         format!("thinking: {}", app.models.reasoning_effort_label()),
@@ -1323,14 +1350,14 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                         profile_id: profile_id.clone(),
                     }));
                 }
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Info,
                     "profile",
                     format!("new sessions will use {profile_id}"),
                 );
                 effects.push(Effect::PersistConfig);
             } else {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "profile",
                     format!("unknown profile: {}", arg),
@@ -1351,7 +1378,7 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
         "delegates" => {
             app.take_input();
             if app.navigation.screen != Screen::Chat {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "delegates",
                     "delegates only available in chat",
@@ -1389,22 +1416,36 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
         "fork" => {
             app.take_input();
             if app.navigation.screen != Screen::Chat {
-                app.set_status(LogLevel::Warn, "fork", "forking is only available in chat");
+                app.diagnostics.set_status(
+                    LogLevel::Warn,
+                    "fork",
+                    "forking is only available in chat",
+                );
                 return (SlashResult::Handled, effects);
             }
             if !can_send_server_commands(app) {
                 return (SlashResult::Handled, effects);
             }
             if app.chat.pending_fork_message_id.is_some() {
-                app.set_status(LogLevel::Warn, "fork", "fork already pending");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "fork", "fork already pending");
             } else if app.chat.has_pending_session_op() {
-                app.set_status(LogLevel::Warn, "fork", "session operation already pending");
+                app.diagnostics.set_status(
+                    LogLevel::Warn,
+                    "fork",
+                    "session operation already pending",
+                );
             } else if app.chat.is_turn_active() {
-                app.set_status(LogLevel::Warn, "fork", "cannot fork while agent is active");
+                app.diagnostics.set_status(
+                    LogLevel::Warn,
+                    "fork",
+                    "cannot fork while agent is active",
+                );
             } else if let Some(turn) = app.chat.latest_fork_boundary() {
                 effects.extend(begin_fork_session(app, turn.message_id));
             } else {
-                app.set_status(LogLevel::Warn, "fork", "no forkable turns");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "fork", "no forkable turns");
             }
         }
         "undo" => {
@@ -1413,13 +1454,14 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                 return (SlashResult::Handled, effects);
             }
             if app.chat.is_turn_active() {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot undo while agent is active",
                 );
             } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
-                app.set_status(LogLevel::Warn, "session", "undo already pending");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "undo already pending");
             } else if let Some(turn) = app.chat.current_undo_target().cloned() {
                 if app.composer.input.trim().is_empty() && !turn.text.is_empty() {
                     app.composer.replace_input(turn.text.clone());
@@ -1427,12 +1469,14 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                 }
                 app.chat.push_pending_undo(&turn);
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
-                app.set_status(LogLevel::Info, "session", "undoing...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "session", "undoing...");
                 effects.push(Effect::Command(Command::Undo {
                     message_id: turn.message_id,
                 }));
             } else {
-                app.set_status(LogLevel::Warn, "session", "nothing to undo");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "nothing to undo");
             }
         }
         "redo" => {
@@ -1441,19 +1485,22 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
                 return (SlashResult::Handled, effects);
             }
             if app.chat.is_turn_active() {
-                app.set_status(
+                app.diagnostics.set_status(
                     LogLevel::Warn,
                     "session",
                     "cannot redo while agent is active",
                 );
             } else if app.chat.has_pending_session_op() || app.chat.has_pending_undo() {
-                app.set_status(LogLevel::Warn, "session", "redo already pending");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "redo already pending");
             } else if app.chat.can_redo() {
                 app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
-                app.set_status(LogLevel::Info, "session", "redoing...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "session", "redoing...");
                 effects.push(Effect::Command(Command::Redo));
             } else {
-                app.set_status(LogLevel::Warn, "session", "nothing to redo");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "session", "nothing to redo");
             }
         }
         "editor" => {
@@ -1464,10 +1511,12 @@ fn try_execute_slash_command(app: &mut App) -> (SlashResult, Vec<Effect>) {
             app.take_input();
             if app.chat.has_cancellable_activity() {
                 app.chat.clear_cancel_confirm();
-                app.set_status(LogLevel::Warn, "activity", "stopping...");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "activity", "stopping...");
                 effects.push(Effect::Command(Command::CancelSession));
             } else {
-                app.set_status(LogLevel::Warn, "activity", "nothing to cancel");
+                app.diagnostics
+                    .set_status(LogLevel::Warn, "activity", "nothing to cancel");
             }
         }
         "quit" => {
@@ -1578,7 +1627,11 @@ fn apply_model_input_result(app: &mut App, result: ModelInputResult) -> Vec<Effe
                     }));
                 }
             }
-            app.set_status(LogLevel::Info, "model", format!("session: {}", model.label));
+            app.diagnostics.set_status(
+                LogLevel::Info,
+                "model",
+                format!("session: {}", model.label),
+            );
             effects.push(Effect::PersistConfig);
             effects
         }
@@ -1608,7 +1661,11 @@ fn apply_model_input_result(app: &mut App, result: ModelInputResult) -> Vec<Effe
                         node_id: model.node_id.clone(),
                     }));
                 }
-                app.set_status(LogLevel::Info, "model", format!("{label}: {}", model.label));
+                app.diagnostics.set_status(
+                    LogLevel::Info,
+                    "model",
+                    format!("{label}: {}", model.label),
+                );
             }
             effects.push(Effect::PersistConfig);
             effects
@@ -1637,7 +1694,7 @@ fn apply_model_input_result(app: &mut App, result: ModelInputResult) -> Vec<Effe
                     node_id: None,
                 }));
             }
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Info,
                 "model",
                 "delegate model uses profile default",
@@ -1687,6 +1744,7 @@ pub(crate) enum SessionKeyAction {
 }
 
 /// Adapt sessions-screen input into the existing root-owned session action.
+#[cfg(test)]
 pub(crate) fn apply_sessions_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
@@ -1899,7 +1957,8 @@ mod model_popup_tests {
         );
 
         app.connection.conn = ConnState::Disconnected;
-        app.set_status(LogLevel::Debug, "test", "before disconnected guard");
+        app.diagnostics
+            .set_status(LogLevel::Debug, "test", "before disconnected guard");
         assert!(!can_send_server_commands(&mut app));
         assert_eq!(
             app.diagnostics.status,
@@ -1907,7 +1966,8 @@ mod model_popup_tests {
         );
 
         app.connection.conn = ConnState::Connected;
-        app.set_status(LogLevel::Debug, "test", "retained");
+        app.diagnostics
+            .set_status(LogLevel::Debug, "test", "retained");
         assert!(can_send_server_commands(&mut app));
         assert_eq!(app.diagnostics.status, "retained");
     }

@@ -111,7 +111,7 @@ fn handle_connection_event(app: &mut App, event: ConnectionEvent) -> Vec<Effect>
         effects
     } else {
         if was_connected && app.connection.conn == ConnState::Disconnected {
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Warn,
                 "connection",
                 "connection lost - reconnecting...",
@@ -133,7 +133,7 @@ fn reconnect_session_effects(app: &mut App) -> Vec<Effect> {
         })];
     }
     if app.sessions.is_remote_session_id(&session_id) {
-        app.set_status(
+        app.diagnostics.set_status(
             LogLevel::Warn,
             "session",
             "remote session is missing node id; reconnect attach skipped",
@@ -156,32 +156,28 @@ fn handle_supervisor_event(app: &mut App, event: ServerEvent) -> Vec<Effect> {
         ServerEvent::Starting => {
             app.connection.apply_server_starting();
             if app.connection.conn != ConnState::Connected {
-                app.set_status(LogLevel::Info, "acp", "starting qmtcode ACP agent...");
+                app.diagnostics
+                    .set_status(LogLevel::Info, "acp", "starting qmtcode ACP agent...");
             }
         }
         ServerEvent::Started => {
             app.connection.apply_server_started();
             if app.connection.conn != ConnState::Connected {
-                app.set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
-            }
-        }
-        ServerEvent::BinaryNotFound => {
-            app.connection.apply_server_binary_not_found();
-            if app.connection.conn != ConnState::Connected {
-                app.set_status(
-                    LogLevel::Warn,
-                    "acp",
-                    "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
-                );
+                app.diagnostics
+                    .set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
             }
         }
         ServerEvent::StartFailed { error } => {
             app.connection.apply_server_start_failed(error.clone());
-            app.set_status(LogLevel::Error, "acp", format!("ACP start failed: {error}"));
+            app.diagnostics.set_status(
+                LogLevel::Error,
+                "acp",
+                format!("ACP start failed: {error}"),
+            );
         }
         ServerEvent::Stopped { reason } => {
             app.connection.apply_server_stopped(reason.clone());
-            app.set_status(
+            app.diagnostics.set_status(
                 LogLevel::Warn,
                 "acp",
                 format!("ACP agent stopped ({reason})"),
@@ -206,17 +202,21 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
                 ExternalEditorOutcome::Completed(updated_input) => {
                     app.composer.replace_input_from_editor(updated_input);
                     app.render.reset_composer_input_geometry();
-                    app.set_status(
+                    app.diagnostics.set_status(
                         LogLevel::Info,
                         "editor",
                         "loaded prompt from external editor",
                     );
                 }
                 ExternalEditorOutcome::Cancelled => {
-                    app.set_status(LogLevel::Info, "editor", "external editor cancelled");
+                    app.diagnostics.set_status(
+                        LogLevel::Info,
+                        "editor",
+                        "external editor cancelled",
+                    );
                 }
                 ExternalEditorOutcome::Failed(message) => {
-                    app.set_status(
+                    app.diagnostics.set_status(
                         LogLevel::Error,
                         "editor",
                         format!("external editor failed: {message}"),
@@ -238,7 +238,8 @@ fn handle_runtime_event(app: &mut App, event: RuntimeEvent) -> Vec<Effect> {
             } else {
                 Vec::new()
             };
-            app.set_status(LogLevel::Error, "command", message);
+            app.diagnostics
+                .set_status(LogLevel::Error, "command", message);
             effects
         }
     }
@@ -1809,7 +1810,8 @@ mod tests {
         seed_thinking_cache(&mut app);
         seed_card_cache(&mut app, 7);
         app.diagnostics.status = "preserved status".into();
-        app.push_log(LogLevel::Debug, "test", "before usage");
+        app.diagnostics
+            .push_log(LogLevel::Debug, "test", "before usage");
         let log_count_before = app.diagnostics.logs.len();
 
         let effects = apply_session_update(
@@ -3667,22 +3669,14 @@ mod tests {
         assert_eq!(app.connection.server_state, ServerState::Running);
         assert_eq!(app.diagnostics.status, "qmtcode ACP agent started");
 
-        update(&mut app, AppEvent::Supervisor(ServerEvent::BinaryNotFound));
-        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
-        assert_eq!(
-            app.diagnostics.status,
-            "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml"
-        );
-
         app.connection.conn = ConnState::Connected;
-        app.set_status(LogLevel::Debug, "test", "retained");
+        app.diagnostics
+            .set_status(LogLevel::Debug, "test", "retained");
         update(&mut app, AppEvent::Supervisor(ServerEvent::Starting));
         assert_eq!(app.connection.server_state, ServerState::Starting);
         assert_eq!(app.diagnostics.status, "retained");
 
         update(&mut app, AppEvent::Supervisor(ServerEvent::Started));
-        update(&mut app, AppEvent::Supervisor(ServerEvent::BinaryNotFound));
-        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
         assert_eq!(app.diagnostics.status, "retained");
 
         update(

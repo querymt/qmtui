@@ -48,11 +48,6 @@ impl AuthProviderEntry {
         !self.supports_oauth && self.env_var_name.is_some()
     }
 
-    /// Provider supports multiple auth methods (both OAuth and API key).
-    pub fn has_multiple_auth_methods(&self) -> bool {
-        self.supports_oauth && self.env_var_name.is_some()
-    }
-
     /// Provider requires OAuth but the build doesn't include it.
     pub fn is_unconfigurable(&self) -> bool {
         !self.supports_oauth && self.env_var_name.is_none()
@@ -267,17 +262,14 @@ mod tests {
     #[test]
     fn auth_provider_classification_helpers() {
         let multi = make_provider("OpenAI");
-        assert!(multi.has_multiple_auth_methods());
         assert!(!multi.is_oauth_only());
         assert!(!multi.is_api_key_only());
 
         let oauth_only = make_oauth_only("Codex");
         assert!(oauth_only.is_oauth_only());
-        assert!(!oauth_only.has_multiple_auth_methods());
 
         let api_only = make_api_key_only("Groq");
         assert!(api_only.is_api_key_only());
-        assert!(!api_only.has_multiple_auth_methods());
     }
 
     #[test]

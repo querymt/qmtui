@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+// Backend profile metadata is retained even when not currently displayed.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProfileInfo {
     pub id: String,
@@ -16,6 +18,7 @@ pub struct ProfileInfo {
     pub fingerprint: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentInfo {
     pub id: String,

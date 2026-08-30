@@ -13,20 +13,16 @@ use crate::domain::model::DelegateModelPreference;
 // ── path overrides for tests ─────────────────────────────────────────────────
 
 static CONFIG_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
 static TEST_PERSISTENCE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn config_path_override() -> &'static Mutex<Option<PathBuf>> {
     CONFIG_PATH_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
 fn test_persistence_lock() -> &'static Mutex<()> {
     TEST_PERSISTENCE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Override the config path used by `TuiConfig::load()` / `save()`.
-/// Intended for tests only; production code should not call this.
-pub fn test_set_config_path_override(path: Option<PathBuf>) {
-    *config_path_override().lock().unwrap() = path;
 }
 
 #[cfg(test)]

@@ -6,8 +6,10 @@ pub enum ElicitationResponseOutcome {
     Text(String),
     Boolean(bool),
     Declined,
+    #[allow(dead_code)]
     Cancelled,
     UnsupportedSchema,
+    #[allow(dead_code)]
     Responded,
 }
 
@@ -32,19 +34,23 @@ pub enum ChatEntry {
         is_error: bool,
         detail: ToolDetail,
     },
+    #[allow(dead_code)]
     CompactionStart {
         token_estimate: u32,
     },
+    #[allow(dead_code)]
     CompactionEnd {
         token_estimate: Option<u32>,
         summary: String,
         summary_len: u32,
     },
+    #[allow(dead_code)]
     Info(String),
     Error(String),
     Elicitation {
         elicitation_id: String,
         message: String,
+        #[allow(dead_code)]
         source: String,
         /// None is pending; Some records the semantic response state.
         outcome: Option<ElicitationResponseOutcome>,

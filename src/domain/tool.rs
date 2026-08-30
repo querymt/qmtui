@@ -87,6 +87,7 @@ pub enum ToolDetail {
     ReplaceSymbolInput {
         replacements: Vec<SymbolReplacement>,
     },
+    #[allow(dead_code)]
     ReplaceSymbolDiff {
         replacements: Vec<SymbolReplacement>,
         sections: Vec<SymbolDiffSection>,

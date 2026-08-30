@@ -21,8 +21,6 @@ pub(crate) struct MentionState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SlashCompletionState {
-    /// The text typed after the leading `/` (e.g. `"mo"` while typing `/mo`).
-    pub(crate) query: String,
     pub(crate) selected_index: usize,
     pub(crate) results: Vec<&'static crate::slash::SlashCommandDef>,
 }
@@ -371,7 +369,6 @@ impl ComposerState {
             .unwrap_or(0);
 
         self.slash_state = Some(SlashCompletionState {
-            query,
             selected_index,
             results,
         });
@@ -749,7 +746,6 @@ mod tests {
         state.refresh_slash_state();
 
         let slash_state = state.slash_state.as_ref().unwrap();
-        assert_eq!(slash_state.query, "mo");
         assert_eq!(
             slash_state.selected_index,
             slash_state.results.len().saturating_sub(1)

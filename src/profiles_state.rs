@@ -54,6 +54,7 @@ impl ProfilesState {
             .find(|profile| profile.id == profile_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_profile(&self) -> Option<&ProfileInfo> {
         self.active_profile_id
             .as_deref()
@@ -148,6 +149,7 @@ impl ProfilesState {
         self.session_profiles.get(session_id).map(String::as_str)
     }
 
+    #[cfg(test)]
     pub(crate) fn session_profile(&self, session_id: &str) -> Option<&ProfileInfo> {
         self.session_profile_id(session_id)
             .and_then(|profile_id| self.profile_by_id(profile_id))

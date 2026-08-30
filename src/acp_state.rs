@@ -353,7 +353,8 @@ impl crate::app::App {
                 }
                 let effects = self.apply_auth_action(AuthAction::ClearUiNotice);
                 debug_assert!(effects.is_empty());
-                self.set_status(LogLevel::Info, "connection", "connected");
+                self.diagnostics
+                    .set_status(LogLevel::Info, "connection", "connected");
                 vec![]
             }
             AcpAppEvent::AgentMode { mode } => {
@@ -413,7 +414,7 @@ impl crate::app::App {
                 vec![]
             }
             AcpAppEvent::ControlCapabilitiesUnavailable(message) => {
-                self.push_log(
+                self.diagnostics.push_log(
                     LogLevel::Warn,
                     "capabilities",
                     format!("capabilities unavailable: {message}"),
@@ -470,7 +471,7 @@ impl crate::app::App {
                 updates,
             } => {
                 let updates = normalize_replay_updates(updates);
-                self.push_log(
+                self.diagnostics.push_log(
                     LogLevel::Info,
                     "session",
                     format!("session replay: {} update(s)", updates.len()),
@@ -527,7 +528,7 @@ impl crate::app::App {
                 self.apply_auth_action(AuthAction::OAuthResult(result))
             }
             AcpAppEvent::InfoLog { target, message } => {
-                self.push_log(LogLevel::Info, target, message);
+                self.diagnostics.push_log(LogLevel::Info, target, message);
                 vec![]
             }
             AcpAppEvent::Error { message } => {
@@ -545,7 +546,8 @@ impl crate::app::App {
             effects,
         } = self.auth.reduce(action);
         for diagnostic in diagnostics {
-            self.push_log(diagnostic.level, "auth", diagnostic.message);
+            self.diagnostics
+                .push_log(diagnostic.level, "auth", diagnostic.message);
         }
         effects
     }
@@ -561,12 +563,12 @@ impl crate::app::App {
                     level,
                     target,
                     message,
-                } => self.push_log(level, target, message),
+                } => self.diagnostics.push_log(level, target, message),
                 ModelCoordination::Status {
                     level,
                     target,
                     message,
-                } => self.set_status(level, target, message),
+                } => self.diagnostics.set_status(level, target, message),
                 ModelCoordination::SetContextLimit(limit) => self.chat.context_limit = limit,
             }
         }
@@ -641,7 +643,7 @@ impl crate::app::App {
                     level,
                     target,
                     message,
-                } => self.set_status(level, target, message),
+                } => self.diagnostics.set_status(level, target, message),
                 SessionCoordination::SynchronizeProfileCommands {
                     session_id,
                     root_only,
@@ -739,7 +741,7 @@ impl crate::app::App {
                     level,
                     target,
                     message,
-                } => self.set_status(level, target, message),
+                } => self.diagnostics.set_status(level, target, message),
                 HistoryCoordination::ClosePopup => self.navigation.popup = Popup::None,
                 HistoryCoordination::ReloadActiveSession => {
                     if let Some(session_id) = self.sessions.session_id.clone() {
@@ -837,12 +839,12 @@ impl crate::app::App {
                     level,
                     target,
                     message,
-                } => self.push_log(level, target, message),
+                } => self.diagnostics.push_log(level, target, message),
                 ChatCoordination::Status {
                     level,
                     target,
                     message,
-                } => self.set_status(level, target, message),
+                } => self.diagnostics.set_status(level, target, message),
                 ChatCoordination::RefreshTransientStatus => self.refresh_transient_status(),
             }
         }
@@ -1096,7 +1098,7 @@ impl crate::app::App {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .unwrap_or("none");
-        self.push_log(
+        self.diagnostics.push_log(
             LogLevel::Info,
             "capabilities",
             format!(
@@ -1125,7 +1127,7 @@ impl crate::app::App {
                 .get("models")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            self.push_log(
+            self.diagnostics.push_log(
                 LogLevel::Debug,
                 "capabilities",
                 format!(
@@ -1148,7 +1150,7 @@ impl crate::app::App {
             .map(String::as_str)
             .filter(|m| m.starts_with("querymt/"))
             .collect();
-        self.push_log(
+        self.diagnostics.push_log(
             LogLevel::Debug,
             "capabilities",
             format!(
@@ -1164,7 +1166,7 @@ impl crate::app::App {
             } else {
                 String::new()
             };
-            self.push_log(
+            self.diagnostics.push_log(
                 LogLevel::Debug,
                 "capabilities",
                 format!("querymt methods: {}{suffix}", preview.join(", ")),

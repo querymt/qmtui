@@ -704,7 +704,12 @@ impl ChatState {
                 name,
                 detail,
             } => {
-                if self.reconcile_tool_call_start(tool_call_id.as_deref(), &name, detail.clone()) {
+                if tool_detail::reconcile_tool_call_start(
+                    &mut self.messages,
+                    tool_call_id.as_deref(),
+                    &name,
+                    detail.clone(),
+                ) {
                     self.clear_streaming_thinking();
                     (
                         ChatToolTransition::StartInserted(ToolStartInsertionTransition::Reconciled),
@@ -1059,14 +1064,6 @@ impl ChatState {
             }
             ActivityState::SessionOp(SessionOp::Undo) => Some("undoing...".into()),
             ActivityState::SessionOp(SessionOp::Redo) => Some("redoing...".into()),
-        }
-    }
-
-    pub(crate) fn pending_session_label(&self) -> Option<&'static str> {
-        match self.activity {
-            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing"),
-            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing"),
-            _ => None,
         }
     }
 
@@ -1694,42 +1691,6 @@ impl ChatState {
         AssistantMessageTransition::Appended
     }
 
-    pub(crate) fn reconcile_tool_call_start(
-        &mut self,
-        tool_call_id: Option<&str>,
-        tool_name: &str,
-        detail: ToolDetail,
-    ) -> bool {
-        let Some(tool_call_id) = tool_call_id else {
-            return false;
-        };
-        let fallback_name = format!("{tool_name} (failed)");
-        for entry in self.messages.iter_mut().rev() {
-            if let ChatEntry::ToolCall {
-                tool_call_id: Some(existing),
-                name,
-                detail: existing_detail,
-                ..
-            } = entry
-            {
-                if existing != tool_call_id {
-                    continue;
-                }
-                let is_failed_fallback = name == &fallback_name;
-                if is_failed_fallback {
-                    *name = tool_name.to_string();
-                }
-                if (is_failed_fallback || matches!(existing_detail, ToolDetail::None))
-                    && !matches!(detail, ToolDetail::None)
-                {
-                    *existing_detail = detail;
-                }
-                return true;
-            }
-        }
-        false
-    }
-
     fn tool_call_detail(&self, tool_call_id: Option<&str>) -> Option<&ToolDetail> {
         let tool_call_id = tool_call_id?;
         self.messages.iter().rev().find_map(|entry| match entry {
@@ -1809,39 +1770,6 @@ impl ChatState {
         } else {
             self.messages.push(ChatEntry::Error(message.to_string()));
             true
-        }
-    }
-
-    pub(crate) fn backfill_elicitation_outcomes(&mut self, result_str: &str) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(result_str) else {
-            return;
-        };
-        let Some(answers) = value.get("answers").and_then(|answers| answers.as_array()) else {
-            return;
-        };
-
-        let mut answer_iter = answers.iter();
-        for entry in &mut self.messages {
-            let ChatEntry::Elicitation { outcome, .. } = entry else {
-                continue;
-            };
-            if outcome.as_ref() != Some(&ElicitationResponseOutcome::Responded) {
-                continue;
-            }
-            let Some(answer_entry) = answer_iter.next() else {
-                break;
-            };
-            let labels = answer_entry
-                .get("answers")
-                .and_then(|answers| answers.as_array())
-                .map(|answers| {
-                    answers
-                        .iter()
-                        .filter_map(|answer| answer.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            *outcome = Some(ElicitationResponseOutcome::Selected(labels));
         }
     }
 }
@@ -2048,7 +1976,6 @@ mod tests {
         assert!(!chat.cancel_confirm_active());
         chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         assert!(chat.has_pending_session_op());
-        assert_eq!(chat.pending_session_label(), Some("undoing"));
         assert!(chat.input_blocked_by_activity());
     }
 
@@ -2577,67 +2504,6 @@ mod tests {
                 message: "fork rejected by server".into(),
             }]
         );
-    }
-
-    #[test]
-    fn elicitation_resolution_and_backfill_update_durable_cards() {
-        let mut chat = ChatState::new();
-        chat.messages.push(ChatEntry::Elicitation {
-            elicitation_id: "elic-1".into(),
-            message: "Pick".into(),
-            source: "question".into(),
-            outcome: None,
-        });
-        let mut active = ElicitationState::new_for_test(Vec::new());
-        active.elicitation_id = "elic-1".into();
-        chat.elicitation = Some(active);
-        chat.elicitation_ui = Some(ElicitationUiState::default());
-
-        let outcome = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
-            elicitation_id: "elic-1".into(),
-            outcome: ElicitationResponseOutcome::Responded,
-        });
-        assert_eq!(outcome.transition, ElicitationTransition::ResolvedActive);
-        assert!(chat.elicitation.is_none());
-        chat.backfill_elicitation_outcomes(
-            r#"{"answers":[{"question":"Pick","answers":["Alpha","Beta"]}]}"#,
-        );
-        assert!(matches!(
-            &chat.messages[0],
-            ChatEntry::Elicitation { outcome: Some(outcome), .. }
-                if outcome == &ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into()])
-        ));
-    }
-
-    #[test]
-    fn elicitation_backfill_ignores_malformed_results_and_preserves_missing_answers_behavior() {
-        let mut chat = ChatState::new();
-        chat.messages.push(ChatEntry::Elicitation {
-            elicitation_id: "elic-1".into(),
-            message: "Pick".into(),
-            source: "question".into(),
-            outcome: Some(ElicitationResponseOutcome::Responded),
-        });
-
-        for result in ["not json", r#"{"answers":"invalid"}"#] {
-            chat.backfill_elicitation_outcomes(result);
-            assert!(matches!(
-                chat.messages.as_slice(),
-                [ChatEntry::Elicitation {
-                    outcome: Some(ElicitationResponseOutcome::Responded),
-                    ..
-                }]
-            ));
-        }
-
-        chat.backfill_elicitation_outcomes(r#"{"answers":[{"question":"Pick"}]}"#);
-        assert!(matches!(
-            chat.messages.as_slice(),
-            [ChatEntry::Elicitation {
-                outcome: Some(ElicitationResponseOutcome::Selected(labels)),
-                ..
-            }] if labels.is_empty()
-        ));
     }
 
     #[test]

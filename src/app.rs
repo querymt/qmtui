@@ -4,7 +4,7 @@ use crate::command::Command;
 use crate::composer_state::ComposerState;
 use crate::connection_state::{ConnState, ConnectionState};
 use crate::delegates_state::DelegatesState;
-use crate::diagnostics::{AppLogEntry, DiagnosticsState, LogLevel};
+use crate::diagnostics::{DiagnosticsState, LogLevel};
 use crate::mesh_state::MeshState;
 use crate::models_state::ModelsState;
 use crate::navigation_state::{NavigationState, Popup};
@@ -45,13 +45,12 @@ pub struct App {
     // connection and server lifecycle
     pub(crate) connection: ConnectionState,
 
-    // temporary render-local composition
     pub(crate) render: RenderState,
 
     // auth popup state
     pub(crate) auth: AuthState,
 
-    pub should_quit: bool,
+    pub(crate) should_quit: bool,
 }
 
 impl App {
@@ -144,51 +143,15 @@ impl App {
             .and_then(|session_id| self.profiles.session_profile_id(session_id))
     }
 
-    pub fn current_profile_label(&self) -> String {
-        self.current_session_profile_id()
-            .map(|profile_id| self.profiles.profile_display_name(profile_id))
-            .unwrap_or_else(|| {
-                if self.sessions.current_session_is_remote() {
-                    "remote".to_string()
-                } else {
-                    self.profiles.active_profile_label()
-                }
-            })
-    }
-
     pub fn open_profile_popup(&mut self) {
         self.navigation.popup = Popup::ProfileSelect;
         self.profiles.reset_for_open();
     }
 
-    // phase 11 compatibility forward
-    pub fn push_log(&mut self, level: LogLevel, target: &'static str, message: impl Into<String>) {
-        self.diagnostics.push_log(level, target, message);
-    }
-
-    // phase 11 compatibility forward
-    pub fn set_status(
-        &mut self,
-        level: LogLevel,
-        target: &'static str,
-        message: impl Into<String>,
-    ) {
-        self.diagnostics.set_status(level, target, message);
-    }
-
-    // phase 11 compatibility forward
-    pub fn filtered_logs(&self) -> Vec<&AppLogEntry> {
-        self.diagnostics.filtered_logs()
-    }
-
-    // phase 11 compatibility forward
-    pub fn cycle_log_level_filter(&mut self) {
-        self.diagnostics.cycle_log_level_filter();
-    }
-
     pub fn arm_cancel_confirm(&mut self) {
         self.chat.arm_cancel_confirm();
-        self.set_status(LogLevel::Warn, "input", "press Esc again to stop");
+        self.diagnostics
+            .set_status(LogLevel::Warn, "input", "press Esc again to stop");
     }
 
     pub fn open_fork_turn_popup(&mut self) {
@@ -209,15 +172,17 @@ impl App {
             return;
         }
         if self.chat.elicitation.is_some() {
-            self.set_status(
+            self.diagnostics.set_status(
                 LogLevel::Debug,
                 "elicitation",
                 "question - answer in the panel above input",
             );
         } else if let Some(activity_status) = self.chat.activity_status_text() {
-            self.set_status(LogLevel::Debug, "activity", activity_status);
+            self.diagnostics
+                .set_status(LogLevel::Debug, "activity", activity_status);
         } else if self.connection.conn == ConnState::Connected {
-            self.set_status(LogLevel::Debug, "activity", "ready");
+            self.diagnostics
+                .set_status(LogLevel::Debug, "activity", "ready");
         }
     }
 
@@ -233,7 +198,7 @@ impl App {
             ConnectionEvent::Connecting { attempt, delay_ms } => {
                 self.connection.apply_connecting(attempt, delay_ms);
                 let secs = delay_ms as f64 / 1000.0;
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Warn,
                     "connection",
                     format!("waiting for server - retry {attempt} in {secs:.1}s"),
@@ -241,7 +206,7 @@ impl App {
             }
             ConnectionEvent::Connected => {
                 self.connection.apply_connected();
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Info,
                     "connection",
                     if self.sessions.session_id.is_some() {
@@ -255,7 +220,7 @@ impl App {
                 self.connection.apply_disconnected();
                 self.sessions.session_discovery_in_progress = false;
                 self.sessions.pending_session_group_loads.clear();
-                self.set_status(
+                self.diagnostics.set_status(
                     LogLevel::Warn,
                     "connection",
                     format!("connection lost - {reason}"),
@@ -282,12 +247,6 @@ impl App {
     ) -> Vec<Command> {
         self.models
             .delegate_model_commands_for_session(session_id, profile_id)
-    }
-
-    /// Cursor position for a delegate agent's preferred model in the popup list.
-    pub fn delegate_model_cursor(&self, agent_id: &str) -> usize {
-        self.models
-            .delegate_model_cursor(self.delegate_preference_profile_id(), agent_id)
     }
 }
 
@@ -635,7 +594,7 @@ mod tests {
     use super::*;
     use crate::connection_state::ServerState;
     use crate::domain::activity::{ActivityState, SessionOp};
-    use crate::domain::chat::{ChatEntry, ElicitationResponseOutcome};
+    use crate::domain::chat::ChatEntry;
     use crate::domain::session::{
         ForkBoundaryKind, UndoFrame, UndoFrameStatus, UndoStackSnapshot, UndoState, UndoableTurn,
     };
@@ -898,18 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_session_label_stays_reserved_for_undo_and_redo() {
-        let mut app = App::new();
-        app.chat.activity = ActivityState::Compacting {
-            token_estimate: 9_000,
-        };
-        assert_eq!(app.chat.pending_session_label(), None);
-
-        app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
-        assert_eq!(app.chat.pending_session_label(), Some("undoing"));
-    }
-
-    #[test]
     fn cancel_confirm_arms_expires_and_restores_status() {
         let mut app = App::new();
         app.chat.activity = ActivityState::Thinking;
@@ -934,7 +881,8 @@ mod tests {
     fn refresh_transient_status_preserves_connection_and_operation_precedence() {
         let mut app = App::new();
         app.connection.conn = ConnState::Disconnected;
-        app.set_status(LogLevel::Warn, "connection", "connection lost - retrying");
+        app.diagnostics
+            .set_status(LogLevel::Warn, "connection", "connection lost - retrying");
         app.refresh_transient_status();
         assert_eq!(app.diagnostics.status, "connection lost - retrying");
 
@@ -961,21 +909,18 @@ mod tests {
         assert!(!app.chat.has_pending_session_op());
         assert!(!app.chat.input_blocked_by_activity());
         assert!(!app.chat.should_hide_input_contents());
-        assert_eq!(app.chat.pending_session_label(), None);
 
         app.chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         assert!(!app.chat.is_turn_active());
         assert!(app.chat.has_pending_session_op());
         assert!(app.chat.input_blocked_by_activity());
         assert!(app.chat.should_hide_input_contents());
-        assert_eq!(app.chat.pending_session_label(), Some("undoing"));
 
         app.chat.activity = ActivityState::SessionOp(SessionOp::Redo);
         assert!(!app.chat.is_turn_active());
         assert!(app.chat.has_pending_session_op());
         assert!(app.chat.input_blocked_by_activity());
         assert!(app.chat.should_hide_input_contents());
-        assert_eq!(app.chat.pending_session_label(), Some("redoing"));
 
         app.chat.activity = ActivityState::RunningTool {
             name: "read_tool".into(),
@@ -985,7 +930,6 @@ mod tests {
         assert!(!app.chat.has_pending_session_op());
         assert!(!app.chat.input_blocked_by_activity());
         assert!(!app.chat.should_hide_input_contents());
-        assert_eq!(app.chat.pending_session_label(), None);
 
         app.arm_cancel_confirm();
         assert!(app.chat.input_blocked_by_activity());
@@ -1081,114 +1025,6 @@ mod tests {
         assert!(
             matches!(app.diagnostics.logs.last(), Some(entry) if entry.message == "connection lost - socket closed")
         );
-    }
-
-    // ── Elicitation: event handling ───────────────────────────────────────────
-
-    // ── backfill_elicitation_outcomes ─────────────────────────────────────────
-
-    #[test]
-    fn backfill_single_answer_sets_outcome() {
-        let mut messages = vec![ChatEntry::Elicitation {
-            elicitation_id: "e1".into(),
-            message: "Pick one".into(),
-            source: "builtin:question".into(),
-            outcome: Some(ElicitationResponseOutcome::Responded),
-        }];
-        let result = r#"{"answers":[{"question":"Pick one","answers":["Beta"]}]}"#;
-        let mut chat = ChatState::new();
-        chat.messages = messages;
-        chat.backfill_elicitation_outcomes(result);
-        messages = chat.messages;
-        assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["Beta".into()])
-        ));
-    }
-
-    #[test]
-    fn backfill_multi_answer_joins_with_newline() {
-        let mut messages = vec![ChatEntry::Elicitation {
-            elicitation_id: "e1".into(),
-            message: "Pick many".into(),
-            source: "builtin:question".into(),
-            outcome: Some(ElicitationResponseOutcome::Responded),
-        }];
-        let result = r#"{"answers":[{"question":"Pick many","answers":["X","Z"]}]}"#;
-        let mut chat = ChatState::new();
-        chat.messages = messages;
-        chat.backfill_elicitation_outcomes(result);
-        messages = chat.messages;
-        assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["X".into(), "Z".into()])
-        ));
-    }
-
-    #[test]
-    fn backfill_multiple_questions_each_card_gets_its_own_answer() {
-        let mut messages = vec![
-            ChatEntry::Elicitation {
-                elicitation_id: "e1".into(),
-                message: "Q1".into(),
-                source: "builtin:question".into(),
-                outcome: Some(ElicitationResponseOutcome::Responded),
-            },
-            ChatEntry::Elicitation {
-                elicitation_id: "e2".into(),
-                message: "Q2".into(),
-                source: "builtin:question".into(),
-                outcome: Some(ElicitationResponseOutcome::Responded),
-            },
-        ];
-        let result = r#"{"answers":[{"question":"Q1","answers":["Alpha"]},{"question":"Q2","answers":["Yes"]}]}"#;
-        let mut chat = ChatState::new();
-        chat.messages = messages;
-        chat.backfill_elicitation_outcomes(result);
-        messages = chat.messages;
-        assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["Alpha".into()])
-        ));
-        assert!(matches!(&messages[1],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["Yes".into()])
-        ));
-    }
-
-    #[test]
-    fn backfill_skips_already_resolved_cards() {
-        let mut messages = vec![
-            ChatEntry::Elicitation {
-                elicitation_id: "e1".into(),
-                message: "Q1".into(),
-                source: "builtin:question".into(),
-                outcome: Some(ElicitationResponseOutcome::Selected(vec![
-                    "AlreadySet".into(),
-                ])),
-            },
-            ChatEntry::Elicitation {
-                elicitation_id: "e2".into(),
-                message: "Q2".into(),
-                source: "builtin:question".into(),
-                outcome: Some(ElicitationResponseOutcome::Responded),
-            },
-        ];
-        let result = r#"{"answers":[{"question":"Q2","answers":["Beta"]}]}"#;
-        let mut chat = ChatState::new();
-        chat.messages = messages;
-        chat.backfill_elicitation_outcomes(result);
-        messages = chat.messages;
-        // First card unchanged
-        assert!(matches!(&messages[0],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["AlreadySet".into()])
-        ));
-        // Second card updated
-        assert!(matches!(&messages[1],
-            ChatEntry::Elicitation { outcome: Some(o), .. }
-                if o == &ElicitationResponseOutcome::Selected(vec!["Beta".into()])
-        ));
     }
 }
 
