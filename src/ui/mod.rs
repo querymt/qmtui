@@ -16,23 +16,6 @@ use crate::features::sessions::view::{
     StartScreenInput, draw_new_session_popup, draw_session_popup, draw_start as draw_start_screen,
     short_cwd,
 };
-// Re-exports used only by the test module (via `use super::*`).
-#[cfg(test)]
-pub(crate) use crate::features::chat::view::{
-    ICON_DELEGATES, ICON_MULTI_SESSION, build_message_cards, build_message_cards_for_width,
-    build_message_cards_for_width_at, build_streaming_card_for_test,
-};
-#[cfg(test)]
-pub(crate) use crate::features::sessions::view::{StartPageRow, build_start_page_rows};
-#[cfg(test)]
-pub(crate) use crate::markdown::{CardBlock, MD_BULLET};
-#[cfg(test)]
-pub(crate) use crate::render_state::{Card, CardKind, RenderChange};
-#[cfg(test)]
-pub(crate) use crate::view_shared::{
-    SpinnerKind, scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
-};
-
 #[cfg(test)]
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, widgets::Block};
@@ -160,11 +143,6 @@ fn conn_indicator(app: &App) -> Span<'static> {
 }
 
 #[cfg(test)]
-use draw_chat_app as draw_chat;
-#[cfg(test)]
-use draw_delegate_app as draw_delegate_view;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::acp_state::{AcpAppEvent, AcpSessionUpdate};
@@ -186,6 +164,17 @@ mod tests {
     use crate::domain::session::{SessionGroup, SessionSummary};
     use crate::domain::tool::{
         MultiEditSection, ShellOutput, SymbolDiffSection, SymbolReplacement, ToolDetail,
+    };
+    use crate::features::chat::view::{
+        build_message_cards, build_message_cards_for_width, build_message_cards_for_width_at,
+        build_streaming_card_for_test,
+        header::{ICON_DELEGATES, ICON_MULTI_SESSION},
+    };
+    use crate::features::sessions::view::start::{StartPageRow, build_start_page_rows};
+    use crate::markdown::{CardBlock, MD_BULLET};
+    use crate::render_state::{Card, CardKind, RenderChange};
+    use crate::view_shared::{
+        SpinnerKind, scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
     };
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -269,14 +258,14 @@ mod tests {
     fn render_chat_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chat(f, app)).unwrap();
+        terminal.draw(|f| draw_chat_app(f, app)).unwrap();
         terminal.backend().buffer().clone()
     }
 
     fn render_delegate_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_delegate_view(f, app)).unwrap();
+        terminal.draw(|f| draw_delegate_app(f, app)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -968,7 +957,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw_chat(f, &mut app)).unwrap();
+        terminal.draw(|f| draw_chat_app(f, &mut app)).unwrap();
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
 
         assert_eq!(cursor, Position::new(2, 8));

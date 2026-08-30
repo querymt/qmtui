@@ -211,7 +211,7 @@ mod tests {
         ElicitationField, ElicitationFieldKind, ElicitationOption, ElicitationState,
     };
     use crate::domain::tool::ToolDetail;
-    use crate::handlers::*;
+    use crate::handlers::{handle_profile_popup_key, handle_theme_popup_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -508,7 +508,7 @@ mod tests {
             },
         });
 
-        let old_preview_fg = crate::ui::build_message_cards(&mut app)
+        let old_preview_fg = crate::features::chat::view::build_message_cards(&mut app)
             .iter()
             .find_map(|card| {
                 let lines = card.lines_for(120);
@@ -570,7 +570,7 @@ mod tests {
             } if old == "aaa" && new == "bbb"
         ));
 
-        let rebuilt_preview_fg = crate::ui::build_message_cards(&mut app)
+        let rebuilt_preview_fg = crate::features::chat::view::build_message_cards(&mut app)
             .iter()
             .find_map(|card| {
                 let lines = card.lines_for(120);
@@ -597,7 +597,7 @@ mod external_editor_tests {
     use crate::config::{AcpConfig, TestPersistenceGuard, TuiConfig};
     use crate::domain::activity::{ActivityState, SessionOp};
     use crate::domain::chat::ChatEntry;
-    use crate::handlers::*;
+    use crate::handlers::{handle_chat_key, handle_fork_turn_popup_key, handle_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serial_test::serial;
 
@@ -1800,7 +1800,7 @@ mod sessions_key_tests {
     use super::*;
     use crate::command::Command;
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::handlers::*;
+    use crate::handlers::{SessionKeyAction, apply_sessions_key, handle_sessions_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2065,7 +2065,10 @@ mod session_popup_key_tests {
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     };
     use crate::domain::session::{SessionGroup, SessionSummary};
-    use crate::handlers::*;
+    use crate::handlers::{
+        SessionKeyAction, apply_popup_session_key, handle_key, handle_new_session_popup_key,
+        handle_session_popup_key,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
@@ -2948,7 +2951,7 @@ mod delegate_popup_key_tests {
     use crate::domain::activity::{
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     };
-    use crate::handlers::*;
+    use crate::handlers::{handle_delegate_popup_key, handle_key, handle_session_popup_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_entry(id: &str, objective: &str, child_sid: Option<&str>) -> DelegateEntry {
@@ -3565,7 +3568,7 @@ mod auth_tests {
     use crate::domain::auth::{
         AuthProviderEntry, OAuthFlow, OAuthFlowKind, OAuthResult, OAuthResultStatus, OAuthStatus,
     };
-    use crate::handlers::*;
+    use crate::handlers::{handle_auth_popup_key, handle_key};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {

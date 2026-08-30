@@ -45,13 +45,12 @@ pub struct App {
     // connection and server lifecycle
     pub(crate) connection: ConnectionState,
 
-    // temporary render-local composition
     pub(crate) render: RenderState,
 
     // auth popup state
     pub(crate) auth: AuthState,
 
-    pub should_quit: bool,
+    pub(crate) should_quit: bool,
 }
 
 impl App {

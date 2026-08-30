@@ -2,7 +2,7 @@ mod cards;
 mod completions;
 mod composer;
 mod elicitation;
-mod header;
+pub(crate) mod header;
 mod history;
 mod screen;
 mod streaming;
@@ -15,8 +15,6 @@ pub(crate) use composer::{draw_input_panel, input_layout_metrics};
 pub(crate) use elicitation::{
     draw_popup as draw_elicitation_popup, popup_height as elicitation_popup_height,
 };
-#[cfg(test)]
-pub(crate) use header::{ICON_DELEGATES, ICON_MULTI_SESSION};
 pub(crate) use history::{ForkPopupInput, draw_fork_turn_popup};
 pub(crate) use screen::{ChatScreenInput, draw_chat, draw_delegate_view};
 #[cfg(test)]
