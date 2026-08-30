@@ -2505,13 +2505,21 @@ mod session_popup_key_tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "qmt-runtime-new-session-{label}-{}-{nanos}-{id}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "qmt-runtime-new-session-{label}-{}-{nanos}-{id}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!(
+                        "failed to create New Session test directory {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
         }
 
         fn path(&self) -> &std::path::Path {
