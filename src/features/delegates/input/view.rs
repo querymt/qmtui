@@ -176,24 +176,125 @@ mod tests {
                 session_id: "parent".into()
             }
         );
+
+        state.parent_session_id = None;
+        assert_eq!(
+            handle_view_key(&state, KeyCode::Esc),
+            DelegateInputResult::NotHandled
+        );
+        assert_eq!(
+            handle_view_key(&state, KeyCode::Char('x')),
+            DelegateInputResult::NotHandled
+        );
     }
 
     #[test]
     fn popup_movement_and_filtering_mutate_delegate_state() {
         let mut state = DelegatesState::new();
-        state.delegate_entries = vec![entry("one", Some("child-1")), entry("two", Some("child-2"))];
+        state.delegate_entries = vec![
+            entry("one", Some("child-1")),
+            entry("two", Some("child-2")),
+            entry("three", Some("child-3")),
+        ];
 
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Up, context(2)),
+            DelegateInputResult::Moved
+        );
+        assert_eq!(state.delegate_cursor, 0);
+
+        for expected_cursor in [1, 2, 2] {
+            assert_eq!(
+                handle_popup_key(&mut state, KeyCode::Down, context(2)),
+                DelegateInputResult::Moved
+            );
+            assert_eq!(state.delegate_cursor, expected_cursor);
+        }
+
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::PageUp, context(2)),
+            DelegateInputResult::Moved
+        );
+        assert_eq!(state.delegate_cursor, 0);
         assert_eq!(
             handle_popup_key(&mut state, KeyCode::PageDown, context(2)),
             DelegateInputResult::Moved
         );
-        assert_eq!(state.delegate_cursor, 1);
+        assert_eq!(state.delegate_cursor, 2);
+
         assert_eq!(
-            handle_popup_key(&mut state, KeyCode::Char('o'), context(1)),
+            handle_popup_key(&mut state, KeyCode::Char('w'), context(2)),
             DelegateInputResult::Filtered
         );
-        assert_eq!(state.delegate_filter, "o");
+        assert_eq!(state.delegate_filter, "w");
         assert_eq!(state.delegate_cursor, 0);
+        assert_eq!(
+            state
+                .visible_entries()
+                .iter()
+                .map(|entry| entry.delegation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two"]
+        );
+        assert_eq!(
+            state
+                .selected_entry()
+                .map(|entry| entry.delegation_id.as_str()),
+            Some("two")
+        );
+
+        state.delegate_cursor = 1;
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Backspace, context(2)),
+            DelegateInputResult::Filtered
+        );
+        assert_eq!(state.delegate_filter, "");
+        assert_eq!(state.delegate_cursor, 0);
+        assert_eq!(state.visible_entries().len(), 3);
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Backspace, context(2)),
+            DelegateInputResult::Filtered
+        );
+        assert_eq!(state.delegate_filter, "");
+        assert_eq!(state.delegate_cursor, 0);
+    }
+
+    #[test]
+    fn popup_unsupported_and_empty_selection_return_not_handled() {
+        let mut state = DelegatesState::new();
+        let unchanged = state.clone();
+
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Enter, context(3)),
+            DelegateInputResult::NotHandled
+        );
+        assert_eq!(state, unchanged);
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Delete, context(3)),
+            DelegateInputResult::NotHandled
+        );
+        assert_eq!(state, unchanged);
+    }
+
+    #[test]
+    fn popup_navigation_boundaries_preserve_typed_moved_result() {
+        let mut state = DelegatesState::new();
+        state.delegate_entries = vec![entry("one", None), entry("two", None)];
+
+        for key in [KeyCode::Up, KeyCode::PageUp] {
+            assert_eq!(
+                handle_popup_key(&mut state, key, context(99)),
+                DelegateInputResult::Moved
+            );
+            assert_eq!(state.delegate_cursor, 0);
+        }
+        for key in [KeyCode::PageDown, KeyCode::Down] {
+            assert_eq!(
+                handle_popup_key(&mut state, key, context(99)),
+                DelegateInputResult::Moved
+            );
+            assert_eq!(state.delegate_cursor, 1);
+        }
     }
 
     #[test]

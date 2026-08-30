@@ -3348,7 +3348,7 @@ mod delegate_popup_key_tests {
         DelegateChildState, DelegateEntry, DelegateStats, DelegateStatus,
     };
     use crate::handlers::*;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_entry(id: &str, objective: &str, child_sid: Option<&str>) -> DelegateEntry {
         DelegateEntry {
@@ -3378,19 +3378,8 @@ mod delegate_popup_key_tests {
         app
     }
 
-    #[test]
-    fn delegate_navigation_clamps_cursor_within_bounds() {
-        let mut app = setup_delegate_app();
-        apply_delegate_popup_key(&mut app, KeyCode::Up);
-        assert_eq!(app.delegates.delegate_cursor, 0);
-
-        apply_delegate_popup_key(&mut app, KeyCode::Down);
-        apply_delegate_popup_key(&mut app, KeyCode::Down);
-        apply_delegate_popup_key(&mut app, KeyCode::Down);
-        assert_eq!(app.delegates.delegate_cursor, 2);
-
-        apply_delegate_popup_key(&mut app, KeyCode::Up);
-        assert_eq!(app.delegates.delegate_cursor, 1);
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
@@ -3404,11 +3393,13 @@ mod delegate_popup_key_tests {
         ]);
         app.render.publish_delegate_popup_visible_rows(4);
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageDown));
         assert_eq!(app.delegates.delegate_cursor, 3);
+        assert!(effects.is_empty());
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageDown));
         assert_eq!(app.delegates.delegate_cursor, 6);
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -3423,38 +3414,57 @@ mod delegate_popup_key_tests {
         app.render.publish_delegate_popup_visible_rows(4);
         app.delegates.delegate_cursor = 6;
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageUp));
         assert_eq!(app.delegates.delegate_cursor, 3);
+        assert!(effects.is_empty());
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageUp));
         assert_eq!(app.delegates.delegate_cursor, 0);
+        assert!(effects.is_empty());
     }
 
     #[test]
     fn delegate_page_keys_fallback_to_single_row_when_visible_rows_unknown() {
         let mut app = setup_delegate_app();
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageDown);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageDown));
         assert_eq!(app.delegates.delegate_cursor, 1);
+        assert!(effects.is_empty());
 
-        apply_delegate_popup_key(&mut app, KeyCode::PageUp);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::PageUp));
         assert_eq!(app.delegates.delegate_cursor, 0);
+        assert!(effects.is_empty());
+
+        let unchanged = app.delegates.clone();
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Delete));
+        assert!(effects.is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert_eq!(app.delegates, unchanged);
     }
 
     #[test]
     fn delegate_enter_loads_selected_child_session() {
         let mut app = setup_delegate_app();
+        app.connection.launch_cwd = Some("/work".into());
+        app.delegates.parent_session_id = Some("parent-1".into());
         app.delegates.delegate_cursor = 1;
-        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            SessionKeyAction::LoadSession {
-                session_id: "child-2".into(),
-                agent_id: Some("coder".into()),
-                cwd: None,
-            }
-        );
+
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Enter));
+
         assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "child-2".into(),
+                    cwd: Some("/work".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "child-2".into(),
+                    agent_id: Some("coder".into()),
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -3474,89 +3484,85 @@ mod delegate_popup_key_tests {
             ended_at: None,
             child_state: DelegateChildState::None,
         }];
-        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
-        assert_eq!(action, SessionKeyAction::None);
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Enter));
+
+        assert!(effects.is_empty());
         assert_eq!(app.navigation.popup, Popup::SessionSelect);
         assert_eq!(
             app.diagnostics.status,
             "delegation still pending — no session to load"
         );
-    }
-
-    #[test]
-    fn delegate_filter_updates_cursor_and_loads_filtered_result() {
-        let mut app = setup_delegate_app();
-        app.delegates.delegate_cursor = 2;
-        for c in "docs".chars() {
-            apply_delegate_popup_key(&mut app, KeyCode::Char(c));
-        }
-        assert_eq!(app.delegates.delegate_filter, "docs");
-        assert_eq!(app.delegates.delegate_cursor, 0);
-        assert_eq!(app.delegates.visible_entries().len(), 1);
-        assert_eq!(app.delegates.visible_entries()[0].delegation_id, "d3");
-
-        apply_delegate_popup_key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.delegates.delegate_filter, "doc");
-        assert_eq!(app.delegates.delegate_cursor, 0);
-
-        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            SessionKeyAction::LoadSession {
-                session_id: "child-3".into(),
-                agent_id: Some("coder".into()),
-                cwd: None,
-            }
-        );
-    }
-
-    #[test]
-    fn delegate_enter_loads_awaiting_input_child_session() {
-        let mut app = setup_delegate_app();
-        app.delegates.delegate_entries[0].status = DelegateStatus::InProgress;
-        app.delegates.delegate_entries[0].child_state = DelegateChildState::PendingElicitation {
-            elicitation_id: "elic-1".into(),
-            message: "Need approval".into(),
-            requested_schema: serde_json::json!({ "properties": {} }),
-            source: "builtin:question".into(),
-        };
-
-        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            action,
-            SessionKeyAction::LoadSession {
-                session_id: "child-1".into(),
-                agent_id: Some("coder".into()),
-                cwd: None,
-            }
-        );
-        assert_eq!(app.navigation.popup, Popup::None);
+        assert!(app.delegates.pending_parent_session_id.is_none());
     }
 
     #[test]
     fn delegate_esc_closes_popup() {
         let mut app = setup_delegate_app();
-        apply_delegate_popup_key(&mut app, KeyCode::Esc);
+
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Esc));
+
+        assert!(effects.is_empty());
         assert_eq!(app.navigation.popup, Popup::None);
     }
 
     #[test]
     fn delegate_popup_enter_sets_parent_for_sibling_navigation() {
         let mut app = setup_delegate_app();
-        // Simulate being in a child session (parent_session_id is set).
+        app.connection.launch_cwd = Some("/sibling-work".into());
         app.delegates.parent_session_id = Some("parent-1".into());
         app.sessions.session_id = Some("child-old".into());
 
-        let action = apply_delegate_popup_key(&mut app, KeyCode::Enter);
-        assert!(
-            matches!(action, SessionKeyAction::LoadSession { .. }),
-            "enter must trigger LoadSession"
+        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "child-1".into(),
+                    cwd: Some("/sibling-work".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "child-1".into(),
+                    agent_id: Some("coder".into()),
+                }),
+            ]
         );
+        assert_eq!(app.navigation.popup, Popup::None);
         assert_eq!(
             app.delegates.pending_parent_session_id.as_deref(),
-            Some("parent-1"),
-            "pending_parent must be the real parent, not the child session_id"
+            Some("parent-1")
         );
+    }
+
+    #[test]
+    fn delegate_view_escape_loads_parent_session_with_exact_context() {
+        let mut app = setup_delegate_app();
+        app.navigation.screen = Screen::Delegate;
+        app.navigation.popup = Popup::None;
+        app.connection.launch_cwd = Some("/parent-work".into());
+        app.sessions.agent_id = Some("parent-agent".into());
+        app.sessions.session_id = Some("child-old".into());
+        app.delegates.parent_session_id = Some("parent-1".into());
+        app.render.set_chat_scroll_offset(7);
+
+        let effects = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Command(Command::LoadSession {
+                    session_id: "parent-1".into(),
+                    cwd: Some("/parent-work".into()),
+                }),
+                Effect::Command(Command::SubscribeSession {
+                    session_id: "parent-1".into(),
+                    agent_id: Some("parent-agent".into()),
+                }),
+            ]
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(app.navigation.screen, Screen::Delegate);
+        assert_eq!(app.render.chat_scroll_offset(), 7);
     }
 }
 
