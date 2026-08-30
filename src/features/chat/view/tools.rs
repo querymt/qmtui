@@ -755,6 +755,24 @@ fn build_write_lines(content: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::tool::{IndexMetadata, SearchResultCounts};
+
+    fn render(name: &str, detail: &ToolDetail) -> Vec<Line<'static>> {
+        render_tool_lines(ToolRenderInput {
+            name,
+            is_error: false,
+            detail,
+            effective_cwd: None,
+            delegate: None,
+        })
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     #[test]
     fn semantic_tool_renderer_accepts_narrow_inputs() {
@@ -762,23 +780,92 @@ mod tests {
             input: Some("request".into()),
             result: Some("response".into()),
         };
-        let lines = render_tool_lines(ToolRenderInput {
-            name: "generic",
-            is_error: false,
-            detail: &detail,
-            effective_cwd: None,
-            delegate: None,
-        });
-        let text = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let lines = render("generic", &detail);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert_eq!(text, ["> generic request", "  response"]);
+    }
+
+    #[test]
+    fn index_tool_call_metadata_suffix_uses_accent_color() {
+        let detail = ToolDetail::Index {
+            path: "src/(generated)/main.rs".into(),
+            metadata: Some(IndexMetadata {
+                language: "rust".into(),
+                imports: 2,
+                functions: 1,
+            }),
+        };
+        let lines = render("index", &detail);
+        let line = &lines[0];
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content, "src/(generated)/main.rs");
+        assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(line.spans[2].content, " (rust, 2 imports, 1 functions)");
+        assert_eq!(line.spans[2].style.fg, Theme::status_accent().fg);
+    }
+
+    #[test]
+    fn search_text_tool_call_counts_suffix_uses_accent_color() {
+        let detail = ToolDetail::SearchText {
+            pattern: "needle".into(),
+            path: String::new(),
+            include: "*.rs".into(),
+            counts: Some(SearchResultCounts {
+                files: 5,
+                matches: 28,
+            }),
+        };
+        let lines = render("search_text", &detail);
+        let line = &lines[0];
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content, "\"needle\" *.rs");
+        assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(line.spans[2].content, " (5 files, 28 matches)");
+        assert_eq!(line.spans[2].style.fg, Theme::status_accent().fg);
+    }
+
+    #[test]
+    fn read_tool_call_range_uses_split_styles() {
+        let detail = ToolDetail::ReadTool {
+            path: "src/acp_state.rs".into(),
+            start_line: Some(2135),
+            end_line: Some(2205),
+        };
+        let lines = render("read_tool", &detail);
+        let line = &lines[0];
+
+        assert_eq!(line_text(line), "> read_tool src/acp_state.rs:2135-2205");
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[1].style.fg, Theme::diff_file().fg);
+        assert_eq!(line.spans[2].content, ":");
+        assert_eq!(line.spans[2].style.fg, Theme::tool_text().fg);
+        assert_eq!(line.spans[3].style.fg, Theme::status_accent().fg);
+    }
+
+    #[test]
+    fn tool_summary_utf8_truncation_is_render_owned_and_char_safe() {
+        let browse_url = format!("https://example.test/{}tail", "界".repeat(50));
+        let objective = format!("{}tail", "界".repeat(50));
+        let expected_url = format!("{}…", browse_url.chars().take(59).collect::<String>());
+        let expected_objective = format!("{}…", objective.chars().take(49).collect::<String>());
+        let browse = ToolDetail::Browse { url: browse_url };
+        let delegate = ToolDetail::Delegate {
+            target_agent_id: String::new(),
+            objective,
+        };
+
+        assert_eq!(
+            [
+                line_text(&render("browse", &browse)[0]),
+                line_text(&render("delegate", &delegate)[0]),
+            ],
+            [
+                format!("> browse {expected_url}"),
+                format!("> delegate {expected_objective}"),
+            ]
+        );
     }
 }
