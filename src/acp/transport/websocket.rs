@@ -348,6 +348,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socket_close_fails_pending_prompt_once_before_connection_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket listener");
+        let url = format!("ws://{}", listener.local_addr().expect("listener address"));
+        let (prompt_seen_tx, prompt_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept WebSocket client");
+            let mut socket = accept_async(stream).await.expect("accept WebSocket");
+
+            let Message::Text(text) = socket
+                .next()
+                .await
+                .expect("new-session request")
+                .expect("valid new-session message")
+            else {
+                panic!("text new-session request");
+            };
+            let request: serde_json::Value = serde_json::from_str(&text).expect("request JSON");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "sessionId": "session-1" }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send new-session response");
+
+            let Message::Text(text) = socket
+                .next()
+                .await
+                .expect("prompt request")
+                .expect("valid prompt message")
+            else {
+                panic!("text prompt request");
+            };
+            let request: serde_json::Value = serde_json::from_str(&text).expect("prompt JSON");
+            assert_eq!(request["method"], "session/prompt");
+            prompt_seen_tx.send(()).expect("signal pending prompt");
+            socket.close(None).await.expect("close socket");
+        });
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let connection_task =
+            tokio::spawn(async move { run(url, &mut cmd_rx, srv_tx, conn_tx, None).await });
+        cmd_tx
+            .send(Command::NewSession {
+                cwd: None,
+                profile_id: None,
+            })
+            .expect("send new-session command");
+        cmd_tx
+            .send(Command::Prompt {
+                prompt: vec![PromptBlock::Text {
+                    text: "hello".to_string(),
+                }],
+                local_id: "local-close".to_string(),
+            })
+            .expect("send prompt command");
+        tokio::time::timeout(Duration::from_secs(1), prompt_seen_rx)
+            .await
+            .expect("prompt reached server")
+            .expect("prompt signal");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), connection_task)
+            .await
+            .expect("connection returned")
+            .expect("connection task")
+            .expect_err("socket closure error");
+        assert!(error.to_string().contains("connection closed"));
+        let failures = std::iter::from_fn(|| srv_rx.try_recv().ok())
+            .filter_map(|message| match message {
+                ServerChannelMsg::Acp(AcpAppEvent::PromptFailed { local_id, message }) => {
+                    Some((local_id, message))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "local-close");
+        assert!(failures[0].1.contains("socket closed"));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn abort_spawned_cancels_owned_prompt_work() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let connection = WebSocketConnection::new(Peer::new(tx));

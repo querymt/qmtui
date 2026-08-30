@@ -190,6 +190,51 @@ mod tests {
         (task, envelope)
     }
 
+    fn wire_value(rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
+        let Message::Text(text) = rx.try_recv().expect("wire message") else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).expect("wire JSON")
+    }
+
+    #[test]
+    fn notify_omits_id_and_respond_selects_result_or_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+
+        peer.notify("session/update", json!({ "value": 1 }))
+            .expect("notification");
+        peer.respond(json!(7), Ok(json!({ "accepted": true })))
+            .expect("successful response");
+        peer.respond(json!(8), Err(internal_error("permission denied")))
+            .expect("error response");
+
+        assert_eq!(
+            wire_value(&mut rx),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "value": 1 }
+            })
+        );
+        assert_eq!(
+            wire_value(&mut rx),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": { "accepted": true }
+            })
+        );
+        let error = wire_value(&mut rx);
+        assert_eq!(error["jsonrpc"], "2.0");
+        assert_eq!(error["id"], 8);
+        assert!(error.get("result").is_none());
+        assert_eq!(error["error"]["code"], -32603);
+        assert_eq!(error["error"]["message"], "Internal error");
+        assert_eq!(error["error"]["data"], "permission denied");
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn ids_start_at_one_and_out_of_order_responses_correlate() {
         let (tx, mut rx) = mpsc::unbounded_channel();
