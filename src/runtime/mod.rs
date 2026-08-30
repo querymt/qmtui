@@ -218,10 +218,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
-    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
-    }
-
     fn test_terminal() -> AppTerminal {
         ratatui::Terminal::with_options(
             ratatui::backend::CrosstermBackend::new(std::io::stdout()),
@@ -1713,7 +1709,7 @@ pub async fn run() -> anyhow::Result<()> {
             } | EndpointSelection::Endpoint {
                 missing_binary_fallback: true,
                 ..
-            } | EndpointSelection::BinaryNotFound
+            }
         ) {
             log_server_binary_discovery(&mut app, &cfg, &discovery);
         }
@@ -1738,10 +1734,6 @@ pub async fn run() -> anyhow::Result<()> {
             discovered_ws: _,
             missing_binary_fallback: _,
         } => (Some(endpoint), state),
-        EndpointSelection::BinaryNotFound => {
-            let _ = sup_event_tx.send(server_manager::ServerEvent::BinaryNotFound);
-            (None, ServerState::BinaryNotFound)
-        }
         EndpointSelection::Disabled => (None, ServerState::Disabled),
     };
 
@@ -1786,12 +1778,16 @@ fn restore_hint(session_id: &str) -> String {
 }
 
 #[cfg(test)]
-struct PersistenceGuard(config::TestPersistenceGuard);
+struct PersistenceGuard {
+    _guard: config::TestPersistenceGuard,
+}
 
 #[cfg(test)]
 impl PersistenceGuard {
     fn new(label: &str) -> Self {
-        Self(config::TestPersistenceGuard::new(label))
+        Self {
+            _guard: config::TestPersistenceGuard::new(label),
+        }
     }
 }
 
@@ -3283,10 +3279,6 @@ mod reasoning_effort_integration_tests {
         }
     }
 
-    fn chord_key(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-    }
-
     fn tab_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
@@ -3366,7 +3358,9 @@ mod reasoning_effort_integration_tests {
             },
         ];
         app.models.model_popup_agent_tab = 0;
-        let expected_delegate_cursor = app.delegate_model_cursor("coder");
+        let expected_delegate_cursor = app
+            .models
+            .delegate_model_cursor(app.delegate_preference_profile_id(), "coder");
         app.models.model_filter = "clear-on-tab-change".into();
         app.models.model_cursor = 9;
 

@@ -1081,6 +1081,7 @@ impl RenderState {
         self.tick = tick;
     }
 
+    #[cfg(test)]
     pub(crate) fn start_page_scroll(&self) -> usize {
         self.start_page.scroll
     }
@@ -1224,6 +1225,7 @@ impl RenderState {
         self.elicitation_custom_editor = ElicitationCustomEditorGeometry::default();
     }
 
+    #[cfg(test)]
     pub(crate) fn chat_scroll_offset(&self) -> u16 {
         self.chat_viewport.scroll_offset
     }

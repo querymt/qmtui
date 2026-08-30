@@ -222,6 +222,7 @@ impl ModelsState {
     }
 
     /// Valid explicit reasoning levels; automatic effort is represented by `None`.
+    #[cfg(test)]
     pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 
     pub(crate) fn new() -> Self {

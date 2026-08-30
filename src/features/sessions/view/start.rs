@@ -29,6 +29,7 @@ pub(crate) struct StartScreenInput<'a> {
 /// Returned by [`build_start_page_rows`] and consumed by [`draw_start`].
 pub(crate) struct StartPageRow {
     /// The logical item this row represents.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) item: StartPageItem,
     /// Pre-rendered line (spans already styled).
     pub(crate) line: Line<'static>,

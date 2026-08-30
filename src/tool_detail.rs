@@ -241,30 +241,6 @@ pub(crate) fn update_tool_detail(
     false
 }
 
-pub(crate) fn mark_tool_call_failed(
-    messages: &mut [ChatEntry],
-    tool_call_id: Option<&str>,
-    tool_name: &str,
-) -> bool {
-    let Some(id) = tool_call_id else { return false };
-    let fallback_name = format!("{tool_name} (failed)");
-    for entry in messages.iter_mut().rev() {
-        if let ChatEntry::ToolCall {
-            tool_call_id: Some(existing),
-            name,
-            is_error,
-            ..
-        } = entry
-            && existing == id
-            && (name == tool_name || name == &fallback_name)
-        {
-            *is_error = true;
-            return true;
-        }
-    }
-    false
-}
-
 fn normalize_args(args: &Value) -> Value {
     args.as_str()
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -1066,36 +1042,6 @@ mod tests {
             ToolDetail::None
         ));
         assert!(matches!(parse_tool_detail("shell", None), ToolDetail::None));
-    }
-
-    #[test]
-    fn failed_tool_end_marks_existing_tool_in_place() {
-        let mut messages = vec![
-            tool_call(
-                "tool-1",
-                "shell",
-                ToolDetail::Generic {
-                    input: Some("echo ok".into()),
-                    result: None,
-                },
-            ),
-            ChatEntry::Assistant {
-                content: "done".into(),
-                thinking: None,
-                message_id: None,
-            },
-        ];
-        assert!(mark_tool_call_failed(
-            &mut messages,
-            Some("tool-1"),
-            "shell",
-        ));
-        assert_eq!(messages.len(), 2);
-        assert!(matches!(
-            messages[0],
-            ChatEntry::ToolCall { is_error: true, .. }
-        ));
-        assert!(matches!(messages[1], ChatEntry::Assistant { .. }));
     }
 
     #[test]

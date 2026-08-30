@@ -10,7 +10,9 @@ use crate::connection_state::ConnState;
 use crate::theme::Theme;
 
 const BRAILLE_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+#[cfg(test)]
 const LINE_SPINNER: &[&str] = &["-", "\\", "|", "/"];
+#[cfg(test)]
 const DOTS_SPINNER: &[&str] = &[".  ", ".. ", "..."];
 
 pub(crate) const CONN_ONLINE: &str = "\u{25CF}";
@@ -71,14 +73,18 @@ pub(crate) fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpinnerKind {
     Braille,
+    #[cfg(test)]
     Line,
+    #[cfg(test)]
     Dots,
 }
 
 fn spinner_frames(kind: SpinnerKind) -> &'static [&'static str] {
     match kind {
         SpinnerKind::Braille => BRAILLE_SPINNER,
+        #[cfg(test)]
         SpinnerKind::Line => LINE_SPINNER,
+        #[cfg(test)]
         SpinnerKind::Dots => DOTS_SPINNER,
     }
 }

@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+// Audit DTOs intentionally deserialize the full backend event contract.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
@@ -139,6 +141,7 @@ pub enum EventKind {
     Unknown,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProgressEntry {
     pub kind: ProgressKind,
@@ -147,6 +150,7 @@ pub struct ProgressEntry {
     pub created_at: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtifactInfo {
     pub kind: String,
@@ -156,6 +160,7 @@ pub struct ArtifactInfo {
     pub created_at: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgressKind {
@@ -165,6 +170,7 @@ pub enum ProgressKind {
     Checkpoint,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionLimits {
     pub max_steps: Option<u32>,
@@ -172,6 +178,7 @@ pub struct SessionLimits {
     pub max_cost_usd: Option<f64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolInfo {
     #[serde(rename = "type", default)]
@@ -180,6 +187,7 @@ pub struct ToolInfo {
     pub function: Option<FunctionToolInfo>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct FunctionToolInfo {
     #[serde(default)]
@@ -191,6 +199,7 @@ pub struct FunctionToolInfo {
 }
 
 /// Subset of the server-side `Delegation` struct that we care about.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DelegationData {
     pub public_id: String,

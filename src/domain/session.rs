@@ -8,6 +8,8 @@ pub struct SessionGroup {
     pub next_cursor: Option<String>,
 }
 
+// Session discovery retains backend metadata beyond the current projection.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionSummary {
     pub session_id: String,
@@ -34,6 +36,7 @@ pub struct SessionSummary {
     pub runtime_state: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionListPage {
     pub groups: Vec<SessionGroup>,
@@ -41,6 +44,7 @@ pub struct SessionListPage {
     pub total_count: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct SessionChildrenPage {
     pub parent_session_id: String,

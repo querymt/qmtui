@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+// Wire fields are retained even when the current UI projects only a subset.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct MeshStatusInfo {
     pub enabled: bool,
@@ -11,12 +13,14 @@ pub struct MeshStatusInfo {
     pub scopes: Vec<MeshScopeInfo>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct MeshScopeInfo {
     pub kind: String,
     pub id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct RemoteNodeInfo {
     pub id: String,
@@ -32,6 +36,7 @@ pub struct MeshNodesInfo {
     pub nodes: Vec<RemoteNodeInfo>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSessionInfo {
     pub id: String,
@@ -44,6 +49,7 @@ pub struct RemoteSessionInfo {
     pub model_id: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSessionListInfo {
     pub node_id: String,
@@ -58,6 +64,7 @@ pub struct RemoteSessionLocation {
     pub cwd: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RemoteSessionAttachInfo {
     pub session_id: String,
@@ -67,6 +74,7 @@ pub struct RemoteSessionAttachInfo {
     pub snapshot: Option<Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct MeshInviteCreatedInfo {
     pub invite_id: String,

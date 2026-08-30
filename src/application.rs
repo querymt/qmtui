@@ -167,16 +167,6 @@ fn handle_supervisor_event(app: &mut App, event: ServerEvent) -> Vec<Effect> {
                     .set_status(LogLevel::Info, "acp", "qmtcode ACP agent started");
             }
         }
-        ServerEvent::BinaryNotFound => {
-            app.connection.apply_server_binary_not_found();
-            if app.connection.conn != ConnState::Connected {
-                app.diagnostics.set_status(
-                    LogLevel::Warn,
-                    "acp",
-                    "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml",
-                );
-            }
-        }
         ServerEvent::StartFailed { error } => {
             app.connection.apply_server_start_failed(error.clone());
             app.diagnostics.set_status(
@@ -3679,13 +3669,6 @@ mod tests {
         assert_eq!(app.connection.server_state, ServerState::Running);
         assert_eq!(app.diagnostics.status, "qmtcode ACP agent started");
 
-        update(&mut app, AppEvent::Supervisor(ServerEvent::BinaryNotFound));
-        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
-        assert_eq!(
-            app.diagnostics.status,
-            "qmtcode not found; install it or set acp.binary_path in ~/.qmt/qmtui.toml"
-        );
-
         app.connection.conn = ConnState::Connected;
         app.diagnostics
             .set_status(LogLevel::Debug, "test", "retained");
@@ -3694,8 +3677,6 @@ mod tests {
         assert_eq!(app.diagnostics.status, "retained");
 
         update(&mut app, AppEvent::Supervisor(ServerEvent::Started));
-        update(&mut app, AppEvent::Supervisor(ServerEvent::BinaryNotFound));
-        assert_eq!(app.connection.server_state, ServerState::BinaryNotFound);
         assert_eq!(app.diagnostics.status, "retained");
 
         update(

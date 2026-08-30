@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod acp;
 mod acp_state;
 mod app;

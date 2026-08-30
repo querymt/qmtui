@@ -804,6 +804,7 @@ pub(crate) fn handle_session_popup_key(app: &mut App, key: KeyEvent) -> Vec<Effe
 }
 
 /// Adapt session-popup input into the existing root-owned session action.
+#[cfg(test)]
 pub(crate) fn apply_popup_session_key(
     app: &mut App,
     key: crossterm::event::KeyCode,
@@ -813,6 +814,7 @@ pub(crate) fn apply_popup_session_key(
     apply_session_popup_input_result(app, result)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_session_fork_toggle_key(app: &mut App, popup_items: bool) -> SessionKeyAction {
     if popup_items {
         let result = toggle_popup_session_children(&mut app.sessions);
@@ -1742,6 +1744,7 @@ pub(crate) enum SessionKeyAction {
 }
 
 /// Adapt sessions-screen input into the existing root-owned session action.
+#[cfg(test)]
 pub(crate) fn apply_sessions_key(
     app: &mut App,
     key: crossterm::event::KeyCode,

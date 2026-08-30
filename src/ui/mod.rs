@@ -29,8 +29,6 @@ use crate::theme::Theme;
 #[cfg(test)]
 use crate::view_shared;
 
-pub(crate) const INPUT_OVERLINE: &str = "\u{00AF}"; // ¯ overline-like separator above chat input
-
 #[cfg(test)]
 use crate::view_shared::{CONN_OFFLINE, CONN_ONLINE};
 
@@ -984,7 +982,6 @@ mod tests {
             results: app.composer.file_index.clone(),
         });
         app.composer.slash_state = Some(crate::composer_state::SlashCompletionState {
-            query: "mo".into(),
             selected_index: 1,
             results: vec![&crate::slash::SLASH_COMMANDS[0]],
         });
@@ -1006,7 +1003,6 @@ mod tests {
             }),
             app.composer.slash_state.as_ref().map(|slash| {
                 (
-                    slash.query.clone(),
                     slash.selected_index,
                     slash
                         .results
@@ -1035,7 +1031,6 @@ mod tests {
                     mention.results.clone(),
                 )),
                 app.composer.slash_state.as_ref().map(|slash| (
-                    slash.query.clone(),
                     slash.selected_index,
                     slash
                         .results

@@ -166,7 +166,6 @@ mod tests {
     fn slash_and_mention_panels_preserve_rows_selection_and_precedence() {
         let mut composer = ComposerState::new();
         composer.slash_state = Some(SlashCompletionState {
-            query: "mo".into(),
             selected_index: 1,
             results: vec![&SLASH_COMMANDS[0], &SLASH_COMMANDS[1]],
         });
@@ -253,7 +252,6 @@ mod tests {
 
         composer.mention_state = None;
         composer.slash_state = Some(SlashCompletionState {
-            query: "missing".into(),
             selected_index: 0,
             results: Vec::new(),
         });

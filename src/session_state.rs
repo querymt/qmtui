@@ -10,7 +10,9 @@ use crate::composer_state::FileIndexEntryLite;
 use crate::diagnostics::LogLevel;
 use crate::domain::activity::SessionActivity;
 use crate::domain::mesh::RemoteSessionLocation;
-use crate::domain::session::{SessionChildrenPage, SessionGroup, SessionListPage, SessionSummary};
+#[cfg(test)]
+use crate::domain::session::SessionChildrenPage;
+use crate::domain::session::{SessionGroup, SessionListPage, SessionSummary};
 
 /// Maximum number of recent sessions shown per group on the start page.
 pub(crate) const MAX_RECENT_SESSIONS: usize = 3;
@@ -783,6 +785,7 @@ impl SessionsState {
         false
     }
 
+    #[cfg(test)]
     pub(crate) fn merge_session_children(&mut self, data: SessionChildrenPage) {
         let remote_locations: Vec<(String, String, Option<String>)> = data
             .sessions
@@ -1013,6 +1016,7 @@ impl SessionsState {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn active_session_count(&self) -> usize {
         const ACTIVE_SESSION_WINDOW: Duration = Duration::from_secs(5);
         let now = Instant::now();
@@ -1160,6 +1164,7 @@ fn matching_session_indices(group: &SessionGroup, query: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, index)| index).collect()
 }
 
+#[cfg(test)]
 fn session_by_id_mut<'a>(
     sessions: &'a mut [SessionSummary],
     session_id: &str,
@@ -1175,6 +1180,7 @@ fn session_by_id_mut<'a>(
     None
 }
 
+#[cfg(test)]
 fn fork_browsing_child(session: &SessionSummary) -> bool {
     session.fork_origin.as_deref() != Some("delegation")
 }

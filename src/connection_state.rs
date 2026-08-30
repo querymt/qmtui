@@ -9,7 +9,6 @@ pub(crate) enum ConnState {
 pub(crate) enum ServerState {
     #[default]
     Disabled,
-    BinaryNotFound,
     Starting,
     Running,
     StartFailed {
@@ -62,10 +61,6 @@ impl ConnectionState {
 
     pub(crate) fn apply_server_started(&mut self) {
         self.server_state = ServerState::Running;
-    }
-
-    pub(crate) fn apply_server_binary_not_found(&mut self) {
-        self.server_state = ServerState::BinaryNotFound;
     }
 
     pub(crate) fn apply_server_start_failed(&mut self, error: String) {
@@ -148,8 +143,6 @@ mod tests {
         assert_eq!(state.server_state, ServerState::Starting);
         state.apply_server_started();
         assert_eq!(state.server_state, ServerState::Running);
-        state.apply_server_binary_not_found();
-        assert_eq!(state.server_state, ServerState::BinaryNotFound);
         state.apply_server_start_failed("invalid command".into());
         assert_eq!(
             state.server_state,

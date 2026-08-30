@@ -95,18 +95,6 @@ impl DelegateEntry {
                 DelegateChildState::PendingElicitation { .. }
             )
     }
-
-    pub fn pending_elicitation(&self) -> Option<(&str, &str, &str)> {
-        match &self.child_state {
-            DelegateChildState::PendingElicitation {
-                elicitation_id,
-                message,
-                source,
-                ..
-            } => Some((elicitation_id.as_str(), message.as_str(), source.as_str())),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,8 +137,13 @@ pub enum ActivityState {
     Idle,
     Thinking,
     Streaming,
-    RunningTool { name: String },
-    Compacting { token_estimate: u32 },
+    RunningTool {
+        name: String,
+    },
+    #[allow(dead_code)]
+    Compacting {
+        token_estimate: u32,
+    },
     SessionOp(SessionOp),
 }
 
@@ -197,10 +190,6 @@ mod tests {
         };
 
         assert!(entry.awaiting_input());
-        assert_eq!(
-            entry.pending_elicitation(),
-            Some(("e1", "Choose", "builtin:question"))
-        );
         entry.status = DelegateStatus::Completed;
         assert!(!entry.awaiting_input());
     }

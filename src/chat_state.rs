@@ -1067,14 +1067,6 @@ impl ChatState {
         }
     }
 
-    pub(crate) fn pending_session_label(&self) -> Option<&'static str> {
-        match self.activity {
-            ActivityState::SessionOp(SessionOp::Undo) => Some("undoing"),
-            ActivityState::SessionOp(SessionOp::Redo) => Some("redoing"),
-            _ => None,
-        }
-    }
-
     pub(crate) fn forkable_turns(&self) -> Vec<ForkTurnItem> {
         let mut turns = Vec::new();
         let mut current_user: Option<(Option<String>, String)> = None;
@@ -1780,39 +1772,6 @@ impl ChatState {
             true
         }
     }
-
-    pub(crate) fn backfill_elicitation_outcomes(&mut self, result_str: &str) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(result_str) else {
-            return;
-        };
-        let Some(answers) = value.get("answers").and_then(|answers| answers.as_array()) else {
-            return;
-        };
-
-        let mut answer_iter = answers.iter();
-        for entry in &mut self.messages {
-            let ChatEntry::Elicitation { outcome, .. } = entry else {
-                continue;
-            };
-            if outcome.as_ref() != Some(&ElicitationResponseOutcome::Responded) {
-                continue;
-            }
-            let Some(answer_entry) = answer_iter.next() else {
-                break;
-            };
-            let labels = answer_entry
-                .get("answers")
-                .and_then(|answers| answers.as_array())
-                .map(|answers| {
-                    answers
-                        .iter()
-                        .filter_map(|answer| answer.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            *outcome = Some(ElicitationResponseOutcome::Selected(labels));
-        }
-    }
 }
 
 fn tool_result_detail_state(detail: &ToolDetail) -> ToolResultDetailState {
@@ -2017,7 +1976,6 @@ mod tests {
         assert!(!chat.cancel_confirm_active());
         chat.activity = ActivityState::SessionOp(SessionOp::Undo);
         assert!(chat.has_pending_session_op());
-        assert_eq!(chat.pending_session_label(), Some("undoing"));
         assert!(chat.input_blocked_by_activity());
     }
 
@@ -2546,67 +2504,6 @@ mod tests {
                 message: "fork rejected by server".into(),
             }]
         );
-    }
-
-    #[test]
-    fn elicitation_resolution_and_backfill_update_durable_cards() {
-        let mut chat = ChatState::new();
-        chat.messages.push(ChatEntry::Elicitation {
-            elicitation_id: "elic-1".into(),
-            message: "Pick".into(),
-            source: "question".into(),
-            outcome: None,
-        });
-        let mut active = ElicitationState::new_for_test(Vec::new());
-        active.elicitation_id = "elic-1".into();
-        chat.elicitation = Some(active);
-        chat.elicitation_ui = Some(ElicitationUiState::default());
-
-        let outcome = chat.reduce_elicitation(ElicitationAction::ResponseAcknowledged {
-            elicitation_id: "elic-1".into(),
-            outcome: ElicitationResponseOutcome::Responded,
-        });
-        assert_eq!(outcome.transition, ElicitationTransition::ResolvedActive);
-        assert!(chat.elicitation.is_none());
-        chat.backfill_elicitation_outcomes(
-            r#"{"answers":[{"question":"Pick","answers":["Alpha","Beta"]}]}"#,
-        );
-        assert!(matches!(
-            &chat.messages[0],
-            ChatEntry::Elicitation { outcome: Some(outcome), .. }
-                if outcome == &ElicitationResponseOutcome::Selected(vec!["Alpha".into(), "Beta".into()])
-        ));
-    }
-
-    #[test]
-    fn elicitation_backfill_ignores_malformed_results_and_preserves_missing_answers_behavior() {
-        let mut chat = ChatState::new();
-        chat.messages.push(ChatEntry::Elicitation {
-            elicitation_id: "elic-1".into(),
-            message: "Pick".into(),
-            source: "question".into(),
-            outcome: Some(ElicitationResponseOutcome::Responded),
-        });
-
-        for result in ["not json", r#"{"answers":"invalid"}"#] {
-            chat.backfill_elicitation_outcomes(result);
-            assert!(matches!(
-                chat.messages.as_slice(),
-                [ChatEntry::Elicitation {
-                    outcome: Some(ElicitationResponseOutcome::Responded),
-                    ..
-                }]
-            ));
-        }
-
-        chat.backfill_elicitation_outcomes(r#"{"answers":[{"question":"Pick"}]}"#);
-        assert!(matches!(
-            chat.messages.as_slice(),
-            [ChatEntry::Elicitation {
-                outcome: Some(ElicitationResponseOutcome::Selected(labels)),
-                ..
-            }] if labels.is_empty()
-        ));
     }
 
     #[test]

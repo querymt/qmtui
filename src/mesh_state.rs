@@ -319,6 +319,7 @@ impl MeshState {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn set_clipboard_fallback(&mut self, url: String) {
         self.mesh_clipboard_fallback = Some(url);
     }

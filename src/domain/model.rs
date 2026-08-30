@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DelegateModelOverrideInfo {
     pub model_id: String,
+    #[allow(dead_code)]
     #[serde(default)]
     pub node_id: Option<String>,
 }
@@ -16,6 +17,8 @@ pub struct DelegateModelPreference {
     pub node_id: Option<String>,
 }
 
+// Provider metadata remains part of the decoded model contract.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub id: String,

@@ -123,15 +123,6 @@ impl Theme {
     fn magenta() -> Color {
         Self::c(0x0E)
     }
-    fn extra() -> Color {
-        Self::c(0x0F)
-    }
-    fn brightest() -> Color {
-        Self::c(0x07)
-    }
-    fn dim_fg() -> Color {
-        Self::c(0x04)
-    }
 
     // -- composed styles --
 
@@ -160,12 +151,7 @@ impl Theme {
     pub fn input() -> Style {
         Style::default().fg(Self::fg()).bg(Self::bg_card())
     }
-    pub fn input_label() -> Style {
-        Style::default()
-            .fg(Self::accent())
-            .bg(Self::bg_card())
-            .add_modifier(Modifier::BOLD)
-    }
+
     pub fn input_thinking() -> Style {
         Style::default().fg(Self::dim()).bg(Self::bg_card())
     }
@@ -187,15 +173,7 @@ impl Theme {
             .bg(Self::bg_card())
             .add_modifier(Modifier::BOLD)
     }
-    pub fn input_compacting() -> Style {
-        Style::default()
-            .fg(Self::accent())
-            .bg(Self::bg_card())
-            .add_modifier(Modifier::BOLD)
-    }
-    pub fn input_border() -> Style {
-        Style::default().fg(Self::accent()).bg(Self::bg_card())
-    }
+
     pub fn input_border_thinking() -> Style {
         Style::default().fg(Self::magenta()).bg(Self::bg_card())
     }
@@ -237,12 +215,7 @@ impl Theme {
     pub fn user_card() -> Style {
         Style::default().bg(Self::bg_card())
     }
-    pub fn user_label() -> Style {
-        Style::default()
-            .fg(Self::accent())
-            .bg(Self::bg_card())
-            .add_modifier(Modifier::BOLD)
-    }
+
     pub fn user_text() -> Style {
         Style::default().fg(Self::bright()).bg(Self::bg_card())
     }
@@ -250,19 +223,11 @@ impl Theme {
     pub fn assistant_card() -> Style {
         Style::default().bg(Self::bg())
     }
-    pub fn assistant_label() -> Style {
-        Style::default()
-            .fg(Self::ok())
-            .bg(Self::bg())
-            .add_modifier(Modifier::BOLD)
-    }
+
     pub fn assistant_text() -> Style {
         Style::default().fg(Self::fg()).bg(Self::bg())
     }
 
-    pub fn tool_label() -> Style {
-        Style::default().fg(Self::dim()).bg(Self::bg())
-    }
     pub fn tool_text() -> Style {
         Style::default()
             .fg(Self::dim())
@@ -317,12 +282,7 @@ impl Theme {
     pub fn selected() -> Style {
         Style::default().fg(Self::bright()).bg(Self::bg_hl())
     }
-    pub fn list_item() -> Style {
-        Style::default().fg(Self::fg()).bg(Self::bg_card())
-    }
-    pub fn list_dim() -> Style {
-        Style::default().fg(Self::dim()).bg(Self::bg_card())
-    }
+
     pub fn session_time() -> Style {
         Style::default().fg(Self::info())
     }
@@ -355,11 +315,7 @@ impl Theme {
     pub fn md_italic() -> Style {
         Style::default().add_modifier(Modifier::ITALIC)
     }
-    pub fn md_bold_italic() -> Style {
-        Style::default()
-            .fg(Self::bright())
-            .add_modifier(Modifier::BOLD | Modifier::ITALIC)
-    }
+
     pub fn md_code_inline() -> Style {
         Style::default().fg(Self::ok()).bg(Self::bg_hl())
     }
@@ -377,11 +333,7 @@ impl Theme {
             .fg(Self::accent())
             .add_modifier(Modifier::BOLD)
     }
-    pub fn md_link() -> Style {
-        Style::default()
-            .fg(Self::info())
-            .add_modifier(Modifier::UNDERLINED)
-    }
+
     pub fn md_link_title() -> Style {
         Style::default().fg(Self::info())
     }
@@ -437,15 +389,6 @@ impl Theme {
     }
 
     // -- connection indicator --
-    pub fn conn_ok() -> Style {
-        Style::default().fg(Self::ok()).bg(Self::bg_dim())
-    }
-    pub fn conn_pending() -> Style {
-        Style::default().fg(Self::warn()).bg(Self::bg_dim())
-    }
-    pub fn conn_err() -> Style {
-        Style::default().fg(Self::err()).bg(Self::bg_dim())
-    }
 
     // -- theme list helpers --
     pub fn available_themes() -> &'static [Base16Palette] {
