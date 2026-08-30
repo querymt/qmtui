@@ -78,12 +78,82 @@ mod tests {
             handle_key(&mut state, key(KeyCode::Char('b'))),
             NewSessionInputResult::Edited
         );
-        assert_eq!(state.new_session_path, "abc");
-        assert_eq!(state.new_session_cursor, 2);
-        handle_key(&mut state, key(KeyCode::Backspace));
-        assert_eq!(state.new_session_path, "ac");
-        handle_key(&mut state, key(KeyCode::End));
-        assert_eq!(state.new_session_cursor, 2);
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 2)
+        );
+
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Left)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 1)
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Right)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 2)
+        );
+
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Home)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 0)
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Left)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 0)
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Backspace)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 0)
+        );
+
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::End)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 3)
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Right)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("abc", 3)
+        );
+
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Left)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Backspace)),
+            NewSessionInputResult::Edited
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("ac", 1)
+        );
     }
 
     #[test]
@@ -105,6 +175,30 @@ mod tests {
         });
 
         assert_eq!(
+            handle_key(&mut state, key(KeyCode::Up)),
+            NewSessionInputResult::MovedCompletion
+        );
+        assert_eq!(
+            state
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            1
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Down)),
+            NewSessionInputResult::MovedCompletion
+        );
+        assert_eq!(
+            state
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+        assert_eq!(
             handle_key(&mut state, key(KeyCode::Down)),
             NewSessionInputResult::MovedCompletion
         );
@@ -117,35 +211,89 @@ mod tests {
             1
         );
         assert_eq!(
+            handle_key(&mut state, key(KeyCode::Up)),
+            NewSessionInputResult::MovedCompletion
+        );
+        assert_eq!(
+            state
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+        assert_eq!(
             handle_key(&mut state, key(KeyCode::Tab)),
             NewSessionInputResult::AcceptCompletion
         );
+
+        state.new_session_completion = Some(PathCompletionState {
+            query: "missing".into(),
+            selected_index: 0,
+            results: Vec::new(),
+        });
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Up)),
+            NewSessionInputResult::MovedCompletion
+        );
+        assert_eq!(
+            state
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Down)),
+            NewSessionInputResult::MovedCompletion
+        );
+        assert_eq!(
+            state
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            0
+        );
+
         accept_completion(&mut state, "/b/".into());
         assert_eq!(state.new_session_path, "/b/");
+        assert_eq!(state.new_session_cursor, 3);
         assert!(state.new_session_completion.is_none());
     }
 
     #[test]
     fn cancel_and_submit_return_data_only_intents() {
         let mut state = SessionsState::new();
-        state.new_session_path = "relative/path".into();
+        state.new_session_path = "  ../project/./  ".into();
         state.new_session_cursor = state.new_session_path.len();
+        let original_path = state.new_session_path.clone();
+        let original_cursor = state.new_session_cursor;
 
         assert_eq!(
             handle_key(&mut state, key(KeyCode::Enter)),
             NewSessionInputResult::Submit {
-                raw_path: "relative/path".into()
+                raw_path: "  ../project/./  ".into()
             }
         );
+        assert_eq!(state.new_session_path, original_path);
+        assert_eq!(state.new_session_cursor, original_cursor);
+
         assert_eq!(
             handle_key(&mut state, key(KeyCode::Esc)),
             NewSessionInputResult::Cancel
         );
+        assert_eq!(state.new_session_path, original_path);
+        assert_eq!(state.new_session_cursor, original_cursor);
     }
 
     #[test]
     fn control_character_is_not_inserted() {
         let mut state = SessionsState::new();
+        state.new_session_path = "project".into();
+        state.new_session_cursor = 3;
+
         assert_eq!(
             handle_key(
                 &mut state,
@@ -153,6 +301,18 @@ mod tests {
             ),
             NewSessionInputResult::NotHandled
         );
-        assert!(state.new_session_path.is_empty());
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("project", 3)
+        );
+
+        assert_eq!(
+            handle_key(&mut state, key(KeyCode::Delete)),
+            NewSessionInputResult::NotHandled
+        );
+        assert_eq!(
+            (state.new_session_path.as_str(), state.new_session_cursor),
+            ("project", 3)
+        );
     }
 }

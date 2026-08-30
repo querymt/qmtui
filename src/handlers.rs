@@ -2450,17 +2450,20 @@ mod model_popup_tests {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
         app.navigation.popup = Popup::NewSession;
-        app.sessions.new_session_path = "/repo".into();
+        app.sessions.new_session_path = "/repo/./project/..".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
         app.profiles.active_profile_id = Some("coder-delegate".into());
-        let mut effects = TestEffects::default();
-        effects.extend(handle_new_session_popup_key(&mut app, key(KeyCode::Enter)));
 
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::NewSession { profile_id: Some(profile_id), .. })
-                if profile_id == "coder-delegate"
-        ));
+        let effects = handle_new_session_popup_key(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::NewSession {
+                cwd: Some("/repo".into()),
+                profile_id: Some("coder-delegate".into()),
+            })]
+        );
     }
 
     #[test]
