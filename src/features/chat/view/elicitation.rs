@@ -634,4 +634,177 @@ mod tests {
             (1, 0, false)
         );
     }
+
+    #[test]
+    fn custom_editor_draw_owns_scroll_resize_and_preserves_elicitation_semantics() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: Some("description".into()),
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![option("a", "Alpha", None)],
+            },
+        }]);
+        state.custom_input = "a\nb\nc\nd\ne\nf\ng".into();
+        state.text_input = "semantic text".into();
+        state
+            .selected
+            .insert("choice".into(), serde_json::json!("a"));
+        let mut ui = ElicitationUiState {
+            field_cursor: 0,
+            option_cursor: 1,
+            text_cursor: 4,
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+        };
+        let snapshot = semantic_snapshot(&state, &ui);
+        let mut render_state = RenderState::new();
+
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 40, 24),
+        );
+        render(&state, &ui, &mut render_state, 40, height);
+        assert_eq!(
+            render_state.test_elicitation_custom_geometry(),
+            (36, 2, true)
+        );
+        assert_eq!(semantic_snapshot(&state, &ui), snapshot);
+
+        ui.custom_cursor = 0;
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 20, 24),
+        );
+        render(&state, &ui, &mut render_state, 20, height);
+        assert_eq!(
+            render_state.test_elicitation_custom_geometry(),
+            (16, 0, true)
+        );
+
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 3, 4),
+        );
+        render(&state, &ui, &mut render_state, 3, height);
+        assert_eq!(render_state.elicitation_custom_line_width(), 1);
+    }
+
+    #[test]
+    fn draw_chat_does_not_panic_with_empty_elicitation_fields() {
+        let state = ElicitationState::new_for_test(vec![]);
+        let ui = ElicitationUiState::default();
+        let mut render_state = RenderState::new();
+
+        let _buffer = render(&state, &ui, &mut render_state, 80, 9);
+    }
+
+    #[test]
+    fn draw_chat_custom_elicitation_wraps_and_expands_with_prefix() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![option("a", "Alpha", None)],
+            },
+        }]);
+        state.custom_input = "a deliberately long custom response that wraps\nsecond line".into();
+        let ui = ElicitationUiState {
+            option_cursor: 1,
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+            ..Default::default()
+        };
+        let mut render_state = RenderState::new();
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 40, 21),
+        );
+
+        let (buffer, _) = render(&state, &ui, &mut render_state, 40, height);
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Custom answer…"));
+        assert!(rendered.contains("> a deliberately long custom"));
+        assert!(rendered.contains("second line"));
+        assert!(rendered.contains("Shift+Enter newline"));
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_question() {
+        let mut state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![option("a", "Alpha", None)],
+            },
+        }]);
+        state.message = "When designing a new system-level tool, which approach best describes how you balance rapid prototyping and maintainability?".into();
+        let ui = ElicitationUiState::default();
+        let mut render_state = RenderState::new();
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 50, 21),
+        );
+
+        let (buffer, _) = render(&state, &ui, &mut render_state, 50, height);
+        let first = find_text(&buffer, "When designing");
+        let second = find_text(&buffer, "best describes how");
+        let option = find_text(&buffer, "Alpha");
+
+        assert!(second.1 > first.1);
+        assert!(option.1 > second.1);
+    }
+
+    #[test]
+    fn draw_chat_wraps_long_elicitation_answers() {
+        let state = ElicitationState::new_for_test(vec![ElicitationField {
+            name: "choice".into(),
+            title: "Choice".into(),
+            description: None,
+            required: true,
+            kind: ElicitationFieldKind::SingleSelect {
+                options: vec![option(
+                    "a",
+                    "Keep the validated prototype as the production foundation and improve it gradually through careful iteration",
+                    None,
+                )],
+            },
+        }]);
+        let ui = ElicitationUiState::default();
+        let mut render_state = RenderState::new();
+        let height = popup_height(
+            Some(&state),
+            Some(&ui),
+            &mut render_state,
+            Rect::new(0, 0, 50, 21),
+        );
+
+        let (buffer, _) = render(&state, &ui, &mut render_state, 50, height);
+        let first = find_text(&buffer, "Keep the validated");
+        let second = find_text(&buffer, "foundation and improve");
+        let custom = find_text(&buffer, "Custom answer…");
+
+        assert!(second.1 > first.1);
+        assert!(custom.1 > second.1);
+    }
 }
