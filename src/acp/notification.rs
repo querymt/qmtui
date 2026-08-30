@@ -388,18 +388,22 @@ mod tests {
                     ]),
             ),
         )));
-        assert!(matches!(
-            failed,
-            Translation::Update(AcpSessionUpdate::ToolCallEnd {
-                tool_call_id: Some(id),
-                name,
-                is_error: true,
-                result: Some(result),
-            }) if id == "tool-2"
-                && name == "tool"
-                && result.contains("failure")
-                && result.contains("file:///tmp/error.log")
-        ));
+        let Translation::Update(AcpSessionUpdate::ToolCallEnd {
+            tool_call_id: Some(id),
+            name,
+            is_error,
+            result: Some(result),
+        }) = failed
+        else {
+            panic!("unexpected failed tool translation: {failed:?}");
+        };
+        assert_eq!(id, "tool-2");
+        assert_eq!(name, "tool");
+        assert!(is_error);
+        assert_eq!(
+            result,
+            "{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"failure\"}}\n{\"type\":\"content\",\"content\":{\"type\":\"resource_link\",\"name\":\"log\",\"uri\":\"file:///tmp/error.log\"}}"
+        );
     }
 
     #[test]

@@ -246,6 +246,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use agent_client_protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
     use tokio::sync::mpsc;
@@ -423,6 +424,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_changed_refreshes_normalized_state_and_event() {
+        let connection = TestConnection::with_responses([json!({
+            "models": [{
+                "id": "openai/gpt-5",
+                "label": "GPT-5",
+                "source": "remote",
+                "provider": "openai",
+                "model": "gpt-5",
+                "node_id": "node-1",
+                "node_label": "Remote Node",
+                "family": "gpt",
+                "quant": "fp16"
+            }],
+            "meta": {
+                "stale": false,
+                "refresh_in_progress": false,
+                "remote_node_count": 2,
+                "remote_timeout_count": 1
+            }
+        })]);
+        let (peer, _wire_rx, state, events, mut event_rx) = websocket_harness();
+
+        websocket_text(
+            &peer,
+            &connection,
+            &state,
+            &events,
+            &envelope("querymt/models/changed", None, json!({})),
+        )
+        .await
+        .expect("models changed notification");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("model refresh timeout")
+            .expect("models event");
+        assert_eq!(
+            connection.messages(),
+            vec![("_querymt/models".into(), json!({}))]
+        );
+        assert!(matches!(
+            event,
+            ServerChannelMsg::Acp(AcpAppEvent::Models { models, meta: Some(meta) })
+                if models.len() == 1
+                    && models[0].id == "openai/gpt-5"
+                    && models[0].label == "GPT-5"
+                    && models[0].provider == "openai"
+                    && models[0].model == "gpt-5"
+                    && models[0].node_id.as_deref() == Some("node-1")
+                    && models[0].node_label.as_deref() == Some("Remote Node")
+                    && models[0].family.as_deref() == Some("gpt")
+                    && models[0].quant.as_deref() == Some("fp16")
+                    && meta.remote_node_count == 2
+                    && meta.remote_timeout_count == 1
+        ));
+        let stored = state
+            .model_by_id("openai/gpt-5")
+            .await
+            .expect("normalized model state");
+        assert_eq!(stored.id, "openai/gpt-5");
+        assert_eq!(stored.label, "GPT-5");
+        assert_eq!(stored.source.as_deref(), Some("remote"));
+        assert_eq!(stored.provider, "openai");
+        assert_eq!(stored.model, "gpt-5");
+        assert_eq!(stored.node_id.as_deref(), Some("node-1"));
+        assert_eq!(stored.node_label.as_deref(), Some("Remote Node"));
+        assert_eq!(stored.family.as_deref(), Some("gpt"));
+        assert_eq!(stored.quant.as_deref(), Some("fp16"));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn mesh_aliases_route_to_the_same_refresh_request_and_event() {
         for method in [
             "querymt/mesh/nodesChanged",
@@ -442,14 +515,17 @@ mod tests {
             )
             .await
             .expect("mesh notification");
-            tokio::task::yield_now().await;
 
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("mesh refresh timeout")
+                .expect("mesh event");
             assert_eq!(
                 connection.messages(),
                 vec![("_querymt/mesh/nodes".into(), json!({}))]
             );
             assert!(matches!(
-                event_rx.try_recv().expect("mesh event"),
+                event,
                 ServerChannelMsg::Acp(AcpAppEvent::MeshNodes(nodes))
                     if nodes.nodes[0].id == "node-1"
             ));
