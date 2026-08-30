@@ -307,8 +307,29 @@ mod tests {
         );
         assert!(state.pending_parent_session_id.is_none());
 
-        state.delegate_entries = vec![entry("ready", Some("child-new"))];
+        let mut awaiting = entry("awaiting", Some("child-awaiting"));
+        awaiting.child_state = DelegateChildState::PendingElicitation {
+            elicitation_id: "elicitation-1".into(),
+            message: "Need approval".into(),
+            requested_schema: serde_json::json!({ "properties": {} }),
+            source: "builtin:question".into(),
+        };
+        state.delegate_entries = vec![awaiting];
         state.parent_session_id = Some("parent".into());
+        assert_eq!(
+            handle_popup_key(&mut state, KeyCode::Enter, context(1)),
+            DelegateInputResult::LoadChild {
+                session_id: "child-awaiting".into(),
+                target_agent_id: Some("coder".into()),
+                current_session_id: Some("child-old".into()),
+                parent_session_id: Some("parent".into()),
+                cwd: Some("/work".into())
+            }
+        );
+        assert_eq!(state.pending_parent_session_id.as_deref(), Some("parent"));
+
+        state.pending_parent_session_id = None;
+        state.delegate_entries = vec![entry("ready", Some("child-new"))];
         assert_eq!(
             handle_popup_key(&mut state, KeyCode::Enter, context(1)),
             DelegateInputResult::LoadChild {

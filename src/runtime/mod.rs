@@ -3446,12 +3446,10 @@ mod delegate_popup_key_tests {
     fn delegate_enter_loads_selected_child_session() {
         let mut app = setup_delegate_app();
         app.connection.launch_cwd = Some("/work".into());
-        app.delegates.parent_session_id = Some("parent-1".into());
         app.delegates.delegate_cursor = 1;
 
-        let effects = handle_delegate_popup_key(&mut app, key(KeyCode::Enter));
+        let effects = handle_session_popup_key(&mut app, key(KeyCode::Enter));
 
-        assert_eq!(app.navigation.popup, Popup::None);
         assert_eq!(
             effects,
             vec![
@@ -3464,6 +3462,11 @@ mod delegate_popup_key_tests {
                     agent_id: Some("coder".into()),
                 }),
             ]
+        );
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            app.delegates.pending_parent_session_id,
+            Some("parent-1".into())
         );
     }
 
