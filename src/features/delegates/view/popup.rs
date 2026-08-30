@@ -366,3 +366,315 @@ pub(crate) fn draw_tab(
     ]);
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
 }
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{
+        backend::TestBackend,
+        layout::{Constraint, Direction, Layout, Rect},
+        style::Modifier,
+    };
+
+    use super::*;
+    use crate::domain::activity::{DelegateChildState, DelegateEntry, DelegateStatus};
+
+    fn delegate_entry(
+        delegation_id: &str,
+        objective: &str,
+        status: DelegateStatus,
+    ) -> DelegateEntry {
+        DelegateEntry {
+            delegation_id: delegation_id.into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: None,
+            objective: objective.into(),
+            status,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        }
+    }
+
+    fn delegate_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+        let popup_width = area.width.saturating_sub(4).clamp(36, 86);
+        let popup_area = Rect {
+            x: area.x + area.width.saturating_sub(popup_width) / 2,
+            y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
+            width: popup_width,
+            height: area.height * 60 / 100,
+        };
+        let inner = Rect {
+            x: popup_area.x + 1,
+            y: popup_area.y + 1,
+            width: popup_area.width.saturating_sub(2),
+            height: popup_area.height.saturating_sub(2),
+        };
+
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner)
+    }
+
+    fn render_delegate_popup(
+        sessions: &SessionsState,
+        delegates: &DelegatesState,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut render = RenderState::new();
+        terminal
+            .draw(|frame| {
+                let chunks = delegate_chunks(frame.area());
+                draw_tab(frame, sessions, delegates, &mut render, &chunks);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn find_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buffer.area.height {
+            let line = buffer_line(buffer, y);
+            if let Some(byte_idx) = line.find(needle) {
+                let x = line[..byte_idx].chars().count() as u16;
+                return Some((x, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn draw_delegate_popup_uses_aligned_stat_columns_without_header() {
+        let mut sessions = SessionsState::new();
+        sessions.session_id = Some("parent".into());
+        let mut delegates = DelegatesState::new();
+        let mut first = delegate_entry("del-1", "Fix the bug", DelegateStatus::Completed);
+        first.child_session_id = Some("child-1".into());
+        first.stats = DelegateStats {
+            tool_calls: 7,
+            messages: 3,
+            cost_usd: 0.0125,
+            context_tokens: 50_000,
+            context_limit: 200_000,
+        };
+        let mut second = delegate_entry("del-2", "Write docs", DelegateStatus::InProgress);
+        second.child_session_id = Some("child-2".into());
+        second.stats = DelegateStats {
+            tool_calls: 12,
+            messages: 1,
+            cost_usd: 0.0345,
+            context_tokens: 20_000,
+            context_limit: 200_000,
+        };
+        delegates.delegate_entries = vec![first, second];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+
+        let (tool_x1, row1) = find_buffer_text(&buffer, "⚒7").expect("missing row1 tools");
+        let (tool_x2, row2) = find_buffer_text(&buffer, "⚒12").expect("missing row2 tools");
+        let (cost_x1, cost_row1) = find_buffer_text(&buffer, "$0.01").expect("missing row1 cost");
+        let (cost_x2, cost_row2) = find_buffer_text(&buffer, "$0.03").expect("missing row2 cost");
+
+        assert_ne!(row1, row2, "expected separate rows for each delegate entry");
+        assert_eq!(tool_x1, tool_x2, "tool column must align across rows");
+        assert_eq!(cost_x1, cost_x2, "cost column must align across rows");
+        assert_eq!(row1, cost_row1, "row1 stats must share same row");
+        assert_eq!(row2, cost_row2, "row2 stats must share same row");
+    }
+
+    #[test]
+    fn draw_delegate_popup_shows_question_pending_marker_and_hint() {
+        let sessions = SessionsState::new();
+        let mut delegates = DelegatesState::new();
+        delegates.delegate_cursor = 1;
+        let mut entry = delegate_entry("del-1", "Pending task", DelegateStatus::InProgress);
+        entry.child_session_id = Some("child-1".into());
+        entry.target_agent_id = Some("coder".into());
+        entry.child_state = DelegateChildState::PendingElicitation {
+            elicitation_id: "elic-1".into(),
+            message: "Need approval".into(),
+            requested_schema: serde_json::json!({ "properties": {} }),
+            source: "builtin:question".into(),
+        };
+        delegates.delegate_entries = vec![entry];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert!(
+            rendered.contains("question pending"),
+            "missing popup marker: {rendered}"
+        );
+        let (x, y) = find_buffer_text(&buffer, "open child to answer").expect("missing popup hint");
+        assert_eq!(buffer[(x, y)].style().fg, Some(Theme::mode_color("plan")));
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered.contains("open child to answer"),
+            "missing popup hint: {rendered}"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_hides_cost_column_when_all_rows_have_zero_cost() {
+        let sessions = SessionsState::new();
+        let mut delegates = DelegatesState::new();
+        let mut first = delegate_entry("del-1", "Pending task", DelegateStatus::InProgress);
+        first.stats = DelegateStats {
+            tool_calls: 2,
+            messages: 1,
+            cost_usd: 0.0,
+            context_tokens: 1000,
+            context_limit: 200_000,
+        };
+        let mut second = delegate_entry("del-2", "Another task", DelegateStatus::Completed);
+        second.stats = DelegateStats {
+            tool_calls: 4,
+            messages: 2,
+            cost_usd: 0.0,
+            context_tokens: 2000,
+            context_limit: 200_000,
+        };
+        delegates.delegate_entries = vec![first, second];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert!(rendered.contains("Pending task"));
+        assert!(rendered.contains("Another task"));
+        assert!(rendered.contains("⚒2"));
+        assert!(rendered.contains("⚒4"));
+        assert!(!rendered.contains("$0.0000"), "unexpected zero cost");
+        assert!(
+            !rendered.contains('$'),
+            "cost column should be hidden when all rows have zero cost"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_truncates_long_objectives_with_unicode_ellipsis() {
+        let sessions = SessionsState::new();
+        let mut delegates = DelegatesState::new();
+        let mut entry = delegate_entry(
+            "del-1",
+            "List the contents of the repository root directory as a simulated user request for the delegate popup",
+            DelegateStatus::InProgress,
+        );
+        entry.stats = DelegateStats {
+            tool_calls: 0,
+            messages: 0,
+            cost_usd: 0.0,
+            context_tokens: 180_000,
+            context_limit: 200_000,
+        };
+        delegates.delegate_entries = vec![entry];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 70, 12);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert!(rendered.contains('…'));
+        assert!(!rendered.contains("..."));
+    }
+
+    #[test]
+    fn draw_delegate_popup_failed_symbol_uses_dim_surface_background() {
+        let sessions = SessionsState::new();
+        let mut delegates = DelegatesState::new();
+        delegates.delegate_cursor = 0;
+        delegates.delegate_entries = vec![
+            delegate_entry("del-0", "Selected row", DelegateStatus::Completed),
+            delegate_entry("del-1", "Failed row", DelegateStatus::Failed),
+        ];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+        let (x, y) = find_buffer_text(&buffer, "☒").expect("missing failed symbol");
+        assert_eq!(
+            buffer[(x, y)].style().bg,
+            Theme::error_on_dim().bg,
+            "failed popup symbol should use dim-surface error background"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_highlights_full_selected_row() {
+        let sessions = SessionsState::new();
+        let mut delegates = DelegatesState::new();
+        delegates.delegate_cursor = 1;
+        let mut first = delegate_entry("del-1", "First row", DelegateStatus::Completed);
+        first.stats = DelegateStats {
+            tool_calls: 7,
+            messages: 3,
+            cost_usd: 0.0125,
+            context_tokens: 50_000,
+            context_limit: 200_000,
+        };
+        let mut second = delegate_entry("del-2", "Second row", DelegateStatus::InProgress);
+        second.stats = DelegateStats {
+            tool_calls: 4,
+            messages: 1,
+            cost_usd: 0.0,
+            context_tokens: 10_000,
+            context_limit: 200_000,
+        };
+        delegates.delegate_entries = vec![first, second];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+
+        let (_, first_y) = find_buffer_text(&buffer, "First row").expect("missing first row");
+        let (_, second_y) = find_buffer_text(&buffer, "Second row").expect("missing second row");
+        assert_ne!(first_y, second_y);
+
+        // Pick populated and empty cells across the selected row.
+        let (obj_x, _) = find_buffer_text(&buffer, "Second row").expect("missing second row");
+        let (tool_x, _) = find_buffer_text(&buffer, "⚒4").expect("missing second row tools");
+        let (cost_x, _) = find_buffer_text(&buffer, "$0.01").expect("missing first row cost");
+
+        let selected_bg = Theme::selected().bg.expect("selected style must define bg");
+        assert_eq!(buffer[(obj_x, second_y)].style().bg, Some(selected_bg));
+        assert_eq!(buffer[(tool_x, second_y)].style().bg, Some(selected_bg));
+        assert_eq!(
+            buffer[(cost_x, second_y)].style().bg,
+            Some(selected_bg),
+            "empty selected-row cost cell should also be highlighted"
+        );
+    }
+
+    #[test]
+    fn draw_delegate_popup_shows_agent_name_column() {
+        let mut sessions = SessionsState::new();
+        sessions.session_id = Some("parent".into());
+        let mut delegates = DelegatesState::new();
+        let mut first = delegate_entry("del-1", "Fix bug", DelegateStatus::Completed);
+        first.target_agent_id = Some("coder".into());
+        let mut second = delegate_entry("del-2", "Plan work", DelegateStatus::InProgress);
+        second.target_agent_id = Some("planner".into());
+        delegates.delegate_entries = vec![first, second];
+
+        let buffer = render_delegate_popup(&sessions, &delegates, 90, 20);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+
+        assert!(
+            rendered.contains("coder"),
+            "agent name 'coder' must appear in popup, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("planner"),
+            "agent name 'planner' must appear in popup"
+        );
+    }
+}
