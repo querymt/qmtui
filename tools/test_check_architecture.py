@@ -210,6 +210,15 @@ const EXAMPLE: &str = "#![allow(dead_code)]";
             "crate-level allow(dead_code)",
         )
 
+    def test_dead_code_policy_rejects_same_line_crate_allowances(self) -> None:
+        for separator in (" ", ""):
+            with self.subTest(separator=separator):
+                self.assert_fails(
+                    "src/lib.rs",
+                    f"#![allow(unused_imports)]{separator}#![allow(dead_code)]\n",
+                    "crate-level allow(dead_code)",
+                )
+
     def test_removed_app_forward_is_scoped_to_impl_app(self) -> None:
         app_with_forward = APP_SOURCE + "\nimpl App { fn push_log(&mut self) {} }\n"
         self.assert_fails("src/app.rs", app_with_forward, "App forwarding method push_log")

@@ -233,7 +233,7 @@ def _matching_brace(code: str, opening: int) -> int | None:
 
 
 def _crate_dead_code_allowance(code: str) -> int | None:
-    for attribute in re.finditer(r"(?m)^[ \t]*#[ \t\r\n]*![ \t\r\n]*\[", code):
+    for attribute in re.finditer(r"#[ \t\r\n]*![ \t\r\n]*\[", code):
         attribute_opening = attribute.end() - 1
         attribute_closing = _matching_delimiter(code, attribute_opening, "[", "]")
         if attribute_closing is None:
