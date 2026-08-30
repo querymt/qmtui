@@ -216,15 +216,38 @@ def _is_feature_kind(relative: Path, kind: str) -> bool:
     )
 
 
-def _matching_brace(code: str, opening: int) -> int | None:
+def _matching_delimiter(code: str, opening: int, left: str, right: str) -> int | None:
     depth = 0
     for index in range(opening, len(code)):
-        if code[index] == "{":
+        if code[index] == left:
             depth += 1
-        elif code[index] == "}":
+        elif code[index] == right:
             depth -= 1
             if depth == 0:
                 return index
+    return None
+
+
+def _matching_brace(code: str, opening: int) -> int | None:
+    return _matching_delimiter(code, opening, "{", "}")
+
+
+def _crate_dead_code_allowance(code: str) -> int | None:
+    for attribute in re.finditer(r"(?m)^[ \t]*#[ \t\r\n]*![ \t\r\n]*\[", code):
+        attribute_opening = attribute.end() - 1
+        attribute_closing = _matching_delimiter(code, attribute_opening, "[", "]")
+        if attribute_closing is None:
+            continue
+
+        body_start = attribute_opening + 1
+        body = code[body_start:attribute_closing]
+        for allowance in re.finditer(r"\ballow\s*\(", body):
+            allowance_opening = body_start + allowance.end() - 1
+            allowance_closing = _matching_delimiter(code, allowance_opening, "(", ")")
+            if allowance_closing is not None and re.search(
+                r"\bdead_code\b", code[allowance_opening + 1 : allowance_closing]
+            ):
+                return attribute.start()
     return None
 
 
@@ -342,11 +365,9 @@ def check_repository(root: Path) -> list[Violation]:
             if position is not None:
                 violations.append(Violation(rel, _line_number(source, position), message))
 
-        dead_code = re.search(
-            r"(?m)^\s*#!\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]", code
-        )
-        if dead_code and rel != "src/themes_gen.rs":
-            add(dead_code.start(), "crate-level allow(dead_code) is only permitted in src/themes_gen.rs")
+        dead_code = _crate_dead_code_allowance(code)
+        if dead_code is not None and rel != "src/themes_gen.rs":
+            add(dead_code, "crate-level allow(dead_code) is only permitted in src/themes_gen.rs")
 
         legacy = re.search(r"\b(?:server_msg|RawServerMsg|handle_server_msg)\b", code)
         add(legacy.start() if legacy else None, "legacy server message symbol must remain removed")

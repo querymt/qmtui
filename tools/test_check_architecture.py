@@ -168,13 +168,45 @@ fn draw_for_test(_app: &mut crate::app::App) {}
     def test_dead_code_policy_allows_generated_and_item_level_allowances(self) -> None:
         self.assert_passes(
             {
-                "src/themes_gen.rs": "#![allow(dead_code)]\n",
-                "src/domain/example.rs": "#[allow(dead_code)]\nstruct RetainedDto;\n",
+                "src/themes_gen.rs": "#![allow(unused_imports, dead_code)]\n",
+                "src/domain/example.rs": """\
+#[allow(dead_code)]
+struct RetainedDto;
+#[cfg_attr(test, allow(dead_code))]
+struct ConditionalRetainedDto;
+const EXAMPLE: &str = "#![allow(dead_code)]";
+// #![cfg_attr(test, allow(dead_code))]
+""",
             }
         )
+
         self.assert_fails(
             "src/lib.rs",
             "#![allow(dead_code)]\n",
+            "crate-level allow(dead_code)",
+        )
+
+    def test_dead_code_policy_rejects_combined_crate_allowance(self) -> None:
+        self.assert_fails(
+            "src/lib.rs",
+            """\
+#![allow(
+    unused_imports,
+    dead_code,
+)]
+""",
+            "crate-level allow(dead_code)",
+        )
+
+    def test_dead_code_policy_rejects_conditional_crate_allowance(self) -> None:
+        self.assert_fails(
+            "src/lib.rs",
+            """\
+#![cfg_attr(
+    any(test, feature = "example"),
+    allow(unused_imports, dead_code),
+)]
+""",
             "crate-level allow(dead_code)",
         )
 
