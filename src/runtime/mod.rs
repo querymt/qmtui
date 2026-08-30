@@ -2574,6 +2574,40 @@ mod session_popup_key_tests {
     // ── Enter on Session loads it ─────────────────────────────────────────────
 
     #[test]
+    fn popup_header_toggle_routes_through_root_adapter() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.navigation.screen = Screen::Sessions;
+        app.navigation.popup = Popup::SessionSelect;
+        app.sessions.session_popup_tab = 0;
+        app.sessions.session_groups = vec![
+            make_group(Some("/work"), &["one"]),
+            make_group(Some("/work"), &["two"]),
+        ];
+        app.sessions.collapsed_groups.insert("/start-only".into());
+        let start_page_collapsed_groups = app.sessions.collapsed_groups.clone();
+        app.sessions.session_cursor = 2;
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+
+        effects.extend(handle_session_popup_key(&mut app, enter));
+
+        assert!(effects.effects.is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert!(app.sessions.popup_collapsed_groups.contains("/work"));
+        assert_eq!(app.sessions.collapsed_groups, start_page_collapsed_groups);
+        assert_eq!(app.sessions.session_cursor, 1);
+
+        effects.extend(handle_session_popup_key(&mut app, enter));
+
+        assert!(effects.effects.is_empty());
+        assert_eq!(app.navigation.popup, Popup::SessionSelect);
+        assert!(!app.sessions.popup_collapsed_groups.contains("/work"));
+        assert_eq!(app.sessions.collapsed_groups, start_page_collapsed_groups);
+        assert_eq!(app.sessions.session_cursor, 1);
+        assert!(app.sessions.session_cursor < app.sessions.visible_popup_items().len());
+    }
+
+    #[test]
     fn popup_enter_on_local_session_emits_load_and_subscribe() {
         let mut app = App::new();
         app.navigation.popup = Popup::SessionSelect;
