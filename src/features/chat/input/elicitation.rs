@@ -448,6 +448,11 @@ mod tests {
         handle(&mut chat, &mut render, KeyCode::Down);
         handle(&mut chat, &mut render, KeyCode::Enter);
         handle(&mut chat, &mut render, KeyCode::Char(' '));
+        assert!(handle(&mut chat, &mut render, KeyCode::Enter).is_empty());
+        assert!(chat.elicitation.is_some());
+        assert!(chat.elicitation_ui.as_ref().unwrap().custom_active);
+        handle(&mut chat, &mut render, KeyCode::Backspace);
+        handle(&mut chat, &mut render, KeyCode::Char(' '));
         handle(&mut chat, &mut render, KeyCode::Char('x'));
         handle_key(
             &mut chat,

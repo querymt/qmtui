@@ -692,11 +692,32 @@ mod tests {
             ),
         ];
 
+        assert_eq!(state.visible_entries().len(), 2);
         for query in ["BUILD", "del-one", "CODER"] {
             state.delegate_filter = query.to_string();
             assert_eq!(state.visible_entries().len(), 1);
             assert_eq!(state.visible_entries()[0].delegation_id, "DEL-ONE");
         }
+
+        state.delegate_filter = "planner".into();
+        assert_eq!(state.visible_entries()[0].delegation_id, "del-two");
+    }
+
+    #[test]
+    fn stats_context_percentage_handles_limits() {
+        let stats = DelegateStats {
+            context_tokens: 50_000,
+            context_limit: 200_000,
+            ..DelegateStats::default()
+        };
+        assert_eq!(stats.context_pct(), Some(25));
+
+        let no_limit = DelegateStats {
+            context_tokens: 1000,
+            context_limit: 0,
+            ..DelegateStats::default()
+        };
+        assert_eq!(no_limit.context_pct(), None);
     }
 
     #[test]
