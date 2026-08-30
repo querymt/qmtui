@@ -226,7 +226,10 @@ mod tests {
     use super::*;
     use crate::{
         chat_state::ElicitationUiState,
-        domain::elicitation::{ElicitationField, ElicitationOption},
+        domain::{
+            chat::ChatEntry,
+            elicitation::{ElicitationField, ElicitationOption},
+        },
     };
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -261,9 +264,30 @@ mod tests {
 
     fn chat_with(state: ElicitationState) -> ChatState {
         let mut chat = ChatState::new();
+        chat.messages.push(ChatEntry::Elicitation {
+            elicitation_id: state.elicitation_id.clone(),
+            message: state.message.clone(),
+            source: state.source.clone(),
+            outcome: None,
+        });
         chat.elicitation = Some(state);
         chat.elicitation_ui = Some(ElicitationUiState::default());
         chat
+    }
+
+    fn assert_pending_card(chat: &ChatState) {
+        let [
+            ChatEntry::Elicitation {
+                elicitation_id,
+                outcome,
+                ..
+            },
+        ] = chat.messages.as_slice()
+        else {
+            panic!("expected one durable elicitation card");
+        };
+        assert_eq!(elicitation_id, "test-id");
+        assert_eq!(outcome, &None);
     }
 
     fn handle(
@@ -292,6 +316,7 @@ mod tests {
             }]
         );
         assert!(chat.elicitation.is_some());
+        assert_pending_card(&chat);
 
         assert_eq!(
             handle(&mut chat, &mut render, KeyCode::Esc),
@@ -303,6 +328,7 @@ mod tests {
             }]
         );
         assert!(chat.elicitation.is_some());
+        assert_pending_card(&chat);
     }
 
     #[test]
@@ -312,6 +338,8 @@ mod tests {
         }));
         let mut render = RenderState::new();
 
+        assert!(handle(&mut chat, &mut render, KeyCode::Up).is_empty());
+        assert_eq!(chat.elicitation_ui.as_ref().unwrap().option_cursor, 0);
         handle(&mut chat, &mut render, KeyCode::Down);
         handle(&mut chat, &mut render, KeyCode::Char(' '));
         handle(&mut chat, &mut render, KeyCode::Up);
@@ -378,8 +406,13 @@ mod tests {
         assert!(handle(&mut chat, &mut render, KeyCode::Enter).is_empty());
         handle(&mut chat, &mut render, KeyCode::Char(' '));
         assert_eq!(
-            handle(&mut chat, &mut render, KeyCode::Enter)[0].outcome,
-            ElicitationResponseOutcome::Boolean(true)
+            handle(&mut chat, &mut render, KeyCode::Enter),
+            vec![ElicitationResponseEffect {
+                elicitation_id: "test-id".into(),
+                action: "accept".into(),
+                content: Some(serde_json::json!({ "confirm": true })),
+                outcome: ElicitationResponseOutcome::Boolean(true),
+            }]
         );
         handle(&mut chat, &mut render, KeyCode::Char(' '));
         assert_eq!(
@@ -448,6 +481,11 @@ mod tests {
         handle(&mut chat, &mut render, KeyCode::Down);
         handle(&mut chat, &mut render, KeyCode::Enter);
         handle(&mut chat, &mut render, KeyCode::Char(' '));
+        assert!(handle(&mut chat, &mut render, KeyCode::Enter).is_empty());
+        assert!(chat.elicitation.is_some());
+        assert!(chat.elicitation_ui.as_ref().unwrap().custom_active);
+        handle(&mut chat, &mut render, KeyCode::Backspace);
+        handle(&mut chat, &mut render, KeyCode::Char(' '));
         handle(&mut chat, &mut render, KeyCode::Char('x'));
         handle_key(
             &mut chat,
@@ -494,7 +532,7 @@ mod tests {
         );
         assert!(chat.elicitation.as_ref().unwrap().text_input.is_empty());
 
-        chat.elicitation = Some(ElicitationState::new_for_test(Vec::new()));
+        chat = chat_with(ElicitationState::new_for_test(Vec::new()));
         for code in [
             KeyCode::Down,
             KeyCode::Char('x'),
@@ -503,5 +541,10 @@ mod tests {
         ] {
             assert!(handle(&mut chat, &mut render, code).is_empty());
         }
+        let active = chat.elicitation.as_ref().expect("active elicitation");
+        assert_eq!(active.elicitation_id, "test-id");
+        assert!(active.fields.is_empty());
+        assert!(chat.elicitation_ui.is_some());
+        assert_pending_card(&chat);
     }
 }
