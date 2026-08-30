@@ -191,6 +191,48 @@ mod tests {
     }
 
     #[test]
+    fn movement_traverses_rows_and_group_boundaries() {
+        let mut state = SessionsState::new();
+        let mut other_group = group(&["two"]);
+        other_group.cwd = Some("/other".into());
+        state.session_groups = vec![group(&["one"]), other_group];
+
+        for cursor in [1, 2, 3] {
+            assert_eq!(
+                handle_key(&mut state, KeyCode::Down, 1),
+                SessionPopupInputResult::Moved
+            );
+            assert_eq!(state.session_cursor, cursor);
+        }
+        for cursor in [2, 1, 0] {
+            assert_eq!(
+                handle_key(&mut state, KeyCode::Up, 1),
+                SessionPopupInputResult::Moved
+            );
+            assert_eq!(state.session_cursor, cursor);
+        }
+    }
+
+    #[test]
+    fn movement_clamps_at_first_and_last_row() {
+        let mut state = SessionsState::new();
+        state.session_groups = vec![group(&["one"])];
+
+        assert_eq!(
+            handle_key(&mut state, KeyCode::Up, 1),
+            SessionPopupInputResult::Moved
+        );
+        assert_eq!(state.session_cursor, 0);
+
+        state.session_cursor = 1;
+        assert_eq!(
+            handle_key(&mut state, KeyCode::Down, 1),
+            SessionPopupInputResult::Moved
+        );
+        assert_eq!(state.session_cursor, 1);
+    }
+
+    #[test]
     fn page_movement_uses_root_supplied_step() {
         let mut state = SessionsState::new();
         state.session_groups = vec![group(&["one", "two", "three", "four"])];
@@ -205,10 +247,44 @@ mod tests {
     }
 
     #[test]
+    fn filtering_plain_characters_and_backspace_reset_cursor() {
+        let mut state = SessionsState::new();
+        state.session_groups = vec![group(&["one", "two"])];
+
+        for (character, expected) in [('x', "x"), ('o', "xo"), ('n', "xon")] {
+            state.session_cursor = 2;
+            assert_eq!(
+                handle_key(&mut state, KeyCode::Char(character), 1),
+                SessionPopupInputResult::Filtered
+            );
+            assert_eq!(state.session_filter, expected);
+            assert_eq!(state.session_cursor, 0);
+        }
+
+        for expected in ["xo", "x", ""] {
+            state.session_cursor = 2;
+            assert_eq!(
+                handle_key(&mut state, KeyCode::Backspace, 1),
+                SessionPopupInputResult::Filtered
+            );
+            assert_eq!(state.session_filter, expected);
+            assert_eq!(state.session_cursor, 0);
+        }
+
+        state.session_cursor = 2;
+        assert_eq!(
+            handle_key(&mut state, KeyCode::Backspace, 1),
+            SessionPopupInputResult::Filtered
+        );
+        assert!(state.session_filter.is_empty());
+        assert_eq!(state.session_cursor, 0);
+    }
+
+    #[test]
     fn collapse_and_load_more_preserve_popup_semantics() {
         let mut state = SessionsState::new();
-        state.session_groups = vec![group(&["one"])];
-        state.session_groups[0].next_cursor = Some("next".into());
+        state.session_groups = vec![group(&["one"]), group(&["two"])];
+        state.session_cursor = 2;
 
         assert_eq!(
             handle_key(&mut state, KeyCode::Enter, 1),
@@ -216,8 +292,17 @@ mod tests {
         );
         assert!(state.popup_collapsed_groups.contains("/work"));
         assert!(!state.collapsed_groups.contains("/work"));
+        assert_eq!(state.session_cursor, 1);
 
-        state.popup_collapsed_groups.clear();
+        assert_eq!(
+            handle_key(&mut state, KeyCode::Enter, 1),
+            SessionPopupInputResult::ToggledGroup
+        );
+        assert!(!state.popup_collapsed_groups.contains("/work"));
+        assert!(!state.collapsed_groups.contains("/work"));
+
+        state.session_groups = vec![group(&["one"])];
+        state.session_groups[0].next_cursor = Some("next".into());
         state.session_cursor = 2;
         assert_eq!(
             handle_key(&mut state, KeyCode::Enter, 1),
@@ -267,6 +352,19 @@ mod tests {
             }
         );
         assert!(state.session_groups.is_empty());
+    }
+
+    #[test]
+    fn delete_on_header_is_not_handled_and_preserves_projection() {
+        let mut state = SessionsState::new();
+        state.session_groups = vec![group(&["one"]), group(&["two"])];
+        let projection = state.visible_popup_items();
+
+        assert_eq!(
+            handle_key(&mut state, KeyCode::Delete, 1),
+            SessionPopupInputResult::NotHandled
+        );
+        assert_eq!(state.visible_popup_items(), projection);
     }
 
     #[test]
