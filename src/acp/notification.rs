@@ -315,17 +315,174 @@ mod tests {
     }
 
     #[test]
-    fn usage_translation_keeps_only_usd_cost() {
-        let (_, translated) = translate(notification(acp::SessionUpdate::UsageUpdate(
-            acp::UsageUpdate::new(5, 10).cost(acp::Cost::new(0.25, "USD")),
+    fn tool_start_and_pending_updates_preserve_names_and_arguments() {
+        let (_, started) = translate(notification(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool-1", "Run shell")
+                .raw_input(serde_json::json!({ "cmd": "cargo test" })),
         )));
         assert!(matches!(
-            translated,
-            Translation::Update(AcpSessionUpdate::UsageUpdate {
-                used: 5,
-                size: 10,
-                cost_usd: Some(0.25)
-            })
+            started,
+            Translation::ToolStart(AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some(id),
+                name,
+                arguments: Some(arguments),
+            }) if id == "tool-1"
+                && name == "shell"
+                && arguments == serde_json::json!({ "cmd": "cargo test" })
         ));
+
+        let (_, pending) = translate(notification(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(
+                "tool-2",
+                acp::ToolCallUpdateFields::new().raw_input(serde_json::json!({ "path": "src" })),
+            ),
+        )));
+        assert!(matches!(
+            pending,
+            Translation::Update(AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some(id),
+                name,
+                arguments: Some(arguments),
+            }) if id == "tool-2"
+                && name == "tool"
+                && arguments == serde_json::json!({ "path": "src" })
+        ));
+    }
+
+    #[test]
+    fn completed_and_failed_tool_updates_choose_raw_output_then_content() {
+        let (_, completed) = translate(notification(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(
+                "tool-1",
+                acp::ToolCallUpdateFields::new()
+                    .title("Run shell".to_string())
+                    .status(acp::ToolCallStatus::Completed)
+                    .raw_output(serde_json::json!({ "exit": 0 }))
+                    .content(vec![
+                        acp::ContentBlock::Text(acp::TextContent::new("fallback")).into(),
+                    ]),
+            ),
+        )));
+        assert!(matches!(
+            completed,
+            Translation::Update(AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some(id),
+                name,
+                is_error: false,
+                result: Some(result),
+            }) if id == "tool-1" && name == "shell" && result == r#"{"exit":0}"#
+        ));
+
+        let (_, failed) = translate(notification(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(
+                "tool-2",
+                acp::ToolCallUpdateFields::new()
+                    .status(acp::ToolCallStatus::Failed)
+                    .content(vec![
+                        acp::ContentBlock::Text(acp::TextContent::new("failure")).into(),
+                        acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                            "log",
+                            "file:///tmp/error.log",
+                        ))
+                        .into(),
+                    ]),
+            ),
+        )));
+        assert!(matches!(
+            failed,
+            Translation::Update(AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some(id),
+                name,
+                is_error: true,
+                result: Some(result),
+            }) if id == "tool-2"
+                && name == "tool"
+                && result.contains("failure")
+                && result.contains("file:///tmp/error.log")
+        ));
+    }
+
+    #[test]
+    fn assistant_content_converts_resource_links_and_non_text_blocks() {
+        let (_, resource) = translate(notification(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "guide",
+                "file:///repo/guide.md",
+            ))),
+        )));
+        assert!(matches!(
+            resource,
+            Translation::AssistantChunk { text, thinking: false, .. }
+                if text == "file:///repo/guide.md"
+        ));
+
+        let (_, image) = translate(notification(acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Image(acp::ImageContent::new(
+                "YWJj",
+                "image/png",
+            ))),
+        )));
+        assert!(matches!(
+            image,
+            Translation::AssistantChunk { text, thinking: true, .. }
+                if text == r#"{"type":"image","data":"YWJj","mimeType":"image/png"}"#
+        ));
+    }
+
+    #[test]
+    fn mode_config_and_ignored_variants_stay_at_the_translation_boundary() {
+        let option = acp::SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "plan",
+            vec![acp::SessionConfigSelectOption::new("plan", "Plan")],
+        );
+        let (_, mode) = translate(notification(acp::SessionUpdate::CurrentModeUpdate(
+            acp::CurrentModeUpdate::new("plan"),
+        )));
+        assert!(matches!(mode, Translation::AgentMode(value) if value == "plan"));
+
+        let (_, config) = translate(notification(acp::SessionUpdate::ConfigOptionUpdate(
+            acp::ConfigOptionUpdate::new(vec![option.clone()]),
+        )));
+        assert!(matches!(
+            config,
+            Translation::ConfigOptions(options) if options == vec![option]
+        ));
+
+        for update in [
+            acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title("ignored")),
+            acp::SessionUpdate::Plan(acp::Plan::new(vec![])),
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![])),
+        ] {
+            assert!(matches!(
+                translate(notification(update)).1,
+                Translation::Ignore
+            ));
+        }
+    }
+
+    #[test]
+    fn usage_translation_keeps_only_usd_cost() {
+        for (cost, expected) in [
+            (Some(acp::Cost::new(0.25, "USD")), Some(0.25)),
+            (Some(acp::Cost::new(1.5, "eur")), None),
+            (None, None),
+        ] {
+            let update = if let Some(cost) = cost {
+                acp::UsageUpdate::new(5, 10).cost(cost)
+            } else {
+                acp::UsageUpdate::new(5, 10)
+            };
+            let (_, translated) = translate(notification(acp::SessionUpdate::UsageUpdate(update)));
+            assert!(matches!(
+                translated,
+                Translation::Update(AcpSessionUpdate::UsageUpdate {
+                    used: 5,
+                    size: 10,
+                    cost_usd,
+                }) if cost_usd == expected
+            ));
+        }
     }
 }
