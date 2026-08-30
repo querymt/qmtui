@@ -1618,6 +1618,9 @@ mod tests {
         assert_eq!(state.mode_before_review.as_deref(), Some("plan"));
         state.apply_mode_transition("plan");
         assert_eq!(state.mode_before_review, None);
+
+        state.agent_mode = "review".into();
+        assert_eq!(state.next_mode(), "build");
     }
 
     #[test]
@@ -1773,5 +1776,808 @@ mod tests {
         state.remember_remote_session_location("remote", "node-2", Some("  ".into()));
         assert_eq!(state.session_remote_node_id("remote"), Some("node-2"));
         assert_eq!(state.session_remote_cwd("remote"), Some("/repo".into()));
+    }
+
+    // ── Start-page session grouping tests ─────────────────────────────────────────
+
+    mod start_page_tests {
+        use super::*;
+        use crate::domain::session::{SessionGroup, SessionSummary};
+        use crate::session_state::{PopupItem, StartPageItem};
+
+        fn make_group(cwd: Option<&str>, ids: &[(&str, Option<&str>)]) -> SessionGroup {
+            SessionGroup {
+                cwd: cwd.map(String::from),
+                latest_activity: None,
+                sessions: ids
+                    .iter()
+                    .map(|(id, updated_at)| SessionSummary {
+                        session_id: id.to_string(),
+                        title: Some(format!("Session {id}")),
+                        cwd: cwd.map(String::from),
+                        created_at: None,
+                        updated_at: updated_at.map(String::from),
+                        parent_session_id: None,
+                        has_children: false,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        // ── visible_start_items: no sessions ─────────────────────────────────────
+
+        #[test]
+        fn visible_items_empty_when_no_sessions() {
+            let state = SessionsState::new();
+            let items = state.visible_start_items();
+            assert!(items.is_empty());
+        }
+
+        // ── visible_start_items: basic structure ─────────────────────────────────
+
+        #[test]
+        fn visible_items_header_then_sessions_expanded() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
+
+            let items = state.visible_start_items();
+            // 1 header + 2 sessions
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], StartPageItem::GroupHeader { .. }));
+            assert!(matches!(&items[1], StartPageItem::Session { .. }));
+            assert!(matches!(&items[2], StartPageItem::Session { .. }));
+        }
+
+        // ── visible_start_items: collapse hides children ─────────────────────────
+
+        #[test]
+        fn visible_items_collapsed_group_hides_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &[("s1", None), ("s2", None)])];
+            state.collapsed_groups.insert("/a".to_string());
+
+            let items = state.visible_start_items();
+            // only the header
+            assert_eq!(items.len(), 1);
+            assert!(matches!(
+                &items[0],
+                StartPageItem::GroupHeader {
+                    collapsed: true,
+                    ..
+                }
+            ));
+        }
+
+        // ── visible_start_items: multiple groups ─────────────────────────────────
+
+        #[test]
+        fn visible_items_multiple_groups() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s1", None)]),
+                make_group(Some("/b"), &[("s2", None), ("s3", None)]),
+            ];
+
+            let items = state.visible_start_items();
+            // group /a: 1 header + 1 session = 2
+            // group /b: 1 header + 2 sessions = 3
+            assert_eq!(items.len(), 5);
+        }
+
+        // ── visible_start_items: mixed collapse ───────────────────────────────────
+
+        #[test]
+        fn visible_items_one_group_collapsed_other_expanded() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s1", None)]),
+                make_group(Some("/b"), &[("s2", None), ("s3", None)]),
+            ];
+            state.collapsed_groups.insert("/a".to_string());
+
+            let items = state.visible_start_items();
+            // /a collapsed: 1 header
+            // /b expanded:  1 header + 2 sessions
+            assert_eq!(items.len(), 4);
+            assert!(matches!(
+                &items[0],
+                StartPageItem::GroupHeader {
+                    collapsed: true,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &items[1],
+                StartPageItem::GroupHeader {
+                    collapsed: false,
+                    ..
+                }
+            ));
+        }
+
+        // ── visible_start_items: filter hides non-matching sessions ──────────────
+
+        #[test]
+        fn visible_items_filter_hides_non_matching_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[("aaa", None), ("bbb", None), ("aab", None)],
+            )];
+            state.session_filter = "aa".to_string();
+
+            let items = state.visible_start_items();
+            // header + "aaa" + "aab" (bbb filtered out by session_id)
+            assert_eq!(items.len(), 3);
+        }
+
+        // ── visible_start_items: filter hides empty groups ────────────────────────
+
+        #[test]
+        fn visible_items_filter_hides_groups_with_no_matches() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("aaa", None)]),
+                make_group(Some("/b"), &[("bbb", None)]),
+            ];
+            state.session_filter = "bbb".to_string();
+
+            let items = state.visible_start_items();
+            // group /a has no matches → hidden entirely
+            // group /b: header + "bbb"
+            assert_eq!(items.len(), 2);
+            if let StartPageItem::GroupHeader { cwd, .. } = &items[0] {
+                assert_eq!(cwd.as_deref(), Some("/b"));
+            } else {
+                panic!("expected GroupHeader");
+            }
+        }
+
+        // ── visible_start_items: session indices are correct ─────────────────────
+
+        #[test]
+        fn visible_items_session_indices_correct() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s0", None), ("s1", None)]),
+                make_group(Some("/b"), &[("s2", None)]),
+            ];
+
+            let items = state.visible_start_items();
+            // items[0]: GroupHeader /a
+            // items[1]: Session group_idx=0, session_idx=0
+            // items[2]: Session group_idx=0, session_idx=1
+            // items[3]: GroupHeader /b
+            // items[4]: Session group_idx=1, session_idx=0
+            assert!(matches!(
+                &items[1],
+                StartPageItem::Session {
+                    group_idx: 0,
+                    path,
+                    depth: 0,
+                } if path == &vec![0]
+            ));
+            assert!(matches!(
+                &items[2],
+                StartPageItem::Session {
+                    group_idx: 0,
+                    path,
+                    depth: 0,
+                } if path == &vec![1]
+            ));
+            assert!(matches!(
+                &items[4],
+                StartPageItem::Session {
+                    group_idx: 1,
+                    path,
+                    depth: 0,
+                } if path == &vec![0]
+            ));
+        }
+
+        #[test]
+        fn remote_node_sessions_are_not_expandable() {
+            let mut state = SessionsState::new();
+            let mut group = make_group(Some("/a"), &[("remote", Some("2024-01-04T00:00:00Z"))]);
+            group.sessions[0].fork_count = 1;
+            group.sessions[0].node = Some("remote-host".to_string());
+            state.session_groups = vec![group];
+
+            assert!(!state.expandable_root_session(0, &[0]));
+            assert!(!state.toggle_session_children(0, &[0]));
+            assert!(state.expanded_session_children.is_empty());
+            assert!(state.pending_session_child_loads.is_empty());
+        }
+
+        #[test]
+        fn expanded_root_children_are_visible_with_load_more_row() {
+            let mut state = SessionsState::new();
+            let mut group = make_group(Some("/a"), &[("root", None)]);
+            group.sessions[0].fork_count = 2;
+            group.sessions[0].children_next_cursor = Some("next".to_string());
+            group.sessions[0].children = vec![SessionSummary {
+                session_id: "child".to_string(),
+                title: Some("Child".to_string()),
+                parent_session_id: Some("root".to_string()),
+                ..Default::default()
+            }];
+            state.expanded_session_children.insert("root".to_string());
+            state.session_groups = vec![group];
+
+            let items = state.visible_popup_items();
+
+            assert!(matches!(
+                &items[2],
+                PopupItem::Session {
+                    group_idx: 0,
+                    path,
+                    depth: 1,
+                } if path == &vec![0, 0]
+            ));
+            assert!(matches!(
+                &items[3],
+                PopupItem::LoadMore {
+                    group_idx: 0,
+                    parent_path,
+                } if parent_path == &vec![0]
+            ));
+        }
+
+        // ── GroupHeader carries correct session_count ─────────────────────────────
+
+        #[test]
+        fn group_header_session_count_reflects_total_not_filtered() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[("s1", None), ("s2", None), ("s3", None)],
+            )];
+            state.session_groups[0].total_count = Some(8);
+
+            let items = state.visible_start_items();
+            assert!(matches!(
+                &items[0],
+                StartPageItem::GroupHeader {
+                    session_count: 3,
+                    session_total: Some(8),
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn group_header_session_total_falls_back_to_unknown() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &[("s1", None)])];
+
+            let items = state.visible_start_items();
+            assert!(matches!(
+                &items[0],
+                StartPageItem::GroupHeader {
+                    session_count: 1,
+                    session_total: None,
+                    ..
+                }
+            ));
+        }
+
+        // ── toggle_group_collapse ─────────────────────────────────────────────────
+
+        #[test]
+        fn toggle_group_collapse_collapses_then_expands() {
+            let mut state = SessionsState::new();
+            let key = "/a".to_string();
+            assert!(!state.collapsed_groups.contains(&key));
+
+            state.toggle_group_collapse(Some("/a"));
+            assert!(state.collapsed_groups.contains(&key));
+
+            state.toggle_group_collapse(Some("/a"));
+            assert!(!state.collapsed_groups.contains(&key));
+        }
+
+        #[test]
+        fn toggle_group_collapse_none_cwd_uses_empty_string_key() {
+            let mut state = SessionsState::new();
+            state.toggle_group_collapse(None);
+            assert!(state.collapsed_groups.contains(""));
+
+            state.toggle_group_collapse(None);
+            assert!(!state.collapsed_groups.contains(""));
+        }
+
+        // ── MAX_RECENT_SESSIONS cap ───────────────────────────────────────────────
+
+        #[test]
+        fn visible_items_group_with_three_sessions_shows_no_show_more() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[("s1", None), ("s2", None), ("s3", None)],
+            )];
+            let items = state.visible_start_items();
+            // header + 3 sessions, no ShowMore
+            assert_eq!(items.len(), 4);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+            );
+        }
+
+        #[test]
+        fn visible_items_group_with_four_sessions_shows_show_more() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[("s1", None), ("s2", None), ("s3", None), ("s4", None)],
+            )];
+            let items = state.visible_start_items();
+            // header + 3 sessions + ShowMore
+            assert_eq!(items.len(), 5);
+            assert!(matches!(
+                items.last(),
+                Some(StartPageItem::ShowMore { remaining: 1, .. })
+            ));
+        }
+
+        #[test]
+        fn visible_items_show_more_remaining_is_total_minus_three() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[
+                    ("s1", None),
+                    ("s2", None),
+                    ("s3", None),
+                    ("s4", None),
+                    ("s5", None),
+                    ("s6", None),
+                    ("s7", None),
+                    ("s8", None),
+                    ("s9", None),
+                    ("s10", None),
+                    ("s11", None),
+                ],
+            )];
+            let items = state.visible_start_items();
+            assert!(matches!(
+                items.last(),
+                Some(StartPageItem::ShowMore {
+                    remaining: 8,
+                    has_more: false,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn visible_items_filter_active_still_caps_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(
+                Some("/a"),
+                &[
+                    ("aaa1", None),
+                    ("aaa2", None),
+                    ("aaa3", None),
+                    ("aaa4", None),
+                    ("aaa5", None),
+                    ("aaa6", None),
+                    ("aaa7", None),
+                    ("aaa8", None),
+                    ("aaa9", None),
+                    ("aaa10", None),
+                    ("aaa11", None),
+                ],
+            )];
+            state.session_filter = "aaa".to_string();
+            let items = state.visible_start_items();
+            assert_eq!(items.len(), 5);
+            assert!(matches!(
+                items.last(),
+                Some(StartPageItem::ShowMore { remaining: 8, .. })
+            ));
+        }
+
+        // ── MAX_VISIBLE_GROUPS cap ────────────────────────────────────────────────
+
+        #[test]
+        fn visible_items_three_groups_shows_no_trailing_show_more() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s1", None)]),
+                make_group(Some("/b"), &[("s2", None)]),
+                make_group(Some("/c"), &[("s3", None)]),
+            ];
+            let items = state.visible_start_items();
+            // 3 headers + 3 sessions = 6, no trailing ShowMore
+            assert_eq!(items.len(), 6);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+            );
+        }
+
+        #[test]
+        fn visible_items_four_groups_caps_at_three_no_trailing_show_more() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s1", None)]),
+                make_group(Some("/b"), &[("s2", None)]),
+                make_group(Some("/c"), &[("s3", None)]),
+                make_group(Some("/d"), &[("s4", None)]),
+            ];
+            let items = state.visible_start_items();
+            // 3 groups (3 headers + 3 sessions) = 6, no trailing ShowMore
+            assert_eq!(items.len(), 6);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+            );
+        }
+
+        #[test]
+        fn visible_items_six_groups_caps_at_three_no_trailing_show_more() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("s1", None)]),
+                make_group(Some("/b"), &[("s2", None)]),
+                make_group(Some("/c"), &[("s3", None)]),
+                make_group(Some("/d"), &[("s4", None)]),
+                make_group(Some("/e"), &[("s5", None)]),
+                make_group(Some("/f"), &[("s6", None)]),
+            ];
+            let items = state.visible_start_items();
+            // 3 shown groups (3 headers + 3 sessions) = 6, no trailing ShowMore
+            assert_eq!(items.len(), 6);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+            );
+        }
+
+        #[test]
+        fn visible_items_group_cap_applied_with_filter_active() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &[("aaa1", None)]),
+                make_group(Some("/b"), &[("aaa2", None)]),
+                make_group(Some("/c"), &[("aaa3", None)]),
+                make_group(Some("/d"), &[("aaa4", None)]),
+            ];
+            state.session_filter = "aaa".to_string();
+            let items = state.visible_start_items();
+            // Filter active but group cap still applies → 3 groups, no trailing ShowMore
+            let headers = items
+                .iter()
+                .filter(|i| matches!(i, StartPageItem::GroupHeader { .. }))
+                .count();
+            assert_eq!(headers, 3);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, StartPageItem::ShowMore { .. }))
+            );
+        }
+    }
+
+    // ── popup_item_tests ──────────────────────────────────────────────────────────
+
+    mod popup_item_tests {
+        use super::*;
+        use crate::domain::session::{SessionGroup, SessionSummary};
+        use crate::session_state::PopupItem;
+
+        fn make_group(cwd: Option<&str>, ids: &[&str]) -> SessionGroup {
+            SessionGroup {
+                cwd: cwd.map(String::from),
+                latest_activity: None,
+                sessions: ids
+                    .iter()
+                    .map(|id| SessionSummary {
+                        session_id: id.to_string(),
+                        title: Some(format!("Session {id}")),
+                        cwd: cwd.map(String::from),
+                        created_at: None,
+                        updated_at: None,
+                        parent_session_id: None,
+                        has_children: false,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        }
+
+        // ── empty state ───────────────────────────────────────────────────────────
+
+        #[test]
+        fn popup_items_empty_when_no_sessions() {
+            let state = SessionsState::new();
+            assert!(state.visible_popup_items().is_empty());
+        }
+
+        // ── basic structure: header then sessions ─────────────────────────────────
+
+        #[test]
+        fn popup_items_header_then_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+            let items = state.visible_popup_items();
+            // 1 header + 2 sessions
+            assert_eq!(items.len(), 3);
+            assert!(matches!(&items[0], PopupItem::GroupHeader { .. }));
+            assert!(matches!(&items[1], PopupItem::Session { .. }));
+            assert!(matches!(&items[2], PopupItem::Session { .. }));
+        }
+
+        // ── no MAX_RECENT_SESSIONS cap ────────────────────────────────────────────
+
+        #[test]
+        fn popup_items_shows_all_sessions_beyond_cap() {
+            let mut state = SessionsState::new();
+            // 10 sessions - all should appear, no cap like start page
+            let ids: Vec<&str> = vec!["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"];
+            state.session_groups = vec![make_group(Some("/a"), &ids)];
+            let items = state.visible_popup_items();
+            // 1 header + 10 sessions = 11
+            assert_eq!(items.len(), 11);
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, PopupItem::LoadMore { .. }))
+            );
+        }
+
+        #[test]
+        fn popup_items_include_load_more_when_group_has_next_cursor() {
+            let mut state = SessionsState::new();
+            let mut group = make_group(Some("/workspace/project"), &["s1"]);
+            group.next_cursor = Some("cursor-1".to_string());
+            state.session_groups = vec![group];
+
+            let items = state.visible_popup_items();
+
+            assert!(matches!(
+                items.last(),
+                Some(PopupItem::LoadMore {
+                    group_idx: 0,
+                    parent_path,
+                }) if parent_path.is_empty()
+            ));
+        }
+
+        // ── no MAX_VISIBLE_GROUPS cap ─────────────────────────────────────────────
+
+        #[test]
+        fn popup_items_shows_all_groups_beyond_cap() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &["s1"]),
+                make_group(Some("/b"), &["s2"]),
+                make_group(Some("/c"), &["s3"]),
+                make_group(Some("/d"), &["s4"]),
+                make_group(Some("/e"), &["s5"]),
+            ];
+            let items = state.visible_popup_items();
+            let headers = items
+                .iter()
+                .filter(|i| matches!(i, PopupItem::GroupHeader { .. }))
+                .count();
+            // All 5 groups shown (start page would cap at MAX_VISIBLE_GROUPS=3)
+            assert_eq!(headers, 5);
+        }
+
+        // ── collapse is separate from start page ──────────────────────────────────
+
+        #[test]
+        fn popup_collapsed_is_independent_of_start_page_collapsed() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+            // Collapse on the start page should NOT affect the popup
+            state.collapsed_groups.insert("/a".to_string());
+            let items = state.visible_popup_items();
+            // Popup uses popup_collapsed_groups, not collapsed_groups
+            // /a is expanded in popup → header + 2 sessions = 3
+            assert_eq!(items.len(), 3);
+        }
+
+        #[test]
+        fn popup_collapsed_hides_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["s1", "s2"])];
+            state.popup_collapsed_groups.insert("/a".to_string());
+            let items = state.visible_popup_items();
+            // Only the header visible
+            assert_eq!(items.len(), 1);
+            assert!(matches!(
+                &items[0],
+                PopupItem::GroupHeader {
+                    collapsed: true,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn popup_expanded_shows_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["s1"])];
+            // Not in popup_collapsed_groups → expanded
+            let items = state.visible_popup_items();
+            assert_eq!(items.len(), 2);
+            assert!(matches!(
+                &items[0],
+                PopupItem::GroupHeader {
+                    collapsed: false,
+                    ..
+                }
+            ));
+        }
+
+        // ── multiple groups, mixed collapse ───────────────────────────────────────
+
+        #[test]
+        fn popup_items_multiple_groups() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &["s1"]),
+                make_group(Some("/b"), &["s2", "s3"]),
+            ];
+            let items = state.visible_popup_items();
+            // /a: 1 header + 1 session; /b: 1 header + 2 sessions = 5
+            assert_eq!(items.len(), 5);
+        }
+
+        #[test]
+        fn popup_one_group_collapsed_other_expanded() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &["s1"]),
+                make_group(Some("/b"), &["s2", "s3"]),
+            ];
+            state.popup_collapsed_groups.insert("/a".to_string());
+            let items = state.visible_popup_items();
+            // /a collapsed: 1 header; /b expanded: 1 header + 2 sessions = 4
+            assert_eq!(items.len(), 4);
+            assert!(matches!(
+                &items[0],
+                PopupItem::GroupHeader {
+                    collapsed: true,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &items[1],
+                PopupItem::GroupHeader {
+                    collapsed: false,
+                    ..
+                }
+            ));
+        }
+
+        // ── filter hides non-matching sessions ────────────────────────────────────
+
+        #[test]
+        fn popup_filter_hides_non_matching_sessions() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["aaa", "bbb", "aab"])];
+            state.session_filter = "aa".to_string();
+            let items = state.visible_popup_items();
+            // header + "aaa" + "aab" (bbb filtered out by session_id)
+            assert_eq!(items.len(), 3);
+        }
+
+        #[test]
+        fn popup_filter_hides_groups_with_no_matches() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &["aaa"]),
+                make_group(Some("/b"), &["bbb"]),
+            ];
+            state.session_filter = "bbb".to_string();
+            let items = state.visible_popup_items();
+            // /a has no matches → hidden; /b: header + "bbb" = 2
+            assert_eq!(items.len(), 2);
+            if let PopupItem::GroupHeader { cwd, .. } = &items[0] {
+                assert_eq!(cwd.as_deref(), Some("/b"));
+            } else {
+                panic!("expected GroupHeader");
+            }
+        }
+
+        // ── session indices are correct ───────────────────────────────────────────
+
+        #[test]
+        fn popup_items_session_indices_correct() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![
+                make_group(Some("/a"), &["s0", "s1"]),
+                make_group(Some("/b"), &["s2"]),
+            ];
+            let items = state.visible_popup_items();
+            // items[0]: GroupHeader /a
+            // items[1]: Session group_idx=0, session_idx=0
+            // items[2]: Session group_idx=0, session_idx=1
+            // items[3]: GroupHeader /b
+            // items[4]: Session group_idx=1, session_idx=0
+            assert!(matches!(
+                &items[1],
+                PopupItem::Session {
+                    group_idx: 0,
+                    path,
+                    depth: 0,
+                } if path == &vec![0]
+            ));
+            assert!(matches!(
+                &items[2],
+                PopupItem::Session {
+                    group_idx: 0,
+                    path,
+                    depth: 0,
+                } if path == &vec![1]
+            ));
+            assert!(matches!(
+                &items[4],
+                PopupItem::Session {
+                    group_idx: 1,
+                    path,
+                    depth: 0,
+                } if path == &vec![0]
+            ));
+        }
+
+        // ── group header carries correct session_count ────────────────────────────
+
+        #[test]
+        fn popup_group_header_session_count_reflects_total() {
+            let mut state = SessionsState::new();
+            state.session_groups = vec![make_group(Some("/a"), &["s1", "s2", "s3"])];
+            state.session_groups[0].total_count = Some(8);
+            let items = state.visible_popup_items();
+            assert!(matches!(
+                &items[0],
+                PopupItem::GroupHeader {
+                    session_count: 3,
+                    session_total: Some(8),
+                    ..
+                }
+            ));
+        }
+
+        // ── toggle_popup_group_collapse ───────────────────────────────────────────
+
+        #[test]
+        fn toggle_popup_collapse_collapses_then_expands() {
+            let mut state = SessionsState::new();
+            assert!(!state.popup_collapsed_groups.contains("/a"));
+            state.toggle_popup_group_collapse(Some("/a"));
+            assert!(state.popup_collapsed_groups.contains("/a"));
+            state.toggle_popup_group_collapse(Some("/a"));
+            assert!(!state.popup_collapsed_groups.contains("/a"));
+        }
+
+        #[test]
+        fn toggle_popup_collapse_none_cwd_uses_empty_string_key() {
+            let mut state = SessionsState::new();
+            state.toggle_popup_group_collapse(None);
+            assert!(state.popup_collapsed_groups.contains(""));
+            state.toggle_popup_group_collapse(None);
+            assert!(!state.popup_collapsed_groups.contains(""));
+        }
+
+        #[test]
+        fn toggle_popup_collapse_does_not_affect_start_page_state() {
+            let mut state = SessionsState::new();
+            state.toggle_popup_group_collapse(Some("/a"));
+            assert!(state.popup_collapsed_groups.contains("/a"));
+            // start page collapsed_groups should be untouched
+            assert!(!state.collapsed_groups.contains("/a"));
+        }
     }
 }
