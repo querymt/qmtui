@@ -2494,6 +2494,37 @@ mod session_popup_key_tests {
         group
     }
 
+    struct NewSessionTempDir(std::path::PathBuf);
+
+    impl NewSessionTempDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "qmt-runtime-new-session-{label}-{}-{nanos}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for NewSessionTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // ── Down / Up navigation ──────────────────────────────────────────────────
 
     #[test]
@@ -3008,6 +3039,107 @@ mod session_popup_key_tests {
     }
 
     #[test]
+    fn new_session_popup_edited_input_refreshes_completion() {
+        let temp_dir = NewSessionTempDir::new("edited-refresh");
+        let directory = temp_dir.path().join("project-dir");
+        let file = temp_dir.path().join("project-file.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "not a directory").unwrap();
+
+        let mut app = App::new();
+        app.navigation.popup = Popup::NewSession;
+        app.connection.launch_cwd = Some(temp_dir.path().to_string_lossy().into_owned());
+        app.sessions.new_session_path = "project-".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
+
+        let effects = handle_new_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(effects, Vec::<Effect>::new());
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        let completion = app.sessions.new_session_completion.as_ref().unwrap();
+        assert_eq!(completion.query, "project-d");
+        assert!(
+            completion
+                .results
+                .iter()
+                .any(|entry| entry.path == directory.to_string_lossy() && entry.is_dir)
+        );
+        assert!(
+            !completion
+                .results
+                .iter()
+                .any(|entry| entry.path == file.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn new_session_popup_navigation_and_unsupported_keys_are_noops_at_root() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::NewSession;
+        app.sessions.new_session_path = "pro".into();
+        app.sessions.new_session_cursor = app.sessions.new_session_path.len();
+        app.sessions.new_session_completion = Some(crate::session_state::PathCompletionState {
+            query: "pro".into(),
+            selected_index: 0,
+            results: vec![
+                crate::composer_state::FileIndexEntryLite {
+                    path: "/launch/project-one".into(),
+                    is_dir: true,
+                },
+                crate::composer_state::FileIndexEntryLite {
+                    path: "/launch/project-two".into(),
+                    is_dir: true,
+                },
+            ],
+        });
+
+        let effects = handle_new_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+
+        assert_eq!(effects, Vec::<Effect>::new());
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(
+            app.sessions
+                .new_session_completion
+                .as_ref()
+                .unwrap()
+                .selected_index,
+            1
+        );
+
+        let path = app.sessions.new_session_path.clone();
+        let cursor = app.sessions.new_session_cursor;
+        let completion = app.sessions.new_session_completion.clone();
+        let effects = handle_new_session_popup_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+
+        assert_eq!(effects, Vec::<Effect>::new());
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(app.sessions.new_session_path, path);
+        assert_eq!(app.sessions.new_session_cursor, cursor);
+        assert_eq!(app.sessions.new_session_completion, completion);
+    }
+
+    #[test]
+    fn new_session_popup_escape_closes_popup() {
+        let mut app = App::new();
+        app.navigation.popup = Popup::NewSession;
+
+        let effects =
+            handle_new_session_popup_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(effects, Vec::<Effect>::new());
+        assert_eq!(app.navigation.popup, Popup::None);
+    }
+
+    #[test]
     fn new_session_popup_enter_with_empty_path_uses_launch_cwd() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;
@@ -3015,20 +3147,20 @@ mod session_popup_key_tests {
         app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path.clear();
         app.sessions.new_session_cursor = 0;
-        let mut effects = TestEffects::default();
-        effects.extend(handle_new_session_popup_key(
+
+        let effects = handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        );
 
         assert_eq!(app.navigation.popup, Popup::None);
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::NewSession {
-                cwd: Some(ref cwd),
-                profile_id: None
-            }) if cwd == "/launch"
-        ));
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::NewSession {
+                cwd: Some("/launch".into()),
+                profile_id: None,
+            })]
+        );
     }
 
     #[test]
@@ -3037,19 +3169,19 @@ mod session_popup_key_tests {
         app.navigation.popup = Popup::NewSession;
         app.sessions.new_session_path = "project".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
-        let mut effects = TestEffects::default();
 
-        effects.extend(handle_new_session_popup_key(
+        let effects = handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        );
 
         assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(app.sessions.new_session_path, "project");
         assert_eq!(
             app.diagnostics.status,
             "not connected - waiting to reconnect"
         );
-        assert!(effects.next_command().is_none());
+        assert_eq!(effects, Vec::<Effect>::new());
     }
 
     #[test]
@@ -3060,19 +3192,20 @@ mod session_popup_key_tests {
         app.connection.launch_cwd = Some("/launch".into());
         app.sessions.new_session_path = "proj/subdir".into();
         app.sessions.new_session_cursor = app.sessions.new_session_path.len();
-        let mut effects = TestEffects::default();
-        effects.extend(handle_new_session_popup_key(
+
+        let effects = handle_new_session_popup_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        );
 
-        assert!(matches!(
-            effects.next_command(),
-            Some(Command::NewSession {
-                cwd: Some(ref cwd),
-                profile_id: None
-            }) if cwd == "/launch/proj/subdir"
-        ));
+        assert_eq!(app.navigation.popup, Popup::None);
+        assert_eq!(
+            effects,
+            vec![Effect::Command(Command::NewSession {
+                cwd: Some("/launch/proj/subdir".into()),
+                profile_id: None,
+            })]
+        );
     }
 
     #[test]
@@ -3083,17 +3216,21 @@ mod session_popup_key_tests {
             query: "pro".into(),
             selected_index: 0,
             results: vec![crate::composer_state::FileIndexEntryLite {
-                path: "/launch/project".into(),
+                path: "/launch/project/../project-two".into(),
                 is_dir: true,
             }],
         });
-        let mut effects = TestEffects::default();
-        effects.extend(handle_new_session_popup_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-        ));
 
-        assert_eq!(app.sessions.new_session_path, "/launch/project/");
+        let effects =
+            handle_new_session_popup_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(effects, Vec::<Effect>::new());
+        assert_eq!(app.navigation.popup, Popup::NewSession);
+        assert_eq!(app.sessions.new_session_path, "/launch/project-two/");
+        assert_eq!(
+            app.sessions.new_session_cursor,
+            "/launch/project-two/".len()
+        );
         assert!(app.sessions.new_session_completion.is_none());
     }
 
