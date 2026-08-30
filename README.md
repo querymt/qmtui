@@ -76,12 +76,7 @@ as `AppEvent::Acp`; ACP code never renders or imports `crate::ui`.
 
 ## Boundary Rules
 
-`tools/check_architecture.py` enforces the dependency direction and migration
-invariants in CI. It parses Rust imports and relevant declarations with comments
-and literals masked, reports `file:line` failures, and is covered by fixture-based
-standard-library `unittest` cases in `tools/test_check_architecture.py`.
-
-The enforced rules are:
+The architectural guidelines are:
 
 - Domain modules stay free of UI/terminal crates, Tokio synchronization,
   filesystem/process access, ACP transport, and protocol DTO imports.
@@ -123,8 +118,6 @@ handler, runtime, and root UI tests cover composition and event/effect ordering.
 Run the same primary gates used by CI:
 
 ```sh
-python3 tools/test_check_architecture.py
-python3 tools/check_architecture.py
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets --all-features
