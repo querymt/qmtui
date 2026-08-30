@@ -677,6 +677,8 @@ mod tests {
     #[test]
     fn filtering_is_case_insensitive_across_objective_id_and_agent() {
         let mut state = DelegatesState::new();
+        assert!(state.visible_entries().is_empty());
+
         state.delegate_entries = vec![
             entry(
                 "DEL-ONE",
