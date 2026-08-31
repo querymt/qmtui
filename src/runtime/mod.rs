@@ -29,7 +29,7 @@ use endpoint::{
     Cli, EndpointSelection, default_acp_ws_url, detect_launch_cwd, select_acp_endpoint,
 };
 use event_loop::run_loop;
-use terminal::AppTerminal;
+use terminal::{AppTerminal, TerminalReaderController};
 
 use tokio::sync::mpsc;
 
@@ -38,11 +38,20 @@ use crate::{acp_state::AcpAppEvent, connection_state::ConnState, navigation_stat
 
 pub(super) struct EffectExecutor<'a> {
     cmd_tx: &'a mpsc::UnboundedSender<Command>,
+    terminal_reader: Option<TerminalReaderController>,
 }
 
 impl<'a> EffectExecutor<'a> {
     fn new(cmd_tx: &'a mpsc::UnboundedSender<Command>) -> Self {
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            terminal_reader: None,
+        }
+    }
+
+    fn with_terminal_reader(mut self, terminal_reader: TerminalReaderController) -> Self {
+        self.terminal_reader = Some(terminal_reader);
+        self
     }
 
     pub(super) fn execute(
@@ -50,9 +59,11 @@ impl<'a> EffectExecutor<'a> {
         terminal: &mut AppTerminal,
         app: &mut App,
         effects: Vec<Effect>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
+        let mut ends_terminal_batch = false;
         let mut effects = effects.into_iter();
         while let Some(effect) = effects.next() {
+            ends_terminal_batch |= !matches!(effect, Effect::Command(_));
             let runtime_event = match effect {
                 Effect::Command(command) => self.send_command(command),
                 Effect::ElicitationResponse {
@@ -83,12 +94,11 @@ impl<'a> EffectExecutor<'a> {
                     success: copy_text_to_clipboard(&text),
                 }),
                 Effect::OpenExternalEditor { initial_text } => {
-                    Some(RuntimeEvent::ExternalEditorFinished {
-                        outcome: terminal::open_external_editor_with_terminal(
-                            terminal,
-                            &initial_text,
-                        )?,
-                    })
+                    let outcome =
+                        terminal::with_reader_paused(self.terminal_reader.as_ref(), || {
+                            terminal::open_external_editor_with_terminal(terminal, &initial_text)
+                        })?;
+                    Some(RuntimeEvent::ExternalEditorFinished { outcome })
                 }
                 Effect::Terminal(TerminalAction::Redraw) => {
                     terminal::redraw(terminal)?;
@@ -96,7 +106,7 @@ impl<'a> EffectExecutor<'a> {
                 }
                 Effect::Quit => {
                     app.should_quit = true;
-                    return Ok(());
+                    return Ok(true);
                 }
             };
 
@@ -108,7 +118,7 @@ impl<'a> EffectExecutor<'a> {
                     .into_iter();
             }
         }
-        Ok(())
+        Ok(ends_terminal_batch)
     }
 
     fn send_command(&self, command: Command) -> Option<RuntimeEvent> {
@@ -1749,20 +1759,31 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let mut terminal = terminal::enter()?;
+    let mut terminal_reader = match terminal::TerminalReader::start() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = terminal::leave(&mut terminal);
+            return Err(error);
+        }
+    };
 
     app.connection.server_state = initial_server_state;
-    let mut executor = EffectExecutor::new(&cmd_tx);
-    let result = run_loop(
+    let mut executor =
+        EffectExecutor::new(&cmd_tx).with_terminal_reader(terminal_reader.controller());
+    let run_result = run_loop(
         &mut terminal,
         &mut app,
         &mut srv_rx,
         &mut conn_rx,
         &mut sup_event_rx,
+        terminal_reader.events(),
         &mut executor,
     )
     .await;
 
-    terminal::leave(&mut terminal)?;
+    let shutdown_result = terminal_reader.shutdown();
+    let leave_result = terminal::leave(&mut terminal);
+    let result = run_result.and(shutdown_result).and(leave_result);
 
     if let Some(session_id) = &app.sessions.session_id {
         eprintln!("{}", restore_hint(session_id));
