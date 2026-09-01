@@ -313,11 +313,12 @@ mod tests {
                     biased;
                     message = srv_rx.recv() => {
                         if let Some(ServerChannelMsg::Acp(AcpAppEvent::PromptFailed {
+                            session_id,
                             local_id,
                             message,
                         })) = message
                         {
-                            break (local_id, message);
+                            break (session_id, local_id, message);
                         }
                     }
                     result = &mut connection_task => {
@@ -328,8 +329,9 @@ mod tests {
         })
         .await
         .expect("prompt failure published during teardown");
-        assert_eq!(prompt_message.0, "local-1");
-        assert!(prompt_message.1.contains("connection shutdown"));
+        assert_eq!(prompt_message.0, "session-1");
+        assert_eq!(prompt_message.1, "local-1");
+        assert!(prompt_message.2.contains("connection shutdown"));
         connection_task
             .await
             .expect("WebSocket connection task")
@@ -426,15 +428,18 @@ mod tests {
         assert!(error.to_string().contains("connection closed"));
         let failures = std::iter::from_fn(|| srv_rx.try_recv().ok())
             .filter_map(|message| match message {
-                ServerChannelMsg::Acp(AcpAppEvent::PromptFailed { local_id, message }) => {
-                    Some((local_id, message))
-                }
+                ServerChannelMsg::Acp(AcpAppEvent::PromptFailed {
+                    session_id,
+                    local_id,
+                    message,
+                }) => Some((session_id, local_id, message)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].0, "local-close");
-        assert!(failures[0].1.contains("socket closed"));
+        assert_eq!(failures[0].0, "session-1");
+        assert_eq!(failures[0].1, "local-close");
+        assert!(failures[0].2.contains("socket closed"));
         server.await.expect("server task");
     }
 

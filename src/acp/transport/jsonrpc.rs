@@ -12,6 +12,11 @@ use tokio_tungstenite::tungstenite::Message;
 use super::super::connection::internal_error;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_PROMPT_METHOD: &str = "session/prompt";
+
+fn response_timeout(method: &str) -> Option<Duration> {
+    (method != SESSION_PROMPT_METHOD).then_some(RESPONSE_TIMEOUT)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::acp) struct Envelope {
@@ -101,7 +106,7 @@ impl Peer {
         method: &str,
         params: Value,
     ) -> Result<Value, acp_sdk::Error> {
-        self.request_with_timeout(method, params, RESPONSE_TIMEOUT)
+        self.request_with_timeout(method, params, response_timeout(method))
             .await
     }
 
@@ -109,7 +114,7 @@ impl Peer {
         &self,
         method: &str,
         params: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Value, acp_sdk::Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -124,16 +129,20 @@ impl Peer {
             self.pending.lock().await.remove(&id);
             return Err(err);
         }
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(result) => result
-                .map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?,
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                Err(internal_error(format!(
-                    "ACP WebSocket request timed out: {method}"
-                )))
+        let result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(internal_error(format!(
+                        "ACP WebSocket request timed out: {method}"
+                    )));
+                }
             }
-        }
+        } else {
+            rx.await
+        };
+        result.map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?
     }
 
     pub(in crate::acp) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
@@ -347,6 +356,42 @@ mod tests {
         assert_eq!(peer.pending_len().await, 0);
     }
 
+    #[test]
+    fn long_running_prompt_is_exempt_from_the_generic_response_timeout() {
+        assert_eq!(response_timeout(SESSION_PROMPT_METHOD), None);
+        assert_eq!(response_timeout("session/load"), Some(RESPONSE_TIMEOUT));
+        assert_eq!(response_timeout("querymt/models"), Some(RESPONSE_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn prompt_request_remains_correlated_until_its_terminal_response() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (mut task, wire) = request_with_wire(&peer, &mut rx, SESSION_PROMPT_METHOD).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.pending_len().await, 1);
+
+        peer.resolve(Envelope {
+            method: None,
+            params: Value::Null,
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+            ..wire
+        })
+        .await;
+
+        assert_eq!(
+            task.await.expect("prompt task").expect("prompt response"),
+            json!({ "stopReason": "end_turn" })
+        );
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
     #[tokio::test]
     async fn send_failure_unregisters_the_request() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -367,7 +412,7 @@ mod tests {
         let request_peer = peer.clone();
         let task = tokio::spawn(async move {
             request_peer
-                .request_with_timeout("querymt/slow", json!({}), Duration::from_millis(10))
+                .request_with_timeout("querymt/slow", json!({}), Some(Duration::from_millis(10)))
                 .await
         });
         let Message::Text(text) = rx.recv().await.expect("request frame") else {

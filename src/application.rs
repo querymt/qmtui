@@ -2239,8 +2239,13 @@ mod tests {
     #[test]
     fn chat_backend_prompt_failure_route_is_owner_bounded_and_release_safe() {
         let mut app = App::new();
+        app.sessions.session_id = Some("active".into());
+        let retained_id = "local:pending:retained".to_string();
+        app.chat.messages.push(ChatEntry::User {
+            text: "retained".into(),
+            message_id: Some(retained_id.clone()),
+        });
         let failed_id = app.chat.push_pending_prompt("failed".into());
-        let retained_id = app.chat.push_pending_prompt("retained".into());
         app.chat.activity = ActivityState::Thinking;
         app.chat.recent_prompt_text = Some("preserved prompt".into());
         app.chat.session_stats.open_llm_request_instant =
@@ -2255,13 +2260,15 @@ mod tests {
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::PromptFailed {
+                session_id: "active".into(),
                 local_id: failed_id.clone(),
                 message: "backend rejected prompt".into(),
             }),
         );
 
         assert!(effects.is_empty());
-        assert_eq!(app.chat.activity, ActivityState::Thinking);
+        assert_eq!(app.chat.activity, ActivityState::Idle);
+        assert!(app.chat.pending_prompt_local_ids.is_empty());
         assert!(app.chat.session_stats.open_llm_request_instant.is_none());
         assert!(app.chat.session_stats.active_llm_duration >= Duration::from_secs(2));
         assert_eq!(
@@ -2280,8 +2287,8 @@ mod tests {
         assert!(app.chat.messages.iter().all(|entry| {
             !matches!(entry, ChatEntry::User { message_id: Some(id), .. } if id == &failed_id)
         }));
-        assert!(content_cache_populated(&app));
-        assert!(thinking_cache_populated(&app));
+        assert!(!content_cache_populated(&app));
+        assert!(!thinking_cache_populated(&app));
         assert_eq!(card_cache_count(&app), 0);
         assert_eq!(app.diagnostics.status, "error: backend rejected prompt");
         let diagnostics = &app.diagnostics.logs[log_count_before..];
@@ -2298,6 +2305,7 @@ mod tests {
         let effects = update(
             &mut app,
             AppEvent::Acp(AcpAppEvent::PromptFailed {
+                session_id: "active".into(),
                 local_id: "missing".into(),
                 message: "backend rejected prompt".into(),
             }),
@@ -2305,7 +2313,7 @@ mod tests {
         assert!(effects.is_empty());
         assert!(content_cache_populated(&app));
         assert!(thinking_cache_populated(&app));
-        assert_eq!(card_cache_count(&app), 0);
+        assert_eq!(card_cache_count(&app), 11);
     }
 
     #[test]

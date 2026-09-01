@@ -73,9 +73,20 @@ fn chat_render_changes(transition: &ChatTransition) -> Vec<RenderChange> {
             }
             changes
         }
-        ChatTransition::BackendPromptFailed { .. } => {
-            vec![RenderChange::FinalizedMessagesChanged]
-        }
+        ChatTransition::BackendPromptFailed {
+            turn_ended: true, ..
+        } => vec![
+            RenderChange::FinalizedMessagesChanged,
+            RenderChange::StreamingContentChanged,
+            RenderChange::StreamingThinkingChanged,
+        ],
+        ChatTransition::BackendPromptFailed {
+            ignored_stale: true,
+            ..
+        } => Vec::new(),
+        ChatTransition::BackendPromptFailed {
+            turn_ended: false, ..
+        } => vec![RenderChange::FinalizedMessagesChanged],
         ChatTransition::RuntimePromptDispatchFailed {
             prompt_rolled_back: true,
         } => vec![RenderChange::FinalizedMessagesChanged],
@@ -300,6 +311,7 @@ pub(crate) enum AcpAppEvent {
         message: String,
     },
     PromptFailed {
+        session_id: String,
         local_id: String,
         message: String,
     },
@@ -534,7 +546,14 @@ impl crate::app::App {
             AcpAppEvent::Error { message } => {
                 self.apply_chat_action(ChatAction::AcpError { message })
             }
-            AcpAppEvent::PromptFailed { local_id, message } => {
+            AcpAppEvent::PromptFailed {
+                session_id,
+                local_id,
+                message,
+            } => {
+                if self.sessions.session_id.as_deref() != Some(session_id.as_str()) {
+                    return Vec::new();
+                }
                 self.apply_chat_action(ChatAction::BackendPromptFailed { local_id, message })
             }
         }
@@ -3511,6 +3530,7 @@ mod tests {
         let second = app.push_pending_prompt("second".into());
 
         app.handle_acp_event(AcpAppEvent::PromptFailed {
+            session_id: TEST_SESSION_ID.into(),
             local_id: first,
             message: "ACP prompt failed".into(),
         });
@@ -3521,6 +3541,10 @@ mod tests {
                 if text == "second" && message_id == &second
         ));
         assert_eq!(
+            app.chat.pending_prompt_local_ids.as_slice(),
+            [second.as_str()]
+        );
+        assert_eq!(
             app.chat
                 .messages
                 .iter()
@@ -3528,6 +3552,34 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn prompt_failure_for_an_inactive_session_cannot_mutate_the_active_turn() {
+        let mut app = app_with_active_session();
+        let local_id = app.push_pending_prompt("active prompt".into());
+        app.chat.activity = ActivityState::Streaming;
+        app.chat.streaming_content = "live output".into();
+        app.chat.streaming_content_message_id = Some("assistant-live".into());
+
+        let effects = app.handle_acp_event(AcpAppEvent::PromptFailed {
+            session_id: "other-session".into(),
+            local_id: local_id.clone(),
+            message: "stale prompt failure".into(),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(app.chat.activity, ActivityState::Streaming);
+        assert_eq!(
+            app.chat.pending_prompt_local_ids.as_slice(),
+            [local_id.as_str()]
+        );
+        assert_eq!(app.chat.streaming_content, "live output");
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, message_id: Some(message_id) }]
+                if text == "active prompt" && message_id == &local_id
+        ));
     }
 
     #[test]

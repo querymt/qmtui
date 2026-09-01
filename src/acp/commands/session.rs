@@ -171,6 +171,7 @@ pub(super) async fn prompt<C: AcpConnection>(
                 }
             }
             Err(err) => events.send(AcpAppEvent::PromptFailed {
+                session_id,
                 local_id,
                 message: format!("ACP prompt failed: {err:?}"),
             }),

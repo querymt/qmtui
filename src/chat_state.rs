@@ -287,6 +287,8 @@ pub(crate) enum ChatTransition {
     BackendPromptFailed {
         prompt_rolled_back: bool,
         error_inserted: bool,
+        turn_ended: bool,
+        ignored_stale: bool,
     },
     RuntimePromptDispatchFailed {
         prompt_rolled_back: bool,
@@ -382,6 +384,7 @@ pub(crate) struct HistoryOutcome {
 pub(crate) struct ChatState {
     pub(crate) messages: Vec<ChatEntry>,
     pub(crate) pending_prompt_seq: u64,
+    pub(crate) pending_prompt_local_ids: Vec<String>,
     pub(crate) fork_filter: String,
     pub(crate) fork_cursor: usize,
     pub(crate) pending_fork_message_id: Option<String>,
@@ -468,23 +471,32 @@ impl ChatState {
                 )
             }
             ChatAction::BackendPromptFailed { local_id, message } => {
-                self.end_llm_request_span(None);
                 let prompt_rolled_back = self.rollback_pending_prompt(&local_id);
-                let error_inserted = self.push_error(&message);
-                (
-                    ChatTransition::BackendPromptFailed {
-                        prompt_rolled_back,
-                        error_inserted,
-                    },
+                let turn_ended = self.fail_prompt_turn(&local_id);
+                let ignored_stale = !prompt_rolled_back && !turn_ended;
+                let error_inserted = !ignored_stale && self.push_error(&message);
+                let coordination = if ignored_stale {
+                    Vec::new()
+                } else {
                     vec![ChatCoordination::Status {
                         level: LogLevel::Error,
                         target: "acp",
                         message: format!("error: {message}"),
-                    }],
+                    }]
+                };
+                (
+                    ChatTransition::BackendPromptFailed {
+                        prompt_rolled_back,
+                        error_inserted,
+                        turn_ended,
+                        ignored_stale,
+                    },
+                    coordination,
                 )
             }
             ChatAction::RuntimePromptDispatchFailed { local_id } => {
                 let prompt_rolled_back = self.rollback_pending_prompt(&local_id);
+                self.remove_pending_prompt(&local_id);
                 (
                     ChatTransition::RuntimePromptDispatchFailed { prompt_rolled_back },
                     Vec::new(),
@@ -956,6 +968,7 @@ impl ChatState {
         Self {
             messages: Vec::new(),
             pending_prompt_seq: 0,
+            pending_prompt_local_ids: Vec::new(),
             fork_filter: String::new(),
             fork_cursor: 0,
             pending_fork_message_id: None,
@@ -982,6 +995,7 @@ impl ChatState {
     pub(crate) fn reset_for_session_switch(&mut self) {
         self.messages.clear();
         self.pending_prompt_seq = 0;
+        self.pending_prompt_local_ids.clear();
         self.streaming_content.clear();
         self.streaming_content_message_id = None;
         self.streaming_thinking.clear();
@@ -1195,6 +1209,7 @@ impl ChatState {
             text,
             message_id: Some(local_id.clone()),
         });
+        self.pending_prompt_local_ids.push(local_id.clone());
         local_id
     }
 
@@ -1537,10 +1552,35 @@ impl ChatState {
         true
     }
 
+    fn remove_pending_prompt(&mut self, local_id: &str) -> bool {
+        let Some(index) = self
+            .pending_prompt_local_ids
+            .iter()
+            .position(|pending| pending == local_id)
+        else {
+            return false;
+        };
+        self.pending_prompt_local_ids.remove(index);
+        true
+    }
+
+    fn fail_prompt_turn(&mut self, local_id: &str) -> bool {
+        if !self.remove_pending_prompt(local_id) || !self.pending_prompt_local_ids.is_empty() {
+            return false;
+        }
+        self.finalize_streaming_segment();
+        self.end_llm_request_span(None);
+        self.clear_cancel_confirm();
+        self.activity = ActivityState::Idle;
+        true
+    }
+
     pub(crate) fn cancel_turn(&mut self, is_replay: bool) {
         if !is_replay {
             self.end_llm_request_span(None);
         }
+        self.pending_prompt_local_ids.clear();
+        self.clear_cancel_confirm();
         self.activity = ActivityState::Idle;
         self.streaming_content.clear();
         self.streaming_content_message_id = None;
@@ -1831,6 +1871,7 @@ mod tests {
         let chat = ChatState::new();
         assert!(chat.messages.is_empty());
         assert_eq!(chat.pending_prompt_seq, 0);
+        assert!(chat.pending_prompt_local_ids.is_empty());
         assert!(chat.fork_filter.is_empty());
         assert_eq!(chat.fork_cursor, 0);
         assert!(chat.pending_fork_message_id.is_none());
@@ -1858,6 +1899,7 @@ mod tests {
         let mut chat = ChatState::new();
         chat.messages.push(ChatEntry::Error("stale".into()));
         chat.pending_prompt_seq = 8;
+        chat.pending_prompt_local_ids = vec!["stale-prompt".into()];
         chat.fork_filter = "keep".into();
         chat.fork_cursor = 3;
         chat.pending_fork_message_id = Some("keep-fork".into());
@@ -1886,6 +1928,7 @@ mod tests {
 
         assert!(chat.messages.is_empty());
         assert_eq!(chat.pending_prompt_seq, 0);
+        assert!(chat.pending_prompt_local_ids.is_empty());
         assert_eq!(chat.fork_filter, "keep");
         assert_eq!(chat.fork_cursor, 3);
         assert_eq!(chat.pending_fork_message_id.as_deref(), Some("keep-fork"));
@@ -3263,9 +3306,16 @@ mod tests {
     #[test]
     fn backend_prompt_failure_reducer_preserves_matching_and_dedupe_semantics() {
         let mut chat = ChatState::new();
+        let retained_id = "local:pending:retained".to_string();
+        chat.messages.push(ChatEntry::User {
+            text: "retained".into(),
+            message_id: Some(retained_id.clone()),
+        });
         let failed_id = chat.push_pending_prompt("failed".into());
-        let retained_id = chat.push_pending_prompt("retained".into());
         chat.recent_prompt_text = Some("preserved prompt".into());
+        chat.activity = ActivityState::Streaming;
+        chat.streaming_content = "partial answer".into();
+        chat.streaming_content_message_id = Some("assistant-partial".into());
         chat.session_stats.open_llm_request_instant = Some(Instant::now() - Duration::from_secs(2));
 
         let failed = chat.reduce(ChatAction::BackendPromptFailed {
@@ -3279,6 +3329,8 @@ mod tests {
                 transition: ChatTransition::BackendPromptFailed {
                     prompt_rolled_back: true,
                     error_inserted: true,
+                    turn_ended: true,
+                    ignored_stale: false,
                 },
                 coordination: vec![ChatCoordination::Status {
                     level: LogLevel::Error,
@@ -3288,6 +3340,9 @@ mod tests {
                 effects: Vec::new(),
             }
         );
+        assert_eq!(chat.activity, ActivityState::Idle);
+        assert!(chat.pending_prompt_local_ids.is_empty());
+        assert!(chat.streaming_content.is_empty());
         assert!(chat.session_stats.open_llm_request_instant.is_none());
         assert!(chat.session_stats.active_llm_duration >= Duration::from_secs(2));
         assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
@@ -3295,13 +3350,19 @@ mod tests {
             chat.messages.as_slice(),
             [
                 ChatEntry::User { text, message_id: Some(message_id) },
+                ChatEntry::Assistant { content, message_id: Some(assistant_id), .. },
                 ChatEntry::Error(message),
             ] if text == "retained"
                 && message_id == &retained_id
+                && content == "partial answer"
+                && assistant_id == "assistant-partial"
                 && message == "backend rejected prompt"
         ));
 
+        chat.activity = ActivityState::Streaming;
+        chat.pending_prompt_local_ids = vec![retained_id.clone()];
         chat.session_stats.open_llm_request_instant = Some(Instant::now());
+        let open_timing = chat.session_stats.open_llm_request_instant;
         let nonmatching = chat.reduce(ChatAction::BackendPromptFailed {
             local_id: "missing".into(),
             message: "backend rejected prompt".into(),
@@ -3311,12 +3372,19 @@ mod tests {
             ChatTransition::BackendPromptFailed {
                 prompt_rolled_back: false,
                 error_inserted: false,
+                turn_ended: false,
+                ignored_stale: true,
             }
         );
-        assert_eq!(nonmatching.coordination, failed.coordination);
+        assert!(nonmatching.coordination.is_empty());
         assert!(nonmatching.effects.is_empty());
-        assert!(chat.session_stats.open_llm_request_instant.is_none());
-        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.activity, ActivityState::Streaming);
+        assert_eq!(
+            chat.pending_prompt_local_ids.as_slice(),
+            [retained_id.as_str()]
+        );
+        assert_eq!(chat.session_stats.open_llm_request_instant, open_timing);
+        assert_eq!(chat.messages.len(), 3);
         assert_eq!(chat.recent_prompt_text.as_deref(), Some("preserved prompt"));
     }
 
