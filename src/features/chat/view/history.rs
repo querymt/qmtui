@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::chat_state::ChatState;
 use crate::theme::Theme;
-use crate::view_shared::{ELLIPSIS, scroll_input, truncate_with_ellipsis};
+use crate::view_shared::{ELLIPSIS, popup_rect, scroll_input, truncate_with_ellipsis};
 
 pub(crate) struct ForkPopupInput<'a> {
     pub(crate) chat: &'a ChatState,
@@ -17,14 +17,14 @@ pub(crate) struct ForkPopupInput<'a> {
 pub(crate) fn draw_fork_turn_popup(f: &mut Frame, input: ForkPopupInput<'_>) {
     let chat = input.chat;
     let area = f.area();
-    let popup_width = area.width.saturating_sub(4).clamp(36, 84);
-    let popup_height = area.height.saturating_sub(4).clamp(6, 12);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(4) as usize,
+        36..=84,
+        6..=12,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -62,7 +62,15 @@ pub(crate) fn draw_fork_turn_popup(f: &mut Frame, input: ForkPopupInput<'_>) {
         Paragraph::new(input_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+    if chunks[1].width > 2 && chunks[1].height > 0 {
+        f.set_cursor_position((
+            chunks[1]
+                .x
+                .saturating_add(2)
+                .saturating_add(filter_cur as u16),
+            chunks[1].y,
+        ));
+    }
 
     let turns = chat.visible_fork_turns();
     if turns.is_empty() {

@@ -596,10 +596,10 @@ impl Card {
     }
 
     /// Compute visual height using the full card render width.
-    pub(crate) fn height(&self, width: u16) -> u16 {
+    pub(crate) fn height(&self, width: u16) -> usize {
         let inner_w = width.saturating_sub(4);
         let lines = self.lines_for(inner_w);
-        let line_rows: u16 = lines
+        let line_rows = lines
             .iter()
             .map(|line| {
                 let width = line.width();
@@ -607,15 +607,17 @@ impl Card {
                 if inner_width == 0 || width == 0 {
                     1
                 } else {
-                    width.div_ceil(inner_width) as u16
+                    width.div_ceil(inner_width)
                 }
             })
-            .sum::<u16>()
+            .fold(0usize, usize::saturating_add)
             .max(1);
-        self.top_pad + line_rows + self.bottom_pad
+        (self.top_pad as usize)
+            .saturating_add(line_rows)
+            .saturating_add(self.bottom_pad as usize)
     }
 
-    pub(crate) fn render(&self, frame: &mut Frame, area: Rect, clip_top: u16) {
+    pub(crate) fn render(&self, frame: &mut Frame, area: Rect, clip_top: usize) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -637,7 +639,8 @@ impl Card {
 
         let has_top_pad = !matches!(self.kind, CardKind::Tool { compact: true });
         let visible_top_pad = u16::from(clip_top == 0 && has_top_pad);
-        let content_skip = clip_top.saturating_sub(1);
+        // Ratatui exposes a u16 paragraph scroll; larger offsets saturate at that API boundary.
+        let content_skip = clip_top.saturating_sub(1).min(u16::MAX as usize) as u16;
         let content_height = area.height.saturating_sub(visible_top_pad);
         if content_height == 0 {
             return;
@@ -862,7 +865,7 @@ impl StreamingCache {
 #[derive(Default)]
 struct ChatViewportState {
     scroll_offset: u16,
-    previous_total_height: u16,
+    previous_total_height: usize,
 }
 
 #[derive(Default)]
@@ -1251,19 +1254,25 @@ impl RenderState {
         self.chat_viewport.scroll_offset = 0;
     }
 
-    pub(crate) fn compensate_chat_growth(&mut self, total_height: u16) {
+    pub(crate) fn compensate_chat_growth(&mut self, total_height: usize) {
         let growth = total_height.saturating_sub(self.chat_viewport.previous_total_height);
         if self.chat_viewport.scroll_offset > 0 && growth > 0 {
-            self.chat_viewport.scroll_offset =
-                self.chat_viewport.scroll_offset.saturating_add(growth);
+            // The public scroll state remains u16; preserve compatibility with explicit saturation.
+            self.chat_viewport.scroll_offset = self
+                .chat_viewport
+                .scroll_offset
+                .saturating_add(growth.min(u16::MAX as usize) as u16);
         }
         self.chat_viewport.previous_total_height = total_height;
     }
 
-    pub(crate) fn clamp_chat_scroll(&mut self, total_height: u16, viewport_height: u16) -> u16 {
-        let max_scroll = total_height.saturating_sub(viewport_height);
-        self.chat_viewport.scroll_offset = self.chat_viewport.scroll_offset.min(max_scroll);
-        max_scroll.saturating_sub(self.chat_viewport.scroll_offset)
+    pub(crate) fn clamp_chat_scroll(&mut self, total_height: usize, viewport_height: u16) -> usize {
+        let max_scroll = total_height.saturating_sub(viewport_height as usize);
+        self.chat_viewport.scroll_offset = self
+            .chat_viewport
+            .scroll_offset
+            .min(max_scroll.min(u16::MAX as usize) as u16);
+        max_scroll.saturating_sub(self.chat_viewport.scroll_offset as usize)
     }
 
     pub(crate) fn reset_chat_viewport(&mut self) {
@@ -1316,12 +1325,12 @@ impl RenderState {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_chat_previous_total_height(&self) -> u16 {
+    pub(crate) fn test_chat_previous_total_height(&self) -> usize {
         self.chat_viewport.previous_total_height
     }
 
     #[cfg(test)]
-    pub(crate) fn test_seed_chat_viewport(&mut self, offset: u16, previous_total_height: u16) {
+    pub(crate) fn test_seed_chat_viewport(&mut self, offset: u16, previous_total_height: usize) {
         self.chat_viewport = ChatViewportState {
             scroll_offset: offset,
             previous_total_height,
@@ -1860,6 +1869,23 @@ mod tests {
         );
         assert_eq!(state.test_session_epoch(), 0);
         assert!(state.invalidation_order.is_empty());
+    }
+
+    #[test]
+    fn wide_chat_height_baseline_does_not_wrap_and_scroll_saturates_explicitly() {
+        let mut state = RenderState::new();
+        state.compensate_chat_growth(70_000);
+        state.set_chat_scroll_offset(1);
+        state.compensate_chat_growth(140_000);
+
+        assert_eq!(state.test_chat_previous_total_height(), 140_000);
+        assert_eq!(state.chat_scroll_offset(), u16::MAX);
+        assert_eq!(state.clamp_chat_scroll(140_000, 20), 74_445);
+
+        state.compensate_chat_growth(1_000);
+        assert_eq!(state.test_chat_previous_total_height(), 1_000);
+        assert_eq!(state.clamp_chat_scroll(1_000, 20), 0);
+        assert_eq!(state.chat_scroll_offset(), 980);
     }
 
     #[test]

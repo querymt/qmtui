@@ -65,6 +65,17 @@ fn cleanup_temp_editor_file(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+fn run_with_cleanup<T>(
+    operation: impl FnOnce() -> anyhow::Result<T>,
+    cleanup: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    let operation_result = operation();
+    if let Err(error) = cleanup() {
+        eprintln!("failed to clean up external editor temporary file: {error}");
+    }
+    operation_result
+}
+
 pub(super) fn open_external_editor(initial_text: &str) -> ExternalEditorOutcome {
     open_external_editor_with_command(initial_text, system_editor_command())
 }
@@ -77,10 +88,13 @@ fn open_external_editor_with_command(
         let command = command
             .ok_or_else(|| anyhow::anyhow!("set $VISUAL or $EDITOR to use an external editor"))?;
         let path = temp_editor_file_path();
-        fs::write(&path, initial_text)?;
-        let result = run_external_editor(&command, &path);
-        cleanup_temp_editor_file(&path)?;
-        result
+        run_with_cleanup(
+            || {
+                fs::write(&path, initial_text)?;
+                run_external_editor(&command, &path)
+            },
+            || cleanup_temp_editor_file(&path),
+        )
     })();
 
     match result {
@@ -92,7 +106,9 @@ fn open_external_editor_with_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorCommand, editor_command_from_env, open_external_editor_with_command};
+    use super::{
+        EditorCommand, editor_command_from_env, open_external_editor_with_command, run_with_cleanup,
+    };
     use crate::application::ExternalEditorOutcome;
     use std::ffi::OsString;
 
@@ -125,6 +141,29 @@ mod tests {
             ExternalEditorOutcome::Failed(message)
                 if message == "set $VISUAL or $EDITOR to use an external editor"
         ));
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_replace_success_or_cancellation() {
+        let completed = run_with_cleanup(
+            || Ok(Some("updated".to_string())),
+            || anyhow::bail!("cleanup failed"),
+        );
+        let cancelled: anyhow::Result<Option<String>> =
+            run_with_cleanup(|| Ok(None), || anyhow::bail!("cleanup failed"));
+
+        assert_eq!(completed.unwrap(), Some("updated".to_string()));
+        assert_eq!(cancelled.unwrap(), None);
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_replace_editor_failure() {
+        let result: anyhow::Result<Option<String>> = run_with_cleanup(
+            || anyhow::bail!("editor failed"),
+            || anyhow::bail!("cleanup failed"),
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "editor failed");
     }
 
     #[cfg(unix)]

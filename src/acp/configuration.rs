@@ -191,7 +191,7 @@ fn model_from_option(option: &Value, model_id: &str) -> Option<Model> {
             let (provider, model) = model_id
                 .split_once('/')
                 .map(|(provider, model)| (provider.to_string(), model.to_string()))
-                .unwrap_or_else(|| ("unknown".to_string(), label.clone()));
+                .unwrap_or_else(|| ("unknown".to_string(), model_id.to_string()));
             Model {
                 id: model_id.to_string(),
                 label,
@@ -234,6 +234,18 @@ mod tests {
         assert_eq!(entry["provider"], "openrouter");
         assert_eq!(entry["model"], "openai/gpt-5");
         assert_eq!(entry["node_id"], "node-1");
+    }
+
+    #[test]
+    fn model_option_without_provider_uses_identifier_not_friendly_label() {
+        let option = json!({
+            "options": [{ "value": "stable-id", "name": "Friendly Label" }]
+        });
+        let model = model_from_option(&option, "stable-id").expect("model");
+
+        assert_eq!(model.label, "Friendly Label");
+        assert_eq!(model.provider, "unknown");
+        assert_eq!(model.model, "stable-id");
     }
 
     #[test]

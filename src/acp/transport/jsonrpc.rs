@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use agent_client_protocol as acp_sdk;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::super::connection::internal_error;
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::acp) struct Envelope {
@@ -98,6 +101,16 @@ impl Peer {
         method: &str,
         params: Value,
     ) -> Result<Value, acp_sdk::Error> {
+        self.request_with_timeout(method, params, RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, acp_sdk::Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -111,8 +124,16 @@ impl Peer {
             self.pending.lock().await.remove(&id);
             return Err(err);
         }
-        rx.await
-            .map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(result) => result
+                .map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(internal_error(format!(
+                    "ACP WebSocket request timed out: {method}"
+                )))
+            }
+        }
     }
 
     pub(in crate::acp) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
@@ -336,6 +357,41 @@ mod tests {
             .await
             .expect_err("send failure");
         assert!(error.to_string().contains("send failed"));
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_removes_pending_request_and_ignores_late_response() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let request_peer = peer.clone();
+        let task = tokio::spawn(async move {
+            request_peer
+                .request_with_timeout("querymt/slow", json!({}), Duration::from_millis(10))
+                .await
+        });
+        let Message::Text(text) = rx.recv().await.expect("request frame") else {
+            panic!("expected text frame");
+        };
+        let wire: Envelope = serde_json::from_str(&text).expect("request envelope");
+
+        let error = task
+            .await
+            .expect("request task")
+            .expect_err("timeout error")
+            .to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("querymt/slow"));
+        assert_eq!(peer.pending_len().await, 0);
+
+        peer.resolve(Envelope {
+            method: None,
+            params: Value::Null,
+            result: Some(json!("late")),
+            error: None,
+            ..wire
+        })
+        .await;
         assert_eq!(peer.pending_len().await, 0);
     }
 

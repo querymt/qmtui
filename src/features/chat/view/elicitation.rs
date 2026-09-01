@@ -26,10 +26,10 @@ fn wrap_elicitation_message(text: &str, width: u16) -> Vec<String> {
 
     for logical_line in text.lines() {
         let mut row = String::new();
-        let mut row_width = 0;
+        let mut row_width = 0usize;
         for word in logical_line.split_whitespace() {
             let word_width = UnicodeWidthStr::width(word);
-            if !row.is_empty() && row_width + 1 + word_width > width {
+            if !row.is_empty() && row_width.saturating_add(1).saturating_add(word_width) > width {
                 rows.push(std::mem::take(&mut row));
                 row_width = 0;
             }
@@ -40,21 +40,21 @@ fn wrap_elicitation_message(text: &str, width: u16) -> Vec<String> {
                     row_width = 0;
                 }
                 for ch in word.chars() {
-                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if row_width > 0 && row_width + ch_width > width {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                    if row_width > 0 && row_width.saturating_add(ch_width) > width {
                         rows.push(std::mem::take(&mut row));
                         row_width = 0;
                     }
                     row.push(ch);
-                    row_width += ch_width;
+                    row_width = row_width.saturating_add(ch_width);
                 }
             } else {
                 if !row.is_empty() {
                     row.push(' ');
-                    row_width += 1;
+                    row_width = row_width.saturating_add(1);
                 }
                 row.push_str(word);
-                row_width += word_width;
+                row_width = row_width.saturating_add(word_width);
             }
         }
         rows.push(row);
@@ -66,10 +66,8 @@ fn wrap_elicitation_message(text: &str, width: u16) -> Vec<String> {
     rows
 }
 
-fn wrapped_text_rows(text: &str, width: u16) -> u16 {
-    wrap_elicitation_message(text, width)
-        .len()
-        .min(u16::MAX as usize) as u16
+fn wrapped_text_rows(text: &str, width: u16) -> usize {
+    wrap_elicitation_message(text, width).len()
 }
 
 fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
@@ -78,22 +76,21 @@ fn elicitation_option_text(label: &str, description: Option<&str>) -> String {
         .unwrap_or_else(|| label.to_string())
 }
 
-fn elicitation_option_rows(state: &ElicitationState, ui: &ElicitationUiState, width: u16) -> u16 {
+fn elicitation_option_rows(state: &ElicitationState, ui: &ElicitationUiState, width: u16) -> usize {
     let schema_rows = match ui
         .current_field_index(state.fields.len())
         .and_then(|index| state.fields.get(index))
         .map(|field| &field.kind)
     {
         Some(ElicitationFieldKind::SingleSelect { options })
-        | Some(ElicitationFieldKind::MultiSelect { options }) => options
-            .iter()
-            .map(|option| {
-                wrapped_text_rows(
+        | Some(ElicitationFieldKind::MultiSelect { options }) => {
+            options.iter().fold(0usize, |rows, option| {
+                rows.saturating_add(wrapped_text_rows(
                     &elicitation_option_text(&option.label, option.description.as_deref()),
                     width,
-                )
+                ))
             })
-            .sum(),
+        }
         _ => 1,
     };
     let option_count = match ui
@@ -105,7 +102,7 @@ fn elicitation_option_rows(state: &ElicitationState, ui: &ElicitationUiState, wi
         | Some(ElicitationFieldKind::MultiSelect { options }) => options.len(),
         _ => 0,
     };
-    schema_rows + u16::from(state.allow_custom && option_count > 0)
+    schema_rows.saturating_add(usize::from(state.allow_custom && option_count > 0))
 }
 
 pub(crate) fn popup_height(
@@ -123,14 +120,18 @@ pub(crate) fn popup_height(
             let width = area.width.saturating_sub(4) as usize;
             render
                 .prepare_elicitation_custom_layout(&state.custom_input, ui.custom_cursor, width, 2)
-                .total_rows() as u16
+                .total_rows()
         } else {
             0
         };
-        // Top padding, title, wrapped message, choices/input, and hint, each separated as needed.
-        let content_rows = option_rows.max(1) + custom_rows.min(5);
-        let custom_spacing = u16::from(ui.custom_active);
-        (7 + message_rows.max(1) + content_rows + custom_spacing).min(area.height.saturating_sub(3))
+        // Keep every remote-content-derived calculation wide until the frame boundary.
+        let content_rows = option_rows.max(1).saturating_add(custom_rows.min(5));
+        let custom_spacing = usize::from(ui.custom_active);
+        7usize
+            .saturating_add(message_rows.max(1))
+            .saturating_add(content_rows)
+            .saturating_add(custom_spacing)
+            .min(area.height.saturating_sub(3) as usize) as u16
     } else {
         0
     }
@@ -149,7 +150,7 @@ pub(crate) fn draw_popup(
 
     f.render_widget(Block::default().style(Theme::popup_bg()), area);
     let inner = Rect {
-        x: area.x + 1,
+        x: area.x.saturating_add(1),
         y: area.y,
         width: area.width.saturating_sub(2),
         height: area.height,
@@ -159,7 +160,7 @@ pub(crate) fn draw_popup(
     }
 
     let mut row = inner.y;
-    let max_y = inner.y + inner.height;
+    let max_y = inner.bottom();
     // Leave one row of padding before the header.
     row = row.saturating_add(1).min(max_y);
     if row < max_y {
@@ -172,20 +173,25 @@ pub(crate) fn draw_popup(
             Paragraph::new(title).style(Theme::popup_bg()),
             Rect::new(inner.x, row, inner.width, 1),
         );
-        row += 1;
+        row = row.saturating_add(1);
     }
     // Keep the title visually separate from the question body.
     row = row.saturating_add(1).min(max_y);
     if row < max_y {
-        let message_area = Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), max_y - row);
+        let message_area = Rect::new(
+            inner.x.saturating_add(2),
+            row,
+            inner.width.saturating_sub(2),
+            max_y.saturating_sub(row),
+        );
         let message_lines: Vec<Line<'static>> =
             wrap_elicitation_message(&state.message, message_area.width)
                 .into_iter()
                 .map(|line| Line::from(Span::styled(line, Theme::fg())))
                 .collect();
-        let message_rows = message_lines.len().max(1) as u16;
+        let message_rows = message_lines.len().max(1);
         let message = Paragraph::new(message_lines).style(Theme::popup_bg());
-        let visible_rows = message_rows.min(message_area.height);
+        let visible_rows = message_rows.min(message_area.height as usize) as u16;
         f.render_widget(
             message,
             Rect::new(
@@ -195,7 +201,7 @@ pub(crate) fn draw_popup(
                 visible_rows,
             ),
         );
-        row += visible_rows;
+        row = row.saturating_add(visible_rows);
     }
     // Keep the choices visually separate from the question text.
     row = row.saturating_add(1).min(max_y);
@@ -243,7 +249,7 @@ pub(crate) fn draw_popup(
                     &elicitation_option_text(&opt.label, opt.description.as_deref()),
                     text_width,
                 )
-                .min(max_y - row);
+                .min(max_y.saturating_sub(row) as usize) as u16;
                 f.render_widget(
                     Paragraph::new(Span::styled(format!("  {bullet}"), style))
                         .style(Theme::popup_bg()),
@@ -260,9 +266,9 @@ pub(crate) fn draw_popup(
                     Paragraph::new(option_line)
                         .style(Theme::popup_bg())
                         .wrap(Wrap { trim: true }),
-                    Rect::new(inner.x + 4, row, text_width, option_rows),
+                    Rect::new(inner.x.saturating_add(4), row, text_width, option_rows),
                 );
-                row += option_rows;
+                row = row.saturating_add(option_rows);
             }
 
             if state.allow_custom && !options.is_empty() && row < max_y {
@@ -291,7 +297,7 @@ pub(crate) fn draw_popup(
                     .style(Theme::popup_bg()),
                     Rect::new(inner.x, row, inner.width, 1),
                 );
-                row += 1;
+                row = row.saturating_add(1);
             }
 
             if ui.custom_active && row < max_y {
@@ -303,9 +309,11 @@ pub(crate) fn draw_popup(
                     inner.width.saturating_sub(2) as usize,
                     2,
                 );
-                let total_rows = layout.total_rows() as u16;
+                let total_rows = layout.total_rows();
                 // Reserve a spacer, the help row, and bottom padding below the editor.
-                let visible = total_rows.min(max_y.saturating_sub(row + 3)).min(5);
+                let visible = total_rows
+                    .min(max_y.saturating_sub(row.saturating_add(3)) as usize)
+                    .min(5) as u16;
                 let scroll = render.ensure_elicitation_custom_cursor_visible(visible);
 
                 let lines: Vec<Line<'static>> = layout
@@ -327,16 +335,24 @@ pub(crate) fn draw_popup(
                     Paragraph::new(lines)
                         .style(Theme::popup_bg())
                         .scroll((scroll, 0)),
-                    Rect::new(inner.x + 2, row, inner.width.saturating_sub(2), visible),
+                    Rect::new(
+                        inner.x.saturating_add(2),
+                        row,
+                        inner.width.saturating_sub(2),
+                        visible,
+                    ),
                 );
-                let cursor_row = (layout.cursor_row as u16).saturating_sub(scroll);
-                if cursor_row < visible {
+                let cursor_row = layout.cursor_row.saturating_sub(scroll as usize);
+                if cursor_row < visible as usize {
                     f.set_cursor_position((
-                        inner.x + 2 + layout.cursor_col as u16,
-                        row + cursor_row,
+                        inner
+                            .x
+                            .saturating_add(2)
+                            .saturating_add(layout.cursor_col.min(u16::MAX as usize) as u16),
+                        row.saturating_add(cursor_row as u16),
                     ));
                 }
-                row += visible;
+                row = row.saturating_add(visible);
             }
         }
         ElicitationFieldKind::TextInput | ElicitationFieldKind::NumberInput { .. } => {
@@ -358,7 +374,7 @@ pub(crate) fn draw_popup(
                 .style(Theme::popup_bg()),
                 Rect::new(inner.x, row, inner.width, 1),
             );
-            row += 1;
+            row = row.saturating_add(1);
         }
         ElicitationFieldKind::BooleanToggle => {
             let value = state
@@ -381,7 +397,7 @@ pub(crate) fn draw_popup(
                 .style(Theme::popup_bg()),
                 Rect::new(inner.x, row, inner.width, 1),
             );
-            row += 1;
+            row = row.saturating_add(1);
         }
     }
 
@@ -695,6 +711,41 @@ mod tests {
         );
         render(&state, &ui, &mut render_state, 3, height);
         assert_eq!(render_state.elicitation_custom_line_width(), 1);
+    }
+
+    #[test]
+    fn huge_remote_content_uses_wide_height_math_and_renders_in_tiny_frames() {
+        let options = (0..70_000)
+            .map(|index| option(&index.to_string(), "x", None))
+            .collect();
+        let mut state =
+            ElicitationState::new_for_test(vec![field(ElicitationFieldKind::SingleSelect {
+                options,
+            })]);
+        state.message = "m".repeat(70_000);
+        state.custom_input = "c\n".repeat(70_000);
+        let ui = ElicitationUiState {
+            custom_active: true,
+            custom_cursor: state.custom_input.len(),
+            ..Default::default()
+        };
+        let mut render_state = RenderState::new();
+
+        assert_eq!(
+            elicitation_option_rows(&state, &ui, 1),
+            70_001,
+            "option rows must not wrap at u16::MAX"
+        );
+        assert_eq!(
+            popup_height(
+                Some(&state),
+                Some(&ui),
+                &mut render_state,
+                Rect::new(0, 0, 1, 1),
+            ),
+            0
+        );
+        let _ = render(&state, &ui, &mut render_state, 1, 1);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::features::delegates::view::draw_tab as draw_delegate_tab;
 use crate::render_state::RenderState;
 use crate::session_state::{SessionsState, session_group_count_text};
 use crate::theme::Theme;
-use crate::view_shared::{ELLIPSIS, scroll_input};
+use crate::view_shared::{ELLIPSIS, popup_rect, scroll_input};
 
 use super::start::{COLLAPSE_CLOSED, COLLAPSE_OPEN, relative_time, short_cwd};
 
@@ -27,16 +27,14 @@ pub(crate) fn draw_session_popup(
     const SESSION_POPUP_MIN_W: u16 = 36;
 
     let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(SESSION_POPUP_MIN_W, SESSION_POPUP_MAX_W);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
-        width: popup_width,
-        height: area.height * 60 / 100,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        (area.height as usize).saturating_mul(60) / 100,
+        SESSION_POPUP_MIN_W as usize..=SESSION_POPUP_MAX_W as usize,
+        0..=area.height as usize,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -110,7 +108,15 @@ fn draw_session_tab_content(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + session_filter_cur as u16, chunks[1].y));
+    if chunks[1].width > 2 && chunks[1].height > 0 {
+        f.set_cursor_position((
+            chunks[1]
+                .x
+                .saturating_add(2)
+                .saturating_add(session_filter_cur as u16),
+            chunks[1].y,
+        ));
+    }
 
     // grouped session list
     let popup_items = sessions.visible_popup_items();

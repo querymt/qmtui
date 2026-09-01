@@ -20,7 +20,7 @@ pub enum PromptBlock {
     ResourceLink { name: String, uri: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Command {
     Init,
     ListSessions {
@@ -132,6 +132,44 @@ pub enum Command {
 }
 
 impl Command {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Init => "Init",
+            Self::ListSessions { .. } => "ListSessions",
+            Self::ListRemoteNodes => "ListRemoteNodes",
+            Self::ListRemoteSessions { .. } => "ListRemoteSessions",
+            Self::CreateRemoteSession { .. } => "CreateRemoteSession",
+            Self::AttachRemoteSession { .. } => "AttachRemoteSession",
+            Self::DismissRemoteSession { .. } => "DismissRemoteSession",
+            Self::CreateMeshInvite { .. } => "CreateMeshInvite",
+            Self::ListSessionChildren { .. } => "ListSessionChildren",
+            Self::SetReasoningEffort { .. } => "SetReasoningEffort",
+            Self::ListProfiles => "ListProfiles",
+            Self::ListProfileAgents { .. } => "ListProfileAgents",
+            Self::SetDelegateModel { .. } => "SetDelegateModel",
+            Self::NewSession { .. } => "NewSession",
+            Self::LoadSession { .. } => "LoadSession",
+            Self::Prompt { .. } => "Prompt",
+            Self::CancelSession => "CancelSession",
+            Self::ListAllModels { .. } => "ListAllModels",
+            Self::SetSessionModel { .. } => "SetSessionModel",
+            Self::SubscribeSession { .. } => "SubscribeSession",
+            Self::DeleteSession { .. } => "DeleteSession",
+            Self::ForkSession { .. } => "ForkSession",
+            Self::Undo { .. } => "Undo",
+            Self::Redo => "Redo",
+            Self::GetFileIndex => "GetFileIndex",
+            Self::SetAgentMode { .. } => "SetAgentMode",
+            Self::ElicitationResponse { .. } => "ElicitationResponse",
+            Self::ListAuthProviders => "ListAuthProviders",
+            Self::StartOAuthLogin { .. } => "StartOAuthLogin",
+            Self::CompleteOAuthLogin { .. } => "CompleteOAuthLogin",
+            Self::DisconnectOAuth { .. } => "DisconnectOAuth",
+            Self::SetApiToken { .. } => "SetApiToken",
+            Self::ClearApiToken { .. } => "ClearApiToken",
+        }
+    }
+
     pub fn list_sessions_browse() -> Self {
         Self::list_sessions_discovery(None)
     }
@@ -187,9 +225,27 @@ impl Command {
     }
 }
 
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
+
+    #[test]
+    fn command_debug_redacts_api_tokens() {
+        let command = Command::SetApiToken {
+            provider: "provider".into(),
+            api_key: "sentinel-secret-api-key".into(),
+        };
+
+        let debug = format!("{command:?}");
+        assert_eq!(debug, "SetApiToken");
+        assert!(!debug.contains("sentinel-secret-api-key"));
+    }
 
     #[test]
     fn load_session_commands_preserve_order_and_fields() {

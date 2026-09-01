@@ -104,7 +104,22 @@ pub(crate) fn draw_tab(
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+    let cursor_area = chunks[1].intersection(f.area());
+    if chunks[1].width > 0
+        && chunks[1].height > 0
+        && cursor_area.width > 0
+        && cursor_area.height > 0
+    {
+        let cursor_x = chunks[1]
+            .x
+            .saturating_add(2)
+            .saturating_add(filter_cur as u16)
+            .clamp(cursor_area.x, cursor_area.right().saturating_sub(1));
+        let cursor_y = chunks[1]
+            .y
+            .clamp(cursor_area.y, cursor_area.bottom().saturating_sub(1));
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     // delegate entry list (built from event stream)
     let visible_rows = chunks[3].height as usize;
@@ -457,6 +472,32 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn delegate_tab_cursor_stays_inside_tiny_session_popup() {
+        let sessions = SessionsState {
+            session_popup_tab: 1,
+            ..SessionsState::new()
+        };
+        let delegates = DelegatesState::new();
+        let backend = TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut render = RenderState::new();
+
+        terminal
+            .draw(|frame| {
+                crate::features::sessions::view::draw_session_popup(
+                    frame,
+                    &sessions,
+                    &delegates,
+                    &mut render,
+                );
+            })
+            .unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(Rect::new(0, 0, 1, 1).contains(cursor));
     }
 
     #[test]

@@ -4,10 +4,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::navigation_state::NavigationState;
 use crate::theme::Theme;
-use crate::view_shared::{ELLIPSIS, scroll_input};
+use crate::view_shared::{ELLIPSIS, popup_rect, scroll_input};
 
 pub(crate) const COLOR_SWATCH: &str = "\u{25A0}";
 
@@ -38,7 +39,7 @@ pub(crate) fn build_theme_list_item(
     } else {
         "  "
     };
-    let marker_w = marker.chars().count();
+    let marker_w = UnicodeWidthStr::width(marker);
     let swatches_w = NUM_SWATCHES + GAP; // 16 ■ + 1 space
 
     // Styles ─────────────────────────────────────────────────────────────────
@@ -55,14 +56,26 @@ pub(crate) fn build_theme_list_item(
 
     // Label truncation (same pattern as session title) ───────────────────────
     let avail = list_w.saturating_sub(marker_w + swatches_w);
-    let label: String = t.label.chars().collect();
-    let label_display = if label.chars().count() > avail {
-        let t: String = label.chars().take(avail.saturating_sub(1)).collect();
-        format!("{t}{ELLIPSIS}")
+    let label = t.label;
+    let label_display = if UnicodeWidthStr::width(label) > avail {
+        let text_width = avail.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+        let mut used = 0usize;
+        let truncated: String = label
+            .chars()
+            .take_while(|character| {
+                let width = UnicodeWidthChar::width(*character).unwrap_or(0).max(1);
+                let fits = used.saturating_add(width) <= text_width;
+                if fits {
+                    used = used.saturating_add(width);
+                }
+                fits
+            })
+            .collect();
+        format!("{truncated}{ELLIPSIS}")
     } else {
-        label.clone()
+        label.to_string()
     };
-    let label_gap = avail.saturating_sub(label_display.chars().count());
+    let label_gap = avail.saturating_sub(UnicodeWidthStr::width(label_display.as_str()));
 
     // Build spans ─────────────────────────────────────────────────────────────
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(3 + NUM_SWATCHES + 1);
@@ -91,16 +104,14 @@ pub(crate) fn draw_theme_popup(f: &mut Frame, navigation: &NavigationState) {
     const THEME_POPUP_MIN_W: u16 = 28;
 
     let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(THEME_POPUP_MIN_W, THEME_POPUP_MAX_W);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
-        width: popup_width,
-        height: area.height * 60 / 100,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        (area.height as usize).saturating_mul(60) / 100,
+        THEME_POPUP_MIN_W as usize..=THEME_POPUP_MAX_W as usize,
+        0..=area.height as usize,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -144,7 +155,15 @@ pub(crate) fn draw_theme_popup(f: &mut Frame, navigation: &NavigationState) {
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + theme_filter_cur as u16, chunks[1].y));
+    if chunks[1].width > 2 && chunks[1].height > 0 {
+        f.set_cursor_position((
+            chunks[1]
+                .x
+                .saturating_add(2)
+                .saturating_add(theme_filter_cur as u16),
+            chunks[1].y,
+        ));
+    }
 
     // theme list
     let all_themes = Theme::available_themes();
@@ -334,136 +353,79 @@ mod tests {
         }
     }
 
-    /// The item must carry exactly 16 swatch spans after marker + label + gap.
+    fn render_theme_item(
+        palette: &crate::themes_gen::Base16Palette,
+        orig_idx: usize,
+        current_idx: usize,
+        width: u16,
+        selected: bool,
+    ) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let item =
+                    build_theme_list_item(palette, orig_idx, current_idx, width as usize, selected);
+                frame.render_widget(List::new(vec![item]), frame.area());
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     #[test]
-    fn theme_list_item_has_sixteen_swatches() {
+    fn rendered_theme_item_has_marker_label_and_sixteen_palette_swatches() {
         crate::theme::Theme::begin_frame();
         let colors = [
             0xff0000, 0x00ff00, 0x0000ff, 0xffffff, 0x000000, 0x111111, 0x222222, 0x333333,
             0x444444, 0x555555, 0x666666, 0x777777, 0x888888, 0x999999, 0xaaaaaa, 0xbbbbbb,
         ];
-        let t = fake_palette(colors);
-        let _item = build_theme_list_item(&t, 0, 99, 80, false);
-        // Extract the underlying Line from the ListItem via Debug round-trip is
-        // not ideal, so we build a second item and count spans via the Line.
-        // We call the function again and introspect the span count indirectly:
-        // marker(1) + label(1) + gap(1) + swatches(16) = 19 spans total.
-        let line = {
-            // build_theme_list_item returns a ListItem whose content is a Text
-            // with one Line. We rebuild it with known inputs so we can count.
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            spans.push(Span::raw("  ")); // marker
-            spans.push(Span::raw("Test Theme")); // label
-            spans.push(Span::raw(" ")); // gap
-            for &c in &colors {
-                let fg = crate::theme::u32_to_color(c);
-                spans.push(Span::styled(
-                    COLOR_SWATCH,
-                    ratatui::style::Style::default().fg(fg),
-                ));
-            }
-            Line::from(spans)
-        };
-        // 19 spans: 1 marker + 1 label + 1 gap + 16 swatches
-        assert_eq!(line.spans.len(), 19);
-        // Verify the swatch fg colours match the palette entries
-        for (i, &c) in colors.iter().enumerate() {
-            let expected_fg = crate::theme::u32_to_color(c);
-            assert_eq!(
-                line.spans[3 + i].style.fg,
-                Some(expected_fg),
-                "swatch {i} should have correct fg colour"
-            );
+        let palette = fake_palette(colors);
+        let buffer = render_theme_item(&palette, 3, 3, 40, true);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "●");
+        assert_eq!(buffer[(0, 0)].fg, Theme::status_accent().fg.unwrap());
+        assert_eq!(buffer[(0, 0)].bg, Theme::bg_hl());
+        assert_eq!(find_buffer_text(&buffer, "Test Theme"), Some((2, 0)));
+        for (index, color) in colors.into_iter().enumerate() {
+            let x = 24 + index as u16;
+            assert_eq!(buffer[(x, 0)].symbol(), COLOR_SWATCH);
+            assert_eq!(buffer[(x, 0)].fg, crate::theme::u32_to_color(color));
+            assert_eq!(buffer[(x, 0)].bg, Theme::bg_hl());
         }
     }
 
-    /// Each swatch span must contain exactly the `■` character.
     #[test]
-    fn theme_list_item_swatches_use_block_char() {
+    fn rendered_theme_item_inactive_marker_and_styles_are_visible() {
         crate::theme::Theme::begin_frame();
-        let _t = fake_palette([0x123456; 16]);
-        // We test the swatch character via u32_to_color directly and the
-        // constant, since the actual ListItem internals are opaque. The real
-        // guarantee is that build_theme_list_item uses SWATCH = "■" for every
-        // colour span — confirmed by the implementation.  Here we verify the
-        // helper produces a valid Color from the u32.
-        let color = crate::theme::u32_to_color(0x123456);
-        assert_eq!(color, ratatui::style::Color::Rgb(0x12, 0x34, 0x56));
+        let palette = fake_palette([0x123456; 16]);
+        let buffer = render_theme_item(&palette, 5, 3, 40, false);
+
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(2, 0)].fg, Theme::popup_bg().fg.unwrap());
+        assert_eq!(buffer[(24, 0)].symbol(), COLOR_SWATCH);
+        assert_eq!(
+            buffer[(24, 0)].fg,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(buffer[(24, 0)].bg, Theme::bg_dim());
     }
 
-    /// Marker is `"* "` when orig_idx == current_idx, `"  "` otherwise.
     #[test]
-    fn theme_list_item_marker_active_vs_inactive() {
+    fn rendered_theme_item_truncates_unicode_by_display_width() {
         crate::theme::Theme::begin_frame();
-        let t = fake_palette([0; 16]);
-        // active: orig_idx == current_idx == 3
-        let active = build_theme_list_item(&t, 3, 3, 80, false);
-        // inactive: orig_idx != current_idx
-        let inactive = build_theme_list_item(&t, 5, 3, 80, false);
-
-        // Verify by rebuilding a reference line for each case.
-        let active_marker = "* ";
-        let inactive_marker = "  ";
-
-        // The marker is always the first span content.
-        // We use the same logic as the implementation to verify:
-        let check = |marker: &str, item: ListItem<'static>| {
-            // ListItem::new(Line::from(spans)) — we need to access the text.
-            // Since ListItem's content is not directly inspectable in all
-            // ratatui versions, we confirm via a parallel build:
-            let _ = item; // item was built correctly if it compiles
-            marker.len() // just return length as a proxy assertion value
-        };
-        assert_eq!(check(active_marker, active), 2);
-        assert_eq!(check(inactive_marker, inactive), 2);
-
-        // More meaningful: assert the marker strings themselves are correct
-        // by constructing the expected first span content directly.
-        assert_eq!(active_marker, "* ");
-        assert_eq!(inactive_marker, "  ");
-    }
-
-    /// Label longer than `avail` must be truncated with `…`.
-    #[test]
-    fn theme_list_item_label_truncated_with_ellipsis() {
-        crate::theme::Theme::begin_frame();
-        // list_w = 24: marker(2) + swatches+gap(17) = 19 overhead → avail = 5
-        // label "Very Long Theme Name" (20 chars) must be cut to 4 + "…" = 5 chars
-        let t = crate::themes_gen::Base16Palette {
+        let palette = crate::themes_gen::Base16Palette {
             id: "t",
-            label: "Very Long Theme Name",
+            label: "界界界界 Theme",
             colors: [0; 16],
         };
-        let list_w = 24usize;
-        // avail = 24 - 2 (marker) - 17 (16 swatches + 1 gap) = 5
-        let avail = list_w.saturating_sub(2 + 17);
-        let expected_label: String = "Very Long Theme Name"
-            .chars()
-            .take(avail.saturating_sub(1))
-            .collect();
-        let expected_display = format!("{expected_label}{ELLIPSIS}");
-        assert_eq!(avail, 5);
-        // take(4) → "Very" + ELLIPSIS = "Very…"  (5 chars, fits in avail=5)
-        assert_eq!(expected_display, "Very\u{2026}");
+        let buffer = render_theme_item(&palette, 0, 99, 24, false);
 
-        // The item must compile and not panic — truncation is exercised.
-        let _item = build_theme_list_item(&t, 0, 99, list_w, false);
-    }
-
-    /// Short label that fits must NOT get an ellipsis.
-    #[test]
-    fn theme_list_item_short_label_no_truncation() {
-        crate::theme::Theme::begin_frame();
-        let t = crate::themes_gen::Base16Palette {
-            id: "t",
-            label: "Hi",
-            colors: [0; 16],
-        };
-        // list_w = 80, avail = 80 - 2 - 17 = 61 — "Hi" (2 chars) fits fine
-        let _item = build_theme_list_item(&t, 0, 99, 80, false);
-        // Just confirm no panic; label is short, no truncation needed.
-        // The label_gap = 61 - 2 = 59, which pads between label and swatches.
-        assert_eq!("Hi".chars().count(), 2);
+        assert_eq!(buffer[(2, 0)].symbol(), "界");
+        assert_eq!(buffer[(4, 0)].symbol(), "界");
+        assert_eq!(buffer[(6, 0)].symbol(), ELLIPSIS);
+        assert_eq!(buffer[(8, 0)].symbol(), COLOR_SWATCH);
+        assert_eq!(buffer[(23, 0)].symbol(), COLOR_SWATCH);
     }
 
     /// u32_to_color converts RGB u32 correctly for all byte boundaries.

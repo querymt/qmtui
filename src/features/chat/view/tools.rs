@@ -775,6 +775,60 @@ mod tests {
     }
 
     #[test]
+    fn shell_renderer_shows_stderr_without_stdout() {
+        let detail = ToolDetail::Shell {
+            command: "failing".into(),
+            arguments: Vec::new(),
+            workdir: None,
+            output: Some(ShellOutput {
+                stdout: String::new(),
+                stderr: "permission denied".into(),
+                preceding_line_count: 0,
+            }),
+        };
+        let text = render("shell", &detail)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line.contains("permission denied")));
+    }
+
+    #[test]
+    fn multiedit_renderer_uses_compact_sequential_section_labels() {
+        let detail = ToolDetail::MultiEdit {
+            file: "src/lib.rs".into(),
+            edit_count: 2,
+            sections: vec![
+                MultiEditSection {
+                    edit_index: 1,
+                    replace_all: false,
+                    old: "one".into(),
+                    new: "ONE".into(),
+                    start_line: None,
+                },
+                MultiEditSection {
+                    edit_index: 2,
+                    replace_all: true,
+                    old: "two".into(),
+                    new: "TWO".into(),
+                    start_line: None,
+                },
+            ],
+        };
+        let text = render("multiedit", &detail)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("(2 edits)"));
+        assert!(text.contains("edit 1"));
+        assert!(text.contains("edit 2 (all)"));
+        assert!(!text.contains("edit 3"));
+    }
+
+    #[test]
     fn semantic_tool_renderer_accepts_narrow_inputs() {
         let detail = ToolDetail::Generic {
             input: Some("request".into()),

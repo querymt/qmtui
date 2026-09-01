@@ -69,14 +69,8 @@ fn build_chat_header_spans(
         .sessions
         .session_id
         .as_deref()
-        .map(|session_id| {
-            if session_id.len() > 8 {
-                &session_id[..8]
-            } else {
-                session_id
-            }
-        })
-        .unwrap_or("???");
+        .map(|session_id| session_id.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "???".to_string());
 
     let mut right_spans = Vec::new();
 
@@ -123,7 +117,10 @@ fn build_chat_header_spans(
         for entry in &input.delegates.delegate_entries {
             match entry.status {
                 DelegateStatus::Completed | DelegateStatus::Cancelled => done += 1,
-                DelegateStatus::Failed => has_failed = true,
+                DelegateStatus::Failed => {
+                    done += 1;
+                    has_failed = true;
+                }
                 DelegateStatus::InProgress => has_running = true,
             }
             awaiting_input |= entry.awaiting_input();
@@ -223,7 +220,33 @@ pub(super) fn draw_chat_header(frame: &mut Frame, area: Rect, input: HeaderRende
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::activity::{DelegateChildState, DelegateEntry, DelegateStats};
     use crate::domain::profile::ProfileInfo;
+
+    fn header_text(
+        chat: &ChatState,
+        delegates: &DelegatesState,
+        sessions: &SessionsState,
+        models: &ModelsState,
+        profiles: &ProfilesState,
+    ) -> (String, Vec<Span<'static>>) {
+        let (left, right) = build_chat_header_spans(&HeaderRenderInput {
+            chat,
+            delegates,
+            sessions,
+            models,
+            profiles,
+            cwd_label: None,
+            mesh_node_count: None,
+            chord: false,
+            connection: ConnState::Connected,
+        });
+        let text = left
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        (text, right)
+    }
 
     #[test]
     fn chat_header_shows_current_and_distinct_new_profile_labels() {
@@ -248,22 +271,51 @@ mod tests {
         profiles.active_profile_id = Some("next".into());
         profiles.bind_session_profile("session-1".into(), "current".into());
 
-        let (left, _) = build_chat_header_spans(&HeaderRenderInput {
-            chat: &chat,
-            delegates: &delegates,
-            sessions: &sessions,
-            models: &models,
-            profiles: &profiles,
-            cwd_label: None,
-            mesh_node_count: None,
-            chord: false,
-            connection: ConnState::Connected,
-        });
-        let text = left
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let (text, _) = header_text(&chat, &delegates, &sessions, &models, &profiles);
 
         assert!(text.contains("profile:Current (new:Next)"));
+    }
+
+    #[test]
+    fn chat_header_truncates_unicode_session_id_on_character_boundaries() {
+        let chat = ChatState::new();
+        let delegates = DelegatesState::new();
+        let mut sessions = SessionsState::new();
+        let models = ModelsState::new();
+        let profiles = ProfilesState::new();
+        sessions.session_id = Some("界😀abcdefghi".into());
+
+        let (text, _) = header_text(&chat, &delegates, &sessions, &models, &profiles);
+        assert!(text.contains("界😀abcdef"));
+        assert!(!text.contains("界😀abcdefg"));
+    }
+
+    #[test]
+    fn failed_delegate_counts_as_done_and_keeps_error_style() {
+        let chat = ChatState::new();
+        let mut delegates = DelegatesState::new();
+        let sessions = SessionsState::new();
+        let models = ModelsState::new();
+        let profiles = ProfilesState::new();
+        delegates.delegate_entries = vec![DelegateEntry {
+            delegation_id: "delegate-1".into(),
+            child_session_id: None,
+            delegate_tool_call_id: None,
+            target_agent_id: None,
+            objective: "test".into(),
+            status: DelegateStatus::Failed,
+            stats: DelegateStats::default(),
+            started_at: None,
+            ended_at: None,
+            child_state: DelegateChildState::None,
+        }];
+
+        let (_, right) = header_text(&chat, &delegates, &sessions, &models, &profiles);
+        let delegate = right
+            .iter()
+            .find(|span| span.content.contains(ICON_DELEGATES))
+            .expect("delegate badge");
+        assert!(delegate.content.contains("1/1"));
+        assert_eq!(delegate.style, Theme::error_on_dim());
     }
 }

@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+const MAX_DIAGNOSTIC_ENTRIES: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LogLevel {
     Trace,
@@ -72,12 +74,25 @@ impl DiagnosticsState {
         }) {
             return;
         }
+        if self.logs.len() >= MAX_DIAGNOSTIC_ENTRIES {
+            let evicted_was_visible = self
+                .logs
+                .first()
+                .is_some_and(|entry| self.log_is_visible(entry));
+            self.logs.remove(0);
+            if evicted_was_visible {
+                self.log_cursor = self.log_cursor.saturating_sub(1);
+            }
+        }
         self.logs.push(AppLogEntry {
             elapsed: self.started_at.elapsed(),
             level,
             target,
             message,
         });
+        self.log_cursor = self
+            .log_cursor
+            .min(self.filtered_logs().len().saturating_sub(1));
     }
 
     pub(crate) fn set_status(
@@ -91,17 +106,21 @@ impl DiagnosticsState {
         self.push_log(level, target, message);
     }
 
-    pub(crate) fn filtered_logs(&self) -> Vec<&AppLogEntry> {
+    fn log_is_visible(&self, entry: &AppLogEntry) -> bool {
+        if entry.level < self.log_level_filter {
+            return false;
+        }
         let query = self.log_filter.to_lowercase();
+        query.is_empty()
+            || entry.message.to_lowercase().contains(&query)
+            || entry.target.to_lowercase().contains(&query)
+            || entry.level.label().to_lowercase().contains(&query)
+    }
+
+    pub(crate) fn filtered_logs(&self) -> Vec<&AppLogEntry> {
         self.logs
             .iter()
-            .filter(|entry| entry.level >= self.log_level_filter)
-            .filter(|entry| {
-                query.is_empty()
-                    || entry.message.to_lowercase().contains(&query)
-                    || entry.target.to_lowercase().contains(&query)
-                    || entry.level.label().to_lowercase().contains(&query)
-            })
+            .filter(|entry| self.log_is_visible(entry))
             .collect()
     }
 
@@ -114,7 +133,7 @@ impl DiagnosticsState {
 mod tests {
     use std::time::Instant;
 
-    use super::{DiagnosticsState, LogLevel};
+    use super::{DiagnosticsState, LogLevel, MAX_DIAGNOSTIC_ENTRIES};
 
     #[test]
     fn constructor_uses_expected_defaults() {
@@ -150,6 +169,56 @@ mod tests {
         assert_eq!(diagnostics.logs[4].level, diagnostics.logs[0].level);
         assert_eq!(diagnostics.logs[4].target, diagnostics.logs[0].target);
         assert_eq!(diagnostics.logs[4].message, diagnostics.logs[0].message);
+    }
+
+    #[test]
+    fn push_log_bounds_capacity_and_retains_newest_entries() {
+        let mut diagnostics = DiagnosticsState::new();
+        for index in 0..=MAX_DIAGNOSTIC_ENTRIES {
+            diagnostics.push_log(LogLevel::Info, "test", format!("entry-{index}"));
+        }
+
+        assert_eq!(diagnostics.logs.len(), MAX_DIAGNOSTIC_ENTRIES);
+        assert_eq!(diagnostics.logs[0].message, "entry-1");
+        assert_eq!(diagnostics.logs.last().unwrap().message, "entry-1024");
+    }
+
+    #[test]
+    fn eviction_adjusts_cursor_only_when_evicted_entry_is_visible() {
+        let mut visible = DiagnosticsState::new();
+        visible.log_level_filter = LogLevel::Info;
+        visible.push_log(LogLevel::Info, "test", "visible-oldest");
+        for index in 1..MAX_DIAGNOSTIC_ENTRIES {
+            visible.push_log(LogLevel::Info, "test", format!("visible-{index}"));
+        }
+        visible.log_cursor = 10;
+        visible.push_log(LogLevel::Info, "test", "visible-newest");
+        assert_eq!(visible.log_cursor, 9);
+
+        let mut hidden = DiagnosticsState::new();
+        hidden.log_level_filter = LogLevel::Info;
+        hidden.push_log(LogLevel::Debug, "test", "hidden-oldest");
+        for index in 1..MAX_DIAGNOSTIC_ENTRIES {
+            hidden.push_log(LogLevel::Info, "test", format!("visible-{index}"));
+        }
+        hidden.log_cursor = 10;
+        hidden.push_log(LogLevel::Info, "test", "visible-newest");
+        assert_eq!(hidden.log_cursor, 10);
+    }
+
+    #[test]
+    fn eviction_clamps_cursor_to_filtered_list() {
+        let mut diagnostics = DiagnosticsState::new();
+        diagnostics.log_filter = "matching".into();
+        diagnostics.push_log(LogLevel::Info, "test", "matching oldest");
+        for index in 1..MAX_DIAGNOSTIC_ENTRIES {
+            diagnostics.push_log(LogLevel::Info, "test", format!("hidden-{index}"));
+        }
+        diagnostics.log_cursor = usize::MAX;
+        diagnostics.push_log(LogLevel::Info, "test", "still hidden");
+
+        assert!(diagnostics.filtered_logs().is_empty());
+        assert_eq!(diagnostics.log_cursor, 0);
     }
 
     #[test]

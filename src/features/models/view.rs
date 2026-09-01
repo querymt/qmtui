@@ -9,7 +9,7 @@ use ratatui::{
 use crate::domain::model::ModelEntry;
 use crate::models_state::{ModelPopupItem, ModelsState};
 use crate::theme::Theme;
-use crate::view_shared::{ELLIPSIS, scroll_input};
+use crate::view_shared::{ELLIPSIS, popup_rect, scroll_input};
 
 const MODEL_GROUP_MARKER: &str = "\u{25B8}";
 
@@ -41,16 +41,14 @@ pub(crate) fn draw_model_popup(f: &mut Frame, input: ModelPopupInput<'_>) {
     let has_tabs = input.models.model_popup_has_tabs();
 
     let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(MODEL_POPUP_MIN_W, MODEL_POPUP_MAX_W);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(area.height * 60 / 100) / 2,
-        width: popup_width,
-        height: area.height * 60 / 100,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        (area.height as usize).saturating_mul(60) / 100,
+        MODEL_POPUP_MIN_W as usize..=MODEL_POPUP_MAX_W as usize,
+        0..=area.height as usize,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -137,7 +135,15 @@ pub(crate) fn draw_model_popup(f: &mut Frame, input: ModelPopupInput<'_>) {
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         filter_area,
     );
-    f.set_cursor_position((filter_area.x + 2 + model_filter_cur as u16, filter_area.y));
+    if filter_area.width > 2 && filter_area.height > 0 {
+        f.set_cursor_position((
+            filter_area
+                .x
+                .saturating_add(2)
+                .saturating_add(model_filter_cur as u16),
+            filter_area.y,
+        ));
+    }
 
     let on_session_tab = input
         .models

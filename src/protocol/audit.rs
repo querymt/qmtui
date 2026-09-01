@@ -168,6 +168,8 @@ pub enum ProgressKind {
     Artifact,
     Note,
     Checkpoint,
+    #[serde(other)]
+    Unknown,
 }
 
 #[allow(dead_code)]
@@ -347,6 +349,24 @@ mod tests {
         assert!(
             matches!(progress.kind, EventKind::ProgressRecorded { progress_entry } if progress_entry.kind == ProgressKind::ToolCall && progress_entry.content == "Calling tool: shell")
         );
+    }
+
+    #[test]
+    fn unknown_progress_kind_falls_back_to_unknown() {
+        let progress: ProgressKind = serde_json::from_value(json!("future_kind")).unwrap();
+        assert_eq!(progress, ProgressKind::Unknown);
+
+        for (value, expected) in [
+            ("tool_call", ProgressKind::ToolCall),
+            ("artifact", ProgressKind::Artifact),
+            ("note", ProgressKind::Note),
+            ("checkpoint", ProgressKind::Checkpoint),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ProgressKind>(json!(value)).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

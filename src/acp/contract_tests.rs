@@ -161,14 +161,34 @@ async fn router_keeps_noop_and_exact_unsupported_semantics() {
     let unsupported = Command::ClearApiToken {
         provider: "openai".into(),
     };
-    commands::dispatch(context(&connection, &state, &events), unsupported.clone())
+    commands::dispatch(context(&connection, &state, &events), unsupported)
         .await
         .expect("api token unsupported");
     assert!(matches!(
         rx.try_recv().expect("unsupported error"),
         ServerChannelMsg::Acp(AcpAppEvent::Error { message })
-            if message == format!("unsupported in the current ACP subset: {unsupported:?}")
+            if message == "unsupported in the current ACP subset: ClearApiToken"
     ));
+
+    let api_key = "sentinel-secret-api-key";
+    let unsupported = Command::SetApiToken {
+        provider: "openai".into(),
+        api_key: api_key.into(),
+    };
+    assert!(!format!("{unsupported:?}").contains(api_key));
+    commands::dispatch(context(&connection, &state, &events), unsupported)
+        .await
+        .expect("set api token unsupported");
+    let ServerChannelMsg::Acp(AcpAppEvent::Error { message }) =
+        rx.try_recv().expect("unsupported error")
+    else {
+        panic!("expected unsupported error");
+    };
+    assert_eq!(
+        message,
+        "unsupported in the current ACP subset: SetApiToken"
+    );
+    assert!(!message.contains(api_key));
     assert!(connection.messages().is_empty());
 }
 

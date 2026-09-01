@@ -1,3 +1,5 @@
+use std::ops::RangeInclusive;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -5,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::connection_state::ConnState;
 use crate::theme::Theme;
@@ -40,6 +43,63 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Build a popup rectangle with wide calculations and a final frame-area clamp.
+pub(crate) fn popup_rect(
+    area: Rect,
+    desired_width: usize,
+    desired_height: usize,
+    width_range: RangeInclusive<usize>,
+    height_range: RangeInclusive<usize>,
+    vertical_divisor: u16,
+) -> Rect {
+    fn dimension(desired: usize, range: RangeInclusive<usize>, available: u16) -> u16 {
+        let min = *range.start();
+        let max = (*range.end()).max(min);
+        desired.max(min).min(max).min(available as usize) as u16
+    }
+
+    let width = dimension(desired_width, width_range, area.width);
+    let height = dimension(desired_height, height_range, area.height);
+    let rect = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / vertical_divisor.max(1)),
+        width,
+        height,
+    );
+    rect.clamp(area)
+}
+
+/// Wrap text by terminal display columns without splitting UTF-8 characters.
+pub(crate) fn wrap_display_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+            continue;
+        }
+
+        let ch_width = ch.width().unwrap_or(0).max(1);
+        if !line.is_empty() && line_width.saturating_add(ch_width) > width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        line.push(ch);
+        line_width = line_width.saturating_add(ch_width);
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Keep a single-line input cursor visible within the available columns.
@@ -98,7 +158,7 @@ pub(crate) fn connection_indicator(connection: ConnState) -> Span<'static> {
     let (symbol, color) = match connection {
         ConnState::Connected => (CONN_ONLINE, Theme::ok()),
         ConnState::Connecting => (CONN_OFFLINE, Theme::warn()),
-        ConnState::Disconnected => (CONN_ONLINE, Theme::err()),
+        ConnState::Disconnected => (CONN_OFFLINE, Theme::err()),
     };
     Span::styled(
         format!("{symbol} "),
@@ -132,9 +192,15 @@ pub(crate) fn draw_header(
     spans.extend(left);
 
     let connection = connection_indicator(connection);
-    let left_len: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    let right_len: usize = right.iter().map(|span| span.content.chars().count()).sum();
-    let connection_len = connection.content.chars().count();
+    let left_len: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let right_len: usize = right
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let connection_len = UnicodeWidthStr::width(connection.content.as_ref());
     let gap = (area.width as usize).saturating_sub(left_len + right_len + connection_len);
     spans.push(Span::styled(" ".repeat(gap), Theme::status()));
     spans.extend(right);
@@ -144,4 +210,70 @@ pub(crate) fn draw_header(
         Paragraph::new(Line::from(spans)).style(Theme::status()),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn popup_rect_is_contained_for_zero_tiny_and_normal_areas() {
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(4, 7, 1, 1),
+            Rect::new(3, 5, 8, 4),
+            Rect::new(0, 0, 100, 40),
+        ] {
+            let popup = popup_rect(area, 80, 20, 24..=84, 6..=24, 2);
+            assert!(popup.x >= area.x);
+            assert!(popup.y >= area.y);
+            assert!(popup.right() <= area.right());
+            assert!(popup.bottom() <= area.bottom());
+        }
+
+        assert_eq!(
+            popup_rect(Rect::new(0, 0, 100, 40), 80, 20, 24..=84, 6..=24, 2),
+            Rect::new(10, 10, 80, 20)
+        );
+        assert_eq!(
+            popup_rect(Rect::new(0, 0, 100, 40), 80, 20, 24..=84, 6..=24, 3),
+            Rect::new(10, 6, 80, 20)
+        );
+    }
+
+    #[test]
+    fn wrap_display_width_handles_unicode_and_zero_width() {
+        assert_eq!(wrap_display_width("ab界cd", 4), ["ab界", "cd"]);
+        assert_eq!(wrap_display_width("e\u{301}x", 2), ["e\u{301}", "x"]);
+        assert_eq!(wrap_display_width("界", 1), ["界"]);
+        assert!(wrap_display_width("text", 0).is_empty());
+    }
+
+    fn rendered_right_x(left: &str) -> u16 {
+        let backend = TestBackend::new(30, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_header(
+                    frame,
+                    frame.area(),
+                    vec![Span::raw(left.to_string())],
+                    vec![Span::raw("RIGHT")],
+                    false,
+                    ConnState::Connected,
+                );
+            })
+            .unwrap();
+        (0..30)
+            .find(|&x| terminal.backend().buffer()[(x, 0)].symbol() == "R")
+            .expect("right header span")
+    }
+
+    #[test]
+    fn header_alignment_uses_display_width() {
+        assert_eq!(rendered_right_x("ab"), rendered_right_x("界"));
+        assert_eq!(rendered_right_x("ab"), rendered_right_x("😀"));
+        assert_eq!(rendered_right_x("a"), rendered_right_x("e\u{301}"));
+    }
 }

@@ -10,6 +10,7 @@ pub(super) fn file_index<C: AcpConnection>(ctx: CommandContext<'_, C>) {
 
 pub(super) fn command<C: AcpConnection>(ctx: CommandContext<'_, C>, command: &Command) {
     ctx.events.error(format!(
-        "unsupported in the current ACP subset: {command:?}"
+        "unsupported in the current ACP subset: {}",
+        command.label()
     ));
 }

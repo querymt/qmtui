@@ -69,21 +69,25 @@ pub(crate) fn parse_tool_detail(tool_name: &str, arguments: Option<&Value>) -> T
                 .map(|edits| {
                     edits
                         .iter()
-                        .enumerate()
-                        .filter_map(|(index, edit)| {
-                            Some(MultiEditSection {
-                                edit_index: index + 1,
-                                replace_all: edit
-                                    .get("replaceAll")
+                        .filter_map(|edit| {
+                            Some((
+                                edit.get("replaceAll")
                                     .or_else(|| edit.get("replace_all"))
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false),
-                                old: string_field(edit, "oldString")
+                                string_field(edit, "oldString")
                                     .or_else(|| string_field(edit, "old_string"))?,
-                                new: string_field(edit, "newString")
+                                string_field(edit, "newString")
                                     .or_else(|| string_field(edit, "new_string"))?,
-                                start_line: None,
-                            })
+                            ))
+                        })
+                        .enumerate()
+                        .map(|(index, (replace_all, old, new))| MultiEditSection {
+                            edit_index: index + 1,
+                            replace_all,
+                            old,
+                            new,
+                            start_line: None,
                         })
                         .collect::<Vec<_>>()
                 })
@@ -256,17 +260,19 @@ fn string_field(obj: &Value, key: &str) -> Option<String> {
 }
 
 fn shell_output_from_result(parsed: Option<&Value>, raw: &str) -> Option<ShellOutput> {
-    let (stdout, stderr) = parsed
-        .and_then(|obj| {
-            Some((
-                obj.get("stdout")?.as_str().unwrap_or_default().to_string(),
-                obj.get("stderr")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ))
-        })
-        .unwrap_or_else(|| (raw.to_string(), String::new()));
+    let (stdout, stderr) = match parsed.and_then(Value::as_object) {
+        Some(obj) if obj.contains_key("stdout") || obj.contains_key("stderr") => (
+            obj.get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            obj.get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        _ => (raw.to_string(), String::new()),
+    };
     if stdout.is_empty() && stderr.is_empty() {
         None
     } else {
@@ -464,6 +470,42 @@ mod tests {
             } if output.stdout == "out1  \n\n out2\nout3\nout4\nout5\nout6\n"
                 && output.stderr == "\nerr1  \n错误\n"
         ));
+
+        let mut stderr_only = vec![tool_call(
+            "shell-2",
+            "shell",
+            parse("shell", serde_json::json!({ "command": "failing" })),
+        )];
+        assert!(update_tool_detail(
+            &mut stderr_only,
+            Some("shell-2"),
+            r#"{"stderr":"permission denied"}"#,
+        ));
+        assert!(matches!(
+            &stderr_only[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output: Some(output), .. },
+                ..
+            } if output.stdout.is_empty() && output.stderr == "permission denied"
+        ));
+
+        let mut unsupported = vec![tool_call(
+            "shell-3",
+            "shell",
+            parse("shell", serde_json::json!({ "command": "custom" })),
+        )];
+        assert!(update_tool_detail(
+            &mut unsupported,
+            Some("shell-3"),
+            r#"{"custom":"result"}"#,
+        ));
+        assert!(matches!(
+            &unsupported[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output: Some(output), .. },
+                ..
+            } if output.stdout == r#"{"custom":"result"}"# && output.stderr.is_empty()
+        ));
     }
 
     #[test]
@@ -573,6 +615,7 @@ mod tests {
             serde_json::json!({
                 "filePath": "/workspace/src/lib.rs",
                 "edits": [
+                    { "oldString": "invalid first entry" },
                     { "oldString": "one\n", "newString": "ONE\n", "replaceAll": true },
                     { "old_string": "two\n", "new_string": "TWO\n", "replace_all": false },
                     { "oldString": "missing new value" },

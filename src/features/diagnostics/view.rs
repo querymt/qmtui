@@ -71,7 +71,22 @@ pub(crate) fn draw_log_popup(f: &mut Frame, input: LogPopupInput<'_>) {
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + log_filter_cur as u16, chunks[1].y));
+    let cursor_area = chunks[1].intersection(area);
+    if chunks[1].width > 0
+        && chunks[1].height > 0
+        && cursor_area.width > 0
+        && cursor_area.height > 0
+    {
+        let cursor_x = chunks[1]
+            .x
+            .saturating_add(2)
+            .saturating_add(log_filter_cur as u16)
+            .clamp(cursor_area.x, cursor_area.right().saturating_sub(1));
+        let cursor_y = chunks[1]
+            .y
+            .clamp(cursor_area.y, cursor_area.bottom().saturating_sub(1));
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     let level_line = Line::from(vec![
         Span::styled("level: ", Theme::status()),
@@ -145,6 +160,27 @@ pub(crate) fn draw_log_popup(f: &mut Frame, input: LogPopupInput<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_popup_cursor_stays_inside_tiny_frame() {
+        let diagnostics = DiagnosticsState::new();
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_log_popup(
+                    frame,
+                    LogPopupInput {
+                        diagnostics: &diagnostics,
+                    },
+                );
+            })
+            .unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(Rect::new(0, 0, 1, 1).contains(cursor));
+    }
 
     #[test]
     fn draw_log_popup_shows_filter_level_and_entries() {

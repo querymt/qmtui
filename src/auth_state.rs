@@ -64,7 +64,42 @@ impl AuthState {
     pub(crate) fn reduce(&mut self, action: AuthAction) -> AuthOutcome {
         match action {
             AuthAction::Providers(providers) => {
+                let selected_provider = self
+                    .selected
+                    .and_then(|index| self.providers.get(index))
+                    .map(|provider| provider.provider.clone());
                 self.providers = providers;
+                self.selected = selected_provider.as_ref().and_then(|selected| {
+                    self.providers
+                        .iter()
+                        .position(|provider| provider.provider == *selected)
+                });
+                let selected_was_removed = selected_provider.is_some() && self.selected.is_none();
+                let panel_is_compatible = match self.panel {
+                    AuthPanel::List => true,
+                    AuthPanel::ApiKeyInput => self
+                        .selected
+                        .and_then(|index| self.providers.get(index))
+                        .is_some_and(|provider| {
+                            provider.env_var_name.is_some() || provider.has_stored_api_key
+                        }),
+                    AuthPanel::OAuthFlow => self
+                        .selected
+                        .and_then(|index| self.providers.get(index))
+                        .is_some_and(|provider| {
+                            provider.supports_oauth
+                                && self
+                                    .oauth_flow
+                                    .as_ref()
+                                    .is_none_or(|flow| flow.provider == provider.provider)
+                        }),
+                };
+                if selected_was_removed || !panel_is_compatible {
+                    self.clear_detail_state();
+                }
+                self.cursor = self
+                    .cursor
+                    .min(self.filtered_providers().len().saturating_sub(1));
                 AuthOutcome {
                     diagnostics: vec![AuthCoordination {
                         level: LogLevel::Debug,
@@ -176,6 +211,10 @@ impl AuthState {
 
     pub(crate) fn close_detail(&mut self) {
         self.selected = None;
+        self.clear_detail_state();
+    }
+
+    fn clear_detail_state(&mut self) {
         self.panel = AuthPanel::List;
         self.api_key_input.clear();
         self.api_key_cursor = 0;
@@ -226,8 +265,11 @@ impl AuthState {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::*;
     use crate::domain::auth::{OAuthFlowKind, OAuthResultStatus, OAuthStatus};
+    use crate::features::auth::input::{AuthInputResult, handle_key};
 
     fn provider(id: &str, display_name: &str) -> AuthProviderEntry {
         AuthProviderEntry {
@@ -280,6 +322,163 @@ mod tests {
                 }],
                 effects: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn provider_replacement_normalizes_cursor_and_selection_identity() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![
+            provider("one", "One"),
+            provider("two", "Two"),
+            provider("three", "Three"),
+        ];
+        auth.cursor = 2;
+        auth.selected = Some(1);
+        auth.filter = "t".into();
+
+        auth.reduce(AuthAction::Providers(vec![
+            provider("two", "Two updated"),
+            provider("four", "Four"),
+        ]));
+        assert_eq!(auth.cursor, 0);
+        assert_eq!(auth.selected, Some(0));
+
+        auth.cursor = 9;
+        auth.selected = Some(0);
+        auth.filter = "four".into();
+        auth.reduce(AuthAction::Providers(vec![provider("four", "Four")]));
+        assert_eq!(auth.cursor, 0);
+        assert_eq!(auth.selected, None);
+
+        auth.cursor = 4;
+        auth.filter = "missing".into();
+        auth.reduce(AuthAction::Providers(Vec::new()));
+        assert_eq!(auth.cursor, 0);
+        assert_eq!(auth.selected, None);
+    }
+
+    fn populate_detail_state(auth: &mut AuthState, provider_id: &str, panel: AuthPanel) {
+        auth.selected = Some(0);
+        auth.panel = panel;
+        auth.api_key_input = "secret".into();
+        auth.api_key_cursor = auth.api_key_input.len();
+        auth.oauth_flow = Some(oauth_flow(provider_id));
+        auth.oauth_response = "callback".into();
+        auth.oauth_response_cursor = auth.oauth_response.len();
+        auth.last_result = Some(oauth_result(
+            provider_id,
+            OAuthResultStatus::Failure,
+            "stale result",
+        ));
+        auth.ui_notice = Some(AuthUiNotice {
+            provider: Some(provider_id.into()),
+            success: false,
+            message: "stale notice".into(),
+        });
+        auth.clipboard_fallback = Some("https://example.com/fallback".into());
+    }
+
+    fn assert_detail_state_cleared(auth: &AuthState) {
+        assert_eq!(auth.panel, AuthPanel::List);
+        assert!(auth.api_key_input.is_empty());
+        assert_eq!(auth.api_key_cursor, 0);
+        assert!(auth.oauth_flow.is_none());
+        assert!(auth.oauth_response.is_empty());
+        assert_eq!(auth.oauth_response_cursor, 0);
+        assert!(auth.last_result.is_none());
+        assert!(auth.ui_notice.is_none());
+        assert!(auth.clipboard_fallback.is_none());
+    }
+
+    #[test]
+    fn provider_removal_clears_api_key_detail_state() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("removed", "Removed")];
+        populate_detail_state(&mut auth, "removed", AuthPanel::ApiKeyInput);
+
+        auth.reduce(AuthAction::Providers(Vec::new()));
+
+        assert!(auth.selected.is_none());
+        assert_detail_state_cleared(&auth);
+        assert_eq!(
+            handle_key(&mut auth, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AuthInputResult::NotHandled
+        );
+    }
+
+    #[test]
+    fn provider_removal_clears_oauth_detail_state() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("removed", "Removed")];
+        populate_detail_state(&mut auth, "removed", AuthPanel::OAuthFlow);
+
+        auth.reduce(AuthAction::Providers(Vec::new()));
+
+        assert!(auth.selected.is_none());
+        assert_detail_state_cleared(&auth);
+        assert_eq!(
+            handle_key(&mut auth, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AuthInputResult::NotHandled
+        );
+    }
+
+    #[test]
+    fn provider_capability_loss_clears_incompatible_api_key_panel() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("retained", "Retained")];
+        populate_detail_state(&mut auth, "retained", AuthPanel::ApiKeyInput);
+        let mut oauth_only = provider("retained", "Retained");
+        oauth_only.env_var_name = None;
+        oauth_only.has_stored_api_key = false;
+
+        auth.reduce(AuthAction::Providers(vec![oauth_only]));
+
+        assert_eq!(auth.selected, Some(0));
+        assert_detail_state_cleared(&auth);
+    }
+
+    #[test]
+    fn provider_capability_loss_clears_incompatible_oauth_panel() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("retained", "Retained")];
+        populate_detail_state(&mut auth, "retained", AuthPanel::OAuthFlow);
+        let mut api_key_only = provider("retained", "Retained");
+        api_key_only.supports_oauth = false;
+        api_key_only.oauth_status = None;
+
+        auth.reduce(AuthAction::Providers(vec![api_key_only]));
+
+        assert_eq!(auth.selected, Some(0));
+        assert_detail_state_cleared(&auth);
+    }
+
+    #[test]
+    fn provider_reorder_preserves_compatible_detail_state_by_identity() {
+        let mut auth = AuthState::new();
+        auth.providers = vec![provider("selected", "Selected"), provider("other", "Other")];
+        populate_detail_state(&mut auth, "selected", AuthPanel::OAuthFlow);
+        let expected_flow = auth.oauth_flow.clone();
+        let expected_result = auth.last_result.clone();
+        let expected_notice = auth.ui_notice.clone();
+
+        auth.reduce(AuthAction::Providers(vec![
+            provider("other", "Other updated"),
+            provider("selected", "Selected updated"),
+        ]));
+
+        assert_eq!(auth.selected, Some(1));
+        assert_eq!(auth.panel, AuthPanel::OAuthFlow);
+        assert_eq!(auth.api_key_input, "secret");
+        assert_eq!(auth.api_key_cursor, 6);
+        assert_eq!(auth.oauth_flow, expected_flow);
+        assert_eq!(auth.oauth_response, "callback");
+        assert_eq!(auth.oauth_response_cursor, 8);
+        assert_eq!(auth.last_result, expected_result);
+        assert_eq!(auth.ui_notice, expected_notice);
+        assert_eq!(
+            auth.clipboard_fallback.as_deref(),
+            Some("https://example.com/fallback")
         );
     }
 

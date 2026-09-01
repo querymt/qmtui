@@ -17,6 +17,12 @@ pub(crate) struct MessagesRenderInput<'a> {
     pub(crate) now_unix_secs: i64,
 }
 
+fn total_card_height<'a>(cards: impl Iterator<Item = &'a Card>, width: u16) -> usize {
+    cards.fold(0usize, |total, card| {
+        total.saturating_add(card.height(width))
+    })
+}
+
 pub(crate) fn draw_messages(
     frame: &mut Frame,
     area: Rect,
@@ -53,12 +59,10 @@ pub(crate) fn draw_messages(
     };
     let streaming_card = build_streaming_card(streaming_input, render);
 
-    let total_height: u16 = render
-        .cards()
-        .iter()
-        .chain(streaming_card.iter())
-        .map(|card| card.height(area.width))
-        .sum();
+    let total_height = total_card_height(
+        render.cards().iter().chain(streaming_card.iter()),
+        area.width,
+    );
 
     if total_height == 0 && render.cards().is_empty() && streaming_card.is_none() {
         return;
@@ -66,33 +70,34 @@ pub(crate) fn draw_messages(
 
     render.compensate_chat_growth(total_height);
     let scroll = render.clamp_chat_scroll(total_height, area.height);
+    let viewport_bottom = scroll.saturating_add(area.height as usize);
 
     let all_cards: Vec<&Card> = render.cards().iter().chain(streaming_card.iter()).collect();
-
-    let mut y = -(scroll as i32);
+    let mut card_top = 0usize;
     for card in &all_cards {
         let card_height = card.height(area.width);
-        let card_top = y;
-        let card_bottom = y + card_height as i32;
+        let card_bottom = card_top.saturating_add(card_height);
 
-        if card_bottom > 0 && card_top < area.height as i32 {
-            let render_y = card_top.max(0) as u16;
-            let visible_height = (card_bottom.min(area.height as i32) - render_y as i32) as u16;
-            let clip_top = (-card_top).max(0) as u16;
+        if card_bottom > scroll && card_top < viewport_bottom {
+            let clip_top = scroll.saturating_sub(card_top);
+            let render_y = card_top.saturating_sub(scroll);
+            let visible_height = card_height
+                .saturating_sub(clip_top)
+                .min((area.height as usize).saturating_sub(render_y));
 
             card.render(
                 frame,
                 Rect {
                     x: area.x,
-                    y: area.y + render_y,
+                    y: area.y.saturating_add(render_y as u16),
                     width: area.width,
-                    height: visible_height.min(card_height),
+                    height: visible_height.min(u16::MAX as usize) as u16,
                 },
                 clip_top,
             );
         }
 
-        y += card_height as i32;
+        card_top = card_bottom;
     }
 }
 
@@ -251,11 +256,11 @@ mod tests {
 
         assert!(total_height > previous_height);
         assert_eq!(
-            app.render.chat_scroll_offset(),
+            app.render.chat_scroll_offset() as usize,
             2 + total_height.saturating_sub(previous_height)
         );
         let max_scroll = total_height.saturating_sub(4);
-        assert_eq!(max_scroll - app.render.chat_scroll_offset(), 3);
+        assert_eq!(max_scroll - app.render.chat_scroll_offset() as usize, 3);
     }
 
     #[test]
@@ -275,7 +280,7 @@ mod tests {
 
         assert!(total_height > previous_height);
         assert_eq!(
-            app.render.chat_scroll_offset(),
+            app.render.chat_scroll_offset() as usize,
             1 + total_height.saturating_sub(previous_height)
         );
         let card = build_streaming_card_for_test(&mut app, 20);
@@ -317,7 +322,7 @@ mod tests {
         let narrow_identity = app.render.test_card_identity(0);
         assert!(narrow_height > wide_height);
         assert_eq!(
-            app.render.chat_scroll_offset(),
+            app.render.chat_scroll_offset() as usize,
             1 + narrow_height.saturating_sub(wide_height)
         );
         assert_ne!(narrow_identity, wide_identity);
@@ -325,7 +330,7 @@ mod tests {
         let _ = render_messages_buffer(&mut app, 40, 1);
         assert_eq!(app.render.test_chat_previous_total_height(), wide_height);
         assert_eq!(
-            app.render.chat_scroll_offset(),
+            app.render.chat_scroll_offset() as usize,
             (1 + narrow_height.saturating_sub(wide_height)).min(wide_height.saturating_sub(1))
         );
     }
@@ -364,6 +369,24 @@ mod tests {
             app.render.test_chat_previous_total_height(),
             app.render.cards()[0].height(30)
         );
+    }
+
+    #[test]
+    fn aggregate_card_height_exceeds_u16_without_wrapping() {
+        let cards = (0..22_000)
+            .map(|_| {
+                Card::new(
+                    CardKind::User,
+                    vec![crate::markdown::CardBlock::Text(ratatui::text::Line::from(
+                        "x",
+                    ))],
+                )
+            })
+            .collect::<Vec<_>>();
+        let total = total_card_height(cards.iter(), 80);
+
+        assert_eq!(total, 66_000);
+        assert!(total > u16::MAX as usize);
     }
 
     #[test]

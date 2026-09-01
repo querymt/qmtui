@@ -293,27 +293,37 @@ impl ModelsState {
         );
     }
 
-    pub(crate) fn filtered_models(&self) -> Vec<&ModelEntry> {
+    fn filtered_model_indices(&self) -> Vec<usize> {
         if self.model_filter.is_empty() {
-            self.models.iter().collect()
+            (0..self.models.len()).collect()
         } else {
             let matcher = SkimMatcherV2::default();
-            let mut scored: Vec<(i64, &ModelEntry)> = self
+            let mut scored: Vec<(i64, usize)> = self
                 .models
                 .iter()
-                .filter_map(|model| {
+                .enumerate()
+                .filter_map(|(index, model)| {
                     let score = [&model.label, &model.provider, &model.model]
                         .iter()
                         .filter_map(|field| matcher.fuzzy_match(field, &self.model_filter))
                         .max();
-                    score.map(|score| (score, model))
+                    score.map(|score| (score, index))
                 })
                 .collect();
             scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-            scored.into_iter().map(|(_, model)| model).collect()
+            scored.into_iter().map(|(_, index)| index).collect()
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn filtered_models(&self) -> Vec<&ModelEntry> {
+        self.filtered_model_indices()
+            .into_iter()
+            .map(|index| &self.models[index])
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn model_index_for_entry(&self, entry: &ModelEntry) -> Option<usize> {
         self.models
             .iter()
@@ -367,13 +377,13 @@ impl ModelsState {
     }
 
     pub(crate) fn visible_model_popup_items(&self) -> Vec<ModelPopupItem> {
-        let filtered = self.filtered_models();
-        let mut groups: BTreeMap<(String, Option<String>), Vec<&ModelEntry>> = BTreeMap::new();
-        for model in filtered {
+        let mut groups: BTreeMap<(String, Option<String>), Vec<usize>> = BTreeMap::new();
+        for model_idx in self.filtered_model_indices() {
+            let model = &self.models[model_idx];
             groups
                 .entry((model.provider.clone(), model.node_id.clone()))
                 .or_default()
-                .push(model);
+                .push(model_idx);
         }
 
         let mut items = Vec::new();
@@ -381,7 +391,7 @@ impl ModelsState {
             let node_suffix = node_id.as_ref().map(|node_id| {
                 models_in_group
                     .first()
-                    .and_then(|model| model.node_label.clone())
+                    .and_then(|&index| self.models[index].node_label.clone())
                     .unwrap_or_else(|| node_id.clone())
             });
             items.push(ModelPopupItem::ProviderHeader {
@@ -389,11 +399,11 @@ impl ModelsState {
                 model_count: models_in_group.len(),
                 node_suffix,
             });
-            for model in models_in_group {
-                if let Some(model_idx) = self.model_index_for_entry(model) {
-                    items.push(ModelPopupItem::Model { model_idx });
-                }
-            }
+            items.extend(
+                models_in_group
+                    .into_iter()
+                    .map(|model_idx| ModelPopupItem::Model { model_idx }),
+            );
         }
         items
     }
@@ -1110,6 +1120,27 @@ mod tests {
                 ModelPopupItem::Model { model_idx: 3 },
             ]
         );
+    }
+
+    #[test]
+    fn visible_items_preserve_exact_catalog_indices_with_filter_and_duplicates() {
+        let mut state = ModelsState::new();
+        state.models = vec![
+            model("duplicate", "match first", "p", "same", Some("node"), None),
+            model("other", "excluded", "p", "other", None, None),
+            model("duplicate", "match second", "p", "same", Some("node"), None),
+        ];
+        state.model_filter = "match".into();
+
+        let indices = state
+            .visible_model_popup_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                ModelPopupItem::Model { model_idx } => Some(model_idx),
+                ModelPopupItem::ProviderHeader { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(indices, [0, 2]);
     }
 
     #[test]

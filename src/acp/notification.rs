@@ -17,7 +17,7 @@ pub(super) enum Translation {
         message_id: Option<String>,
         thinking: bool,
     },
-    ToolStart(AcpSessionUpdate),
+    ToolBoundary(AcpSessionUpdate),
     AgentMode(String),
     ConfigOptions(Vec<acp::SessionConfigOption>),
     Ignore,
@@ -43,9 +43,11 @@ pub(super) fn translate(notification: acp::SessionNotification) -> (String, Tran
             thinking: true,
         },
         acp::SessionUpdate::ToolCall(tool_call) => {
-            Translation::ToolStart(tool_start_update(&tool_call))
+            Translation::ToolBoundary(tool_start_update(&tool_call))
         }
-        acp::SessionUpdate::ToolCallUpdate(update) => Translation::Update(tool_call_update(update)),
+        acp::SessionUpdate::ToolCallUpdate(update) => {
+            Translation::ToolBoundary(tool_call_update(update))
+        }
         acp::SessionUpdate::CurrentModeUpdate(update) => {
             Translation::AgentMode(update.current_mode_id.to_string())
         }
@@ -69,7 +71,7 @@ pub(super) async fn apply(
 ) {
     match translation {
         Translation::Update(update) => emit_or_buffer(state, events, &session_id, update).await,
-        Translation::ToolStart(update) => match state.replay.route(&session_id, update).await {
+        Translation::ToolBoundary(update) => match state.replay.route(&session_id, update).await {
             None => {}
             Some(update) => {
                 flush_assistant(state, events, &session_id).await;
@@ -248,6 +250,8 @@ fn value_to_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_events::ServerChannelMsg;
+    use tokio::sync::mpsc;
 
     fn notification(update: acp::SessionUpdate) -> acp::SessionNotification {
         acp::SessionNotification::new("session-1", update)
@@ -322,7 +326,7 @@ mod tests {
         )));
         assert!(matches!(
             started,
-            Translation::ToolStart(AcpSessionUpdate::ToolCallStart {
+            Translation::ToolBoundary(AcpSessionUpdate::ToolCallStart {
                 tool_call_id: Some(id),
                 name,
                 arguments: Some(arguments),
@@ -339,7 +343,7 @@ mod tests {
         )));
         assert!(matches!(
             pending,
-            Translation::Update(AcpSessionUpdate::ToolCallStart {
+            Translation::ToolBoundary(AcpSessionUpdate::ToolCallStart {
                 tool_call_id: Some(id),
                 name,
                 arguments: Some(arguments),
@@ -365,7 +369,7 @@ mod tests {
         )));
         assert!(matches!(
             completed,
-            Translation::Update(AcpSessionUpdate::ToolCallEnd {
+            Translation::ToolBoundary(AcpSessionUpdate::ToolCallEnd {
                 tool_call_id: Some(id),
                 name,
                 is_error: false,
@@ -388,7 +392,7 @@ mod tests {
                     ]),
             ),
         )));
-        let Translation::Update(AcpSessionUpdate::ToolCallEnd {
+        let Translation::ToolBoundary(AcpSessionUpdate::ToolCallEnd {
             tool_call_id: Some(id),
             name,
             is_error,
@@ -464,6 +468,126 @@ mod tests {
                 Translation::Ignore
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn live_tool_updates_flush_assistant_content_at_each_boundary() {
+        let state = Arc::new(RuntimeState::new(None));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let events = EventSink::new(tx);
+
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::AssistantChunk {
+                text: "before start".into(),
+                message_id: Some("a1".into()),
+                thinking: false,
+            },
+        )
+        .await;
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::ToolBoundary(AcpSessionUpdate::ToolCallStart {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                arguments: None,
+            }),
+        )
+        .await;
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::AssistantChunk {
+                text: "before end".into(),
+                message_id: Some("a2".into()),
+                thinking: false,
+            },
+        )
+        .await;
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::ToolBoundary(AcpSessionUpdate::ToolCallEnd {
+                tool_call_id: Some("tool-1".into()),
+                name: "shell".into(),
+                is_error: false,
+                result: None,
+            }),
+        )
+        .await;
+
+        let updates = (0..6)
+            .map(|_| match rx.try_recv().expect("session update") {
+                ServerChannelMsg::Acp(AcpAppEvent::SessionUpdate { update, .. }) => update,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            &updates[..],
+            [
+                AcpSessionUpdate::AssistantContentDelta { content: first_delta, .. },
+                AcpSessionUpdate::AssistantMessage { content: first_final, .. },
+                AcpSessionUpdate::ToolCallStart { .. },
+                AcpSessionUpdate::AssistantContentDelta { content: second_delta, .. },
+                AcpSessionUpdate::AssistantMessage { content: second_final, .. },
+                AcpSessionUpdate::ToolCallEnd { .. },
+            ] if first_delta == "before start"
+                && first_final == "before start"
+                && second_delta == "before end"
+                && second_final == "before end"
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_updates_do_not_flush_assistant_content() {
+        let state = Arc::new(RuntimeState::new(None));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let events = EventSink::new(tx);
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::AssistantChunk {
+                text: "buffered".into(),
+                message_id: None,
+                thinking: false,
+            },
+        )
+        .await;
+        apply(
+            &state,
+            &events,
+            "session-1".into(),
+            Translation::Update(AcpSessionUpdate::UsageUpdate {
+                used: 1,
+                size: 2,
+                cost_usd: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerChannelMsg::Acp(AcpAppEvent::SessionUpdate {
+                update: AcpSessionUpdate::AssistantContentDelta { .. },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerChannelMsg::Acp(AcpAppEvent::SessionUpdate {
+                update: AcpSessionUpdate::UsageUpdate { .. },
+                ..
+            }))
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(state.assistants.flush("session-1").await.is_some());
     }
 
     #[test]

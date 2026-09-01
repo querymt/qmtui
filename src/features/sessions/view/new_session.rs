@@ -7,7 +7,7 @@ use ratatui::{
 
 use crate::session_state::SessionsState;
 use crate::theme::Theme;
-use crate::view_shared::scroll_input;
+use crate::view_shared::{popup_rect, scroll_input};
 
 pub(crate) fn draw_new_session_popup(f: &mut Frame, sessions: &SessionsState) {
     let area = f.area();
@@ -16,18 +16,15 @@ pub(crate) fn draw_new_session_popup(f: &mut Frame, sessions: &SessionsState) {
         .as_ref()
         .map(|completion| !completion.results.is_empty())
         .unwrap_or(false);
-    let popup_width = area.width.saturating_sub(4).clamp(24, 72);
-    let popup_height = area
-        .height
-        .saturating_sub(4)
-        .min(if show_completion { 10 } else { 6 })
-        .max(4);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let max_height = if show_completion { 10 } else { 6 };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(4).min(max_height) as usize,
+        24..=72,
+        4..=max_height as usize,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -75,7 +72,15 @@ pub(crate) fn draw_new_session_popup(f: &mut Frame, sessions: &SessionsState) {
         Paragraph::new(input_line).style(Theme::popup_bg()),
         chunks[2],
     );
-    f.set_cursor_position((chunks[2].x + 2 + path_cur as u16, chunks[2].y));
+    if chunks[2].width > 2 && chunks[2].height > 0 {
+        f.set_cursor_position((
+            chunks[2]
+                .x
+                .saturating_add(2)
+                .saturating_add(path_cur as u16),
+            chunks[2].y,
+        ));
+    }
 
     if let Some(completion) = &sessions.new_session_completion
         && !completion.results.is_empty()

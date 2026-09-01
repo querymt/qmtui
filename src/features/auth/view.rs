@@ -8,7 +8,9 @@ use ratatui::{
 use crate::auth_state::{AuthPanel, AuthState};
 use crate::domain::auth::{AuthMethod, AuthStatus, OAuthFlowKind, OAuthStatus};
 use crate::theme::Theme;
-use crate::view_shared::{ELLIPSIS, scroll_input, scroll_input_chars};
+use crate::view_shared::{
+    ELLIPSIS, popup_rect, scroll_input, scroll_input_chars, wrap_display_width,
+};
 
 const AUTH_POPUP_MAX_W: u16 = 68;
 const AUTH_POPUP_MIN_W: u16 = 44;
@@ -32,17 +34,16 @@ fn auth_status_label(status: AuthStatus) -> &'static str {
 
 pub(crate) fn draw_auth_popup(f: &mut Frame, auth: &AuthState) {
     let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(AUTH_POPUP_MIN_W, AUTH_POPUP_MAX_W);
-    let popup_height = (area.height * 30 / 100).max(15).min(area.height);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let desired_width = area.width.saturating_sub(4) as usize;
+    let desired_height = (area.height as usize).saturating_mul(30) / 100;
+    let popup_area = popup_rect(
+        area,
+        desired_width,
+        desired_height,
+        AUTH_POPUP_MIN_W as usize..=AUTH_POPUP_MAX_W as usize,
+        15..=area.height as usize,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -104,8 +105,14 @@ pub(crate) fn draw_auth_popup(f: &mut Frame, auth: &AuthState) {
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    if auth.panel == AuthPanel::List {
-        f.set_cursor_position((chunks[1].x + 2 + auth_filter_cur as u16, chunks[1].y));
+    if auth.panel == AuthPanel::List && chunks[1].width > 2 && chunks[1].height > 0 {
+        f.set_cursor_position((
+            chunks[1]
+                .x
+                .saturating_add(2)
+                .saturating_add(auth_filter_cur as u16),
+            chunks[1].y,
+        ));
     }
 
     // provider list
@@ -387,10 +394,10 @@ fn draw_auth_detail_panel(f: &mut Frame, auth: &AuthState, area: Rect) {
 
             // Position cursor in the input field
             let input_row_idx = if provider.has_stored_api_key { 2 } else { 1 };
-            if (input_row_idx as u16) < area.height {
+            if area.width > 3 && (input_row_idx as u16) < area.height {
                 f.set_cursor_position((
-                    area.x + 3 + api_key_cur as u16,
-                    area.y + input_row_idx as u16,
+                    area.x.saturating_add(3).saturating_add(api_key_cur as u16),
+                    area.y.saturating_add(input_row_idx as u16),
                 ));
             }
         }
@@ -482,8 +489,11 @@ fn draw_auth_detail_panel(f: &mut Frame, auth: &AuthState, area: Rect) {
                 let avail = area.width.saturating_sub(3) as usize;
                 let (_, oauth_cur) =
                     scroll_input(&auth.oauth_response, auth.oauth_response_cursor, avail);
-                if 3 < area.height {
-                    f.set_cursor_position((area.x + 3 + oauth_cur as u16, area.y + 3));
+                if area.width > 3 && 3 < area.height {
+                    f.set_cursor_position((
+                        area.x.saturating_add(3).saturating_add(oauth_cur as u16),
+                        area.y.saturating_add(3),
+                    ));
                 }
             }
         }
@@ -502,16 +512,12 @@ fn draw_auth_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
     )));
     lines.push(Line::from(""));
 
-    // Word-wrap the URL into available width
     let avail = area.width.saturating_sub(2) as usize;
-    let mut remaining = url;
-    while !remaining.is_empty() {
-        let take = remaining.len().min(avail);
+    for chunk in wrap_display_width(url, avail) {
         lines.push(Line::from(Span::styled(
-            format!(" {}", &remaining[..take]),
+            format!(" {chunk}"),
             Theme::popup_bg(),
         )));
-        remaining = &remaining[take..];
     }
 
     lines.push(Line::from(""));

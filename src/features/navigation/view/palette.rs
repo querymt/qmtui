@@ -89,7 +89,22 @@ pub(crate) fn draw_command_palette_popup(f: &mut Frame, navigation: &NavigationS
         Paragraph::new(filter_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+    let cursor_area = chunks[1].intersection(area);
+    if chunks[1].width > 0
+        && chunks[1].height > 0
+        && cursor_area.width > 0
+        && cursor_area.height > 0
+    {
+        let cursor_x = chunks[1]
+            .x
+            .saturating_add(2)
+            .saturating_add(filter_cur as u16)
+            .clamp(cursor_area.x, cursor_area.right().saturating_sub(1));
+        let cursor_y = chunks[1]
+            .y
+            .clamp(cursor_area.y, cursor_area.bottom().saturating_sub(1));
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     let list_w = chunks[3].width as usize;
     let desc_avail = list_w.saturating_sub(3 + TITLE_COL_W + 1 + SHORTCUT_COL_W + 1);
@@ -180,6 +195,20 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn command_palette_cursor_stays_inside_tiny_frame() {
+        let navigation = NavigationState::new();
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_command_palette_popup(frame, &navigation))
+            .unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(Rect::new(0, 0, 1, 1).contains(cursor));
     }
 
     #[test]

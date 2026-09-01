@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::domain::profile::ProfileInfo;
 use crate::profiles_state::ProfilesState;
 use crate::theme::Theme;
-use crate::view_shared::{scroll_input, truncate_with_ellipsis};
+use crate::view_shared::{popup_rect, scroll_input, truncate_with_ellipsis};
 
 pub(crate) struct ProfilePopupInput<'a> {
     pub(crate) profiles: &'a ProfilesState,
@@ -79,14 +79,14 @@ fn profile_table_widths(
 
 pub(crate) fn draw_profile_popup(f: &mut Frame, input: ProfilePopupInput<'_>) {
     let area = f.area();
-    let popup_width = area.width.saturating_sub(4).clamp(32, 76);
-    let popup_height = area.height.saturating_sub(4).clamp(6, 16);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(4) as usize,
+        32..=76,
+        6..=16,
+        2,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -125,7 +125,15 @@ pub(crate) fn draw_profile_popup(f: &mut Frame, input: ProfilePopupInput<'_>) {
         Paragraph::new(input_line).style(Theme::popup_bg()),
         chunks[1],
     );
-    f.set_cursor_position((chunks[1].x + 2 + filter_cur as u16, chunks[1].y));
+    if chunks[1].width > 2 && chunks[1].height > 0 {
+        f.set_cursor_position((
+            chunks[1]
+                .x
+                .saturating_add(2)
+                .saturating_add(filter_cur as u16),
+            chunks[1].y,
+        ));
+    }
 
     let active_id = input.profiles.active_profile_id.as_deref();
     let current_session_id = input.current_session_profile_id;

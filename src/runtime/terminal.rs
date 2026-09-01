@@ -181,6 +181,15 @@ impl TerminalReaderController {
     }
 }
 
+fn preserve_operation_result<T>(
+    operation_result: anyhow::Result<T>,
+    cleanup_result: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    let value = operation_result?;
+    cleanup_result?;
+    Ok(value)
+}
+
 pub(super) fn with_reader_paused<T>(
     reader: Option<&TerminalReaderController>,
     operation: impl FnOnce() -> anyhow::Result<T>,
@@ -189,10 +198,11 @@ pub(super) fn with_reader_paused<T>(
         reader.pause()?;
     }
     let operation_result = operation();
-    let resume_result = reader.map(TerminalReaderController::resume).transpose();
-    let value = operation_result?;
-    resume_result?;
-    Ok(value)
+    let resume_result = reader
+        .map(TerminalReaderController::resume)
+        .transpose()
+        .map(|_| ());
+    preserve_operation_result(operation_result, resume_result)
 }
 
 pub(super) struct TerminalReader {
@@ -338,20 +348,87 @@ pub(super) fn leave(terminal: &mut AppTerminal) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorHandoffCommand {
+    ShowCursor,
+    DisableRawMode,
+    DisableMouseCapture,
+    LeaveAlternateScreen,
+    EnableRawMode,
+    EnterAlternateScreen,
+    EnableMouseCapture,
+    HideCursor,
+}
+
+fn run_editor_handoff<T>(
+    mut apply: impl FnMut(EditorHandoffCommand) -> anyhow::Result<()>,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let setup_commands = [
+        EditorHandoffCommand::ShowCursor,
+        EditorHandoffCommand::DisableRawMode,
+        EditorHandoffCommand::DisableMouseCapture,
+        EditorHandoffCommand::LeaveAlternateScreen,
+    ];
+    for (completed_setup_steps, command) in setup_commands.into_iter().enumerate() {
+        if let Err(setup_error) = apply(command) {
+            let restore_result = restore_editor_handoff(&mut apply, completed_setup_steps);
+            return preserve_operation_result(Err(setup_error), restore_result);
+        }
+    }
+
+    let operation_result = operation();
+    let restore_result = restore_editor_handoff(&mut apply, setup_commands.len());
+    preserve_operation_result(operation_result, restore_result)
+}
+
+fn restore_editor_handoff(
+    apply: &mut impl FnMut(EditorHandoffCommand) -> anyhow::Result<()>,
+    completed_setup_steps: usize,
+) -> anyhow::Result<()> {
+    let restore_commands = [
+        (2, EditorHandoffCommand::EnableRawMode),
+        (4, EditorHandoffCommand::EnterAlternateScreen),
+        (3, EditorHandoffCommand::EnableMouseCapture),
+        (1, EditorHandoffCommand::HideCursor),
+    ];
+    let mut restore_result = Ok(());
+    for (required_setup_steps, command) in restore_commands {
+        if completed_setup_steps >= required_setup_steps
+            && let Err(error) = apply(command)
+            && restore_result.is_ok()
+        {
+            restore_result = Err(error);
+        }
+    }
+    restore_result
+}
+
 pub(super) fn open_external_editor_with_terminal(
     terminal: &mut AppTerminal,
     initial_text: &str,
 ) -> anyhow::Result<ExternalEditorOutcome> {
-    terminal.show_cursor()?;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    let outcome = open_external_editor(initial_text);
-
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.hide_cursor()?;
-    Ok(outcome)
+    run_editor_handoff(
+        |command| match command {
+            EditorHandoffCommand::ShowCursor => Ok(terminal.show_cursor()?),
+            EditorHandoffCommand::DisableRawMode => Ok(disable_raw_mode()?),
+            EditorHandoffCommand::DisableMouseCapture => {
+                Ok(execute!(terminal.backend_mut(), DisableMouseCapture)?)
+            }
+            EditorHandoffCommand::LeaveAlternateScreen => {
+                Ok(execute!(terminal.backend_mut(), LeaveAlternateScreen)?)
+            }
+            EditorHandoffCommand::EnableRawMode => Ok(enable_raw_mode()?),
+            EditorHandoffCommand::EnterAlternateScreen => {
+                Ok(execute!(terminal.backend_mut(), EnterAlternateScreen)?)
+            }
+            EditorHandoffCommand::EnableMouseCapture => {
+                Ok(execute!(terminal.backend_mut(), EnableMouseCapture)?)
+            }
+            EditorHandoffCommand::HideCursor => Ok(terminal.hide_cursor()?),
+        },
+        || Ok(open_external_editor(initial_text)),
+    )
 }
 
 pub(super) fn redraw(terminal: &mut AppTerminal) -> anyhow::Result<()> {
@@ -581,6 +658,151 @@ mod tests {
             .map(|index| key(char::from_u32('a' as u32 + (index % 26) as u32).unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(queued, expected);
+    }
+
+    #[test]
+    fn editor_handoff_orders_mouse_capture_and_restores_after_operation_error() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+        let result: anyhow::Result<()> = run_editor_handoff(
+            move |command| {
+                recorded.lock().unwrap().push(command);
+                Ok(())
+            },
+            || anyhow::bail!("editor failed"),
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "editor failed");
+        assert_eq!(
+            *commands.lock().unwrap(),
+            [
+                EditorHandoffCommand::ShowCursor,
+                EditorHandoffCommand::DisableRawMode,
+                EditorHandoffCommand::DisableMouseCapture,
+                EditorHandoffCommand::LeaveAlternateScreen,
+                EditorHandoffCommand::EnableRawMode,
+                EditorHandoffCommand::EnterAlternateScreen,
+                EditorHandoffCommand::EnableMouseCapture,
+                EditorHandoffCommand::HideCursor,
+            ]
+        );
+    }
+
+    #[test]
+    fn editor_handoff_rolls_back_each_completed_setup_prefix() {
+        let cases = [
+            (
+                EditorHandoffCommand::ShowCursor,
+                vec![EditorHandoffCommand::ShowCursor],
+            ),
+            (
+                EditorHandoffCommand::DisableRawMode,
+                vec![
+                    EditorHandoffCommand::ShowCursor,
+                    EditorHandoffCommand::DisableRawMode,
+                    EditorHandoffCommand::HideCursor,
+                ],
+            ),
+            (
+                EditorHandoffCommand::DisableMouseCapture,
+                vec![
+                    EditorHandoffCommand::ShowCursor,
+                    EditorHandoffCommand::DisableRawMode,
+                    EditorHandoffCommand::DisableMouseCapture,
+                    EditorHandoffCommand::EnableRawMode,
+                    EditorHandoffCommand::HideCursor,
+                ],
+            ),
+            (
+                EditorHandoffCommand::LeaveAlternateScreen,
+                vec![
+                    EditorHandoffCommand::ShowCursor,
+                    EditorHandoffCommand::DisableRawMode,
+                    EditorHandoffCommand::DisableMouseCapture,
+                    EditorHandoffCommand::LeaveAlternateScreen,
+                    EditorHandoffCommand::EnableRawMode,
+                    EditorHandoffCommand::EnableMouseCapture,
+                    EditorHandoffCommand::HideCursor,
+                ],
+            ),
+        ];
+
+        for (failed_setup, expected_commands) in cases {
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&commands);
+            let editor_calls = AtomicUsize::new(0);
+            let result: anyhow::Result<()> = run_editor_handoff(
+                move |command| {
+                    recorded.lock().unwrap().push(command);
+                    if command == failed_setup {
+                        anyhow::bail!("setup failed at {command:?}");
+                    }
+                    Ok(())
+                },
+                || {
+                    editor_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("setup failed at {failed_setup:?}")
+            );
+            assert_eq!(editor_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(*commands.lock().unwrap(), expected_commands);
+        }
+    }
+
+    #[test]
+    fn editor_handoff_preserves_setup_error_when_rollback_fails() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+        let editor_calls = AtomicUsize::new(0);
+        let result: anyhow::Result<()> = run_editor_handoff(
+            move |command| {
+                recorded.lock().unwrap().push(command);
+                match command {
+                    EditorHandoffCommand::DisableMouseCapture => {
+                        anyhow::bail!("disable mouse failed")
+                    }
+                    EditorHandoffCommand::EnableRawMode => anyhow::bail!("enable raw failed"),
+                    _ => Ok(()),
+                }
+            },
+            || {
+                editor_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "disable mouse failed");
+        assert_eq!(editor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *commands.lock().unwrap(),
+            [
+                EditorHandoffCommand::ShowCursor,
+                EditorHandoffCommand::DisableRawMode,
+                EditorHandoffCommand::DisableMouseCapture,
+                EditorHandoffCommand::EnableRawMode,
+                EditorHandoffCommand::HideCursor,
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_error_takes_precedence_over_restore_or_resume_error() {
+        let operation: anyhow::Result<()> = Err(anyhow::anyhow!("operation failed"));
+        let cleanup = Err(anyhow::anyhow!("restore failed"));
+        assert_eq!(
+            preserve_operation_result(operation, cleanup)
+                .unwrap_err()
+                .to_string(),
+            "operation failed"
+        );
+
+        let cleanup = preserve_operation_result(Ok(()), Err(anyhow::anyhow!("resume failed")));
+        assert_eq!(cleanup.unwrap_err().to_string(), "resume failed");
     }
 
     #[test]

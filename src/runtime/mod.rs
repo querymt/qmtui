@@ -4124,8 +4124,8 @@ mod auth_tests {
         assert!(app.auth.providers[0].has_env_api_key);
         assert_eq!(app.auth.providers[1].provider, "groq");
         assert!(app.auth.providers[1].has_stored_api_key);
-        assert_eq!(app.auth.cursor, 7);
-        assert_eq!(app.auth.selected, Some(9));
+        assert_eq!(app.auth.cursor, 1);
+        assert_eq!(app.auth.selected, None);
     }
 
     #[test]

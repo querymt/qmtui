@@ -7,7 +7,7 @@ use ratatui::{
 
 use crate::mesh_state::{MeshFocus, MeshInviteFormField, MeshState};
 use crate::theme::Theme;
-use crate::view_shared::truncate_with_ellipsis;
+use crate::view_shared::{popup_rect, truncate_with_ellipsis, wrap_display_width};
 
 pub(crate) fn draw_mesh_popup(f: &mut Frame, mesh: &MeshState) {
     const MESH_POPUP_MIN_W: u16 = 54;
@@ -16,20 +16,14 @@ pub(crate) fn draw_mesh_popup(f: &mut Frame, mesh: &MeshState) {
     const MESH_POPUP_MAX_H: u16 = 28;
 
     let area = f.area();
-    let popup_width = area
-        .width
-        .saturating_sub(4)
-        .clamp(MESH_POPUP_MIN_W.min(area.width), MESH_POPUP_MAX_W);
-    let popup_height = area
-        .height
-        .saturating_sub(2)
-        .clamp(MESH_POPUP_MIN_H.min(area.height), MESH_POPUP_MAX_H);
-    let popup_area = Rect {
-        x: area.x + area.width.saturating_sub(popup_width) / 2,
-        y: area.y + area.height.saturating_sub(popup_height) / 3,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(2) as usize,
+        MESH_POPUP_MIN_W as usize..=MESH_POPUP_MAX_W as usize,
+        MESH_POPUP_MIN_H as usize..=MESH_POPUP_MAX_H as usize,
+        3,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -186,9 +180,14 @@ pub(crate) fn draw_mesh_popup(f: &mut Frame, mesh: &MeshState) {
 
 pub(crate) fn draw_mesh_invite_popup(f: &mut Frame, mesh: &MeshState) {
     let area = f.area();
-    let popup_width = area.width.saturating_sub(6).clamp(48.min(area.width), 54);
-    let popup_height = area.height.saturating_sub(4).clamp(9.min(area.height), 11);
-    let popup_area = sized_centered_rect(area, popup_width, popup_height);
+    let popup_area = popup_rect(
+        area,
+        area.width.saturating_sub(6) as usize,
+        area.height.saturating_sub(4) as usize,
+        48..=54,
+        9..=11,
+        3,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -236,17 +235,25 @@ pub(crate) fn draw_mesh_invite_qr_popup(f: &mut Frame, mesh: &MeshState) {
         .and_then(|invite| invite.qr_code.as_deref())
         .map(qr_text_size)
         .unwrap_or((36, 1));
-    let title_width = "QR Code Invite".len() as u16;
-    let hint_width = 32;
-    let popup_width = qr_width
-        .max(title_width)
-        .max(hint_width)
-        .saturating_add(5)
-        .min(area.width.saturating_sub(2).max(1));
-    let popup_height = qr_height
-        .saturating_add(5)
-        .min(area.height.saturating_sub(2).max(1));
-    let popup_area = sized_centered_rect(area, popup_width, popup_height);
+    let title_width = "QR Code Invite".len();
+    let hint_width = 32usize;
+    let desired_width = qr_width.max(title_width).max(hint_width).saturating_add(5);
+    let desired_height =
+        qr_height
+            .saturating_add(5)
+            .max(if mesh.mesh_clipboard_fallback.is_some() {
+                10
+            } else {
+                1
+            });
+    let popup_area = popup_rect(
+        area,
+        desired_width,
+        desired_height,
+        1..=area.width.saturating_sub(2).max(1) as usize,
+        1..=area.height.saturating_sub(2).max(1) as usize,
+        3,
+    );
 
     f.render_widget(Clear, popup_area);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
@@ -292,23 +299,14 @@ pub(crate) fn draw_mesh_invite_qr_popup(f: &mut Frame, mesh: &MeshState) {
     f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[3]);
 }
 
-fn qr_text_size(qr: &str) -> (u16, u16) {
+fn qr_text_size(qr: &str) -> (usize, usize) {
     let width = qr
         .lines()
         .map(|line| line.chars().count())
         .max()
-        .unwrap_or(1) as u16;
-    let height = qr.lines().count().max(1) as u16;
+        .unwrap_or(1);
+    let height = qr.lines().count().max(1);
     (width, height)
-}
-
-fn sized_centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
-    }
 }
 
 fn draw_mesh_invite_form(f: &mut Frame, mesh: &MeshState, area: Rect) {
@@ -428,12 +426,14 @@ fn draw_mesh_invite_details(f: &mut Frame, mesh: &MeshState, area: Rect) {
 }
 
 fn draw_mesh_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
-    let popup = Rect {
-        x: area.x + 2,
-        y: area.y + 2,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(4).max(6),
-    };
+    let popup = popup_rect(
+        area,
+        area.width.saturating_sub(4) as usize,
+        area.height.saturating_sub(4) as usize,
+        0..=area.width as usize,
+        6..=area.height as usize,
+        2,
+    );
     f.render_widget(Clear, popup);
     f.render_widget(Block::default().style(Theme::popup_bg()), popup);
     let mut lines = vec![
@@ -447,7 +447,7 @@ fn draw_mesh_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
         )),
         Line::from(""),
     ];
-    for chunk in wrap_plain_text(url, popup.width.saturating_sub(2) as usize) {
+    for chunk in wrap_display_width(url, popup.width.saturating_sub(2) as usize) {
         lines.push(Line::from(Span::styled(
             format!(" {chunk}"),
             Theme::popup_bg(),
@@ -459,19 +459,4 @@ fn draw_mesh_clipboard_fallback(f: &mut Frame, area: Rect, url: &str) {
         Theme::status(),
     )));
     f.render_widget(Paragraph::new(lines).style(Theme::popup_bg()), popup);
-}
-
-fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut remaining = text;
-    let mut out = Vec::new();
-    while !remaining.is_empty() {
-        let take = remaining.len().min(width);
-        out.push(remaining[..take].to_string());
-        remaining = &remaining[take..];
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }

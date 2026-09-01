@@ -186,7 +186,7 @@ mod tests {
         for (state, symbol, color) in [
             (ConnState::Connecting, CONN_OFFLINE, Theme::warn()),
             (ConnState::Connected, CONN_ONLINE, Theme::ok()),
-            (ConnState::Disconnected, CONN_ONLINE, Theme::err()),
+            (ConnState::Disconnected, CONN_OFFLINE, Theme::err()),
         ] {
             app.connection.conn = state;
             let indicator = conn_indicator(&app);
@@ -234,7 +234,7 @@ mod tests {
             .collect()
     }
 
-    fn rendered_card_snapshot(app: &mut App, width: u16) -> Vec<(CardKind, Vec<String>, u16)> {
+    fn rendered_card_snapshot(app: &mut App, width: u16) -> Vec<(CardKind, Vec<String>, usize)> {
         build_message_cards_for_width(app, width)
             .iter()
             .map(|card| {
@@ -492,6 +492,41 @@ mod tests {
                 find_buffer_text(&buffer, "ROOT BASE COMPOSER").is_some(),
                 "root draw did not compose the base screen before {popup:?}"
             );
+        }
+    }
+
+    #[test]
+    fn affected_popups_render_inside_tiny_frames_without_invalid_cursors() {
+        for (width, height) in [(1, 1), (4, 2), (8, 4)] {
+            let mut app = App::new();
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_auth_popup(frame, &app.auth);
+                    draw_fork_turn_popup(frame, ForkPopupInput { chat: &app.chat });
+                    draw_theme_popup(frame, &app.navigation);
+                    draw_new_session_popup(frame, &app.sessions);
+                    draw_profile_popup(
+                        frame,
+                        ProfilePopupInput {
+                            profiles: &app.profiles,
+                            current_session_profile_id: None,
+                        },
+                    );
+                    draw_model_popup(
+                        frame,
+                        ModelPopupInput {
+                            models: &app.models,
+                            delegate_preference_profile_id: None,
+                        },
+                    );
+                    draw_session_popup(frame, &app.sessions, &app.delegates, &mut app.render);
+                    draw_mesh_popup(frame, &app.mesh);
+                    draw_mesh_invite_popup(frame, &app.mesh);
+                    draw_mesh_invite_qr_popup(frame, &app.mesh);
+                })
+                .unwrap();
         }
     }
 
@@ -1386,6 +1421,17 @@ mod tests {
         assert!(fallback.contains("Clipboard not available"));
         assert!(fallback.contains("https://example.com/manual"));
         assert!(!fallback.contains("Copied to clipboard"));
+
+        app.auth.clipboard_fallback = Some("https://例子.test/路径😀尾部".into());
+        let (unicode_buffer, _) = render_auth_popup(&app, 30, 14);
+        let symbols = unicode_buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+        for symbol in ["例", "子", "路", "径", "😀", "尾", "部"] {
+            assert!(symbols.contains(&symbol), "missing Unicode symbol {symbol}");
+        }
     }
 
     #[test]
@@ -1676,6 +1722,22 @@ mod tests {
         assert!(find_buffer_text(&buffer, "Clipboard not available").is_some());
         assert!(find_buffer_text(&buffer, "qmt://mesh/join/token").is_some());
         assert!(find_buffer_text(&buffer, "press any key to dismiss").is_some());
+
+        app.mesh.mesh_clipboard_fallback = Some("qmt://网格/邀请😀尾部".into());
+        let backend = ratatui::backend::TestBackend::new(30, 16);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_mesh_invite_qr_popup(f, &app.mesh))
+            .unwrap();
+        let unicode = terminal.backend().buffer();
+        let symbols = unicode
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>();
+        for symbol in ["网", "格", "邀", "请", "😀", "尾", "部"] {
+            assert!(symbols.contains(&symbol), "missing Unicode symbol {symbol}");
+        }
     }
 
     #[test]

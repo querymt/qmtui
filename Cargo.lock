@@ -1790,6 +1790,7 @@ version = "0.1.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "chrono",
  "clap",
  "crossterm",
  "dirs",

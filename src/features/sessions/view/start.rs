@@ -39,65 +39,31 @@ pub(crate) struct StartPageRow {
 
 /// Parse an ISO 8601 timestamp and return a human-readable relative time.
 pub(super) fn relative_time(iso: &str) -> String {
-    // parse "2026-03-21T14:30:00Z" or "2026-03-21T14:30:00.000Z" etc.
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // strip fractional seconds and parse manually
-    let cleaned = iso.replace('T', " ").replace('Z', "");
-    // try to extract year/month/day/hour/min/sec
-    let parts: Vec<&str> = cleaned.split(&['-', ' ', ':', '.'][..]).collect();
-    if parts.len() < 6 {
+    let Some(seconds) = iso.get(17..19).and_then(|value| value.parse::<u8>().ok()) else {
+        return iso.to_string();
+    };
+    if seconds > 59 {
         return iso.to_string();
     }
-    let Ok(year) = parts[0].parse::<i64>() else {
+    let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(iso) else {
         return iso.to_string();
     };
-    let Ok(month) = parts[1].parse::<i64>() else {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return iso.to_string();
     };
-    let Ok(day) = parts[2].parse::<i64>() else {
+    let Ok(now) = i64::try_from(now.as_secs()) else {
         return iso.to_string();
     };
-    let Ok(hour) = parts[3].parse::<i64>() else {
+    let Some(diff) = now.checked_sub(timestamp.timestamp()) else {
         return iso.to_string();
     };
-    let Ok(min) = parts[4].parse::<i64>() else {
-        return iso.to_string();
-    };
-    let Ok(sec) = parts[5].parse::<i64>() else {
-        return iso.to_string();
-    };
-
-    // rough epoch calculation (not accounting for leap years perfectly, good enough)
-    let days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut total_days: i64 = 0;
-    for y in 1970..year {
-        total_days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
-        } else {
-            365
-        };
-    }
-    for m in 1..month {
-        total_days += days_in_month[m as usize] as i64;
-        if m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            total_days += 1;
-        }
-    }
-    total_days += day - 1;
-    let ts = total_days * 86400 + hour * 3600 + min * 60 + sec;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let diff = now - ts;
     if diff < 0 {
         return "just now".into();
     }
 
-    let secs = diff;
+    let secs = diff as u64;
     if secs < 60 {
         return "just now".into();
     }
@@ -737,5 +703,37 @@ mod tests {
         let mut render = RenderState::new();
         let text = draw_at(&sessions, &mut render, "Fast", 100, 20);
         assert!(text.contains("profile:Fast"));
+    }
+
+    #[test]
+    fn relative_time_accepts_rfc3339_offsets_and_fractions() {
+        for timestamp in [
+            "2020-01-02T03:04:05Z",
+            "2020-01-02T03:04:05.123456789Z",
+            "2020-01-02T03:04:05+02:30",
+        ] {
+            assert_ne!(relative_time(timestamp), timestamp);
+        }
+    }
+
+    #[test]
+    fn relative_time_rejects_invalid_and_pathological_timestamps() {
+        for timestamp in [
+            "not-a-timestamp",
+            "2020-13-02T03:04:05Z",
+            "2021-02-29T03:04:05Z",
+            "2020-01-02T24:04:05Z",
+            "2020-01-02T03:60:05Z",
+            "2020-01-02T03:04:60Z",
+            "999999999999999999-01-01T00:00:00Z",
+            "2020-01-02T03:04:05+99:00",
+        ] {
+            assert_eq!(relative_time(timestamp), timestamp);
+        }
+    }
+
+    #[test]
+    fn relative_time_treats_future_timestamps_as_just_now() {
+        assert_eq!(relative_time("2999-01-01T00:00:00Z"), "just now");
     }
 }
