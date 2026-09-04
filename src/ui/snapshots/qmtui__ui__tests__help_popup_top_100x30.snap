@@ -1,0 +1,44 @@
+---
+source: src/ui/mod.rs
+expression: "buffer_region(&top, top.area)"
+---
+BufferRegion {
+    area: Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    },
+    rows: [
+        " querymt profile:default                                                                          ○ ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                shortcuts                                                                           ",
+        "                                                                                                    ",
+        "                  global                                                                            ",
+        "                  C-p           command palette                                                     ",
+        "                  C-x …         chord prefix                                                        ",
+        "                  Tab           cycle mode (build → plan → review)                                  ",
+        "                  C-c           clear input / quit                                                  ",
+        "                                                                                                    ",
+        "                  chord  (C-x …)                                                                    ",
+        "                  ?             this help                                                           ",
+        "                  a             provider auth                                                       ",
+        "                  d             delegate sessions                                                   ",
+        "                  e             external editor                                                     ",
+        "                  m             model selector                                                      ",
+        "                  n             new session                                                         ",
+        "                  l             logs popup                                                          ",
+        "                  p             profile selector                                                    ",
+        "                  j             jump to parent session                                              ",
+        "                  q             quit                                                                ",
+        "                  r             redo                                                                ",
+        "                  s             session switcher                                                    ",
+        "                 ↑↓ scroll  esc close                                                               ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        " ↑↓ navigate  enter open/collapse  del delete  C-x n new  C-x s popup  q quit                       ",
+    ],
+}

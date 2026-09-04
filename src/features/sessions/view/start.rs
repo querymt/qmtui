@@ -566,6 +566,7 @@ pub(crate) fn draw_start(f: &mut Frame, input: StartScreenInput<'_>, render: &mu
 mod tests {
     use super::*;
     use crate::domain::session::{SessionGroup, SessionSummary};
+    use crate::view_shared::{buffer_region, buffer_row, find_ascii_text_rect};
 
     fn group(cwd: &str, count: usize) -> SessionGroup {
         SessionGroup {
@@ -615,7 +616,7 @@ mod tests {
         active_profile_label: &str,
         width: u16,
         height: u16,
-    ) -> String {
+    ) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -633,13 +634,7 @@ mod tests {
                 )
             })
             .unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
+        terminal.backend().buffer().clone()
     }
 
     #[test]
@@ -680,8 +675,15 @@ mod tests {
         let mut render = RenderState::new();
         render.test_seed_start_page_scroll(7);
         let before = session_semantics(&sessions);
-        let rendered = draw_at(&sessions, &mut render, "default", 80, 20);
-        assert!(rendered.contains("No sessions yet"));
+        let buffer = draw_at(&sessions, &mut render, "default", 80, 20);
+        let empty_message =
+            find_ascii_text_rect(&buffer, "No sessions yet.  C-x n to start a new one.")
+                .expect("empty-state message");
+        assert_eq!(empty_message.y, 14);
+        assert_eq!(
+            buffer_region(&buffer, empty_message).rows,
+            ["No sessions yet.  C-x n to start a new one."]
+        );
         assert_eq!(render.start_page_scroll(), 7);
         assert_eq!(session_semantics(&sessions), before);
 
@@ -701,8 +703,51 @@ mod tests {
     fn start_page_header_uses_active_profile_label() {
         let sessions = SessionsState::new();
         let mut render = RenderState::new();
-        let text = draw_at(&sessions, &mut render, "Fast", 100, 20);
-        assert!(text.contains("profile:Fast"));
+        let buffer = draw_at(&sessions, &mut render, "Fast", 100, 20);
+        let profile = find_ascii_text_rect(&buffer, "profile:Fast").expect("profile label");
+        assert_eq!(profile, Rect::new(9, 0, 12, 1));
+        assert_eq!(&buffer_row(&buffer, 0)[8..22], " profile:Fast ");
+    }
+
+    #[test]
+    fn start_page_empty_render_snapshot() {
+        let sessions = SessionsState::new();
+        let mut render = RenderState::new();
+        render.replace_tick(3);
+
+        let buffer = draw_at(&sessions, &mut render, "default", 80, 24);
+
+        insta::assert_debug_snapshot!(
+            "start_page_empty_80x24",
+            buffer_region(&buffer, buffer.area)
+        );
+    }
+
+    #[test]
+    fn start_page_populated_render_snapshot() {
+        let mut sessions = SessionsState::new();
+        let mut querymt = group("/work/querymt", 2);
+        querymt.sessions[0].session_id = "qmt-001".into();
+        querymt.sessions[1].session_id = "qmt-002".into();
+        let mut qmtui = group("/work/qmtui", 1);
+        qmtui.sessions[0].session_id = "ui-001".into();
+        sessions.session_groups = vec![querymt, qmtui];
+        sessions.session_cursor = 1;
+        let mut render = RenderState::new();
+        render.replace_tick(3);
+
+        let buffer = draw_at(&sessions, &mut render, "work", 80, 24);
+
+        let selected = find_ascii_text_rect(&buffer, "qmt-001").expect("selected session");
+        assert_eq!(selected.y, 14);
+        assert_eq!(
+            buffer[(selected.x, selected.y)].style().bg,
+            Theme::selected().bg
+        );
+        insta::assert_debug_snapshot!(
+            "start_page_populated_80x24",
+            buffer_region(&buffer, buffer.area)
+        );
     }
 
     #[test]

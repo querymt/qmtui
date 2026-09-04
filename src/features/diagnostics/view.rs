@@ -159,7 +159,11 @@ pub(crate) fn draw_log_popup(f: &mut Frame, input: LogPopupInput<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::diagnostics::AppLogEntry;
+    use crate::view_shared::{buffer_region, find_ascii_text_rect};
 
     #[test]
     fn log_popup_cursor_stays_inside_tiny_frame() {
@@ -187,8 +191,20 @@ mod tests {
         let mut diagnostics = DiagnosticsState::new();
         diagnostics.log_filter = "server".into();
         diagnostics.log_level_filter = LogLevel::Info;
-        diagnostics.push_log(LogLevel::Info, "server", "starting local server");
-        diagnostics.push_log(LogLevel::Error, "server", "start failed");
+        diagnostics.logs = vec![
+            AppLogEntry {
+                elapsed: Duration::from_millis(1_200),
+                level: LogLevel::Info,
+                target: "server",
+                message: "starting local server".into(),
+            },
+            AppLogEntry {
+                elapsed: Duration::from_millis(12_300),
+                level: LogLevel::Error,
+                target: "server",
+                message: "start failed".into(),
+            },
+        ];
         diagnostics.log_cursor = diagnostics.filtered_logs().len().saturating_sub(1);
 
         let backend = ratatui::backend::TestBackend::new(100, 20);
@@ -204,18 +220,35 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let rendered = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
 
-        assert!(rendered.contains("logs"));
-        assert!(rendered.contains("level: INFO+"));
-        assert!(rendered.contains("starting local server"));
-        assert!(rendered.contains("start failed"));
-        assert!(rendered.contains("server"));
-        assert!(rendered.contains("esc close"));
-        assert!(rendered.contains("tab level"));
+        assert_eq!(
+            find_ascii_text_rect(&buffer, "logs"),
+            Some(Rect::new(11, 4, 4, 1))
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 5, 24, 2)).rows,
+            [
+                format!("> server{}", " ".repeat(16)),
+                format!("level: INFO+{}", " ".repeat(12))
+            ]
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 7, 52, 2)).rows,
+            [
+                format!(
+                    "      1.2 INFO  server     starting local server{}",
+                    " ".repeat(4)
+                ),
+                format!("     12.3 ERROR server     start failed{}", " ".repeat(13)),
+            ]
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 15, 24, 1)).rows,
+            [format!(" esc close  tab level{}", " ".repeat(3))]
+        );
+        insta::assert_debug_snapshot!(
+            "diagnostics_popup_fixed_entries_100x20",
+            buffer_region(&buffer, buffer.area)
+        );
     }
 }

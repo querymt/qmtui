@@ -1,0 +1,34 @@
+---
+source: src/features/diagnostics/view.rs
+expression: "buffer_region(&buffer, buffer.area)"
+---
+BufferRegion {
+    area: Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 20,
+    },
+    rows: [
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "           logs                                                                                     ",
+        "           > server                                                                                 ",
+        "           level: INFO+                                                                             ",
+        "                 1.2 INFO  server     starting local server                                         ",
+        "                12.3 ERROR server     start failed                                                  ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "            esc close  tab level                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+    ],
+}

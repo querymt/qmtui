@@ -172,7 +172,8 @@ mod tests {
     use crate::markdown::{CardBlock, MD_BULLET};
     use crate::render_state::{Card, CardKind, RenderChange};
     use crate::view_shared::{
-        SpinnerKind, scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
+        SpinnerKind, buffer_region, buffer_row, find_ascii_text, find_ascii_text_rect,
+        scroll_input, scroll_input_chars, spinner, truncate_with_ellipsis,
     };
     use ratatui::backend::Backend;
     use ratatui::layout::Position;
@@ -567,16 +568,47 @@ mod tests {
             assert_eq!(top[position].fg, expected.fg.expect("expected foreground"));
             assert_eq!(top[position].bg, expected.bg.expect("expected background"));
         }
+        let global_row = find_ascii_text_rect(&top, "global").expect("global section row");
+        assert_eq!(
+            buffer_region(
+                &top,
+                ratatui::layout::Rect::new(global_row.x - 2, global_row.y, 36, 2)
+            )
+            .rows,
+            [
+                format!("  global{}", " ".repeat(28)),
+                format!("  C-p           command palette{}", " ".repeat(5)),
+            ]
+        );
         assert!(find_buffer_text(&top, "cycle mode (build").is_some());
         assert!(find_buffer_text(&top, "slash commands").is_none());
         assert!(find_buffer_text(&top, "UNDERLYING ROOT FILTER").is_none());
+        insta::assert_debug_snapshot!("help_popup_top_100x30", buffer_region(&top, top.area));
 
         app.navigation.help_scroll = 56;
         let scrolled = render_root_buffer(&mut app, 100, 30);
         assert!(find_buffer_text(&scrolled, "global").is_none());
         assert!(find_buffer_text(&scrolled, "command palette").is_none());
-        assert!(find_buffer_text(&scrolled, "slash commands").is_some());
-        assert!(find_buffer_text(&scrolled, "/model [q]").is_some());
+        let slash_commands =
+            find_ascii_text_rect(&scrolled, "slash commands").expect("slash commands section");
+        assert_eq!(
+            buffer_region(
+                &scrolled,
+                ratatui::layout::Rect::new(slash_commands.x - 2, slash_commands.y, 68, 2)
+            )
+            .rows,
+            [
+                format!("  slash commands{}", " ".repeat(52)),
+                format!(
+                    "  /model [q]    model selector (optional filter){}",
+                    " ".repeat(20)
+                ),
+            ]
+        );
+        insta::assert_debug_snapshot!(
+            "help_popup_scrolled_100x30",
+            buffer_region(&scrolled, scrolled.area)
+        );
 
         app.navigation.help_scroll = 0;
         let clipped = render_root_buffer(&mut app, 52, 10);
@@ -595,17 +627,26 @@ mod tests {
     }
 
     fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
-        (0..buffer.area.width)
-            .map(|x| buffer[(x, y)].symbol())
-            .collect::<String>()
+        buffer_row(buffer, y)
     }
 
     fn find_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
-        for y in 0..buffer.area.height {
-            let line = buffer_line(buffer, y);
-            if let Some(byte_idx) = line.find(needle) {
-                let x = line[..byte_idx].chars().count() as u16;
-                return Some((x, y));
+        if needle.is_ascii() {
+            return find_ascii_text(buffer, needle).map(|position| (position.x, position.y));
+        }
+
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                let mut candidate = String::new();
+                for end_x in x..buffer.area.right() {
+                    candidate.push_str(buffer[(end_x, y)].symbol());
+                    if candidate == needle {
+                        return Some((x, y));
+                    }
+                    if !needle.starts_with(&candidate) {
+                        break;
+                    }
+                }
             }
         }
         None
