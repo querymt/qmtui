@@ -8,52 +8,76 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::DelegateModelPreference;
+use crate::domain::model::DelegateModelPreference;
 
 // ── path overrides for tests ─────────────────────────────────────────────────
 
 static CONFIG_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
 static TEST_PERSISTENCE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn config_path_override() -> &'static Mutex<Option<PathBuf>> {
     CONFIG_PATH_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
 fn test_persistence_lock() -> &'static Mutex<()> {
     TEST_PERSISTENCE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Override the config path used by `TuiConfig::load()` / `save()`.
-/// Intended for tests only; production code should not call this.
-pub fn test_set_config_path_override(path: Option<PathBuf>) {
-    *config_path_override().lock().unwrap() = path;
 }
 
 #[cfg(test)]
 pub struct TestPersistenceGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
+    path: PathBuf,
+    dir: PathBuf,
+    previous_override: Option<PathBuf>,
 }
 
 #[cfg(test)]
 impl TestPersistenceGuard {
     pub fn new(label: &str) -> Self {
-        let lock = test_persistence_lock().lock().unwrap();
+        let lock = test_persistence_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("qmt-persistence-tests-{label}-{pid}-{nanos}"));
+        let path = dir.join("qmtui.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        test_set_config_path_override(Some(dir.join("qmtui.toml")));
-        Self { _lock: lock }
+        let previous_override = config_path_override()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(path.clone());
+        Self {
+            _lock: lock,
+            path,
+            dir,
+            previous_override,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn user_config_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".qmt")
+            .join("qmtui.toml")
     }
 }
 
 #[cfg(test)]
 impl Drop for TestPersistenceGuard {
     fn drop(&mut self) {
-        test_set_config_path_override(None);
+        *config_path_override()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.previous_override.take();
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -117,6 +141,12 @@ impl TuiConfig {
 
     /// Load from the default path (`~/.qmt/qmtui.toml`).
     pub fn load() -> Self {
+        #[cfg(test)]
+        assert!(
+            config_path_override().lock().unwrap().is_some(),
+            "TuiConfig::load() called in test without config path override! \
+             Use TestPersistenceGuard to avoid reading the real ~/.qmt/qmtui.toml."
+        );
         Self::load_from_path(&Self::config_path())
     }
 
@@ -155,11 +185,11 @@ impl TuiConfig {
     pub fn with_app_settings(&self, app: &crate::app::App) -> Self {
         let mut merged = self.clone();
         merged.theme = Some(crate::theme::Theme::current_id().to_string());
-        merged.show_thinking = Some(app.show_thinking);
-        merged.profile_delegate_models = app.delegate_model_preferences.clone();
-        merged.profile.id = app.active_profile_id.clone();
-        if let Some(profile_id) = app.active_profile_id.as_deref()
-            && let Some(preferences) = app.delegate_model_preferences.get(profile_id)
+        merged.show_thinking = Some(app.chat.show_thinking);
+        merged.profile_delegate_models = app.models.delegate_model_preferences.clone();
+        merged.profile.id = app.profiles.active_profile_id.clone();
+        if let Some(profile_id) = app.profiles.active_profile_id.as_deref()
+            && let Some(preferences) = app.models.delegate_model_preferences.get(profile_id)
         {
             merged
                 .delegate_models
@@ -182,6 +212,7 @@ impl TuiConfig {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::domain::model::ModelEntry;
     use serial_test::serial;
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -200,6 +231,10 @@ mod tests {
     impl TestPathGuard {
         fn new(label: &str) -> Self {
             Self(TestPersistenceGuard::new(label))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
         }
     }
 
@@ -307,8 +342,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_default_load_save_respects_override_path() {
-        let _guard = TestPathGuard::new("cfg-override");
+    fn config_default_load_save_respects_isolated_override_path() {
+        let guard = TestPathGuard::new("cfg-override");
+        let guarded_path = guard.path().to_path_buf();
+        assert_eq!(TuiConfig::config_path(), guarded_path);
+        assert_ne!(guarded_path, TestPersistenceGuard::user_config_path());
+        assert!(guarded_path.starts_with(std::env::temp_dir()));
+        assert!(!guarded_path.exists());
+
         let cfg = TuiConfig {
             theme: Some("base16-ocean".into()),
             show_thinking: None,
@@ -316,8 +357,66 @@ mod tests {
             ..Default::default()
         };
         cfg.save();
-        let loaded = TuiConfig::load();
-        assert_eq!(loaded, cfg);
+
+        assert!(guarded_path.exists());
+        assert_eq!(TuiConfig::load(), cfg);
+        assert_eq!(TuiConfig::load(), cfg);
+    }
+
+    #[test]
+    fn config_default_io_without_guard_panics_before_real_path_access() {
+        let _lock = test_persistence_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(config_path_override().lock().unwrap().is_none());
+        assert_eq!(
+            TuiConfig::config_path(),
+            TestPersistenceGuard::user_config_path()
+        );
+
+        let load_result = std::panic::catch_unwind(TuiConfig::load);
+        let save_result = std::panic::catch_unwind(|| TuiConfig::default().save());
+
+        assert!(load_result.is_err());
+        assert!(save_result.is_err());
+        assert!(config_path_override().lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn persistence_guard_restores_override_after_normal_and_panicking_scopes() {
+        let first_path = {
+            let guard = TestPersistenceGuard::new("guard-restore-normal");
+            assert_eq!(TuiConfig::config_path(), guard.path());
+            guard.path().to_path_buf()
+        };
+        {
+            let _lock = test_persistence_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(config_path_override().lock().unwrap().is_none());
+        }
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let guard = TestPersistenceGuard::new("guard-restore-panic");
+            assert_eq!(TuiConfig::config_path(), guard.path());
+            panic!("exercise persistence guard unwind");
+        });
+        assert!(panic_result.is_err());
+        {
+            let _lock = test_persistence_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(config_path_override().lock().unwrap().is_none());
+            assert_eq!(
+                TuiConfig::config_path(),
+                TestPersistenceGuard::user_config_path()
+            );
+        }
+
+        let next_guard = TestPersistenceGuard::new("guard-restore-next");
+        assert_ne!(next_guard.path(), first_path);
+        assert_eq!(TuiConfig::config_path(), next_guard.path());
     }
 
     #[test]
@@ -346,7 +445,7 @@ mod tests {
     #[test]
     fn with_app_settings_preserves_acp_settings() {
         let mut app = App::new();
-        app.show_thinking = false;
+        app.chat.show_thinking = false;
 
         let existing = TuiConfig {
             theme: Some("base16-ocean".into()),
@@ -373,7 +472,7 @@ mod tests {
     fn config_round_trip_with_delegate_models() {
         let _guard = TestPathGuard::new("delegate-models-rt");
         let mut app = App::new();
-        let coder = crate::protocol::ModelEntry {
+        let coder = ModelEntry {
             id: "anthropic/claude-sonnet".into(),
             label: "Claude Sonnet".into(),
             provider: "anthropic".into(),
@@ -383,7 +482,7 @@ mod tests {
             family: None,
             quant: None,
         };
-        let planner = crate::protocol::ModelEntry {
+        let planner = ModelEntry {
             id: "openai/gpt-4o".into(),
             label: "GPT-4o".into(),
             provider: "openai".into(),
@@ -393,9 +492,11 @@ mod tests {
             family: None,
             quant: None,
         };
-        app.active_profile_id = Some("quorum".into());
-        app.set_delegate_model_preference("quorum", "coder", &coder);
-        app.set_delegate_model_preference("quorum", "planner", &planner);
+        app.profiles.active_profile_id = Some("quorum".into());
+        app.models
+            .set_delegate_model_preference("quorum", "coder", &coder);
+        app.models
+            .set_delegate_model_preference("quorum", "planner", &planner);
 
         let cfg = TuiConfig::load().with_app_settings(&app);
         cfg.save();
@@ -410,6 +511,34 @@ mod tests {
             loaded.profile_delegate_models["quorum"]["planner"].model_id,
             "openai/gpt-4o"
         );
+    }
+
+    #[test]
+    fn with_app_settings_persists_only_active_profile_state() {
+        let mut app = App::new();
+        app.profiles.active_profile_id = Some("fast".into());
+        app.profiles
+            .profiles
+            .push(crate::domain::profile::ProfileInfo {
+                id: "fast".into(),
+                name: "Fast".into(),
+                ..Default::default()
+            });
+        app.profiles
+            .bind_session_profile("session".into(), "fast".into());
+        app.profiles.profile_cursor = 7;
+        app.profiles.profile_filter = "query".into();
+
+        let merged = TuiConfig::default().with_app_settings(&app);
+        let text = toml::to_string_pretty(&merged).unwrap();
+
+        assert_eq!(merged.profile.id.as_deref(), Some("fast"));
+        assert!(text.contains("[profile]"));
+        assert!(text.contains("id = \"fast\""));
+        assert!(!text.contains("session"));
+        assert!(!text.contains("query"));
+        assert!(!text.contains("profile_cursor"));
+        assert!(!text.contains("profile_filter"));
     }
 
     #[test]

@@ -1,34 +1,32 @@
 use serde_json::Value;
 
-use crate::app::{ChatEntry, DiffPreviewSection, ShellOutputTail, ToolDetail};
-use crate::ui::{
-    build_diff_lines, build_sectioned_diff_lines, build_shell_lines, build_write_lines,
-};
+use crate::domain::chat::ChatEntry;
+use crate::domain::tool::{MultiEditSection, ShellOutput, SymbolReplacement, TodoItem, ToolDetail};
 
 const DEFAULT_READ_TOOL_LIMIT: u64 = 2000;
 
-pub(crate) fn parse_tool_detail(
-    tool_name: &str,
-    arguments: Option<&Value>,
-    cwd: Option<&str>,
-) -> ToolDetail {
+pub(crate) fn parse_tool_detail(tool_name: &str, arguments: Option<&Value>) -> ToolDetail {
     let Some(args) = arguments else {
         return ToolDetail::None;
     };
     let obj = normalize_args(args);
 
     match tool_name {
-        "shell" => {
-            let command = shell_command_display(&obj);
-            let workdir = string_field(&obj, "workdir");
-            let cached_lines = build_shell_lines(&command, workdir.as_deref(), None);
-            ToolDetail::Shell {
-                command,
-                workdir,
-                output_tail: None,
-                cached_lines,
-            }
-        }
+        "shell" => ToolDetail::Shell {
+            command: string_field(&obj, "command").unwrap_or_default(),
+            arguments: obj
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            workdir: string_field(&obj, "workdir"),
+            output: None,
+        },
         "read_tool" => {
             let path = string_field(&obj, "path").unwrap_or_default();
             let offset = obj.get("offset").and_then(Value::as_u64).unwrap_or(0);
@@ -43,115 +41,106 @@ pub(crate) fn parse_tool_detail(
                 end_line: Some(offset.saturating_add(limit)),
             }
         }
-        "write_file" => {
-            let path = string_field(&obj, "path").unwrap_or_default();
-            let content = string_field(&obj, "content").unwrap_or_default();
-            ToolDetail::WriteFile {
-                path,
-                cached_lines: build_write_lines(&content),
-                content,
-            }
-        }
-        "edit" => {
-            let file = string_field(&obj, "filePath")
+        "write_file" => ToolDetail::WriteFile {
+            path: string_field(&obj, "path").unwrap_or_default(),
+            content: string_field(&obj, "content").unwrap_or_default(),
+        },
+        "edit" => ToolDetail::Edit {
+            file: string_field(&obj, "filePath")
                 .or_else(|| string_field(&obj, "file_path"))
-                .unwrap_or_default();
-            let old = string_field(&obj, "oldString")
+                .unwrap_or_default(),
+            old: string_field(&obj, "oldString")
                 .or_else(|| string_field(&obj, "old_string"))
-                .unwrap_or_default();
-            let new = string_field(&obj, "newString")
+                .unwrap_or_default(),
+            new: string_field(&obj, "newString")
                 .or_else(|| string_field(&obj, "new_string"))
-                .unwrap_or_default();
-            ToolDetail::Edit {
-                file,
-                cached_lines: build_diff_lines(&old, &new, None),
-                old,
-                new,
-                start_line: None,
-            }
-        }
+                .unwrap_or_default(),
+            replace_all: obj
+                .get("replaceAll")
+                .or_else(|| obj.get("replace_all"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            start_line: None,
+        },
         "multiedit" => {
-            let file = string_field(&obj, "filePath")
-                .or_else(|| string_field(&obj, "file_path"))
-                .unwrap_or_default();
             let sections = obj
                 .get("edits")
                 .and_then(Value::as_array)
                 .map(|edits| {
                     edits
                         .iter()
+                        .filter_map(|edit| {
+                            Some((
+                                edit.get("replaceAll")
+                                    .or_else(|| edit.get("replace_all"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                                string_field(edit, "oldString")
+                                    .or_else(|| string_field(edit, "old_string"))?,
+                                string_field(edit, "newString")
+                                    .or_else(|| string_field(edit, "new_string"))?,
+                            ))
+                        })
                         .enumerate()
-                        .filter_map(|(idx, edit)| {
-                            let old = string_field(edit, "oldString")
-                                .or_else(|| string_field(edit, "old_string"))?;
-                            let new = string_field(edit, "newString")
-                                .or_else(|| string_field(edit, "new_string"))?;
-                            let suffix = if edit
-                                .get("replaceAll")
-                                .or_else(|| edit.get("replace_all"))
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                " (all)"
-                            } else {
-                                ""
-                            };
-                            Some(DiffPreviewSection {
-                                header: format!("edit {}{}", idx + 1, suffix),
-                                old,
-                                new,
-                                start_line: None,
-                            })
+                        .map(|(index, (replace_all, old, new))| MultiEditSection {
+                            edit_index: index + 1,
+                            replace_all,
+                            old,
+                            new,
+                            start_line: None,
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             ToolDetail::MultiEdit {
-                file,
+                file: string_field(&obj, "filePath")
+                    .or_else(|| string_field(&obj, "file_path"))
+                    .unwrap_or_default(),
                 edit_count: sections.len(),
-                cached_lines: build_sectioned_diff_lines(&sections, 6),
                 sections,
             }
         }
-        "search_text" => {
-            let pattern = string_field(&obj, "pattern").unwrap_or_default();
-            let path = string_field(&obj, "path").unwrap_or_default();
-            let include = string_field(&obj, "include").unwrap_or_default();
-            let location = if !include.is_empty() {
-                include
-            } else if !path.is_empty() {
-                short_path(&path).to_string()
-            } else {
-                ".".into()
-            };
-            ToolDetail::Summary(format!("\"{}\" {}", pattern, location))
-        }
-        "glob" => summary_path_arg(&obj, "pattern", "path"),
-        "ls" | "index" => ToolDetail::Summary(
-            string_field(&obj, "path")
-                .map(|path| short_path(&path).to_string())
-                .unwrap_or_else(|| ".".into()),
-        ),
-        "delete_file" => ToolDetail::Summary(
-            string_field(&obj, "path")
-                .map(|path| short_path(&path).to_string())
-                .unwrap_or_default(),
-        ),
-        "browse" | "web_fetch" => ToolDetail::Summary(
-            string_field(&obj, "url")
-                .map(|url| truncate_summary(&url, 60))
-                .unwrap_or_default(),
-        ),
-        "todowrite" => todo_summary(&obj),
-        "delegate" => delegate_summary(&obj),
-        "language_query" => {
-            let action = string_field(&obj, "action").unwrap_or_default();
-            let uri = string_field(&obj, "uri").unwrap_or_default();
-            ToolDetail::Summary(format!("{} {}", action, short_path(&uri)))
-        }
-        "question" => ToolDetail::Summary("asking...".into()),
-        "apply_patch" => ToolDetail::Summary("patch".into()),
-        "replace_symbol" => ToolDetail::Summary(replace_symbol_title(&obj, cwd)),
+        "search_text" => ToolDetail::SearchText {
+            pattern: string_field(&obj, "pattern").unwrap_or_default(),
+            path: string_field(&obj, "path").unwrap_or_default(),
+            include: string_field(&obj, "include").unwrap_or_default(),
+            counts: None,
+        },
+        "glob" => ToolDetail::Glob {
+            pattern: string_field(&obj, "pattern").unwrap_or_default(),
+            path: string_field(&obj, "path").unwrap_or_default(),
+        },
+        "ls" => ToolDetail::List {
+            path: string_field(&obj, "path").unwrap_or_default(),
+        },
+        "index" => ToolDetail::Index {
+            path: string_field(&obj, "path").unwrap_or_default(),
+            metadata: None,
+        },
+        "delete_file" => ToolDetail::DeleteFile {
+            path: string_field(&obj, "path").unwrap_or_default(),
+        },
+        "browse" | "web_fetch" => ToolDetail::Browse {
+            url: string_field(&obj, "url").unwrap_or_default(),
+        },
+        "todowrite" => todo_detail(&obj),
+        "delegate" => ToolDetail::Delegate {
+            target_agent_id: string_field(&obj, "target_agent_id").unwrap_or_default(),
+            objective: string_field(&obj, "objective").unwrap_or_default(),
+        },
+        "language_query" => ToolDetail::LanguageQuery {
+            action: string_field(&obj, "action").unwrap_or_default(),
+            uri: string_field(&obj, "uri").unwrap_or_default(),
+        },
+        "question" => ToolDetail::Question {
+            prompt: string_field(&obj, "prompt").unwrap_or_default(),
+        },
+        "apply_patch" => ToolDetail::ApplyPatch {
+            patch: string_field(&obj, "patch").unwrap_or_default(),
+        },
+        "replace_symbol" => ToolDetail::ReplaceSymbolInput {
+            replacements: symbol_replacements(&obj),
+        },
         _ => ToolDetail::None,
     }
 }
@@ -175,10 +164,13 @@ pub(crate) fn reconcile_tool_call_start(
             if existing != id {
                 continue;
             }
-            if name == &fallback_name {
+            let is_failed_fallback = name == &fallback_name;
+            if is_failed_fallback {
                 *name = tool_name.to_string();
             }
-            if matches!(detail, ToolDetail::None) && !matches!(start_detail, ToolDetail::None) {
+            if (is_failed_fallback || matches!(detail, ToolDetail::None))
+                && !matches!(start_detail, ToolDetail::None)
+            {
                 *detail = start_detail;
             }
             return true;
@@ -211,16 +203,9 @@ pub(crate) fn update_tool_detail(
         }
 
         match detail {
-            ToolDetail::Shell {
-                command,
-                workdir,
-                output_tail,
-                cached_lines,
-            } if name.starts_with("shell") => {
-                if let Some(tail) = shell_output_tail_from_result(parsed.as_ref(), result) {
-                    *output_tail = Some(tail);
-                    *cached_lines =
-                        build_shell_lines(command, workdir.as_deref(), output_tail.as_ref());
+            ToolDetail::Shell { output, .. } if name.starts_with("shell") => {
+                if let Some(result_output) = shell_output_from_result(parsed.as_ref(), result) {
+                    *output = Some(result_output);
                 }
             }
             ToolDetail::ReadTool {
@@ -233,58 +218,29 @@ pub(crate) fn update_tool_detail(
                     *end_line = Some(last);
                 }
             }
-            ToolDetail::Edit {
-                old,
-                new,
-                start_line,
-                cached_lines,
-                ..
-            } => {
-                if let Some(start) = compact_receipt_old_starts(&result_text).into_iter().next() {
+            ToolDetail::Edit { start_line, .. } => {
+                let json_start = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("startLineOld"))
+                    .and_then(Value::as_u64)
+                    .map(|start| start as usize);
+                if let Some(start) = json_start
+                    .or_else(|| compact_receipt_old_starts(&result_text).into_iter().next())
+                {
                     *start_line = Some(start);
-                    *cached_lines = build_diff_lines(old, new, Some(start));
                 }
             }
-            ToolDetail::MultiEdit {
-                sections,
-                cached_lines,
-                ..
-            } => {
+            ToolDetail::MultiEdit { sections, .. } => {
                 let starts = compact_receipt_old_starts(&result_text);
                 if !starts.is_empty() {
                     for (section, start) in sections.iter_mut().zip(starts) {
                         section.start_line = Some(start);
                     }
-                    *cached_lines = build_sectioned_diff_lines(sections, 6);
                 }
             }
             _ => {}
         }
         return true;
-    }
-    false
-}
-
-pub(crate) fn mark_tool_call_failed(
-    messages: &mut [ChatEntry],
-    tool_call_id: Option<&str>,
-    tool_name: &str,
-) -> bool {
-    let Some(id) = tool_call_id else { return false };
-    for entry in messages.iter_mut().rev() {
-        if let ChatEntry::ToolCall {
-            tool_call_id: Some(existing),
-            name,
-            is_error,
-            ..
-        } = entry
-            && existing == id
-            && name == tool_name
-            && !*is_error
-        {
-            *is_error = true;
-            return true;
-        }
     }
     false
 }
@@ -303,62 +259,71 @@ fn string_field(obj: &Value, key: &str) -> Option<String> {
     })
 }
 
-fn shell_command_display(obj: &Value) -> String {
-    let command = string_field(obj, "command").unwrap_or_default();
-    let Some(args) = obj.get("args").and_then(Value::as_array) else {
-        return command;
+fn shell_output_from_result(parsed: Option<&Value>, raw: &str) -> Option<ShellOutput> {
+    let (stdout, stderr) = match parsed.and_then(Value::as_object) {
+        Some(obj) if obj.contains_key("stdout") || obj.contains_key("stderr") => (
+            obj.get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            obj.get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        _ => (raw.to_string(), String::new()),
     };
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(shell_quote_arg(&command));
-    parts.extend(args.iter().filter_map(Value::as_str).map(shell_quote_arg));
-    if parts.len() == 1 {
-        command
+    if stdout.is_empty() && stderr.is_empty() {
+        None
     } else {
-        parts.join(" ")
-    }
-}
-
-fn shell_quote_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-    if arg
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '='))
-    {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
-fn shell_output_tail_from_result(parsed: Option<&Value>, raw: &str) -> Option<ShellOutputTail> {
-    let (stdout, stderr) = parsed
-        .and_then(|obj| {
-            Some((
-                obj.get("stdout")?.as_str().unwrap_or_default().to_string(),
-                obj.get("stderr")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ))
+        Some(ShellOutput {
+            stdout,
+            stderr,
+            preceding_line_count: 0,
         })
-        .unwrap_or_else(|| (raw.to_string(), String::new()));
-    let lines = stdout
-        .lines()
-        .chain(stderr.lines())
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
     }
-    let keep = 5;
-    let hidden_line_count = lines.len().saturating_sub(keep);
-    Some(ShellOutputTail {
-        lines: lines.into_iter().skip(hidden_line_count).collect(),
-        hidden_line_count,
-    })
+}
+
+fn todo_detail(obj: &Value) -> ToolDetail {
+    let Some(todos) = obj.get("todos").and_then(Value::as_array) else {
+        return ToolDetail::None;
+    };
+    let items = todos
+        .iter()
+        .filter_map(|todo| {
+            Some(TodoItem {
+                content: todo.get("content")?.as_str()?.to_string(),
+                status: todo
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+                    .to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        ToolDetail::None
+    } else {
+        ToolDetail::Todo { items }
+    }
+}
+
+fn symbol_replacements(obj: &Value) -> Vec<SymbolReplacement> {
+    obj.get("replacements")
+        .and_then(Value::as_array)
+        .map(|replacements| {
+            replacements
+                .iter()
+                .map(|replacement| SymbolReplacement {
+                    path: string_field(replacement, "path").unwrap_or_default(),
+                    symbol: string_field(replacement, "symbol").unwrap_or_default(),
+                    new_text: string_field(replacement, "newText")
+                        .or_else(|| string_field(replacement, "new_text"))
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn tool_result_text(parsed: Option<&Value>, raw: &str) -> String {
@@ -410,101 +375,752 @@ fn compact_receipt_old_starts(text: &str) -> Vec<usize> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
-            let rest = line.strip_prefix("old_start=")?;
-            rest.split_whitespace().next()?.parse().ok()
+            if let Some(rest) = line.strip_prefix("old_start=") {
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+            let old_part = line
+                .strip_prefix("H ")?
+                .split_whitespace()
+                .find(|part| part.starts_with("old="))?;
+            old_part
+                .strip_prefix("old=")?
+                .split(',')
+                .next()?
+                .parse()
+                .ok()
         })
         .collect()
 }
 
-fn summary_path_arg(obj: &Value, main_key: &str, path_key: &str) -> ToolDetail {
-    let main = string_field(obj, main_key).unwrap_or_default();
-    let path = string_field(obj, path_key).unwrap_or_default();
-    if path.is_empty() {
-        ToolDetail::Summary(main)
-    } else {
-        ToolDetail::Summary(format!("{} in {}", main, short_path(&path)))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(tool_name: &str, arguments: serde_json::Value) -> ToolDetail {
+        parse_tool_detail(tool_name, Some(&arguments))
     }
-}
 
-fn todo_summary(obj: &Value) -> ToolDetail {
-    let Some(todos) = obj.get("todos").and_then(Value::as_array) else {
-        return ToolDetail::None;
-    };
-    let lines = todos
-        .iter()
-        .filter_map(|todo| {
-            let content = todo.get("content").and_then(Value::as_str)?;
-            let status = todo
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("pending");
-            let check = if status == "completed" { "x" } else { " " };
-            Some(format!("[{check}] {content}"))
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        ToolDetail::None
-    } else {
-        ToolDetail::Summary(lines.join("\n"))
-    }
-}
-
-fn delegate_summary(obj: &Value) -> ToolDetail {
-    let agent = string_field(obj, "target_agent_id").unwrap_or_default();
-    let objective = string_field(obj, "objective").unwrap_or_default();
-    let objective = truncate_summary(&objective, 50);
-    if agent.is_empty() {
-        ToolDetail::Summary(objective)
-    } else {
-        ToolDetail::Summary(format!("({agent}) {objective}"))
-    }
-}
-
-fn replace_symbol_title(obj: &Value, cwd: Option<&str>) -> String {
-    let Some(replacements) = obj.get("replacements").and_then(Value::as_array) else {
-        return "symbols".into();
-    };
-    let mut files = replacements
-        .iter()
-        .filter_map(|replacement| string_field(replacement, "path"))
-        .map(|path| strip_cwd(&path, cwd))
-        .collect::<Vec<_>>();
-    files.sort();
-    files.dedup();
-    match files.as_slice() {
-        [] => "symbols".into(),
-        [one] => short_path(one).to_string(),
-        [first, ..] => format!("{} (+{})", short_path(first), files.len() - 1),
-    }
-}
-
-fn strip_cwd(path: &str, cwd: Option<&str>) -> String {
-    cwd.and_then(|cwd| path.strip_prefix(cwd))
-        .map(|path| path.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn short_path(path: &str) -> &str {
-    let mut count = 0;
-    for (i, c) in path.char_indices().rev() {
-        if c == '/' {
-            count += 1;
-            if count == 2 {
-                return &path[i + 1..];
-            }
+    fn tool_call(id: &str, name: &str, detail: ToolDetail) -> ChatEntry {
+        ChatEntry::ToolCall {
+            tool_call_id: Some(id.into()),
+            name: name.into(),
+            is_error: false,
+            detail,
         }
     }
-    path
-}
 
-fn truncate_summary(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+    #[test]
+    fn delegate_and_browse_preserve_raw_untruncated_values() {
+        let objective = format!("{}tail", "界".repeat(50));
+        assert_eq!(
+            parse(
+                "delegate",
+                serde_json::json!({
+                    "target_agent_id": "coder",
+                    "objective": objective,
+                }),
+            ),
+            ToolDetail::Delegate {
+                target_agent_id: "coder".into(),
+                objective: objective.clone(),
+            }
+        );
+
+        let url = format!("https://example.test/{}tail", "界".repeat(50));
+        assert_eq!(
+            parse("browse", serde_json::json!({ "url": url })),
+            ToolDetail::Browse { url: url.clone() }
+        );
+        assert!(objective.chars().count() > 50);
+        assert!(url.chars().count() > 60);
     }
-    let mut out = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push('…');
-    out
+
+    #[test]
+    fn shell_preserves_command_arguments_workdir_and_full_raw_output() {
+        let detail = parse(
+            "shell",
+            serde_json::json!({
+                "command": "printf",
+                "args": ["hello world", "it's", "界", "", 7],
+                "workdir": "/tmp/工作",
+            }),
+        );
+        assert_eq!(
+            detail,
+            ToolDetail::Shell {
+                command: "printf".into(),
+                arguments: vec!["hello world".into(), "it's".into(), "界".into(), "".into()],
+                workdir: Some("/tmp/工作".into()),
+                output: None,
+            }
+        );
+
+        let mut messages = vec![tool_call("shell-1", "shell", detail)];
+        let result = serde_json::json!({
+            "stdout": "out1  \n\n out2\nout3\nout4\nout5\nout6\n",
+            "stderr": "\nerr1  \n错误\n",
+        })
+        .to_string();
+        assert!(update_tool_detail(&mut messages, Some("shell-1"), &result));
+        assert!(matches!(
+            &messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output: Some(output), .. },
+                ..
+            } if output.stdout == "out1  \n\n out2\nout3\nout4\nout5\nout6\n"
+                && output.stderr == "\nerr1  \n错误\n"
+        ));
+
+        let mut stderr_only = vec![tool_call(
+            "shell-2",
+            "shell",
+            parse("shell", serde_json::json!({ "command": "failing" })),
+        )];
+        assert!(update_tool_detail(
+            &mut stderr_only,
+            Some("shell-2"),
+            r#"{"stderr":"permission denied"}"#,
+        ));
+        assert!(matches!(
+            &stderr_only[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output: Some(output), .. },
+                ..
+            } if output.stdout.is_empty() && output.stderr == "permission denied"
+        ));
+
+        let mut unsupported = vec![tool_call(
+            "shell-3",
+            "shell",
+            parse("shell", serde_json::json!({ "command": "custom" })),
+        )];
+        assert!(update_tool_detail(
+            &mut unsupported,
+            Some("shell-3"),
+            r#"{"custom":"result"}"#,
+        ));
+        assert!(matches!(
+            &unsupported[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Shell { output: Some(output), .. },
+                ..
+            } if output.stdout == r#"{"custom":"result"}"# && output.stderr.is_empty()
+        ));
+    }
+
+    #[test]
+    fn read_tool_preserves_raw_path_and_semantic_one_based_range() {
+        let detail = parse(
+            "read_tool",
+            serde_json::json!({
+                "path": "/workspace/project/src/acp_state.rs",
+                "offset": 2134,
+                "limit": 71,
+            }),
+        );
+        assert_eq!(
+            detail,
+            ToolDetail::ReadTool {
+                path: "/workspace/project/src/acp_state.rs".into(),
+                start_line: Some(2135),
+                end_line: Some(2205),
+            }
+        );
+
+        for (arguments, expected_end) in [
+            (
+                serde_json::json!({ "path": "README.md" }),
+                DEFAULT_READ_TOOL_LIMIT,
+            ),
+            (
+                serde_json::json!({ "path": "README.md", "limit": 0 }),
+                DEFAULT_READ_TOOL_LIMIT,
+            ),
+            (
+                serde_json::json!({ "path": "README.md", "limit": 300 }),
+                300,
+            ),
+        ] {
+            assert!(matches!(
+                parse("read_tool", arguments),
+                ToolDetail::ReadTool { start_line: Some(1), end_line: Some(end), .. }
+                    if end == expected_end
+            ));
+        }
+    }
+
+    #[test]
+    fn read_results_refine_semantic_line_ranges() {
+        let detail = parse(
+            "read_tool",
+            serde_json::json!({ "path": "src/lib.rs", "limit": 260 }),
+        );
+        let mut messages = vec![tool_call("read-1", "read_tool", detail)];
+        let result = "<content>\n00041| first\n00042| second\n00430| last\n</content>";
+        assert!(update_tool_detail(&mut messages, Some("read-1"), result));
+        assert!(matches!(
+            &messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::ReadTool {
+                    start_line: Some(41),
+                    end_line: Some(430),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn edit_and_multiedit_preserve_raw_text_flags_indices_and_line_metadata() {
+        let edit = parse(
+            "edit",
+            serde_json::json!({
+                "file_path": "/workspace/src/lib.rs",
+                "old_string": "before\n",
+                "new_string": "after\n",
+                "replace_all": true,
+            }),
+        );
+        assert_eq!(
+            edit,
+            ToolDetail::Edit {
+                file: "/workspace/src/lib.rs".into(),
+                old: "before\n".into(),
+                new: "after\n".into(),
+                replace_all: true,
+                start_line: None,
+            }
+        );
+
+        let mut edit_messages = vec![tool_call("edit-1", "edit", edit)];
+        assert!(update_tool_detail(
+            &mut edit_messages,
+            Some("edit-1"),
+            r#"{"startLineOld":42}"#,
+        ));
+        assert!(matches!(
+            &edit_messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Edit {
+                    start_line: Some(42),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let multiedit = parse(
+            "multiedit",
+            serde_json::json!({
+                "filePath": "/workspace/src/lib.rs",
+                "edits": [
+                    { "oldString": "invalid first entry" },
+                    { "oldString": "one\n", "newString": "ONE\n", "replaceAll": true },
+                    { "old_string": "two\n", "new_string": "TWO\n", "replace_all": false },
+                    { "oldString": "missing new value" },
+                ],
+            }),
+        );
+        let ToolDetail::MultiEdit {
+            file,
+            edit_count,
+            sections,
+        } = &multiedit
+        else {
+            panic!("expected MultiEdit, got {multiedit:?}");
+        };
+        assert_eq!(file, "/workspace/src/lib.rs");
+        assert_eq!(*edit_count, 2);
+        assert_eq!(
+            sections,
+            &[
+                MultiEditSection {
+                    edit_index: 1,
+                    replace_all: true,
+                    old: "one\n".into(),
+                    new: "ONE\n".into(),
+                    start_line: None,
+                },
+                MultiEditSection {
+                    edit_index: 2,
+                    replace_all: false,
+                    old: "two\n".into(),
+                    new: "TWO\n".into(),
+                    start_line: None,
+                },
+            ]
+        );
+
+        let mut multiedit_messages = vec![tool_call("multi-1", "multiedit", multiedit)];
+        let receipt = "old_start=10 old_lines=1\nold_start=20 old_lines=1";
+        assert!(update_tool_detail(
+            &mut multiedit_messages,
+            Some("multi-1"),
+            receipt,
+        ));
+        assert!(matches!(
+            &multiedit_messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::MultiEdit { sections, .. },
+                ..
+            } if sections.iter().map(|section| section.start_line).collect::<Vec<_>>()
+                == [Some(10), Some(20)]
+        ));
+    }
+
+    #[test]
+    fn structured_tool_families_keep_raw_protocol_values() {
+        assert_eq!(
+            parse(
+                "search_text",
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": "/workspace/project/src/lib.rs",
+                    "include": "*.rs",
+                }),
+            ),
+            ToolDetail::SearchText {
+                pattern: "needle".into(),
+                path: "/workspace/project/src/lib.rs".into(),
+                include: "*.rs".into(),
+                counts: None,
+            }
+        );
+        assert_eq!(
+            parse(
+                "glob",
+                serde_json::json!({ "pattern": "*.rs", "path": "/workspace/project/src" }),
+            ),
+            ToolDetail::Glob {
+                pattern: "*.rs".into(),
+                path: "/workspace/project/src".into(),
+            }
+        );
+        assert_eq!(
+            parse(
+                "ls",
+                serde_json::json!({ "path": "/workspace/project/src" })
+            ),
+            ToolDetail::List {
+                path: "/workspace/project/src".into(),
+            }
+        );
+        assert_eq!(
+            parse(
+                "index",
+                serde_json::json!({ "path": "/workspace/project/src/main.rs" }),
+            ),
+            ToolDetail::Index {
+                path: "/workspace/project/src/main.rs".into(),
+                metadata: None,
+            }
+        );
+        assert_eq!(
+            parse(
+                "delete_file",
+                serde_json::json!({ "path": "/workspace/project/tmp/out.txt" }),
+            ),
+            ToolDetail::DeleteFile {
+                path: "/workspace/project/tmp/out.txt".into(),
+            }
+        );
+        assert_eq!(
+            parse(
+                "language_query",
+                serde_json::json!({
+                    "action": "definition",
+                    "uri": "file:///workspace/project/src/lib.rs",
+                }),
+            ),
+            ToolDetail::LanguageQuery {
+                action: "definition".into(),
+                uri: "file:///workspace/project/src/lib.rs".into(),
+            }
+        );
+        assert_eq!(
+            parse("question", serde_json::json!({ "prompt": "Continue?" })),
+            ToolDetail::Question {
+                prompt: "Continue?".into(),
+            }
+        );
+        assert_eq!(
+            parse("apply_patch", serde_json::json!({ "patch": "raw patch" })),
+            ToolDetail::ApplyPatch {
+                patch: "raw patch".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn todo_and_replace_symbol_preserve_semantic_items_and_replacements() {
+        assert_eq!(
+            parse(
+                "todowrite",
+                serde_json::json!({ "todos": [
+                    { "content": "done", "status": "completed" },
+                    { "content": "next", "status": "pending" },
+                    { "content": "working", "status": "in_progress" },
+                ] }),
+            ),
+            ToolDetail::Todo {
+                items: vec![
+                    TodoItem {
+                        content: "done".into(),
+                        status: "completed".into()
+                    },
+                    TodoItem {
+                        content: "next".into(),
+                        status: "pending".into()
+                    },
+                    TodoItem {
+                        content: "working".into(),
+                        status: "in_progress".into()
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            parse(
+                "replace_symbol",
+                serde_json::json!({ "replacements": [
+                    {
+                        "path": "/workspace/src/one.rs",
+                        "symbol": "one",
+                        "newText": "fn one() {}",
+                    },
+                    {
+                        "path": "/workspace/src/two.rs",
+                        "symbol": "two",
+                        "newText": "fn two() {}",
+                    },
+                ] }),
+            ),
+            ToolDetail::ReplaceSymbolInput {
+                replacements: vec![
+                    SymbolReplacement {
+                        path: "/workspace/src/one.rs".into(),
+                        symbol: "one".into(),
+                        new_text: "fn one() {}".into(),
+                    },
+                    SymbolReplacement {
+                        path: "/workspace/src/two.rs".into(),
+                        symbol: "two".into(),
+                        new_text: "fn two() {}".into(),
+                    },
+                ],
+            }
+        );
+        assert!(matches!(
+            parse("todowrite", serde_json::json!({ "todos": [] })),
+            ToolDetail::None
+        ));
+    }
+
+    #[test]
+    fn delegate_without_agent_preserves_objective_only() {
+        assert_eq!(
+            parse(
+                "delegate",
+                serde_json::json!({ "objective": "Do something" }),
+            ),
+            ToolDetail::Delegate {
+                target_agent_id: String::new(),
+                objective: "Do something".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn shell_preserves_full_utf8_multiline_command() {
+        let command =
+            "cat > check/kimi.md << 'EOF'\n# Review: feat/profiles\n\n## 🔴 Critical / High";
+        assert!(matches!(
+            parse("shell", serde_json::json!({ "command": command })),
+            ToolDetail::Shell { command: parsed, arguments, .. }
+                if parsed == command && arguments.is_empty()
+        ));
+    }
+
+    #[test]
+    fn shell_keeps_arguments_distinct_without_display_quoting() {
+        assert!(matches!(
+            parse(
+                "shell",
+                serde_json::json!({
+                    "command": "echo",
+                    "args": ["hello world", "", "safe"],
+                }),
+            ),
+            ToolDetail::Shell { command, arguments, .. }
+                if command == "echo" && arguments == ["hello world", "", "safe"]
+        ));
+    }
+
+    #[test]
+    fn shell_uses_only_explicit_workdir() {
+        assert!(matches!(
+            parse(
+                "shell",
+                serde_json::json!({ "command": "pwd", "workdir": "/workspace/project" }),
+            ),
+            ToolDetail::Shell { workdir: Some(workdir), .. }
+                if workdir == "/workspace/project"
+        ));
+        assert!(matches!(
+            parse("shell", serde_json::json!({ "command": "pwd" })),
+            ToolDetail::Shell { workdir: None, .. }
+        ));
+    }
+
+    #[test]
+    fn read_tool_parses_json_string_arguments() {
+        let arguments = Value::String(
+            r#"{"path":"apps/admin/lib/admin_web/components/layouts/root.html.heex","limit":220}"#
+                .into(),
+        );
+        assert_eq!(
+            parse_tool_detail("read_tool", Some(&arguments)),
+            ToolDetail::ReadTool {
+                path: "apps/admin/lib/admin_web/components/layouts/root.html.heex".into(),
+                start_line: Some(1),
+                end_line: Some(220),
+            }
+        );
+    }
+
+    #[test]
+    fn read_tool_result_refines_range_from_json_text_content() {
+        let detail = parse(
+            "read_tool",
+            serde_json::json!({ "path": "src/lib.rs", "offset": 40, "limit": 390 }),
+        );
+        let mut messages = vec![tool_call("read-json", "read_tool", detail)];
+        let result = serde_json::json!([{
+            "type": "text",
+            "text": "<content>\n00041| first\n00042| second\n00430| last\n</content>",
+        }])
+        .to_string();
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("read-json"),
+            &result,
+        ));
+        assert!(matches!(
+            &messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::ReadTool {
+                    start_line: Some(41),
+                    end_line: Some(430),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn edit_result_uses_compact_old_start_receipt() {
+        let detail = parse(
+            "edit",
+            serde_json::json!({
+                "filePath": "src/lib.rs",
+                "oldString": "before\n",
+                "newString": "after\n",
+            }),
+        );
+        let mut messages = vec![tool_call("edit-compact", "edit", detail)];
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("edit-compact"),
+            "old_start=73 old_lines=1 new_start=73 new_lines=1",
+        ));
+        assert!(matches!(
+            &messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::Edit {
+                    start_line: Some(73),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn multiedit_result_uses_hunk_old_start_metadata() {
+        let detail = parse(
+            "multiedit",
+            serde_json::json!({
+                "filePath": "src/lib.rs",
+                "edits": [
+                    { "oldString": "aaa\n", "newString": "bbb\n" },
+                    { "oldString": "ccc\n", "newString": "ddd\n" },
+                ],
+            }),
+        );
+        let mut messages = vec![tool_call("multi-hunks", "multiedit", detail)];
+        let result = "H replace old=10,1 new=10,1 +1 -1\nH replace old=20,1 new=20,1 +1 -1";
+
+        assert!(update_tool_detail(
+            &mut messages,
+            Some("multi-hunks"),
+            result,
+        ));
+        assert!(matches!(
+            &messages[0],
+            ChatEntry::ToolCall {
+                detail: ToolDetail::MultiEdit { sections, .. },
+                ..
+            } if sections.iter().map(|section| section.start_line).collect::<Vec<_>>()
+                == [Some(10), Some(20)]
+        ));
+    }
+
+    #[test]
+    fn replace_symbol_missing_and_empty_inputs_remain_semantic() {
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({ "replacements": [] }),
+        ] {
+            assert_eq!(
+                parse("replace_symbol", arguments),
+                ToolDetail::ReplaceSymbolInput {
+                    replacements: Vec::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn replace_symbol_duplicate_paths_are_not_display_deduplicated() {
+        let detail = parse(
+            "replace_symbol",
+            serde_json::json!({ "replacements": [
+                { "path": "/workspace/src/lib.rs", "symbol": "run", "newText": "run" },
+                { "path": "/workspace/src/lib.rs", "symbol": "stop", "newText": "stop" },
+            ] }),
+        );
+        assert!(matches!(
+            detail,
+            ToolDetail::ReplaceSymbolInput { replacements }
+                if replacements.len() == 2
+                    && replacements[0].path == "/workspace/src/lib.rs"
+                    && replacements[1].path == "/workspace/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn todowrite_missing_and_empty_inputs_produce_no_detail() {
+        assert!(matches!(
+            parse("todowrite", serde_json::json!({})),
+            ToolDetail::None
+        ));
+        assert!(matches!(
+            parse("todowrite", serde_json::json!({ "todos": [] })),
+            ToolDetail::None
+        ));
+    }
+
+    #[test]
+    fn browse_keeps_utf8_url_without_parser_ellipsis() {
+        let url = format!("https://example.test/{}tail", "界".repeat(50));
+        assert!(matches!(
+            parse("browse", serde_json::json!({ "url": url })),
+            ToolDetail::Browse { url: parsed } if parsed == url
+        ));
+    }
+
+    #[test]
+    fn delegate_keeps_utf8_objective_without_parser_ellipsis() {
+        let objective = format!("{}tail", "界".repeat(50));
+        assert!(matches!(
+            parse(
+                "delegate",
+                serde_json::json!({
+                    "target_agent_id": "coder",
+                    "objective": objective,
+                }),
+            ),
+            ToolDetail::Delegate { target_agent_id, objective: parsed }
+                if target_agent_id == "coder" && parsed == objective
+        ));
+    }
+
+    #[test]
+    fn index_keeps_full_unshortened_path() {
+        let path = "/home/user/project/src/main.rs";
+        assert_eq!(
+            parse("index", serde_json::json!({ "path": path })),
+            ToolDetail::Index {
+                path: path.into(),
+                metadata: None,
+            }
+        );
+    }
+
+    #[test]
+    fn write_file_preserves_raw_unicode_path_and_content() {
+        assert_eq!(
+            parse(
+                "write_file",
+                serde_json::json!({
+                    "path": "/workspace/src/界.rs",
+                    "content": "fn 界() {\n    println!(\"ok\");\n}\n",
+                }),
+            ),
+            ToolDetail::WriteFile {
+                path: "/workspace/src/界.rs".into(),
+                content: "fn 界() {\n    println!(\"ok\");\n}\n".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_and_missing_arguments_produce_no_detail() {
+        assert!(matches!(
+            parse("unknown_tool", serde_json::json!({ "raw": true })),
+            ToolDetail::None
+        ));
+        assert!(matches!(parse_tool_detail("shell", None), ToolDetail::None));
+    }
+
+    #[test]
+    fn tool_start_reconciles_failed_fallback_in_place() {
+        let mut messages = vec![
+            ChatEntry::Assistant {
+                content: "before".into(),
+                thinking: None,
+                message_id: None,
+            },
+            ChatEntry::ToolCall {
+                tool_call_id: Some("missing-start".into()),
+                name: "shell (failed)".into(),
+                is_error: true,
+                detail: ToolDetail::None,
+            },
+        ];
+        let detail = parse(
+            "shell",
+            serde_json::json!({ "command": "cargo test tool_detail_tests" }),
+        );
+        assert!(reconcile_tool_call_start(
+            &mut messages,
+            Some("missing-start"),
+            "shell",
+            detail,
+        ));
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1],
+            ChatEntry::ToolCall {
+                name,
+                is_error: true,
+                detail: ToolDetail::Shell { command, .. },
+                ..
+            } if name == "shell" && command == "cargo test tool_detail_tests"
+        ));
+    }
 }

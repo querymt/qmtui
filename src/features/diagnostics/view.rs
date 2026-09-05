@@ -1,0 +1,254 @@
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    text::{Line, Span},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+};
+
+use crate::diagnostics::{DiagnosticsState, LogLevel};
+use crate::theme::Theme;
+use crate::view_shared::{ELLIPSIS, centered_rect, scroll_input};
+
+pub(crate) struct LogPopupInput<'a> {
+    pub(crate) diagnostics: &'a DiagnosticsState,
+}
+
+fn popup_log_level_style(level: LogLevel) -> ratatui::style::Style {
+    match level {
+        LogLevel::Trace => Theme::status(),
+        LogLevel::Debug => Theme::status_accent(),
+        LogLevel::Info => ratatui::style::Style::default()
+            .fg(Theme::info())
+            .bg(Theme::bg_dim()),
+        LogLevel::Warn => ratatui::style::Style::default()
+            .fg(Theme::warn())
+            .bg(Theme::bg_dim()),
+        LogLevel::Error => ratatui::style::Style::default()
+            .fg(Theme::err())
+            .bg(Theme::bg_dim()),
+    }
+}
+
+pub(crate) fn draw_log_popup(f: &mut Frame, input: LogPopupInput<'_>) {
+    let diagnostics = input.diagnostics;
+    let area = f.area();
+    let popup_area = centered_rect(80, 70, area);
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(Block::default().style(Theme::popup_bg()), popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 1,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(2),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // filter
+            Constraint::Length(1), // level
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled("logs", Theme::popup_title())).style(Theme::popup_bg()),
+        chunks[0],
+    );
+
+    let avail = chunks[1].width.saturating_sub(2) as usize;
+    let (log_filter_display, log_filter_cur) =
+        scroll_input(&diagnostics.log_filter, diagnostics.log_filter.len(), avail);
+    let filter_line = Line::from(vec![
+        Span::styled("> ", Theme::popup_title()),
+        Span::styled(log_filter_display, Theme::popup_bg()),
+    ]);
+    f.render_widget(
+        Paragraph::new(filter_line).style(Theme::popup_bg()),
+        chunks[1],
+    );
+    let cursor_area = chunks[1].intersection(area);
+    if chunks[1].width > 0
+        && chunks[1].height > 0
+        && cursor_area.width > 0
+        && cursor_area.height > 0
+    {
+        let cursor_x = chunks[1]
+            .x
+            .saturating_add(2)
+            .saturating_add(log_filter_cur as u16)
+            .clamp(cursor_area.x, cursor_area.right().saturating_sub(1));
+        let cursor_y = chunks[1]
+            .y
+            .clamp(cursor_area.y, cursor_area.bottom().saturating_sub(1));
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
+
+    let level_line = Line::from(vec![
+        Span::styled("level: ", Theme::status()),
+        Span::styled(
+            format!("{}+", diagnostics.log_level_filter.label()),
+            popup_log_level_style(diagnostics.log_level_filter),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(level_line).style(Theme::popup_bg()),
+        chunks[2],
+    );
+
+    let filtered = diagnostics.filtered_logs();
+    let list_w = chunks[3].width as usize;
+    let items: Vec<ListItem> = if filtered.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            " no log entries match current filter",
+            Theme::status(),
+        )))]
+    } else {
+        filtered
+            .iter()
+            .map(|entry| {
+                let time_part = format!(
+                    " {:>6}.{:01} ",
+                    entry.elapsed.as_secs(),
+                    entry.elapsed.subsec_millis() / 100,
+                );
+                let level_part = format!("{:<5}", entry.level.label());
+                let target_part = format!(" {:<10} ", entry.target);
+                let prefix_w = time_part.chars().count()
+                    + level_part.chars().count()
+                    + target_part.chars().count();
+                let avail = list_w.saturating_sub(prefix_w);
+                let message = if entry.message.chars().count() > avail {
+                    let truncated: String = entry
+                        .message
+                        .chars()
+                        .take(avail.saturating_sub(1))
+                        .collect();
+                    format!("{truncated}{ELLIPSIS}")
+                } else {
+                    entry.message.clone()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(time_part, Theme::status()),
+                    Span::styled(level_part, popup_log_level_style(entry.level)),
+                    Span::styled(target_part, Theme::status()),
+                    Span::styled(message, Theme::popup_bg()),
+                ]))
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(Block::default().style(Theme::popup_bg()));
+    let selected = (!filtered.is_empty())
+        .then_some(diagnostics.log_cursor.min(filtered.len().saturating_sub(1)));
+    let mut state = ListState::default().with_selected(selected);
+    f.render_stateful_widget(list, chunks[3], &mut state);
+
+    let hint = Line::from(vec![
+        Span::styled(" esc ", Theme::status_accent()),
+        Span::styled("close  ", Theme::status()),
+        Span::styled("tab ", Theme::status_accent()),
+        Span::styled("level", Theme::status()),
+    ]);
+    f.render_widget(Paragraph::new(hint).style(Theme::popup_bg()), chunks[4]);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::diagnostics::AppLogEntry;
+    use crate::view_shared::{buffer_region, find_ascii_text_rect};
+
+    #[test]
+    fn log_popup_cursor_stays_inside_tiny_frame() {
+        let diagnostics = DiagnosticsState::new();
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_log_popup(
+                    frame,
+                    LogPopupInput {
+                        diagnostics: &diagnostics,
+                    },
+                );
+            })
+            .unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(Rect::new(0, 0, 1, 1).contains(cursor));
+    }
+
+    #[test]
+    fn draw_log_popup_shows_filter_level_and_entries() {
+        let mut diagnostics = DiagnosticsState::new();
+        diagnostics.log_filter = "server".into();
+        diagnostics.log_level_filter = LogLevel::Info;
+        diagnostics.logs = vec![
+            AppLogEntry {
+                elapsed: Duration::from_millis(1_200),
+                level: LogLevel::Info,
+                target: "server",
+                message: "starting local server".into(),
+            },
+            AppLogEntry {
+                elapsed: Duration::from_millis(12_300),
+                level: LogLevel::Error,
+                target: "server",
+                message: "start failed".into(),
+            },
+        ];
+        diagnostics.log_cursor = diagnostics.filtered_logs().len().saturating_sub(1);
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_log_popup(
+                    f,
+                    LogPopupInput {
+                        diagnostics: &diagnostics,
+                    },
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        assert_eq!(
+            find_ascii_text_rect(&buffer, "logs"),
+            Some(Rect::new(11, 4, 4, 1))
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 5, 24, 2)).rows,
+            [
+                format!("> server{}", " ".repeat(16)),
+                format!("level: INFO+{}", " ".repeat(12))
+            ]
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 7, 52, 2)).rows,
+            [
+                format!(
+                    "      1.2 INFO  server     starting local server{}",
+                    " ".repeat(4)
+                ),
+                format!("     12.3 ERROR server     start failed{}", " ".repeat(13)),
+            ]
+        );
+        assert_eq!(
+            buffer_region(&buffer, Rect::new(11, 15, 24, 1)).rows,
+            [format!(" esc close  tab level{}", " ".repeat(3))]
+        );
+        insta::assert_debug_snapshot!(
+            "diagnostics_popup_fixed_entries_100x20",
+            buffer_region(&buffer, buffer.area)
+        );
+    }
+}

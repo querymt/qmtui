@@ -1,0 +1,38 @@
+---
+source: src/features/sessions/view/start.rs
+expression: "buffer_region(&buffer, buffer.area)"
+---
+BufferRegion {
+    area: Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 24,
+    },
+    rows: [
+        " querymt profile:default                                                      ○ ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                    ___                        __  __ _____                     ",
+        "                   / _ \\ _   _  ___ _ __ _   _|  \\/  |_   _|                    ",
+        "                  | | | | | | |/ _ \\ '__| | | | |\\/| | | |                      ",
+        "                  | |_| | |_| |  __/ |  | |_| | |  | | | |                      ",
+        "                   \\__\\_\\\\__,_|\\___|_|   \\__, |_|  |_| |_|                      ",
+        "                                         |___/                                  ",
+        "                                                                                ",
+        "         >                                                                      ",
+        "                                                                                ",
+        "                  No sessions yet.  C-x n to start a new one.                   ",
+        "                                 + New Session                                  ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        "                                                                                ",
+        " ↑↓ navigate  enter open/collapse  del delete  C-x n new  C-x s popup  q quit   ",
+    ],
+}

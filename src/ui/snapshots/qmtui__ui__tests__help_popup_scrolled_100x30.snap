@@ -1,0 +1,44 @@
+---
+source: src/ui/mod.rs
+expression: "buffer_region(&scrolled, scrolled.area)"
+---
+BufferRegion {
+    area: Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    },
+    rows: [
+        " querymt profile:default                                                                          ○ ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                shortcuts                                                                           ",
+        "                                                                                                    ",
+        "                  slash commands                                                                    ",
+        "                  /model [q]    model selector (optional filter)                                    ",
+        "                  /mode [m]     switch mode (build, plan)                                           ",
+        "                  /review       enter review mode                                                   ",
+        "                  /thinking [lvl]set thinking (auto, low, med, high, max)                           ",
+        "                  /theme        open theme picker                                                   ",
+        "                  /profile [q|id]set profile for new sessions                                       ",
+        "                  /sessions     open session switcher                                               ",
+        "                  /delegates    list delegate sessions                                              ",
+        "                  /new          new session                                                         ",
+        "                  /help         show help                                                           ",
+        "                  /logs         open logs popup                                                     ",
+        "                  /auth         provider auth                                                       ",
+        "                  /undo         undo last turn                                                      ",
+        "                  /redo         redo                                                                ",
+        "                  /editor       open external editor                                                ",
+        "                  /cancel       cancel active turn                                                  ",
+        "                  /quit         quit                                                                ",
+        "                                                                                                    ",
+        "                 ↑↓ scroll  esc close                                                               ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        "                                                                                                    ",
+        " ↑↓ navigate  enter open/collapse  del delete  C-x n new  C-x s popup  q quit                       ",
+    ],
+}

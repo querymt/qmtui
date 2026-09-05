@@ -1,0 +1,475 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+use agent_client_protocol as acp_sdk;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
+
+use super::super::connection::internal_error;
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_PROMPT_METHOD: &str = "session/prompt";
+
+fn response_timeout(method: &str) -> Option<Duration> {
+    (method != SESSION_PROMPT_METHOD).then_some(RESPONSE_TIMEOUT)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::acp) struct Envelope {
+    pub(in crate::acp) jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::acp) id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::acp) method: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub(in crate::acp) params: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::acp) result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::acp) error: Option<Value>,
+}
+
+impl Envelope {
+    pub(super) fn request(id: i64, method: &str, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(id)),
+            method: Some(method.to_string()),
+            params,
+            result: None,
+            error: None,
+        }
+    }
+
+    pub(super) fn notification(method: &str, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: Some(method.to_string()),
+            params,
+            result: None,
+            error: None,
+        }
+    }
+
+    pub(super) fn response(id: Value, result: Result<Value, acp_sdk::Error>) -> Self {
+        let (result, error) = match result {
+            Ok(value) => (Some(value), None),
+            Err(err) => (
+                None,
+                Some(serde_json::to_value(err).unwrap_or_else(|_| {
+                    json!({
+                        "code": -32603,
+                        "message": "internal error"
+                    })
+                })),
+            ),
+        };
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: None,
+            params: Value::Null,
+            result,
+            error,
+        }
+    }
+}
+
+struct PendingRequest {
+    method: String,
+    tx: oneshot::Sender<Result<Value, acp_sdk::Error>>,
+}
+
+#[derive(Clone)]
+pub(in crate::acp) struct Peer {
+    tx: mpsc::UnboundedSender<Message>,
+    pending: Arc<Mutex<HashMap<i64, PendingRequest>>>,
+    next_id: Arc<AtomicI64>,
+}
+
+impl Peer {
+    pub(in crate::acp) fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
+        Self {
+            tx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicI64::new(1)),
+        }
+    }
+
+    pub(in crate::acp) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, acp_sdk::Error> {
+        self.request_with_timeout(method, params, response_timeout(method))
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, acp_sdk::Error> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(
+            id,
+            PendingRequest {
+                method: method.to_string(),
+                tx,
+            },
+        );
+        if let Err(err) = self.send(Envelope::request(id, method, params)) {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
+        }
+        let result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(internal_error(format!(
+                        "ACP WebSocket request timed out: {method}"
+                    )));
+                }
+            }
+        } else {
+            rx.await
+        };
+        result.map_err(|_| internal_error(format!("ACP WebSocket request dropped: {method}")))?
+    }
+
+    pub(in crate::acp) fn notify(&self, method: &str, params: Value) -> Result<(), acp_sdk::Error> {
+        self.send(Envelope::notification(method, params))
+    }
+
+    pub(in crate::acp) fn respond(
+        &self,
+        id: Value,
+        result: Result<Value, acp_sdk::Error>,
+    ) -> Result<(), acp_sdk::Error> {
+        self.send(Envelope::response(id, result))
+    }
+
+    fn send(&self, envelope: Envelope) -> Result<(), acp_sdk::Error> {
+        let text = serde_json::to_string(&envelope).map_err(acp_sdk::Error::into_internal_error)?;
+        self.tx
+            .send(Message::Text(text.into()))
+            .map_err(|err| internal_error(format!("ACP WebSocket send failed: {err}")))
+    }
+
+    pub(in crate::acp) async fn resolve(&self, envelope: Envelope) {
+        let Some(id) = envelope.id.and_then(|id| id.as_i64()) else {
+            return;
+        };
+        let Some(pending) = self.pending.lock().await.remove(&id) else {
+            return;
+        };
+        let result = if let Some(error) = envelope.error {
+            Err(internal_error(format!(
+                "ACP WebSocket {} failed: {error}",
+                pending.method
+            )))
+        } else {
+            Ok(envelope.result.unwrap_or(Value::Null))
+        };
+        let _ = pending.tx.send(result);
+    }
+
+    pub(in crate::acp) async fn fail_all(&self, reason: &str) {
+        let pending = std::mem::take(&mut *self.pending.lock().await);
+        for (_, request) in pending {
+            let _ = request.tx.send(Err(internal_error(format!(
+                "ACP WebSocket {} failed: {reason}",
+                request.method
+            ))));
+        }
+    }
+
+    #[cfg(test)]
+    async fn pending_len(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn request_with_wire(
+        peer: &Peer,
+        rx: &mut mpsc::UnboundedReceiver<Message>,
+        method: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<Result<Value, acp_sdk::Error>>,
+        Envelope,
+    ) {
+        let request_peer = peer.clone();
+        let task = tokio::spawn(async move { request_peer.request(method, json!({})).await });
+        let message = rx.recv().await.expect("request frame");
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        let envelope = serde_json::from_str(&text).expect("request envelope");
+        (task, envelope)
+    }
+
+    fn wire_value(rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
+        let Message::Text(text) = rx.try_recv().expect("wire message") else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).expect("wire JSON")
+    }
+
+    #[test]
+    fn notify_omits_id_and_respond_selects_result_or_error() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+
+        peer.notify("session/update", json!({ "value": 1 }))
+            .expect("notification");
+        peer.respond(json!(7), Ok(json!({ "accepted": true })))
+            .expect("successful response");
+        peer.respond(json!(8), Err(internal_error("permission denied")))
+            .expect("error response");
+
+        assert_eq!(
+            wire_value(&mut rx),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "value": 1 }
+            })
+        );
+        assert_eq!(
+            wire_value(&mut rx),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "result": { "accepted": true }
+            })
+        );
+        let error = wire_value(&mut rx);
+        assert_eq!(error["jsonrpc"], "2.0");
+        assert_eq!(error["id"], 8);
+        assert!(error.get("result").is_none());
+        assert_eq!(error["error"]["code"], -32603);
+        assert_eq!(error["error"]["message"], "Internal error");
+        assert_eq!(error["error"]["data"], "permission denied");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ids_start_at_one_and_out_of_order_responses_correlate() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (first, first_wire) = request_with_wire(&peer, &mut rx, "first").await;
+        let (second, second_wire) = request_with_wire(&peer, &mut rx, "second").await;
+        assert_eq!(first_wire.id, Some(json!(1)));
+        assert_eq!(second_wire.id, Some(json!(2)));
+
+        peer.resolve(Envelope {
+            result: Some(json!("second-result")),
+            method: None,
+            params: Value::Null,
+            error: None,
+            ..second_wire
+        })
+        .await;
+        peer.resolve(Envelope {
+            result: Some(json!("first-result")),
+            method: None,
+            params: Value::Null,
+            error: None,
+            ..first_wire
+        })
+        .await;
+
+        assert_eq!(
+            first.await.expect("first task").expect("first result"),
+            "first-result"
+        );
+        assert_eq!(
+            second.await.expect("second task").expect("second result"),
+            "second-result"
+        );
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn errors_precede_results_and_include_the_method() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (task, wire) = request_with_wire(&peer, &mut rx, "querymt/models").await;
+        peer.resolve(Envelope {
+            result: Some(json!("ignored")),
+            error: Some(json!({ "code": -1, "message": "nope" })),
+            method: None,
+            params: Value::Null,
+            ..wire
+        })
+        .await;
+        let error = task
+            .await
+            .expect("task")
+            .expect_err("request error")
+            .to_string();
+        assert!(error.contains("querymt/models"));
+        assert!(error.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn missing_result_is_null_and_duplicate_unknown_late_ids_are_ignored() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (task, wire) = request_with_wire(&peer, &mut rx, "empty").await;
+        let response = Envelope {
+            method: None,
+            params: Value::Null,
+            result: None,
+            error: None,
+            ..wire.clone()
+        };
+        peer.resolve(Envelope {
+            id: Some(json!(999)),
+            ..response.clone()
+        })
+        .await;
+        peer.resolve(response.clone()).await;
+        peer.resolve(response).await;
+        peer.resolve(Envelope {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("nonnumeric")),
+            method: None,
+            params: Value::Null,
+            result: Some(json!(1)),
+            error: None,
+        })
+        .await;
+        assert_eq!(task.await.expect("task").expect("result"), Value::Null);
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[test]
+    fn long_running_prompt_is_exempt_from_the_generic_response_timeout() {
+        assert_eq!(response_timeout(SESSION_PROMPT_METHOD), None);
+        assert_eq!(response_timeout("session/load"), Some(RESPONSE_TIMEOUT));
+        assert_eq!(response_timeout("querymt/models"), Some(RESPONSE_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn prompt_request_remains_correlated_until_its_terminal_response() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (mut task, wire) = request_with_wire(&peer, &mut rx, SESSION_PROMPT_METHOD).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.pending_len().await, 1);
+
+        peer.resolve(Envelope {
+            method: None,
+            params: Value::Null,
+            result: Some(json!({ "stopReason": "end_turn" })),
+            error: None,
+            ..wire
+        })
+        .await;
+
+        assert_eq!(
+            task.await.expect("prompt task").expect("prompt response"),
+            json!({ "stopReason": "end_turn" })
+        );
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn send_failure_unregisters_the_request() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let peer = Peer::new(tx);
+        let error = peer
+            .request("closed", json!({}))
+            .await
+            .expect_err("send failure");
+        assert!(error.to_string().contains("send failed"));
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_removes_pending_request_and_ignores_late_response() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let request_peer = peer.clone();
+        let task = tokio::spawn(async move {
+            request_peer
+                .request_with_timeout("querymt/slow", json!({}), Some(Duration::from_millis(10)))
+                .await
+        });
+        let Message::Text(text) = rx.recv().await.expect("request frame") else {
+            panic!("expected text frame");
+        };
+        let wire: Envelope = serde_json::from_str(&text).expect("request envelope");
+
+        let error = task
+            .await
+            .expect("request task")
+            .expect_err("timeout error")
+            .to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("querymt/slow"));
+        assert_eq!(peer.pending_len().await, 0);
+
+        peer.resolve(Envelope {
+            method: None,
+            params: Value::Null,
+            result: Some(json!("late")),
+            error: None,
+            ..wire
+        })
+        .await;
+        assert_eq!(peer.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn fail_all_drains_each_pending_request_once_and_late_responses_are_ignored() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let peer = Peer::new(tx);
+        let (first, first_wire) = request_with_wire(&peer, &mut rx, "first").await;
+        let (second, _) = request_with_wire(&peer, &mut rx, "second").await;
+        peer.fail_all("socket closed").await;
+        peer.fail_all("duplicate close").await;
+        peer.resolve(Envelope {
+            method: None,
+            params: Value::Null,
+            result: Some(json!("late")),
+            error: None,
+            ..first_wire
+        })
+        .await;
+
+        let first_error = first
+            .await
+            .expect("first task")
+            .expect_err("first error")
+            .to_string();
+        let second_error = second
+            .await
+            .expect("second task")
+            .expect_err("second error")
+            .to_string();
+        assert!(first_error.contains("first"));
+        assert!(first_error.contains("socket closed"));
+        assert!(second_error.contains("second"));
+        assert_eq!(peer.pending_len().await, 0);
+    }
+}

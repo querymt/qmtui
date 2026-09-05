@@ -40,7 +40,7 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   build-and-test:
     name: Build & Test
@@ -57,7 +57,7 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --all-features
 
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --all-targets --all-features
