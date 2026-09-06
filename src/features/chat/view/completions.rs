@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
     Frame,
     layout::Rect,
@@ -57,7 +59,7 @@ fn draw_slash_panel(f: &mut Frame, composer: &ComposerState, area: Rect) {
                     format!("  /{:<width$}  ", cmd.name, width = max_name_len),
                     Theme::status_accent(),
                 ),
-                Span::styled(cmd.description.as_str(), Theme::dim()),
+                Span::styled(sanitize_terminal_text(&cmd.description), Theme::dim()),
             ]))
         })
         .collect();
@@ -72,6 +74,25 @@ fn draw_slash_panel(f: &mut Frame, composer: &ComposerState, area: Rect) {
         .highlight_symbol("");
     let mut list_state = ListState::default().with_selected(Some(state.selected_index));
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn sanitize_terminal_text(value: &str) -> Cow<'_, str> {
+    if value.chars().any(char::is_control) {
+        Cow::Owned(
+            value
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 fn draw_mention_panel(f: &mut Frame, composer: &ComposerState, spinner_frame: &str, area: Rect) {
@@ -261,6 +282,26 @@ mod tests {
         let filtered = render(&composer);
         find_text(&filtered, "/ commands");
         assert_eq!(completion_panel_height(&composer), 6);
+    }
+
+    #[test]
+    fn slash_panel_replaces_control_characters_in_peer_descriptions() {
+        let mut composer = ComposerState::new();
+        composer.slash_state = Some(SlashCompletionState {
+            selected_index: 0,
+            results: vec![crate::slash::SlashCommandItem {
+                name: "remote".into(),
+                description: "ordinary\u{1b}[31m text\nnext".into(),
+            }],
+        });
+
+        let rendered = render(&composer)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("ordinary [31m text next"));
     }
 
     #[test]

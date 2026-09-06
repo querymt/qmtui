@@ -36,6 +36,10 @@ struct Cli {
     #[arg(short, long, value_name = "url")]
     url: Option<String>,
 
+    /// Allow plaintext ws:// connections to non-loopback hosts.
+    #[arg(long)]
+    allow_insecure: bool,
+
     /// Keep reading notifications after the last request, in milliseconds.
     #[arg(short, long, default_value_t = 2000)]
     listen: u64,
@@ -70,8 +74,13 @@ enum Command {
     },
     /// initialize + session/list
     List,
-    /// initialize + session/prompt
-    Prompt { session_id: String, text: String },
+    /// initialize + session/load + session/prompt
+    Prompt {
+        session_id: String,
+        text: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// initialize, then send a raw JSON-RPC method
     Call {
         method: String,
@@ -83,15 +92,19 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let url = normalize_acp_ws_url(cli.url.as_deref().unwrap_or(DEFAULT_HOST))?;
+    let url = normalize_acp_ws_url(
+        cli.url.as_deref().unwrap_or(DEFAULT_HOST),
+        cli.allow_insecure,
+    )?;
+    let endpoint = safe_endpoint_label(&url)?;
     let listen = Duration::from_millis(cli.listen);
     let command = cli.command.unwrap_or(Command::Handshake {
         cwd: None,
         profile: None,
     });
 
-    eprintln!("connecting {url}");
-    let client = AcpClient::connect(&url).await?;
+    eprintln!("connecting {endpoint}");
+    let client = AcpClient::connect(&url, &endpoint).await?;
     match command {
         Command::Init => {
             print_json("initialize", &client.initialize().await?)?;
@@ -108,8 +121,21 @@ async fn main() -> Result<()> {
             print_json("initialize", &client.initialize().await?)?;
             print_json("session/list", &client.list_sessions().await?)?;
         }
-        Command::Prompt { session_id, text } => {
-            print_json("initialize", &client.initialize().await?)?;
+        Command::Prompt {
+            session_id,
+            text,
+            cwd,
+        } => {
+            let initialized = client.initialize().await?;
+            print_json("initialize", &initialized)?;
+            if !initialized.agent_capabilities.load_session {
+                bail!("agent cannot resume session {session_id}: session/load is unsupported");
+            }
+            let loaded = client
+                .load_session(session_id.clone(), cwd)
+                .await
+                .with_context(|| format!("agent cannot resume session {session_id}"))?;
+            print_json("session/load", &loaded)?;
             print_json("session/prompt", &client.prompt(session_id, text).await?)?;
         }
         Command::Call { method, params } => {
@@ -133,10 +159,10 @@ struct AcpClient {
 }
 
 impl AcpClient {
-    async fn connect(url: &str) -> Result<Self> {
+    async fn connect(url: &str, endpoint: &str) -> Result<Self> {
         let (socket, _) = connect_async(url)
             .await
-            .with_context(|| format!("connect {url}"))?;
+            .with_context(|| format!("connect {endpoint}"))?;
         let (mut write, mut read) = socket.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
@@ -337,12 +363,7 @@ fn inbound_request_reply(id: Value, method: &str, params: &Value) -> Result<Valu
         let outcome = request
             .options
             .iter()
-            .find(|option| {
-                matches!(
-                    option.kind,
-                    acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
-                )
-            })
+            .find(|option| matches!(option.kind, acp::PermissionOptionKind::RejectOnce))
             .map(|option| {
                 acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
                     option.option_id.clone(),
@@ -410,7 +431,7 @@ fn default_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn normalize_acp_ws_url(value: &str) -> Result<String> {
+fn normalize_acp_ws_url(value: &str, allow_insecure: bool) -> Result<String> {
     let trimmed = value.trim();
     let trimmed = if trimmed.is_empty() {
         DEFAULT_HOST
@@ -442,6 +463,9 @@ fn normalize_acp_ws_url(value: &str) -> Result<String> {
     if url.host_str().is_none() {
         bail!("WebSocket URL is missing a host");
     }
+    if url.scheme() == "ws" && !is_loopback_url(&url) && !allow_insecure {
+        bail!("remote endpoints require wss://; pass --allow-insecure to use ws://");
+    }
     if explicit_port.is_none() {
         url.set_port(Some(DEFAULT_PORT))
             .map_err(|_| anyhow::anyhow!("cannot set default WebSocket port"))?;
@@ -455,6 +479,31 @@ fn normalize_acp_ws_url(value: &str) -> Result<String> {
         (Some(port), None) => Ok(insert_port(&normalized, port)),
         _ => Ok(normalized),
     }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn safe_endpoint_label(value: &str) -> Result<String> {
+    let url = Url::parse(value).context("invalid normalized WebSocket URL")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("WebSocket URL is missing a host"))?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("WebSocket URL is missing a port"))?;
+    Ok(format!("{}://{host}:{port}{}", url.scheme(), url.path()))
 }
 
 fn explicit_port(value: &str) -> Result<Option<u16>> {
@@ -516,21 +565,53 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            assert_eq!(normalize_acp_ws_url(input).unwrap(), expected);
+            assert_eq!(normalize_acp_ws_url(input, true).unwrap(), expected);
         }
     }
 
     #[test]
     fn rejects_non_websocket_urls() {
-        assert!(normalize_acp_ws_url("https://example.com").is_err());
+        assert!(normalize_acp_ws_url("https://example.com", false).is_err());
     }
 
     #[test]
-    fn permission_requests_choose_a_reject_option() {
+    fn plaintext_remote_endpoints_require_an_explicit_opt_in() {
+        assert!(normalize_acp_ws_url("remote.example", false).is_err());
+        assert!(normalize_acp_ws_url("ws://remote.example", false).is_err());
+        assert_eq!(
+            normalize_acp_ws_url("wss://remote.example", false).unwrap(),
+            "wss://remote.example:3030/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("localhost", false).unwrap(),
+            "ws://localhost:3030/ws"
+        );
+        assert_eq!(
+            normalize_acp_ws_url("::1", false).unwrap(),
+            "ws://[::1]:3030/ws"
+        );
+    }
+
+    #[test]
+    fn endpoint_label_redacts_credentials_query_and_fragment() {
+        assert_eq!(
+            safe_endpoint_label("wss://user:secret@example.com:443/ws?token=secret#fragment")
+                .unwrap(),
+            "wss://example.com:443/ws"
+        );
+    }
+
+    #[test]
+    fn permission_requests_choose_reject_once() {
         let request = acp::RequestPermissionRequest::new(
             "session-1",
             acp::ToolCallUpdate::new("tool-1", acp::ToolCallUpdateFields::new()),
             vec![
+                acp::PermissionOption::new(
+                    "reject-always",
+                    "Reject always",
+                    acp::PermissionOptionKind::RejectAlways,
+                ),
                 acp::PermissionOption::new("allow", "Allow", acp::PermissionOptionKind::AllowOnce),
                 acp::PermissionOption::new(
                     "reject",
@@ -545,5 +626,22 @@ mod tests {
         assert_eq!(reply["id"], 7);
         assert_eq!(reply["result"]["outcome"]["outcome"], "selected");
         assert_eq!(reply["result"]["outcome"]["optionId"], "reject");
+    }
+
+    #[test]
+    fn permission_requests_cancel_instead_of_rejecting_always() {
+        let request = acp::RequestPermissionRequest::new(
+            "session-1",
+            acp::ToolCallUpdate::new("tool-1", acp::ToolCallUpdateFields::new()),
+            vec![acp::PermissionOption::new(
+                "reject-always",
+                "Reject always",
+                acp::PermissionOptionKind::RejectAlways,
+            )],
+        );
+        let params = request.to_untyped_message().unwrap().params;
+        let reply = inbound_request_reply(json!(8), "session/request_permission", &params).unwrap();
+
+        assert_eq!(reply["result"]["outcome"]["outcome"], "cancelled");
     }
 }
