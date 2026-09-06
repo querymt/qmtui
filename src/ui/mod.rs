@@ -1059,7 +1059,9 @@ mod tests {
         });
         app.composer.slash_state = Some(crate::composer_state::SlashCompletionState {
             selected_index: 1,
-            results: vec![&crate::slash::SLASH_COMMANDS[0]],
+            results: vec![crate::slash::SlashCommandItem::from_local(
+                &crate::slash::SLASH_COMMANDS[0],
+            )],
         });
         let semantic_snapshot = (
             app.composer.input.clone(),
@@ -1083,7 +1085,7 @@ mod tests {
                     slash
                         .results
                         .iter()
-                        .map(|command| command.name)
+                        .map(|command| command.name.clone())
                         .collect::<Vec<_>>(),
                 )
             }),
@@ -1111,7 +1113,7 @@ mod tests {
                     slash
                         .results
                         .iter()
-                        .map(|command| command.name)
+                        .map(|command| command.name.clone())
                         .collect::<Vec<_>>(),
                 )),
             ),
