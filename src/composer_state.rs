@@ -4,6 +4,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::input_layout::build_input_visual_layout;
+use crate::slash::{SLASH_COMMANDS, SlashCommandItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileIndexEntryLite {
@@ -22,7 +23,7 @@ pub(crate) struct MentionState {
 #[derive(Debug, Clone)]
 pub(crate) struct SlashCompletionState {
     pub(crate) selected_index: usize,
-    pub(crate) results: Vec<&'static crate::slash::SlashCommandDef>,
+    pub(crate) results: Vec<SlashCommandItem>,
 }
 
 pub(crate) struct ComposerState {
@@ -35,6 +36,7 @@ pub(crate) struct ComposerState {
     pub(crate) file_index_error: Option<String>,
     pub(crate) mention_state: Option<MentionState>,
     pub(crate) slash_state: Option<SlashCompletionState>,
+    pub(crate) acp_slash_commands: Vec<SlashCommandItem>,
 }
 
 impl ComposerState {
@@ -49,6 +51,7 @@ impl ComposerState {
             file_index_error: None,
             mention_state: None,
             slash_state: None,
+            acp_slash_commands: Vec::new(),
         }
     }
 
@@ -352,10 +355,23 @@ impl ComposerState {
         };
 
         let query_lower = query.to_lowercase();
-        let results: Vec<&'static crate::slash::SlashCommandDef> = crate::slash::SLASH_COMMANDS
+        let mut results: Vec<SlashCommandItem> = SLASH_COMMANDS
             .iter()
             .filter(|command| command.name.starts_with(query_lower.as_str()))
+            .map(SlashCommandItem::from_local)
             .collect();
+        results.extend(
+            self.acp_slash_commands
+                .iter()
+                .filter(|command| {
+                    command
+                        .name
+                        .to_lowercase()
+                        .starts_with(query_lower.as_str())
+                        && !crate::slash::is_local_command_name(&command.name)
+                })
+                .cloned(),
+        );
 
         if results.is_empty() {
             self.slash_state = None;
@@ -390,7 +406,7 @@ impl ComposerState {
         let Some(state) = self.slash_state.clone() else {
             return false;
         };
-        let Some(&command) = state.results.get(state.selected_index) else {
+        let Some(command) = state.results.get(state.selected_index).cloned() else {
             self.slash_state = None;
             return false;
         };
@@ -412,6 +428,13 @@ impl ComposerState {
         self.file_index_loading = false;
         self.file_index_error = None;
         self.mention_state = None;
+        self.acp_slash_commands.clear();
+        self.refresh_slash_state();
+    }
+
+    pub(crate) fn replace_acp_slash_commands(&mut self, commands: Vec<SlashCommandItem>) {
+        self.acp_slash_commands = commands;
+        self.refresh_slash_state();
     }
 }
 
@@ -439,6 +462,7 @@ mod tests {
         assert_eq!(state.file_index_error, None);
         assert!(state.mention_state.is_none());
         assert!(state.slash_state.is_none());
+        assert!(state.acp_slash_commands.is_empty());
     }
 
     #[test]
@@ -731,6 +755,57 @@ mod tests {
         state.input.push(' ');
         state.input_cursor += 1;
         assert_eq!(state.active_slash_query(), None);
+    }
+
+    #[test]
+    fn advertised_acp_commands_follow_local_matches_and_survive_until_session_switch() {
+        let mut state = ComposerState::new();
+        state.replace_acp_slash_commands(vec![
+            SlashCommandItem {
+                name: "explain-error".into(),
+                description: "Explain an error [error]".into(),
+            },
+            SlashCommandItem {
+                name: "model".into(),
+                description: "should not collide with local /model".into(),
+            },
+        ]);
+        state.input = "/".into();
+        state.input_cursor = 1;
+        state.refresh_slash_state();
+
+        let names: Vec<&str> = state
+            .slash_state
+            .as_ref()
+            .unwrap()
+            .results
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names.first().copied(), Some("model"));
+        assert!(names.contains(&"explain-error"));
+        assert_eq!(
+            names.iter().filter(|name| **name == "model").count(),
+            1,
+            "local /model must not be duplicated by ACP"
+        );
+
+        state.input = "/ex".into();
+        state.input_cursor = 3;
+        state.refresh_slash_state();
+        let results = &state.slash_state.as_ref().unwrap().results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "explain-error");
+        assert_eq!(results[0].description, "Explain an error [error]");
+        assert!(state.accept_selected_slash_completion());
+        assert_eq!(state.input, "/explain-error ");
+
+        state.reset_for_session_switch();
+        assert!(state.acp_slash_commands.is_empty());
+        state.input = "/ex".into();
+        state.input_cursor = 3;
+        state.refresh_slash_state();
+        assert!(state.slash_state.is_none());
     }
 
     #[test]

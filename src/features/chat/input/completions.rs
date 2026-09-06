@@ -163,7 +163,9 @@ mod tests {
     #[test]
     fn slash_acceptance_precedes_mention_acceptance() {
         let mut composer = composer_with_both_completions();
-        let command = composer.slash_state.as_ref().unwrap().results[0].name;
+        let command = composer.slash_state.as_ref().unwrap().results[0]
+            .name
+            .clone();
 
         assert_eq!(
             handle_key(&mut composer, key(KeyCode::Enter), true),

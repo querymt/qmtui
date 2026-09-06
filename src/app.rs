@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::auth_state::AuthState;
 use crate::chat_state::ChatState;
 use crate::command::Command;
@@ -29,6 +31,7 @@ pub struct App {
     // chat
     pub(crate) chat: ChatState,
     pub(crate) composer: ComposerState,
+    pub(crate) acp_slash_commands_by_session: HashMap<String, Vec<crate::slash::SlashCommandItem>>,
 
     // profile info
     pub(crate) profiles: ProfilesState,
@@ -87,6 +90,7 @@ impl App {
             delegates: DelegatesState::new(),
             chat: ChatState::new(),
             composer: ComposerState::new(),
+            acp_slash_commands_by_session: HashMap::new(),
             profiles: ProfilesState::new(),
             models: ModelsState::new(),
             diagnostics: DiagnosticsState::new(),
@@ -220,6 +224,8 @@ impl App {
                 self.connection.apply_disconnected();
                 self.sessions.session_discovery_in_progress = false;
                 self.sessions.pending_session_group_loads.clear();
+                self.acp_slash_commands_by_session.clear();
+                self.composer.replace_acp_slash_commands(Vec::new());
                 self.diagnostics.set_status(
                     LogLevel::Warn,
                     "connection",
@@ -985,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_event_clears_only_transient_session_discovery_and_delay_state() {
+    fn disconnected_event_clears_connection_scoped_state() {
         let mut app = App::new();
         app.connection.launch_cwd = Some("/workspace".into());
         app.connection.reconnect_attempt = 4;
@@ -1000,6 +1006,13 @@ mod tests {
             .pending_session_child_loads
             .insert("session-1".into());
         app.composer.input = "retained prompt".into();
+        let command = crate::slash::SlashCommandItem {
+            name: "stale".into(),
+            description: "stale command".into(),
+        };
+        app.acp_slash_commands_by_session
+            .insert("session-1".into(), vec![command.clone()]);
+        app.composer.replace_acp_slash_commands(vec![command]);
         app.arm_cancel_confirm();
 
         app.handle_connection_event(ConnectionEvent::Disconnected {
@@ -1020,6 +1033,8 @@ mod tests {
                 .contains("session-1")
         );
         assert_eq!(app.composer.input, "retained prompt");
+        assert!(app.acp_slash_commands_by_session.is_empty());
+        assert!(app.composer.acp_slash_commands.is_empty());
         assert!(app.chat.pending_cancel_confirm_until.is_none());
         assert_eq!(app.diagnostics.status, "connection lost - socket closed");
         assert!(

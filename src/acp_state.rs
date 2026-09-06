@@ -216,6 +216,9 @@ pub(crate) enum AcpSessionUpdate {
     Finished {
         finish_reason: String,
     },
+    AvailableCommands {
+        commands: Vec<crate::slash::SlashCommandItem>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +892,11 @@ impl crate::app::App {
         self.render.reset_elicitation_custom_geometry();
         let effects = self.apply_delegate_action(DelegateAction::ClearRootSessionState);
         self.composer.reset_for_session_switch();
+        if let Some(session_id) = self.sessions.session_id.as_deref()
+            && let Some(commands) = self.acp_slash_commands_by_session.get(session_id)
+        {
+            self.composer.replace_acp_slash_commands(commands.clone());
+        }
         effects
     }
 
@@ -944,7 +952,8 @@ impl crate::app::App {
             AcpSessionUpdate::ToolCallEnd { .. }
             | AcpSessionUpdate::TimingUpdate { .. }
             | AcpSessionUpdate::Cancelled
-            | AcpSessionUpdate::Finished { .. } => DelegateChildActivity::Unchanged,
+            | AcpSessionUpdate::Finished { .. }
+            | AcpSessionUpdate::AvailableCommands { .. } => DelegateChildActivity::Unchanged,
         };
         self.apply_inactive_delegate_action(session_id, activity)
     }
@@ -955,6 +964,15 @@ impl crate::app::App {
         update: AcpSessionUpdate,
         is_replay: bool,
     ) -> Vec<Effect> {
+        if let AcpSessionUpdate::AvailableCommands { commands } = update {
+            self.apply_acp_available_commands_log(&commands);
+            self.acp_slash_commands_by_session
+                .insert(session_id.to_string(), commands.clone());
+            if self.sessions.session_id.as_deref() == Some(session_id) {
+                self.composer.replace_acp_slash_commands(commands);
+            }
+            return Vec::new();
+        }
         if self.sessions.session_id.as_deref() != Some(session_id) {
             return self.apply_acp_delegate_child_update(session_id, &update);
         }
@@ -1086,7 +1104,34 @@ impl crate::app::App {
                     is_replay,
                 })
             }
+            AcpSessionUpdate::AvailableCommands { .. } => unreachable!("handled before routing"),
         }
+    }
+
+    fn apply_acp_available_commands_log(&mut self, commands: &[crate::slash::SlashCommandItem]) {
+        self.diagnostics.push_log(
+            LogLevel::Info,
+            "slash",
+            format!("acp commands: {} total", commands.len()),
+        );
+        if commands.is_empty() {
+            return;
+        }
+        let preview: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .take(12)
+            .collect();
+        let suffix = if commands.len() > preview.len() {
+            format!(" ...+{}", commands.len() - preview.len())
+        } else {
+            String::new()
+        };
+        self.diagnostics.push_log(
+            LogLevel::Debug,
+            "slash",
+            format!("acp commands: {}{suffix}", preview.join(", ")),
+        );
     }
 
     fn apply_acp_control_capabilities_log(&mut self, data: Value) {
@@ -2683,6 +2728,7 @@ mod tests {
         assert_eq!(app.composer.file_index_error, None);
         assert!(app.composer.mention_state.is_none());
         assert!(app.composer.slash_state.is_some());
+        assert!(app.composer.acp_slash_commands.is_empty());
         assert!(app.chat.undo_state.is_none());
         assert!(app.chat.elicitation.is_none());
         assert_eq!(app.chat.session_stats.total_tool_calls, 0);
@@ -3506,6 +3552,92 @@ mod tests {
             elapsed >= std::time::Duration::from_secs(2)
                 && elapsed < std::time::Duration::from_secs(3)
         }));
+    }
+
+    #[test]
+    fn available_commands_update_replaces_session_slash_catalog() {
+        let mut app = app_with_active_session();
+        app.composer.input = "/ex".into();
+        app.composer.input_cursor = 3;
+
+        let replies = app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: TEST_SESSION_ID.into(),
+            is_replay: false,
+            update: AcpSessionUpdate::AvailableCommands {
+                commands: vec![crate::slash::SlashCommandItem {
+                    name: "explain-error".into(),
+                    description: "Explain an error [error]".into(),
+                }],
+            },
+        });
+
+        assert!(replies.is_empty());
+        assert_eq!(
+            app.acp_slash_commands_by_session[TEST_SESSION_ID][0].name,
+            "explain-error"
+        );
+        assert_eq!(app.composer.acp_slash_commands.len(), 1);
+        assert_eq!(app.composer.acp_slash_commands[0].name, "explain-error");
+        let results = &app.composer.slash_state.as_ref().unwrap().results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "explain-error");
+        let logs = &app.diagnostics.logs;
+        assert!(logs.iter().any(|entry| {
+            entry.level == LogLevel::Info
+                && entry.target == "slash"
+                && entry.message == "acp commands: 1 total"
+        }));
+        assert!(logs.iter().any(|entry| {
+            entry.level == LogLevel::Debug
+                && entry.target == "slash"
+                && entry.message == "acp commands: explain-error"
+        }));
+
+        app.handle_acp_event(AcpAppEvent::SessionUpdate {
+            session_id: TEST_SESSION_ID.into(),
+            is_replay: false,
+            update: AcpSessionUpdate::AvailableCommands {
+                commands: Vec::new(),
+            },
+        });
+        assert!(app.composer.acp_slash_commands.is_empty());
+        assert!(app.composer.slash_state.is_none());
+        assert_eq!(
+            app.diagnostics
+                .logs
+                .last()
+                .map(|entry| { (entry.level, entry.target, entry.message.as_str()) }),
+            Some((LogLevel::Info, "slash", "acp commands: 0 total"))
+        );
+    }
+
+    #[test]
+    fn session_switch_restores_each_cached_slash_catalog() {
+        let mut app = app_with_active_session();
+        for (session_id, command) in [("session-1", "alpha"), ("session-2", "beta")] {
+            app.handle_acp_event(AcpAppEvent::SessionUpdate {
+                session_id: session_id.into(),
+                is_replay: false,
+                update: AcpSessionUpdate::AvailableCommands {
+                    commands: vec![crate::slash::SlashCommandItem {
+                        name: command.into(),
+                        description: format!("{command} command"),
+                    }],
+                },
+            });
+        }
+
+        assert_eq!(app.composer.acp_slash_commands[0].name, "alpha");
+        assert_eq!(app.acp_slash_commands_by_session.len(), 2);
+
+        app.sessions.session_id = Some("session-2".into());
+        app.reset_active_session_view();
+        assert_eq!(app.composer.acp_slash_commands[0].name, "beta");
+
+        app.sessions.session_id = Some("session-1".into());
+        app.reset_active_session_view();
+        assert_eq!(app.composer.acp_slash_commands[0].name, "alpha");
+        assert_eq!(app.acp_slash_commands_by_session.len(), 2);
     }
 
     #[test]

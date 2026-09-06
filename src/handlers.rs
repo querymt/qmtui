@@ -1821,6 +1821,36 @@ mod model_popup_tests {
     }
 
     #[test]
+    fn advertised_acp_slash_command_is_sent_as_prompt() {
+        let mut effects = TestEffects::default();
+        let mut app = App::new();
+        app.connection.conn = ConnState::Connected;
+        app.composer
+            .replace_acp_slash_commands(vec![crate::slash::SlashCommandItem {
+                name: "explain-error".into(),
+                description: "Explain an error [error]".into(),
+            }]);
+        app.composer
+            .replace_input("/explain-error cargo test".into());
+
+        effects.extend(handle_chat_key(&mut app, key(KeyCode::Enter)));
+
+        assert!(app.composer.input.is_empty());
+        assert!(matches!(
+            effects.next_command(),
+            Some(Command::Prompt { prompt, .. })
+                if matches!(
+                    prompt.as_slice(),
+                    [PromptBlock::Text { text }] if text == "/explain-error cargo test"
+                )
+        ));
+        assert!(matches!(
+            app.chat.messages.as_slice(),
+            [ChatEntry::User { text, .. }] if text == "/explain-error cargo test"
+        ));
+    }
+
+    #[test]
     fn whitespace_prompt_early_return_still_snaps_chat_to_bottom() {
         let mut app = App::new();
         app.connection.conn = ConnState::Connected;

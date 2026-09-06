@@ -55,9 +55,12 @@ pub(super) fn translate(notification: acp::SessionNotification) -> (String, Tran
             Translation::ConfigOptions(update.config_options)
         }
         acp::SessionUpdate::UsageUpdate(update) => Translation::Update(usage_update(update)),
-        acp::SessionUpdate::SessionInfoUpdate(_)
-        | acp::SessionUpdate::Plan(_)
-        | acp::SessionUpdate::AvailableCommandsUpdate(_) => Translation::Ignore,
+        acp::SessionUpdate::AvailableCommandsUpdate(update) => {
+            Translation::Update(available_commands_update(update))
+        }
+        acp::SessionUpdate::SessionInfoUpdate(_) | acp::SessionUpdate::Plan(_) => {
+            Translation::Ignore
+        }
         _ => Translation::Ignore,
     };
     (session_id, translation)
@@ -223,6 +226,37 @@ fn tool_result(fields: &acp::ToolCallUpdateFields) -> Option<String> {
 
 fn tool_name(title: &str) -> String {
     title.strip_prefix("Run ").unwrap_or(title).to_string()
+}
+
+fn available_commands_update(update: acp::AvailableCommandsUpdate) -> AcpSessionUpdate {
+    use crate::slash::{
+        SlashCommandItem, advertised_description, is_local_command_name, normalize_command_name,
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let commands = update
+        .available_commands
+        .into_iter()
+        .filter_map(|command| {
+            let name = normalize_command_name(&command.name)?;
+            if is_local_command_name(&name) || !seen.insert(name.to_lowercase()) {
+                return None;
+            }
+            let argument_hint = command.input.as_ref().and_then(|input| match input {
+                acp::AvailableCommandInput::Unstructured(unstructured)
+                    if !unstructured.hint.trim().is_empty() =>
+                {
+                    Some(unstructured.hint.as_str())
+                }
+                _ => None,
+            });
+            Some(SlashCommandItem {
+                name,
+                description: advertised_description(&command.description, argument_hint),
+            })
+        })
+        .collect();
+    AcpSessionUpdate::AvailableCommands { commands }
 }
 
 fn content_block_to_json(block: &acp::ContentBlock) -> Value {
@@ -461,13 +495,51 @@ mod tests {
         for update in [
             acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title("ignored")),
             acp::SessionUpdate::Plan(acp::Plan::new(vec![])),
-            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![])),
         ] {
             assert!(matches!(
                 translate(notification(update)).1,
                 Translation::Ignore
             ));
         }
+
+        let (_, empty_commands) = translate(notification(
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![])),
+        ));
+        assert!(matches!(
+            empty_commands,
+            Translation::Update(AcpSessionUpdate::AvailableCommands { commands })
+                if commands.is_empty()
+        ));
+    }
+
+    #[test]
+    fn available_commands_normalize_hints_and_skip_local_or_invalid_names() {
+        let advertised = acp::AvailableCommand::new("/explain-error", "Explain an error").input(
+            acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new("[error]")),
+        );
+        let local_collision = acp::AvailableCommand::new("/help", "agent help");
+        let duplicate = acp::AvailableCommand::new("explain-error", "duplicate");
+        let invalid = acp::AvailableCommand::new("two words", "not one command token");
+
+        let (_, translated) = translate(notification(acp::SessionUpdate::AvailableCommandsUpdate(
+            acp::AvailableCommandsUpdate::new(vec![
+                advertised,
+                local_collision,
+                duplicate,
+                invalid,
+            ]),
+        )));
+        let Translation::Update(AcpSessionUpdate::AvailableCommands { commands }) = translated
+        else {
+            panic!("expected available commands translation");
+        };
+        assert_eq!(
+            commands,
+            vec![crate::slash::SlashCommandItem {
+                name: "explain-error".into(),
+                description: "Explain an error [error]".into(),
+            }]
+        );
     }
 
     #[tokio::test]

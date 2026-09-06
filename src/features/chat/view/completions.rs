@@ -57,7 +57,7 @@ fn draw_slash_panel(f: &mut Frame, composer: &ComposerState, area: Rect) {
                     format!("  /{:<width$}  ", cmd.name, width = max_name_len),
                     Theme::status_accent(),
                 ),
-                Span::styled(cmd.description, Theme::dim()),
+                Span::styled(cmd.description.as_str(), Theme::dim()),
             ]))
         })
         .collect();
@@ -167,7 +167,10 @@ mod tests {
         let mut composer = ComposerState::new();
         composer.slash_state = Some(SlashCompletionState {
             selected_index: 1,
-            results: vec![&SLASH_COMMANDS[0], &SLASH_COMMANDS[1]],
+            results: vec![
+                crate::slash::SlashCommandItem::from_local(&SLASH_COMMANDS[0]),
+                crate::slash::SlashCommandItem::from_local(&SLASH_COMMANDS[1]),
+            ],
         });
         composer.mention_state = Some(MentionState {
             trigger_start: 0,
