@@ -39,4 +39,4 @@ tokio-tungstenite = "0.29"
 
 [dev-dependencies]
 insta = "1.48.0"
-serial_test = "3"
+serial_test = "4"
